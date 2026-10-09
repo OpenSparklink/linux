@@ -173,6 +173,42 @@ before reserving pending state or credit. Domain/data decoding and full
 native discovery transactions are still pending; unsupported well-formed
 RX is counted rather than aliased to a standard event.
 
+Command validation is owned by the retained driver's side-effect-free
+``validate_command`` operation. The core calls it before allocating pending
+state/credit and again before transfer. The WS73 implementation currently
+allows only its four metadata queries. The fixed-size raw DLI ioctl rejects
+a declared parameter length over 240 with EINVAL; it never silently clamps
+the request to that buffer. This is an internal operations change, not a new
+userspace ABI or an expansion of Ready capabilities.
+
+The separate production ``discovery.c`` codec prepares the next native Host
+step with an explicit WS73 schema: 49-byte advertising parameters, a
+three-byte complete-data header (handle, operation, length), five-byte
+advertising enable, eight-byte single-frame-type scanning parameters and
+two-byte scanning enable. It never inserts defaults for power, addresses or
+timing, and rejects unsupported multiple frame types rather than choosing
+one. Advertising-parameter validation checks framing only; the controller
+must still reject unsupported values. The reference shares the data schema
+with scan response, whose actual hardware behavior remains unverified here.
+
+The decoder for WS73 event 0x180b accepts exactly a 23-byte header plus its
+declared 0..255 data bytes, preserves all header bytes and exposes raw signed
+RSSI. Address type, direct address, PHY and the uninterpreted vendor byte at
+offset 20 are retained. Short or trailing data fails without changing the
+output; no normalization or truncation hides a malformed event. The decoder
+is not yet connected to native Runtime RX or a userspace event ABI. In
+particular, the current native slot limit and legacy 240-byte event buffer
+cannot represent every such report; that route must be expanded explicitly
+before enabling scanning. Native discovery commands still return
+EOPNOTSUPP through Runtime, including syntactically correct commands.
+
+``ws73_discovery_test`` checks independently specified marker/control/report
+vectors, all complete-data/report lengths, unsupported frame sets, signed
+RSSI values and unchanged outputs on failure. It also feeds the data codec
+through production HCC command framing. Run it using the selftests Makefile
+or compile its C source with ``discovery.c`` and ``wire.c``. These are
+synthetic memory tests, not real dual-controller discovery or RF evidence.
+
 Context references outlive the Backend and all callbacks. Removal atomically
 takes only the matching generation, keeps its registry index reserved while
 workers/URBs drain, and invalidates old fds before reusing it. RX or uncertain

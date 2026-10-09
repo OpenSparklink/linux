@@ -16,6 +16,8 @@ void sparklink_native_transport_free(struct sparklink_native_transport *transpor
 int sparklink_native_transport_open(struct sparklink_native_transport *transport,
 				    u16 id, u64 generation);
 void sparklink_native_transport_close(struct sparklink_native_transport *transport);
+int sparklink_native_transport_validate(struct sparklink_native_transport *transport,
+					u16 opcode, const u8 *params, size_t length);
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,
 				       u16 opcode, const u8 *params, size_t length);
 

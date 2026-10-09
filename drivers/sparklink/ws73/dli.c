@@ -11,6 +11,24 @@
 
 #define WS73_QUERY_MS 10000U
 
+int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
+			      size_t size)
+{
+	if (size && !params)
+		return -EINVAL;
+	switch (opcode) {
+	case 0x0402:
+	case 0x0403:
+	case 0x0404:
+		return size ? -EINVAL : 0;
+	case 0x0406:
+		return size == 1 && params[0] <= 1 ? 0 : -EINVAL;
+	default:
+		/* WS73 0401 is SetEventMask, not standard ReadCmdLen. */
+		return -EOPNOTSUPP;
+	}
+}
+
 struct ws73_query {
 	unsigned int opcode;
 	unsigned int *credits;

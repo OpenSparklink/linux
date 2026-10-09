@@ -517,6 +517,11 @@ fail:
 	return ret;
 }
 
+static int ws73_native_validate(void *context, u16 opcode, const u8 *params, size_t length)
+{
+	return ws73_dli_validate_command(opcode, params, length);
+}
+
 static int ws73_native_command(void *context, u16 opcode, const u8 *params, size_t length)
 {
 	struct ws73_usb *ws = context;
@@ -545,6 +550,7 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.put = ws73_native_put,
 	.open = ws73_native_open,
 	.close = ws73_native_close,
+	.validate_command = ws73_native_validate,
 	.send_command = ws73_native_command,
 };
 

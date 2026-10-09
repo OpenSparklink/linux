@@ -43,6 +43,9 @@ extern "C" {
     fn sparklink_native_transport_free(transport: *mut c_void);
     fn sparklink_native_transport_open(transport: *mut c_void, id: u16, generation: u64) -> i32;
     fn sparklink_native_transport_close(transport: *mut c_void);
+    fn sparklink_native_transport_validate(
+        transport: *mut c_void, opcode: u16, params: *const u8, length: usize,
+    ) -> i32;
     fn sparklink_native_transport_command(
         transport: *mut c_void, opcode: u16, params: *const u8, length: usize,
     ) -> i32;
@@ -76,13 +79,12 @@ impl NativeController {
     }
 
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
-        // Metadata queries only until complete native typed transactions.
-        let valid = match opcode {
-            0x0402..=0x0404 => params.is_empty(),
-            0x0406 => params.len() == 1 && params[0] <= 1,
-            _ => return Err(Error::from_errno(UNSUPPORTED)),
-        };
-        if valid { Ok(()) } else { Err(EINVAL) }
+        // SAFETY: this Backend retains the driver/context. Validation neither
+        // performs I/O nor changes transaction/credit state; the driver owns
+        // its supported command dialect, independently of standard USB.
+        Self::result(unsafe {
+            sparklink_native_transport_validate(self.transport, opcode, params.as_ptr(), params.len())
+        })
     }
 
     pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {

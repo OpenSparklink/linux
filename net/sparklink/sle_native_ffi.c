@@ -26,7 +26,7 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 	struct sparklink_native_transport *transport;
 
 	if (!info || !ops || !context || !identity || !ops->get || !ops->put ||
-	    !ops->open || !ops->close || !ops->send_command)
+	    !ops->open || !ops->close || !ops->validate_command || !ops->send_command)
 		return -EINVAL;
 	transport = kmalloc_obj(*transport);
 	if (!transport)
@@ -61,6 +61,12 @@ int sparklink_native_transport_open(struct sparklink_native_transport *transport
 void sparklink_native_transport_close(struct sparklink_native_transport *transport)
 {
 	transport->ops.close(transport->context);
+}
+
+int sparklink_native_transport_validate(struct sparklink_native_transport *transport,
+					u16 opcode, const u8 *params, size_t length)
+{
+	return transport->ops.validate_command(transport->context, opcode, params, length);
 }
 
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,

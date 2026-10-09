@@ -3114,7 +3114,10 @@ fn ioctl_sync_data_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
 #[inline(never)]
 fn ioctl_dli_send_cmd(context: &RuntimeContext, arg: usize) -> Result<isize> {
     let mut cmd_data: SleDliCmd = read_user_struct(arg)?;
-    let param_len = (cmd_data.param_len as usize).min(DLI_PARAM_MAX);
+    let param_len = cmd_data.param_len as usize;
+    if param_len > DLI_PARAM_MAX {
+        return Err(EINVAL);
+    }
     if sle_dli::sle_opcode_from_u16(cmd_data.opcode).is_none() {
         return Err(EINVAL);
     }

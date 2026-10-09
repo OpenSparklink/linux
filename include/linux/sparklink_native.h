@@ -31,6 +31,9 @@ struct sparklink_native_identity {
 /* open/close/send execute in process context. close must join all callbacks.
  * get/put retain the context across every Backend and in-flight callback.
  * Core owns scheduling/credit/transactions; send only performs one transfer.
+ * validate_command is side-effect free and must not perform I/O or acquire
+ * Runtime/Host locks. It runs before a transaction/credit is allocated, and
+ * again before transfer. The driver owns its dialect and supported commands.
  */
 struct sparklink_native_ops {
 	struct module *owner;
@@ -38,6 +41,7 @@ struct sparklink_native_ops {
 	void (*put)(void *context);
 	int (*open)(void *context, u16 id, u64 generation);
 	void (*close)(void *context);
+	int (*validate_command)(void *context, u16 opcode, const u8 *params, size_t length);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
 };
 

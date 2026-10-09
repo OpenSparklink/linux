@@ -163,6 +163,24 @@ static int exercise(int fd, const struct sci_dev_info *info)
 	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &wrong) != -1 || errno != EOPNOTSUPP ||
 	    ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || memcmp(&before, &after, sizeof(before)))
 		return fail("ReadCmdLen rejected before credit/pending consumption");
+	/* A declared parameter length must never be clamped to the ABI buffer.
+	 * Same unsupported opcode distinguishes EINVAL from dialect rejection.
+	 */
+	wrong.param_len = 0xffff;
+	errno = 0;
+	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &wrong) != -1 || errno != EINVAL ||
+	    ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || memcmp(&before, &after, sizeof(before)))
+		return fail("oversized parameters rejected before dialect/pending/credit");
+	wrong = (struct sle_dli_cmd){ .opcode = 0x1002, .param_len = 2, .params = { 1, 0 } };
+	errno = 0;
+	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &wrong) != -1 || errno != EOPNOTSUPP ||
+	    ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || memcmp(&before, &after, sizeof(before)))
+		return fail("discovery schema is not Runtime support until event route exists");
+	wrong = (struct sle_dli_cmd){ .opcode = 0x0406, .param_len = 1, .params = { 2 } };
+	errno = 0;
+	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &wrong) != -1 || errno != EINVAL ||
+	    ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || memcmp(&before, &after, sizeof(before)))
+		return fail("driver query parameter rejected before pending/credit");
 	for (int i = 0; i < 8; i++)
 		if (query(fd, info, 0x0406, 0) || query(fd, info, 0x0403, 0))
 			return -1;

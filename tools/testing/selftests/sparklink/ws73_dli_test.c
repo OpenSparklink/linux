@@ -220,6 +220,20 @@ static void command_tests(void)
 	unsigned int i;
 
 	memset(params, 0x5a, sizeof(params));
+	for (unsigned int op = 0x0402; op <= 0x0404; op++) {
+		CHECK(ws73_dli_validate_command(op, NULL, 0) == 0);
+		CHECK(ws73_dli_validate_command(op, params, 1) == -EINVAL);
+	}
+	CHECK(ws73_dli_validate_command(0x0406, NULL, 0) == -EINVAL);
+	CHECK(ws73_dli_validate_command(0x0406, NULL, 1) == -EINVAL);
+	for (i = 0; i < 256; i++) {
+		params[0] = i;
+		CHECK(ws73_dli_validate_command(0x0406, params, 1) == (i <= 1 ? 0 : -EINVAL));
+	}
+	CHECK(ws73_dli_validate_command(0x0401, NULL, 0) == -EOPNOTSUPP);
+	CHECK(ws73_dli_validate_command(0x1001, params, 8) == -EOPNOTSUPP);
+	CHECK(ws73_dli_validate_command(0x0c05, params, 5) == -EOPNOTSUPP);
+	memset(params, 0x5a, sizeof(params));
 	CHECK(ws73_wire_command(tx, sizeof(tx), 8, 0x0404, NULL, 0) == 128);
 	CHECK(!memcmp(tx + 64, "\xa0\x08\x05\x00\xa1\x04\x04\x00\x00", 9));
 	CHECK(ws73_wire_command(tx, sizeof(tx), 9, 0x0406, params, 1) == 128);

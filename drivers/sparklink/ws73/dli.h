@@ -19,6 +19,12 @@ struct ws73_dli_result {
 	unsigned int status; /* exact controller status; not an errno alias */
 };
 
+/* Runtime support policy: metadata queries only until the discovery Host
+ * transaction and report route are implemented. No I/O or state mutation.
+ */
+int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
+			      size_t size);
+
 /* Fresh BSLE-open instance only. The caller provides its initial probe
  * window (one); every subsequent grant is an absolute controller credit.
  * Do not call again after an uncertain send/timeout. Publish info only on
