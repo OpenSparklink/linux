@@ -16,13 +16,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(USBWs73Test, USB_WS73_TEST)
 
 struct USBWs73Test {
     USBDevice parent_obj;
-    uint8_t packets[16][156];
-    int64_t ready_at[16];
+    uint8_t packets[64][384];
+    unsigned int packet_size[64];
+    int64_t ready_at[64];
     QEMUTimer *wake;
     bool in_flight;
     unsigned int head, count, sequence, commands, serial;
     uint8_t runtime_status;
     uint8_t runtime_fault;
+    uint8_t runtime_reports;
+    bool reports_emitted;
     bool bsp, pm, custom, opened, failed_once;
 };
 
@@ -90,12 +93,14 @@ static void queue_frame(USBWs73Test *s, uint8_t service, uint8_t queue,
 {
     uint8_t *p;
 
-    g_assert(s->count < 16 && length <= 60);
-    unsigned int tail = (s->head + s->count++) % 16;
+    g_assert(s->count < 64 && length <= 283);
+    unsigned int slot = MAX(64, ROUND_UP(length + 4, 32));
+    unsigned int tail = (s->head + s->count++) % 64;
     p = s->packets[tail];
     s->ready_at[tail] = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-    memset(p, 0, 156);
-    put32(p, 2); put32(p + 4, 156); put16(p + 12, 64);
+    memset(p, 0, sizeof(s->packets[tail]));
+    s->packet_size[tail] = 92 + slot;
+    put32(p, 2); put32(p + 4, 92 + slot); put16(p + 12, slot);
     p[92] = service << 4; p[93] = queue; put16(p + 94, length);
     memcpy(p + 96, data, length);
 }
@@ -117,7 +122,27 @@ static void command_event(USBWs73Test *s, unsigned int event, unsigned int opcod
     if (opcode) { data[8] = status; if (length) { memcpy(data + 9, value, length); } }
     queue_frame(s, 10, 8, data, opcode ? 9 + length : 8);
     if (opcode && event == 2) {
-        s->ready_at[(s->head + s->count - 1) % 16] += 25;
+        s->ready_at[(s->head + s->count - 1) % 64] += 25;
+    }
+}
+
+static void report_events(USBWs73Test *s)
+{
+    /* Synthetic unsolicited maximum-length reports; not RF or a scanner.
+     * Forty records intentionally overrun the production 32-entry log.
+     */
+    for (unsigned int ordinal = 1; ordinal <= s->runtime_reports; ordinal++) {
+        uint8_t data[283] = { 0xa2 };
+        uint8_t *body = data + 5;
+        put16(data + 1, 0x180b); put16(data + 3, 278);
+        body[0] = 3; body[1] = 6;
+        memcpy(body + 2, "\xaa\xbb\xcc\xdd\xee", 5); body[7] = s->serial;
+        body[8] = 4; memcpy(body + 9, "\x09\x08\x07\x06\x05\x04", 6);
+        body[15] = 1; body[16] = 2; body[17] = 3;
+        body[18] = 0x44; body[19] = 0x55; body[20] = 0xa7;
+        body[21] = 0xd6; body[22] = 255;
+        for (unsigned int i = 0; i < 255; i++) { body[23 + i] = i ^ ordinal; }
+        queue_frame(s, 10, 8, data, sizeof(data));
     }
 }
 
@@ -157,7 +182,7 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         /* Later bytes are intentionally inconsistent with the aggregate.
          * Production wire validation must fail before invoking native RX.
          */
-        put32(s->packets[(s->head + s->count - 1) % 16] + 4, 155);
+        put32(s->packets[(s->head + s->count - 1) % 64] + 4, 155);
         return true;
     }
     if (s->commands > 4 && s->runtime_status && !s->failed_once) {
@@ -169,6 +194,10 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
     command_event(s, 1, op, 1, 0, NULL, 0); /* acceptance, not completion */
     command_event(s, 2, op, 0, 0, value, size); /* zero window */
     command_event(s, 2, 0, 1, 0, NULL, 0); /* genuine unsolicited grant */
+    if (s->commands > 4 && op == 0x0404 && s->runtime_reports && !s->reports_emitted) {
+        s->reports_emitted = true;
+        report_events(s);
+    }
     return true;
 }
 
@@ -201,6 +230,7 @@ static void reset(USBDevice *dev)
     USBWs73Test *s = USB_WS73_TEST(dev);
     s->head = s->count = s->sequence = s->commands = 0;
     s->bsp = true; s->pm = s->custom = s->opened = s->failed_once = s->in_flight = false;
+    s->reports_emitted = false;
     if (s->wake) { timer_del(s->wake); }
 }
 
@@ -217,6 +247,7 @@ static void realize(USBDevice *dev, Error **errp)
     s->wake = timer_new_ms(QEMU_CLOCK_VIRTUAL, wakeup, s);
     s->serial = ++instances;
     g_assert(s->serial < 255);
+    g_assert(s->runtime_reports <= 40);
     reset(dev);
 }
 
@@ -245,14 +276,14 @@ static void transfer(USBDevice *dev, USBPacket *p)
         bits[0] = 1; s->bsp = false; usb_packet_copy(p, bits, 8);
     } else if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
         if (!s->count) { p->status = USB_RET_NAK; return; }
-        if (n < 156) { p->status = USB_RET_STALL; return; }
+        if (n < s->packet_size[s->head]) { p->status = USB_RET_STALL; return; }
         if (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) < s->ready_at[s->head]) {
             timer_mod(s->wake, s->ready_at[s->head]); p->status = USB_RET_NAK; return;
         }
         if (s->packets[s->head][96] == 0xa2 && le16(s->packets[s->head] + 97) == 2
             && le16(s->packets[s->head] + 101)) { s->in_flight = false; }
-        usb_packet_copy(p, s->packets[s->head], 156);
-        s->head = (s->head + 1) % 16; s->count--;
+        usb_packet_copy(p, s->packets[s->head], s->packet_size[s->head]);
+        s->head = (s->head + 1) % 64; s->count--;
     } else if (p->pid == USB_TOKEN_OUT && p->ep->nr == 1 && n <= sizeof(out)) {
         usb_packet_copy(p, out, n);
         if (!outgoing(s, out, n)) { p->status = USB_RET_STALL; }
@@ -263,6 +294,7 @@ static void transfer(USBDevice *dev, USBPacket *p)
 static Property properties[] = {
     DEFINE_PROP_UINT8("runtime-status", USBWs73Test, runtime_status, 0),
     DEFINE_PROP_UINT8("runtime-fault", USBWs73Test, runtime_fault, 0),
+    DEFINE_PROP_UINT8("runtime-reports", USBWs73Test, runtime_reports, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

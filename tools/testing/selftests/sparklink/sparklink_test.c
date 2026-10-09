@@ -829,7 +829,7 @@ static void test_conn_data_loopback(int fd)
 	if (ret < 0 && errno == EAGAIN) {
 		printf("  OK:   CONN_RECV (empty): correctly got EAGAIN\n");
 	} else {
-		printf("  WARN: expected EAGAIN, got ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EAGAIN, got ret=%d errno=%d\n", ret, errno);
 	}
 
 	/* Step 8: Check stats */
@@ -847,6 +847,10 @@ static void test_conn_data_loopback(int fd)
 	check("DISCONNECT", ret);
 
 	/* Step 10: Try to send after disconnect — should fail ENOENT (handle gone) */
+	if (ret < 0 || wait_conn_removed(fd, handle)) {
+		test_fail("  FAIL: data loopback disconnect did not complete: %s\n", strerror(errno));
+		return;
+	}
 	memset(&sd, 0, sizeof(sd));
 	sd.handle = handle;
 	sd.length = 5;
@@ -855,7 +859,7 @@ static void test_conn_data_loopback(int fd)
 	if (ret < 0 && errno == ENOENT) {
 		printf("  OK:   CONN_SEND (disconnected): correctly got ENOENT\n");
 	} else {
-		printf("  WARN: expected ENOENT, got ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected ENOENT, got ret=%d errno=%d\n", ret, errno);
 	}
 }
 

@@ -74,6 +74,7 @@ impl Drop for NativeController {
 }
 
 impl NativeController {
+    pub(crate) fn profile(&self) -> u32 { self.metadata.profile }
     fn result(ret: i32) -> Result {
         if ret < 0 { Err(Error::from_errno(ret)) } else { Ok(()) }
     }
@@ -229,6 +230,29 @@ pub(crate) extern "C" fn sparklink_native_unregister_rust(id: u16, generation: u
             let _ = ss.dev_registry.unregister(id);
         }
     }
+}
+
+/// Callback receives a validated HCC slot, not a complete USB aggregate.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_event_rust(
+    id: u16, generation: u64, profile: u32, event_code: u16, params: *const u8, length: usize,
+) -> i32 {
+    if params.is_null() { return EINVAL.to_errno(); }
+    if length > super::sle_uapi::CONTROLLER_EVENT_PAYLOAD_MAX { return -(kernel::bindings::EMSGSIZE as i32); }
+    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
+        return ENODEV.to_errno();
+    };
+    if profile == 0 || profile != owner.protocol_profile { return PROTOCOL_ERROR; }
+    // Management replies cannot bypass the Host's reserved matching slot.
+    if event_code <= 2 { return PROTOCOL_ERROR; }
+    // SAFETY: driver retains a validated live parameter buffer for this call.
+    let bytes = unsafe { core::slice::from_raw_parts(params, length) };
+    let gate = owner.schedule_gate.lock();
+    if *gate { return ENODEV.to_errno(); }
+    let result = owner.controller_events.lock().publish(owner.identity, profile, event_code, bytes);
+    drop(gate);
+    if result.is_ok() { owner.controller_event_poll.notify_all(); }
+    NativeController::result_to_errno(result)
 }
 
 /// Callback receives a validated HCC slot, not a complete USB aggregate.

@@ -421,6 +421,49 @@ pub(crate) const SL_IOCTL_EVENT_STATS: u32 = _IOR::<SleEventStats>(SL_MAGIC, 0x7
 
 /// Get DLI controller information.
 pub(crate) const SL_IOCTL_DLI_INFO: u32 = _IOR::<SleDliInfo>(SL_MAGIC, 0x80);
+pub(crate) const SL_IOCTL_CONTROLLER_EVENT_GET: u32 =
+    _IOWR::<SleControllerEventQuery>(SL_MAGIC, 0x87);
+
+pub(crate) const CONTROLLER_EVENT_VERSION: u32 = 1;
+pub(crate) const CONTROLLER_EVENT_PAYLOAD_MAX: usize = 288;
+
+/// Complete native controller parameters, attributed to one registration.
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleControllerEvent {
+    pub seq: u64,
+    pub generation: u64,
+    pub timestamp_ns: u64,
+    pub lost: u64,
+    pub profile: u32,
+    pub dev_index: u16,
+    pub event_code: u16,
+    pub payload_len: u16,
+    pub flags: u16,
+    pub _reserved: u32,
+    pub payload: [u8; CONTROLLER_EVENT_PAYLOAD_MAX],
+}
+
+/// Versioned non-destructive cursor request; event is output only.
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleControllerEventQuery {
+    pub after_seq: u64,
+    pub generation: u64,
+    pub version: u32,
+    pub flags: u32,
+    pub event: SleControllerEvent,
+}
+
+// SAFETY: both repr(C) types contain only integer fields and byte arrays;
+// every input bit pattern is valid. Query fields are checked by the handler.
+unsafe impl FromBytes for SleControllerEvent {}
+unsafe impl FromBytes for SleControllerEventQuery {}
+
+const _: () = assert!(core::mem::size_of::<SleControllerEvent>() == 336);
+const _: () = assert!(core::mem::offset_of!(SleControllerEvent, payload) == 48);
+const _: () = assert!(core::mem::size_of::<SleControllerEventQuery>() == 360);
+const _: () = assert!(core::mem::offset_of!(SleControllerEventQuery, event) == 24);
 
 /// Get USB SLE device count (hardware discovery).
 pub(crate) const SL_IOCTL_USB_DEV_COUNT: u32 = _IO(SL_MAGIC, 0x81);
@@ -2884,6 +2927,8 @@ impl_check_reserved!(SleOobData);
 impl_check_reserved!(SlePasskeyInput);
 impl_check_reserved!(SlePmInterval);
 impl_check_reserved!(SleDliCmd);
+// Query.event is output-only. Only the handler validates input version/flags.
+impl_check_reserved!(SleControllerEventQuery);
 impl_check_reserved!(SlePhyMcsSelect);
 impl_check_reserved!(SsapUuidOp);
 impl_check_reserved!(SleMeasLinkParam);

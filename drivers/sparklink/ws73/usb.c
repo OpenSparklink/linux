@@ -20,6 +20,7 @@
 
 #include "bsle.h"
 #include "dli.h"
+#include "discovery.h"
 
 #define WS73_VID		0xffff
 #define WS73_PID		0x3733
@@ -428,6 +429,18 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 
 	if (service != WS73_WIRE_SLE_SERVICE || queue != WS73_WIRE_SLE_QUEUE)
 		return 0;
+	if (size >= 5 && data[0] == 0xa2 && get_unaligned_le16(data + 1) == WS73_DISC_REPORT_EVENT) {
+		struct ws73_discovery_report report;
+
+		if (get_unaligned_le16(data + 3) != size - 5)
+			return -EPROTO;
+		ret = ws73_discovery_report_decode(data + 5, size - 5, &report);
+		if (ret)
+			return ret;
+		return sparklink_native_event(ws->native_id, ws->native_generation,
+					      SPARKLINK_NATIVE_WS73_HCC, WS73_DISC_REPORT_EVENT,
+					      report.header, size - 5);
+	}
 	ret = sparklink_native_receive(ws->native_id, ws->native_generation, data, size);
 	if (ret == -EOPNOTSUPP) {
 		atomic_inc(&ws->unsupported_rx);

@@ -12,11 +12,53 @@ NATIVE_REMOVE_FIRST
 NATIVE_READD_FIRST
 NATIVE_LIFETIME: old=1 new=3 unaffected=2
 NATIVE_LIFECYCLE: PASS
+RUNTIME_KERNEL_LOG_BEGIN
+[    0.000000] Linux version synthetic-verdict-fixture
+RUNTIME_KERNEL_LOG_END
 RUNTIME_GUEST_EXIT: 0
 '''
 
 
+EVENTS = ('NATIVE_EVENTS: index=0 retained=32 first=9 last=40 lost=8 payload=278 '
+          'fanout=2 fault_retry=1 poll=1\n'
+          'NATIVE_EVENTS: index=1 retained=32 first=9 last=40 lost=8 payload=278 '
+          'fanout=2 fault_retry=1 poll=1\n'
+          'NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1\n')
+
+
 class NativeVerdict(unittest.TestCase):
+    def test_missing_full_kernel_log(self):
+        self.assertTrue(assess_native(GOOD.replace('RUNTIME_KERNEL_LOG_BEGIN', 'missing'), 0))
+
+    def test_missing_early_kernel_log(self):
+        self.assertTrue(assess_native(GOOD.replace('[    0.000000]', '[    1.000000]'), 0))
+
+    def test_duplicate_kernel_log(self):
+        self.assertTrue(assess_native(GOOD + 'RUNTIME_KERNEL_LOG_END\n', 0))
+    def test_event_stream(self):
+        self.assertEqual(assess_native(GOOD + EVENTS, 0, events=True), [])
+
+    def test_missing_event_stream(self):
+        self.assertTrue(assess_native(GOOD, 0, events=True))
+
+    def test_event_fanout_missing(self):
+        self.assertTrue(assess_native(GOOD + EVENTS.replace('fanout=2', 'fanout=1'), 0, events=True))
+
+    def test_event_payload_truncated(self):
+        self.assertTrue(assess_native(GOOD + EVENTS.replace('payload=278', 'payload=240'), 0, events=True))
+
+    def test_event_loss_hidden(self):
+        self.assertTrue(assess_native(GOOD + EVENTS.replace('lost=8', 'lost=0'), 0, events=True))
+
+    def test_event_owner_duplicate(self):
+        self.assertTrue(assess_native(GOOD + EVENTS.replace('index=1', 'index=0'), 0, events=True))
+
+    def test_event_replug_missing(self):
+        self.assertTrue(assess_native(GOOD + EVENTS.split('NATIVE_EVENTS_REPLUG')[0], 0, events=True))
+
+    def test_event_unexpected(self):
+        self.assertTrue(assess_native(GOOD + EVENTS, 0))
+
     def test_complete(self):
         self.assertEqual(assess_native(GOOD, 0), [])
 

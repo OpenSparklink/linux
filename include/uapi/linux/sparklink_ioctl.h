@@ -633,6 +633,46 @@ struct sle_wire_event {
 	__u8  _pad[2];
 };
 
+/* Versioned, non-destructive native controller event stream. All integer
+ * fields use the same native-endian convention as existing SparkLink ioctls.
+ * payload contains exact validated controller parameters, not USB/HCC headers.
+ * Profile describes their dialect; no discovery fields are normalized here.
+ */
+#define SLE_CONTROLLER_EVENT_VERSION 1U
+#define SLE_CONTROLLER_EVENT_PAYLOAD_MAX 288U
+#define SLE_CONTROLLER_EVENT_PROFILE_WS73_HCC 1U
+
+struct sle_controller_event {
+	__aligned_u64 seq;             /* starts at 1 per registration */
+	__aligned_u64 generation;      /* immutable registration identity */
+	__aligned_u64 timestamp_ns;    /* CLOCK_BOOTTIME at receipt */
+	__aligned_u64 lost;            /* overwritten entries after requested cursor */
+	__u32 profile;
+	__u16 dev_index;
+	__u16 event_code;
+	__u16 payload_len;
+	__u16 flags;                   /* zero in version 1 */
+	__u32 _reserved;               /* zero */
+	__u8 payload[SLE_CONTROLLER_EVENT_PAYLOAD_MAX];
+};
+
+struct sle_controller_event_query {
+	__aligned_u64 after_seq;       /* caller-owned cursor, 0 starts oldest retained */
+	__aligned_u64 generation;      /* 0 only with after_seq=0; otherwise exact identity */
+	__u32 version;                 /* SLE_CONTROLLER_EVENT_VERSION */
+	__u32 flags;                   /* input must be zero */
+	struct sle_controller_event event; /* output only; ignored on input */
+};
+
+/* GET is nonblocking: EAGAIN means no newer event, ENODEV a retired/mismatched
+ * registration, EINVAL a future cursor/flags, EOPNOTSUPP an unknown version.
+ * No shared dequeue: independent readers can request the same sequence.
+ * GET subscribes this fd's poll to this registration's native stream, even
+ * on EAGAIN. In that mode poll excludes the legacy 44-byte event queue.
+ * DEV_SELECT resets this poll subscription. Errors never advance the cursor.
+ * Management replies continue through their dedicated transaction path.
+ */
+
 struct sle_event_stats {
 	__u32 pending;
 	__u32 _pad;
@@ -845,6 +885,7 @@ struct ssap_uuid_op {
 /* --- Subsystem statistics ----------------------------------------------- */
 
 #define SL_IOCTL_SUBSYS_STATS		_IOR(SL_MAGIC, 0x86, struct sle_subsys_stats)
+#define SL_IOCTL_CONTROLLER_EVENT_GET	_IOWR(SL_MAGIC, 0x87, struct sle_controller_event_query)
 
 /* --- PHY layer ---------------------------------------------------------- */
 

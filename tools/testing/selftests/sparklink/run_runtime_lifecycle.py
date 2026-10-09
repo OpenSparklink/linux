@@ -48,13 +48,20 @@ def assess(console, qemu_exit):
     return errors
 
 
-def assess_native(console, qemu_exit, fault=False):
+def assess_native(console, qemu_exit, fault=False, events=False):
     console = console.replace('\r', '')
     errors = []
     if qemu_exit:
         errors.append(f'QEMU exit {qemu_exit}')
     if KERNEL_FAULT.search(console):
         errors.append('kernel fault')
+    if (console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1
+            or console.count('RUNTIME_KERNEL_LOG_END') != 1):
+        errors.append('missing or duplicate complete native kernel log')
+    else:
+        log = console.split('RUNTIME_KERNEL_LOG_BEGIN', 1)[1].split('RUNTIME_KERNEL_LOG_END', 1)[0]
+        if '[    0.000000]' not in log:
+            errors.append('native kernel log missing early record')
     if 'NATIVE_FAILURE:' in console:
         errors.append('native guest assertion failure')
     markers = re.findall(r'^NATIVE_(ADD_SECOND|REMOVE_FIRST|FAULT_FIRST|READD_FIRST|LIFECYCLE: PASS)$',
@@ -79,6 +86,14 @@ def assess_native(console, qemu_exit, fault=False):
             errors.append('invalid native generation isolation')
     if re.findall(r'^RUNTIME_GUEST_EXIT: (\d+)$', console, re.MULTILINE) != ['0']:
         errors.append('missing or unsuccessful guest exit')
+    event_evidence = re.findall(r'^NATIVE_EVENTS: index=(\d+) retained=32 first=9 last=40 '
+                                r'lost=8 payload=278 fanout=2 fault_retry=1 poll=1$',
+                                console, re.MULTILINE)
+    if sorted(event_evidence) != (['0', '1'] if events else []):
+        errors.append('missing, duplicate or unexpected complete native event evidence')
+    replug = 'NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1'
+    if console.count(replug) != (1 if events else 0):
+        errors.append('missing, duplicate or unexpected native event replug evidence')
     return errors
 
 
@@ -123,9 +138,13 @@ def main():
                         help='synthetic WS73 HCC/BSLE/URB bootstrap; never real WS73/RF')
     parser.add_argument('--native-ws73-fault', action='store_true',
                         help='inject one malformed native aggregate, retaining the other owner')
+    parser.add_argument('--native-ws73-events', action='store_true',
+                        help='synthetic maximum reports, fanout/loss/poll/copy-fault and replug')
     args = parser.parse_args()
     if args.native_ws73_fault and not args.native_ws73:
         parser.error('--native-ws73-fault requires --native-ws73')
+    if args.native_ws73_events and (not args.native_ws73 or args.native_ws73_fault):
+        parser.error('--native-ws73-events requires --native-ws73 without --native-ws73-fault')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     build = args.kernel_build.resolve()
@@ -134,6 +153,7 @@ def main():
     scope = ('synthetic WS73 USB HCC/BSLE/native SETUP lifetime; no ROM/RF/slkd/no-sudo acceptance'
              if args.native_ws73 else 'virtual standard-DLI Runtime lifetime; not WS73/RF/slkd/no-sudo acceptance')
     manifest = dict(scope=scope, native_fault_injection=args.native_ws73_fault,
+                    native_event_stream=args.native_ws73_events,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
     process = monitor = None
     try:
@@ -200,6 +220,10 @@ poweroff -f
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
                                                           '/bin/sparklink_runtime_test --fault\n'))
+        if args.native_ws73_events:
+            initfile = initroot / 'init'
+            initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
+                                                          '/bin/sparklink_runtime_test --events\n'))
         (initroot / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -222,7 +246,8 @@ poweroff -f
                        '-device', 'qemu-xhci,id=xhci',
                        '-device', f'{model},id=sle0,bus=xhci.0,port=1' +
                        (',runtime-fault=1' if args.native_ws73_fault else
-                        ',runtime-status=254' if args.native_ws73 else '')]
+                        ',runtime-status=254' if args.native_ws73 else '') +
+                       (',runtime-reports=40' if args.native_ws73_events else '')]
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
                 command.append('-enable-kvm')
             manifest['qemu_args'] = command
@@ -230,19 +255,21 @@ poweroff -f
                 process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
                 wait_marker(process, console, f'{prefix}_ADD_SECOND')
                 monitor = load_qmp()(sock, output / 'qmp.jsonl')
+                event_properties = {'runtime-reports': 40} if args.native_ws73_events else {}
                 monitor.execute('device_add', dict(driver=model, id='sle1',
-                                                    bus='xhci.0', port='2'))
+                                                    bus='xhci.0', port='2', **event_properties))
                 wait_marker(process, console, f'{prefix}_FAULT_FIRST' if args.native_ws73_fault
                             else f'{prefix}_REMOVE_FIRST')
                 monitor.execute('device_del', dict(id='sle0'))
                 monitor.wait_deleted('sle0')
                 wait_marker(process, console, f'{prefix}_READD_FIRST')
                 monitor.execute('device_add', dict(driver=model, id='sle0',
-                                                    bus='xhci.0', port='1'))
+                                                    bus='xhci.0', port='1', **event_properties))
                 exit_code = process.wait(timeout=30)
             manifest['qemu_exit'] = exit_code
             verify = assess_native if args.native_ws73 else assess
-            errors = (verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault)
+            errors = (verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
+                             args.native_ws73_events)
                       if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code))
             if errors:
                 raise RuntimeError('; '.join(errors))

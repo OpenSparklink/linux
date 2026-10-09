@@ -55,4 +55,12 @@ void sparklink_native_unregister(u16 id, u64 generation);
  */
 int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t length);
 
+/* Publish exact driver-validated native event parameters. IRQ-safe; copies
+ * into the attributed owner's bounded log before returning. No pointer is
+ * retained. Profile must match this registration. Management replies must
+ * continue through receive above, not this discovery/notification stream.
+ */
+int sparklink_native_event(u16 id, u64 generation, u32 profile, u16 event_code,
+			   const u8 *params, size_t length);
+
 #endif

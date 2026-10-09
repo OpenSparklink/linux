@@ -196,10 +196,9 @@ declared 0..255 data bytes, preserves all header bytes and exposes raw signed
 RSSI. Address type, direct address, PHY and the uninterpreted vendor byte at
 offset 20 are retained. Short or trailing data fails without changing the
 output; no normalization or truncation hides a malformed event. The decoder
-is not yet connected to native Runtime RX or a userspace event ABI. In
-particular, the current native slot limit and legacy 240-byte event buffer
-cannot represent every such report; that route must be expanded explicitly
-before enabling scanning. Native discovery commands still return
+now connected to the separate complete native event route described below.
+The legacy command-slot limit and 240-byte raw event buffer are retained;
+reports use the versioned route without being truncated. Native discovery commands still return
 EOPNOTSUPP through Runtime, including syntactically correct commands.
 
 ``ws73_discovery_test`` checks independently specified marker/control/report
@@ -208,6 +207,54 @@ RSSI values and unchanged outputs on failure. It also feeds the data codec
 through production HCC command framing. Run it using the selftests Makefile
 or compile its C source with ``discovery.c`` and ``wire.c``. These are
 synthetic memory tests, not real dual-controller discovery or RF evidence.
+
+Complete native controller event stream
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The WS73 driver now routes validated 0x180b bodies through the internal
+``sparklink_native_event`` callback, independently of management reply slots.
+The old 260-byte command-slot restriction does not apply to this route. RX
+copies into 32 preallocated records under the attributed Runtime's IRQ-safe
+lock; there is no per-report allocation or retained driver-buffer pointer.
+The complete 23-byte vendor header and up to 255 data bytes are preserved.
+Malformed report lengths fail before publication and withdraw only the
+matching registration through the driver's existing fault work.
+
+``SL_IOCTL_CONTROLLER_EVENT_GET`` (number 0x87, 360-byte query) exposes version
+1 records with registration id/generation, profile, raw event code, receipt
+``CLOCK_BOOTTIME`` timestamp, per-registration sequence and exact payload.
+Records have 288 payload bytes and a fixed 336-byte layout; C/Rust size and
+offset assertions include explicit eight-byte alignment for 64-bit fields.
+The unused payload tail, flags and reserved fields are zero. This supplements
+the old interfaces; it does not resize or reinterpret their records.
+
+Each reader supplies ``after_seq`` and the exact generation. The initial
+cursor may use generation/sequence zero. GET returns the oldest retained
+newer record, and ``lost`` explicitly reports overwritten records since the
+requested cursor. Readers do not compete for dequeue, and can replay retained
+records. EAGAIN means no newer record; a future cursor/flags gives EINVAL,
+unknown versions EOPNOTSUPP and a stale generation ENODEV. A failed copyout
+does not acknowledge the record or advance poll readiness.
+
+GET also selects native-stream poll readiness for that fd, including on
+EAGAIN; legacy queue readiness is excluded in this mode. Waiters register on
+this owner's PollCondVar and wake directly after publication. Retirement
+wakes them with POLLHUP/POLLERR and subsequent GET returns ENODEV. DEV_SELECT
+clears the subscription. Use an independently opened, selected fd for this
+stream; management/control fds retain their existing behavior. A reused
+device index cannot retarget a bound old fd or reuse its event sequence.
+
+Currently this stream contains validated WS73 discovery reports only. It
+does not claim complete native/standard snoop, command/event unification,
+discovery reassembly, Ready, active scanning, or real RF reception. Native
+discovery commands remain disabled until the full Host transactions exist.
+The synthetic support gate adds forty maximum-length reports per owner to
+exercise loss, independent fanout, poll, copyout retry and replug::
+
+  python3 tools/testing/selftests/sparklink/run_runtime_lifecycle.py \
+    --kernel-build /path/to/build --qemu /path/to/custom/qemu \
+    --busybox /path/to/static/busybox --native-ws73 --native-ws73-events \
+    --output /path/to/fresh-event-evidence
 
 Context references outlive the Backend and all callbacks. Removal atomically
 takes only the matching generation, keeps its registry index reserved while

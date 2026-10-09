@@ -3,11 +3,13 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -190,6 +192,112 @@ static int exercise(int fd, const struct sci_dev_info *info)
 	return 0;
 }
 
+/* Complete native event gate. All packets are injected by the NO-RF fixture. */
+_Static_assert(sizeof(struct sle_controller_event) == 336, "event ABI");
+_Static_assert(sizeof(struct sle_controller_event_query) == 360, "event query ABI");
+_Static_assert(SL_IOCTL_CONTROLLER_EVENT_GET == 0xc1685387U, "event ioctl ABI");
+
+static int events_subscribe(int fd, unsigned long long generation)
+{
+    struct sle_controller_event_query request = { .version = 1, .generation = generation };
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 || errno != EAGAIN ||
+        poll(&p, 1, 0) != 0)
+        return fail("empty native subscription ignores queued legacy replies");
+    return 0;
+}
+
+static int events_read(int fd, const struct sci_dev_info *info, unsigned long long generation,
+                       struct sle_controller_event *first)
+{
+    struct sle_controller_event_query request = { .version = 1, .generation = generation };
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    unsigned long long timestamp = 0;
+    if (poll(&p, 1, 1000) != 1 || p.revents != POLLIN)
+        return fail("native subscription readiness");
+    for (unsigned int ordinal = 9; ordinal <= 40; ordinal++) {
+        if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request))
+            return fail("complete native record read");
+        const struct sle_controller_event *e = &request.event;
+        const unsigned char *b = e->payload;
+        if (e->seq != ordinal || e->generation != generation || e->dev_index != info->index ||
+            e->profile != 1 || e->event_code != 0x180b || e->payload_len != 278 ||
+            e->flags || e->_reserved || e->lost != (ordinal == 9 ? 8U : 0U) ||
+            !e->timestamp_ns || e->timestamp_ns < timestamp || b[0] != 3 || b[1] != 6 ||
+            memcmp(b + 2, "\xaa\xbb\xcc\xdd\xee", 5) || b[7] != info->addr[5] ||
+            b[8] != 4 || memcmp(b + 9, "\x09\x08\x07\x06\x05\x04", 6) ||
+            memcmp(b + 15, "\x01\x02\x03\x44\x55\xa7\xd6\xff", 8))
+            return fail("native identity/header/loss/timestamp preserved");
+        for (unsigned int i = 0; i < 255; i++)
+            if (b[23 + i] != (unsigned char)(i ^ ordinal))
+                return fail("maximum report data is not truncated");
+        for (unsigned int i = 278; i < sizeof(e->payload); i++)
+            if (b[i])
+                return fail("unused event bytes are zero");
+        if (ordinal == 9)
+            *first = *e;
+        timestamp = e->timestamp_ns;
+        request.after_seq = e->seq;
+    }
+    errno = 0;
+    p.revents = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 || errno != EAGAIN ||
+        poll(&p, 1, 0) != 0)
+        return fail("native cursor caught up");
+    return 0;
+}
+
+static int events_gate(int fd, int reader, const struct sci_dev_info *info,
+                       unsigned long long generation)
+{
+    struct sle_controller_event_query request = { .version = 2, .generation = generation };
+    struct sle_controller_event first, second;
+    const unsigned int fields[][2] = { {2, 0}, {1, 1} };
+    for (unsigned int i = 0; i < 2; i++) {
+        request.version = fields[i][0]; request.flags = fields[i][1]; errno = 0;
+        if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 ||
+            errno != (i ? EINVAL : EOPNOTSUPP))
+            return fail("event version/flags validation");
+    }
+    request.version = 1; request.flags = 0; request.after_seq = 41; errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 || errno != EINVAL)
+        return fail("future event cursor rejected");
+    request.after_seq = 1; request.generation = 0; errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 || errno != EINVAL)
+        return fail("noninitial cursor requires generation");
+    request.after_seq = 0; request.generation = generation + 100; errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 || errno != ENODEV)
+        return fail("cross-registration event generation rejected");
+    request.generation = generation;
+    void *readonly = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (readonly == MAP_FAILED)
+        return fail("event copy-fault mapping");
+    memcpy(readonly, &request, sizeof(request));
+    if (mprotect(readonly, 4096, PROT_READ)) {
+        munmap(readonly, 4096); return fail("event copy-fault protection");
+    }
+    errno = 0;
+    int result = ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, readonly), error = errno;
+    munmap(readonly, 4096);
+    if (result != -1 || error != EFAULT || events_read(fd, info, generation, &first) ||
+        events_read(reader, info, generation, &second) || memcmp(&first, &second, sizeof(first)))
+        return fail("copy fault retry and independent complete fanout");
+    printf("NATIVE_EVENTS: index=%u retained=32 first=9 last=40 lost=8 payload=278 fanout=2 fault_retry=1 poll=1\n", info->index);
+    return 0;
+}
+
+static int events_retired(int fd, unsigned long long generation)
+{
+    struct sle_controller_event_query request = { .version = 1, .generation = generation, .after_seq = 40 };
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_EVENT_GET, &request) != -1 || errno != ENODEV ||
+        poll(&p, 1, 1000) != 1 || !(p.revents & POLLHUP))
+        return fail("retired event subscription ENODEV/HUP");
+    return 0;
+}
+
 static int same(int fd, const struct sci_dev_info *expected, unsigned long long generation)
 {
 	struct sci_dev_info current;
@@ -272,10 +380,11 @@ int main(int argc, char **argv)
 	struct sci_dev_info a_info, b_info, replacement_info;
 	unsigned long long a_gen, b_gen, replacement_gen;
 	int control = open("/dev/sparklink", O_RDWR | O_NONBLOCK), a = -1, b = -1, replacement = -1;
-	int complete = 0;
+	int complete = 0, readers[2] = { -1, -1 };
 	pid_t children[2];
 	int fault_mode = argc == 2 && !strcmp(argv[1], "--fault");
-	if (argc != 1 && !fault_mode)
+	int event_mode = argc == 2 && !strcmp(argv[1], "--events");
+	if (argc != 1 && !fault_mode && !event_mode)
 		return 2;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -292,6 +401,18 @@ int main(int argc, char **argv)
 	b = bind_owner(1, &b_info, &b_gen);
 	if (b < 0 || same(a, &a_info, a_gen))
 		goto out;
+    if (event_mode) {
+        struct sci_dev_info unused;
+        unsigned long long reader_gen;
+        readers[0] = bind_owner(0, &unused, &reader_gen);
+        if (readers[0] < 0 || reader_gen != a_gen)
+            goto out;
+        readers[1] = bind_owner(1, &unused, &reader_gen);
+        if (readers[1] < 0 || reader_gen != b_gen ||
+            events_subscribe(a, a_gen) || events_subscribe(b, b_gen) ||
+            events_subscribe(readers[0], a_gen) || events_subscribe(readers[1], b_gen))
+            goto out;
+    }
     if (fault_mode) {
         struct sle_dli_cmd cmd = { .opcode = 0x0406, .param_len = 1 };
         if (exercise(b, &b_info) || ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||
@@ -317,10 +438,15 @@ int main(int argc, char **argv)
 	}
 	if (failed)
 		goto out;
+	if (event_mode && (events_gate(a, readers[0], &a_info, a_gen) ||
+	    events_gate(b, readers[1], &b_info, b_gen)))
+		goto out;
 	puts("NATIVE_REMOVE_FIRST");
 	if (mask_wait(control, 2) || stale(a) || same(b, &b_info, b_gen) || query(b, &b_info, 0x0406, 0))
 		goto out;
 	}
+	if (event_mode && (events_retired(a, a_gen) || events_retired(readers[0], a_gen)))
+		goto out;
 	puts("NATIVE_READD_FIRST");
 	if (mask_wait(control, 3) || stale(a) || same(b, &b_info, b_gen))
 		goto out;
@@ -328,6 +454,14 @@ int main(int argc, char **argv)
 	if (replacement < 0 || replacement_gen == a_gen || !memcmp(a_info.addr, replacement_info.addr, 6) ||
 	    query(replacement, &replacement_info, 0x0406, 0) || query(b, &b_info, 0x0406, 0) || stale(a))
 		goto out;
+    if (event_mode) {
+        struct sle_controller_event first;
+        if (query(replacement, &replacement_info, 0x0404, 0) ||
+            events_read(replacement, &replacement_info, replacement_gen, &first) ||
+            events_retired(a, a_gen))
+            goto out;
+        puts("NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1");
+    }
 	printf("NATIVE_LIFETIME: old=%llu new=%llu unaffected=%llu\n", a_gen, replacement_gen, b_gen);
 	complete = 1;
 	puts("NATIVE_LIFECYCLE: PASS");
@@ -342,6 +476,8 @@ out:
 		close(b);
 	if (a >= 0)
 		close(a);
+	for (int i = 0; i < 2; i++)
+		if (readers[i] >= 0) close(readers[i]);
 	if (control >= 0)
 		close(control);
 	return failed ? 1 : 0;

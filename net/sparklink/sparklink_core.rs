@@ -17,6 +17,7 @@
 mod sle_adv;
 mod sle_configfs;
 mod sle_conn;
+mod sle_controller_event;
 mod sle_crypto;
 mod sle_dev;
 mod sle_dli;
@@ -510,6 +511,11 @@ impl ControllerState {
 #[pin_data]
 pub(crate) struct ControllerRuntime {
     pub(crate) identity: sle_dev::DeviceIdentity,
+    pub(crate) protocol_profile: u32,
+    #[pin]
+    pub(crate) controller_events: Lock<KBox<sle_controller_event::ControllerEventLog>, IrqLockBackend>,
+    #[pin]
+    pub(crate) controller_event_poll: PollCondVar,
     #[pin]
     pub(crate) state: Mutex<Option<KBox<ControllerState>>>,
     #[pin]
@@ -537,8 +543,16 @@ impl ControllerRuntime {
         state.dev_info.name[..len].copy_from_slice(&dev.name()[..len]);
         let ingress = sle_dli::ControllerEventRing::new_boxed()?;
         let host = sle_host::CommandHost::new_boxed(state.command_credits)?;
+        let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
+        let protocol_profile = match &state.controller {
+            sle_dli::ControllerBackend::Ws73(controller) => controller.profile(),
+            _ => 0,
+        };
         Arc::pin_init(pin_init!(Self {
             identity: dev.identity(),
+            protocol_profile,
+            controller_events <- new_irq_lock!(controller_events, "sparklink_controller_events"),
+            controller_event_poll <- new_poll_condvar!("sparklink_controller_event"),
             state <- new_mutex!(Some(state), "sparklink_runtime"),
             ingress <- new_irq_lock!(ingress, "sparklink_runtime_rx"),
             host <- new_irq_lock!(host, "sparklink_runtime_host"),
@@ -560,6 +574,7 @@ impl ControllerRuntime {
         if let Some(state) = state {
             state.controller.close();
         }
+        self.controller_event_poll.notify_all();
     }
 }
 
@@ -1317,6 +1332,8 @@ struct SparkLinkCtl {
     /// Removal leaves the binding stale, so a reused index cannot retarget it.
     #[pin]
     target: Mutex<Option<Arc<ControllerRuntime>>>,
+    #[pin]
+    controller_subscription: Mutex<Option<sle_controller_event::Subscription>>,
 }
 
 /// Advertising, scanning, device management ioctl sub-dispatcher.
@@ -1384,6 +1401,7 @@ fn ioctl_dev_select(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
         None
     };
     *me.target.lock() = identity;
+    *me.controller_subscription.lock() = None;
     // Events queued for a previous selection must not masquerade as the new one.
     *me.events.lock() = EventQueue::new();
     me.last_seq.store(sle_event::BroadcastRing::current_seq(), core::sync::atomic::Ordering::Relaxed);
@@ -3143,10 +3161,42 @@ fn ioctl_dli_send_cmd(context: &RuntimeContext, arg: usize) -> Result<isize> {
     Ok(0)
 }
 
+/// Read one complete native record without mutating the controller protocol.
+#[inline(never)]
+fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let mut query: SleControllerEventQuery = read_user_struct(arg)?;
+    if query.version != CONTROLLER_EVENT_VERSION { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if query.flags != 0 || (query.after_seq != 0 && query.generation == 0) { return Err(EINVAL); }
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    let state = context.lock()?;
+    if query.generation != 0 && query.generation != owner.identity.generation { return Err(ENODEV); }
+    let event = {
+        let log = owner.controller_events.lock();
+        if query.after_seq > log.current_seq() { return Err(EINVAL); }
+        log.next_after(query.after_seq)
+    };
+    *me.controller_subscription.lock() = Some(sle_controller_event::Subscription {
+        identity: owner.identity, after_seq: query.after_seq,
+    });
+    drop(state);
+    query.event = event.ok_or(EAGAIN)?;
+    query.generation = owner.identity.generation;
+    write_user_struct(arg, &query)?;
+    // EFAULT must leave this fd's readiness cursor on the unread event.
+    let mut subscription = me.controller_subscription.lock();
+    if let Some(current) = Option::as_mut(&mut *subscription) {
+        if current.identity == owner.identity {
+            current.after_seq = current.after_seq.max(query.event.seq);
+        }
+    }
+    Ok(0)
+}
+
 /// Infrastructure ioctl sub-dispatcher: PM, sync, DLI, events, PHY, role, RAL/RPA.
 #[inline(never)]
 fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
+        SL_IOCTL_CONTROLLER_EVENT_GET => ioctl_controller_event_get(context, me, arg),
         SL_IOCTL_PM_INFO => {
             let info = {
                 let ss = context.lock()?;
@@ -3597,6 +3647,7 @@ impl MiscDevice for SparkLinkCtl {
                         sle_event::BroadcastRing::current_seq()
                     ),
                     target <- new_mutex!(None),
+                    controller_subscription <- new_mutex!(None),
                 }
             },
             GFP_KERNEL,
@@ -3627,6 +3678,21 @@ impl MiscDevice for SparkLinkCtl {
     }
 
     fn poll(me: Pin<&SparkLinkCtl>, file: &FsFile, table: &PollTable<'_>) -> u32 {
+        let subscription = *me.controller_subscription.lock();
+        if let Some(subscription) = subscription {
+            let target = me.target.lock().clone();
+            let context = match target {
+                Some(owner) => RuntimeContext::from_owner(owner),
+                None => RuntimeContext::default_selection(),
+            };
+            let Some(owner) = context.owner.as_ref() else { return bindings::POLLERR | bindings::POLLHUP; };
+            if owner.identity != subscription.identity { return bindings::POLLERR | bindings::POLLHUP; }
+            table.register_wait(file, &owner.controller_event_poll);
+            if context.lock().is_err() { return bindings::POLLERR | bindings::POLLHUP; }
+            return if owner.controller_events.lock().current_seq() > subscription.after_seq {
+                bindings::POLLIN | bindings::POLLRDNORM
+            } else { 0 };
+        }
         table.register_wait(file, &me.event_poll);
         // Sync broadcast events into per-fd queue before checking.
         Self::sync_broadcast(me.as_ref());
@@ -3663,7 +3729,9 @@ impl MiscDevice for SparkLinkCtl {
             }
         };
         let context = &context;
-        if !registration_only { Self::sync_power_mode(context)?; }
+        if !registration_only && cmd != SL_IOCTL_CONTROLLER_EVENT_GET {
+            Self::sync_power_mode(context)?;
+        }
 
         match cmd {
             // --- Advertising, scanning, device management ---
@@ -3768,6 +3836,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_EVENT_COUNT
             | SL_IOCTL_EVENT_STATS
             | SL_IOCTL_DLI_INFO
+            | SL_IOCTL_CONTROLLER_EVENT_GET
             | SL_IOCTL_DLI_POLL_EVENT
             | SL_IOCTL_DLI_RESET
             | SL_IOCTL_DLI_SEND_CMD

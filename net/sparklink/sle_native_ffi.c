@@ -5,11 +5,16 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/sparklink_native.h>
+#include <uapi/linux/sparklink_ioctl.h>
 
 static_assert(sizeof(struct sparklink_native_info) == 32);
 static_assert(offsetof(struct sparklink_native_info, features) == 9);
 static_assert(offsetof(struct sparklink_native_info, address) == 19);
 static_assert(offsetof(struct sparklink_native_info, acb_length) == 26);
+static_assert(sizeof(struct sle_controller_event) == 336);
+static_assert(offsetof(struct sle_controller_event, payload) == 48);
+static_assert(sizeof(struct sle_controller_event_query) == 360);
+static_assert(offsetof(struct sle_controller_event_query, event) == 24);
 
 /* The copied operations and retained context outlive the Rust Backend. */
 struct sparklink_native_transport {
@@ -86,3 +91,10 @@ int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t leng
 	return sparklink_native_receive_rust(id, generation, data, length);
 }
 EXPORT_SYMBOL_GPL(sparklink_native_receive);
+
+int sparklink_native_event(u16 id, u64 generation, u32 profile, u16 event_code,
+			   const u8 *params, size_t length)
+{
+	return sparklink_native_event_rust(id, generation, profile, event_code, params, length);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_event);
