@@ -14,7 +14,7 @@
  *   sle_usb_alloc()      ──► sle_usb_alloc_urb()  ──► usb_alloc_urb()
  *   sle_usb_submit_bulk()──► sle_usb_submit_bulk()──► usb_fill_bulk_urb()
  *                                                  ──► usb_submit_urb()
- *   <completion callback> ◄── sle_usb_bulk_cb()   ◄── USB core IRQ
+ *   <completion callback> ◄── sle_usb_bulk_out_cb()   ◄── USB core IRQ
  *   sle_usb_kill()        ──► sle_usb_kill_urb()  ──► usb_kill_urb()
  *   sle_usb_free()        ──► sle_usb_free_urb()  ──► usb_free_urb()
  */
@@ -22,6 +22,7 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/unaligned.h>
 
 /* -----------------------------------------------------------------------
  * Rust-side completion callback declaration
@@ -35,6 +36,9 @@
  */
 extern void sparklink_usb_complete(void *ctx, const u8 *data,
 				   int length, int status);
+extern void sparklink_usb_registered_complete(u32 dev_id, u64 generation,
+					      const u8 *data, int length,
+					      int status);
 
 /* Forward declarations for exported FFI functions */
 struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size);
@@ -64,18 +68,35 @@ struct sle_urb_ctx {
 	u8 *buf;
 	int buf_size;
 	void *rust_ctx;  /* opaque pointer handed back to Rust on completion */
+	/* Immutable after registration, before first submit. USB kill/join
+	 * precedes free; identity belongs to this URB allocation, not its slot.
+	 */
+	u32 registration_id;
+	u64 registration_generation;
 };
 
 /* -----------------------------------------------------------------------
  * Completion handler: called by USB core when transfer finishes
  * -----------------------------------------------------------------------
  */
-static void sle_usb_bulk_cb(struct urb *urb)
+static void sle_usb_bulk_out_cb(struct urb *urb)
 {
 	struct sle_urb_ctx *ctx = urb->context;
 
-	sparklink_usb_complete(ctx->rust_ctx, ctx->buf,
-			       urb->actual_length, urb->status);
+	/* Preserve transport status without feeding the transmitted bytes into RX. */
+	sparklink_usb_complete(ctx->rust_ctx, NULL, 0, urb->status);
+}
+
+static void sle_usb_receive_complete(struct sle_urb_ctx *ctx, struct urb *urb)
+{
+	if (ctx->registration_generation)
+		sparklink_usb_registered_complete(ctx->registration_id,
+						  ctx->registration_generation,
+						  ctx->buf, urb->actual_length,
+						  urb->status);
+	else
+		sparklink_usb_complete(ctx->rust_ctx, ctx->buf,
+				       urb->actual_length, urb->status);
 }
 
 /* Bulk IN (data) callback with auto-resubmit for continuous reception */
@@ -83,8 +104,7 @@ static void sle_usb_bulk_in_cb(struct urb *urb)
 {
 	struct sle_urb_ctx *ctx = urb->context;
 
-	sparklink_usb_complete(ctx->rust_ctx, ctx->buf,
-			       urb->actual_length, urb->status);
+	sle_usb_receive_complete(ctx, urb);
 
 	/* Auto-resubmit unless cancelled or device disconnected */
 	if (urb->status == 0 || urb->status == -EOVERFLOW) {
@@ -99,8 +119,7 @@ static void sle_usb_intr_cb(struct urb *urb)
 {
 	struct sle_urb_ctx *ctx = urb->context;
 
-	sparklink_usb_complete(ctx->rust_ctx, ctx->buf,
-			       urb->actual_length, urb->status);
+	sle_usb_receive_complete(ctx, urb);
 
 	/* For interrupt IN endpoints: auto-resubmit unless cancelled */
 	if (urb->status == 0 || urb->status == -EOVERFLOW) {
@@ -199,7 +218,7 @@ int sle_usb_submit_bulk_out(struct sle_urb_ctx *ctx,
 
 	usb_fill_bulk_urb(ctx->urb, udev, pipe,
 			  ctx->buf, len,
-			  sle_usb_bulk_cb, ctx);
+			  sle_usb_bulk_out_cb, ctx);
 
 	return usb_submit_urb(ctx->urb, GFP_KERNEL);
 }
@@ -362,7 +381,7 @@ int sle_usb_sync_bulk_in(struct usb_device *udev, u8 ep,
 #define SLE_CMD_TIMEOUT_MS 5000
 
 /* Forward declarations for device table functions */
-int sle_usb_dev_register(int dev_id, void *intf_ptr);
+int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation);
 void sle_usb_dev_unregister(int dev_id);
 int sle_usb_dev_send_cmd(int dev_id, u16 opcode, const u8 *params, int plen);
 int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len);
@@ -372,6 +391,7 @@ int sle_usb_dev_start_data(int dev_id);
 void sle_usb_dev_stop_data(int dev_id);
 int sle_usb_dev_init_controller(int dev_id);
 u32 sle_usb_dev_get_fw_version(int dev_id);
+u8 sle_usb_dev_get_command_credits(int dev_id);
 int sle_usb_dev_get_mac(int dev_id, u8 *mac);
 int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 			    int chunk_size);
@@ -397,6 +417,7 @@ struct sle_usb_dev {
 	/* Read-back from controller during init */
 	u8 mac_addr[6];
 	u32 fw_version;
+	u8 command_credits;
 };
 
 static struct sle_usb_dev usb_dev_table[SLE_USB_MAX_DEVS];
@@ -405,18 +426,19 @@ static struct sle_usb_dev usb_dev_table[SLE_USB_MAX_DEVS];
  * sle_usb_dev_register - Register a USB device for I/O by dev_id.
  * @dev_id:   device id from sle_attach_device
  * @intf_ptr: raw struct usb_interface pointer (from Rust probe)
+ * @generation: nonzero registration generation allocated by the registry
  *
  * Extracts the usb_device, allocates URB contexts for event and data
  * reception. Returns 0 on success.
  */
-int sle_usb_dev_register(int dev_id, void *intf_ptr)
+int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
 {
 	struct sle_usb_dev *d;
 	struct usb_interface *intf;
 	struct usb_endpoint_descriptor *bulk_in, *bulk_out, *int_in;
 	int ret;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !intf_ptr)
+	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !intf_ptr || !generation)
 		return -EINVAL;
 
 	d = &usb_dev_table[dev_id];
@@ -472,6 +494,10 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr)
 
 	memset(d->mac_addr, 0, 6);
 	d->fw_version = 0;
+	d->evt_urb->registration_id = dev_id;
+	d->evt_urb->registration_generation = generation;
+	d->rx_urb->registration_id = dev_id;
+	d->rx_urb->registration_generation = generation;
 	d->active = true;
 	return 0;
 }
@@ -560,7 +586,9 @@ int sle_usb_dev_send_cmd(int dev_id, u16 opcode, const u8 *params, int plen)
 	ret = usb_bulk_msg(d->udev, pipe, pkt, total,
 			   &actual_len, SLE_CMD_TIMEOUT_MS);
 	kfree(pkt);
-	return ret;
+	if (ret)
+		return ret;
+	return actual_len == total ? 0 : -EREMOTEIO;
 }
 
 /**
@@ -640,7 +668,7 @@ int sle_usb_dev_start_evt(int dev_id)
 
 	ret = sle_usb_submit_intr_in(d->evt_urb, d->udev,
 				      d->ep_intr_in,
-				      (void *)(uintptr_t)(dev_id + 1),
+				      NULL,
 				      d->ep_intr_in_interval);
 	return ret;
 }
@@ -680,7 +708,7 @@ int sle_usb_dev_start_data(int dev_id)
 
 	return sle_usb_submit_bulk_in(d->rx_urb, d->udev,
 				      d->ep_bulk_in,
-				      (void *)(uintptr_t)(dev_id + 1));
+				      NULL);
 }
 
 /**
@@ -714,15 +742,16 @@ void sle_usb_dev_stop_data(int dev_id)
  * DLI command packet format (T/XS 10003-2025):
  *   [0]    = 0xA1 (Command)
  *   [1..2] = opcode (LE16)
- *   [3]    = param_len
- *   [4..N] = params
+ *   [3..4] = param_len (LE16)
+ *   [5..N] = params
  *
  * DLI event packet format:
  *   [0..1] = event_code (LE16) — expect CmdComplete 0x0002
- *   [2]    = param_len
- *   [3..4] = opcode echo (LE16)
- *   [5]    = status (0 = success)
- *   [6..N] = return params
+ *   [2..3] = param_len (LE16)
+ *   [4..5] = opcode echo (LE16)
+ *   [6]    = command credits
+ *   [7]    = status (0 = success)
+ *   [8..N] = remaining return params
  * ----------------------------------------------------------------------- */
 
 /* DLI opcodes from T/XS 10003-2025 */
@@ -761,6 +790,8 @@ static int sle_usb_send_cmd_sync(struct sle_usb_dev *d, u16 opcode,
 	kfree(cmd);
 	if (ret)
 		return ret;
+	if (actual_len != 5)
+		return -EIO;
 
 	/* Read response from bulk IN using heap buffer */
 	rbuf = kmalloc(resp_size, GFP_KERNEL);
@@ -776,19 +807,29 @@ static int sle_usb_send_cmd_sync(struct sle_usb_dev *d, u16 opcode,
 	return ret;
 }
 
+/* A transport write or an unrelated/truncated reply is not query success. */
+static int sle_usb_validate_init_reply(const u8 *resp, int len,
+				       u16 opcode, int return_size)
+{
+	if (len != 8 + return_size ||
+	    get_unaligned_le16(resp) != SLE_EVT_CMD_COMPLETE ||
+	    get_unaligned_le16(resp + 2) != 4 + return_size ||
+	    get_unaligned_le16(resp + 4) != opcode)
+		return -EPROTO;
+	if (resp[7])
+		return -EREMOTEIO;
+	return 0;
+}
+
 /**
  * sle_usb_dev_init_controller - Run the SLE controller init sequence.
  * @dev_id: device id (must be registered)
  *
  * Sends Reset, ReadLocalVersion, ReadMacAddr commands and stores the
- * results in the per-device state. If the device does not respond (e.g.
- * no real hardware attached), returns -ENODEV without failing the probe
- * — the driver remains functional in degraded mode with placeholder
- * values from sle_attach_device.
+ * results only after all three matching CommandComplete replies succeed.
+ * The driver rolls back probe on transport, framing or controller errors.
  *
  * Returns 0 on full success. Negative errno if any command fails.
- * Partial success is allowed: fw_version and mac_addr are updated
- * independently.
  */
 int sle_usb_dev_init_controller(int dev_id)
 {
@@ -796,6 +837,8 @@ int sle_usb_dev_init_controller(int dev_id)
 	u8 resp[64];
 	int resp_len = 0;
 	int ret;
+	u32 fw_version;
+	u8 mac_addr[6];
 
 	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
 		return -EINVAL;
@@ -807,11 +850,16 @@ int sle_usb_dev_init_controller(int dev_id)
 	/* Step 1: Reset controller */
 	ret = sle_usb_send_cmd_sync(d, SLE_OP_RESET, resp, sizeof(resp),
 				    &resp_len);
-	if (ret) {
-		pr_info("sparklink-usb: init reset failed (%d), "
-			"continuing with defaults\n", ret);
+	if (ret)
 		return ret;
-	}
+	ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_RESET, 0);
+	if (ret)
+		return ret;
+	/* Bootstrap has no asynchronous credit waiter yet: fail closed rather
+	 * than send a query when the controller advertises zero capacity.
+	 */
+	if (!resp[6])
+		return -EAGAIN;
 	pr_info("sparklink-usb: controller reset OK\n");
 
 	/* Step 2: ReadLocalVersion
@@ -819,35 +867,51 @@ int sle_usb_dev_init_controller(int dev_id)
 	 *   [0..1] evt_code  (0x0002)
 	 *   [2..3] param_len (LE16)
 	 *   [4..5] opcode    (LE16)
-	 *   [6]    status
-	 *   [7..10] version  (LE32)
+	 *   [6]    command credits
+	 *   [7]    status
+	 *   [8] protocol version, [9..10] company id, [11..12] sub-version
+	 *   (T/XS 10003-2025 section 8.1.4: 1 + 2 + 2 bytes)
 	 */
 	ret = sle_usb_send_cmd_sync(d, SLE_OP_READ_LOCAL_VERSION,
 				    resp, sizeof(resp), &resp_len);
-	if (!ret && resp_len >= 11) {
-		if (resp[6] == 0) {
-			d->fw_version = le32_to_cpup((__le32 *)&resp[7]);
-			pr_info("sparklink-usb: fw_version=0x%08x\n",
-				d->fw_version);
-		}
-	}
+	if (ret)
+		return ret;
+	ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_READ_LOCAL_VERSION, 5);
+	if (ret)
+		return ret;
+	if (!resp[6])
+		return -EAGAIN;
+	/* Preserve the old u32 metadata projection for the legacy ABI. It is not
+	 * a complete standards version tuple; raw DLI queries return all 5 bytes.
+	 */
+	fw_version = get_unaligned_le32(resp + 8);
 
 	/* Step 3: ReadMacAddr
-	 * CmdComplete:  [0..6] header  [7..12] mac (6 bytes)
+	 * CmdComplete: [0..7] header, opcode, credit, status; [8..13] MAC.
 	 */
 	ret = sle_usb_send_cmd_sync(d, SLE_OP_READ_MAC_ADDR,
 				    resp, sizeof(resp), &resp_len);
-	if (!ret && resp_len >= 13) {
-		if (resp[6] == 0) {
-			memcpy(d->mac_addr, &resp[7], 6);
-			pr_info("sparklink-usb: mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-				d->mac_addr[0], d->mac_addr[1],
-				d->mac_addr[2], d->mac_addr[3],
-				d->mac_addr[4], d->mac_addr[5]);
-		}
-	}
+	if (ret)
+		return ret;
+	ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_READ_MAC_ADDR, 6);
+	if (ret)
+		return ret;
+	memcpy(mac_addr, resp + 8, sizeof(mac_addr));
+	if (!memchr_inv(mac_addr, 0, sizeof(mac_addr)))
+		return -EPROTO;
+	/* Commit metadata together, never a partial/default successful bootstrap. */
+	d->fw_version = fw_version;
+	d->command_credits = resp[6];
+	memcpy(d->mac_addr, mac_addr, sizeof(mac_addr));
 
 	return 0;
+}
+
+u8 sle_usb_dev_get_command_credits(int dev_id)
+{
+    if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !usb_dev_table[dev_id].active)
+        return 0;
+    return usb_dev_table[dev_id].command_credits;
 }
 
 /**

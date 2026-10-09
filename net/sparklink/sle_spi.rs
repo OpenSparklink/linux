@@ -434,6 +434,7 @@ impl SleController for SpiController {
         );
         self.enqueue_event(SleEvent::CommandComplete {
             opcode,
+            command_credits: 1,
             status: SleStatus::Success,
             data: KVec::new(),
         });

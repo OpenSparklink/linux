@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+//! Native WS73 bootstrap owner. Transport callbacks retain their context;
+//! protocol scheduling and transaction credit belong to ControllerRuntime.
+//! Registration remains SETUP until the complete native Host path is ready.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::ffi::c_void;
+use kernel::prelude::*;
+
+const PROTOCOL_ERROR: i32 = -(kernel::bindings::EPROTO as i32);
+const UNSUPPORTED: i32 = -(kernel::bindings::EOPNOTSUPP as i32);
+
+use super::sle_dev::DeviceIdentity;
+use super::sle_dli::{SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct NativeInfo {
+    profile: u32,
+    version: [u8; 5],
+    features: [u8; 10],
+    address: [u8; 6],
+    command_credits: u8,
+    acb_length: u16,
+    icb_length: u16,
+    acb_count: u8,
+    icb_count: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<NativeInfo>() == 32);
+const _: () = assert!(core::mem::offset_of!(NativeInfo, features) == 9);
+const _: () = assert!(core::mem::offset_of!(NativeInfo, address) == 19);
+const _: () = assert!(core::mem::offset_of!(NativeInfo, acb_length) == 26);
+
+#[repr(C)]
+pub(crate) struct NativeIdentity {
+    id: u16,
+    generation: u64,
+}
+
+extern "C" {
+    fn sparklink_native_transport_free(transport: *mut c_void);
+    fn sparklink_native_transport_open(transport: *mut c_void, id: u16, generation: u64) -> i32;
+    fn sparklink_native_transport_close(transport: *mut c_void);
+    fn sparklink_native_transport_command(
+        transport: *mut c_void, opcode: u16, params: *const u8, length: usize,
+    ) -> i32;
+}
+
+pub(crate) struct NativeController {
+    transport: *mut c_void,
+    identity: DeviceIdentity,
+    metadata: NativeInfo,
+    opened: AtomicBool,
+}
+
+// SAFETY: C retains its context and operations; the Runtime mutex serializes
+// open/send/close. Callback RX accesses only the separately retained owner.
+unsafe impl Send for NativeController {}
+// SAFETY: identity/metadata are immutable after publication, opened is atomic,
+// and transport I/O is serialized by Runtime plus the driver's I/O mutex.
+unsafe impl Sync for NativeController {}
+
+impl Drop for NativeController {
+    fn drop(&mut self) {
+        self.close();
+        // SAFETY: this Backend exclusively owns the C retained transport.
+        unsafe { sparklink_native_transport_free(self.transport) };
+    }
+}
+
+impl NativeController {
+    fn result(ret: i32) -> Result {
+        if ret < 0 { Err(Error::from_errno(ret)) } else { Ok(()) }
+    }
+
+    pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
+        // Metadata queries only until complete native typed transactions.
+        let valid = match opcode {
+            0x0402..=0x0404 => params.is_empty(),
+            0x0406 => params.len() == 1 && params[0] <= 1,
+            _ => return Err(Error::from_errno(UNSUPPORTED)),
+        };
+        if valid { Ok(()) } else { Err(EINVAL) }
+    }
+
+    pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {
+        self.validate_command(opcode, params)?;
+        // SAFETY: retained transport lives until Backend drop. Called only
+        // by this owner's TX worker after reserving a command credit.
+        Self::result(unsafe {
+            sparklink_native_transport_command(self.transport, opcode, params.as_ptr(), params.len())
+        })
+    }
+}
+
+impl SleController for NativeController {
+    fn info(&self) -> SleControllerInfo {
+        let mut name = [0; 32];
+        name[..11].copy_from_slice(b"ws73-native");
+        SleControllerInfo {
+            name, bus: SleBus::Usb, addr: self.metadata.address,
+            // Legacy projection only; the retained tuple contains all 5 bytes.
+            fw_version: u32::from_le_bytes(self.metadata.version[..4].try_into().unwrap()),
+            features: u64::from_le_bytes(self.metadata.features[..8].try_into().unwrap()),
+            features_ext: u16::from_le_bytes(self.metadata.features[8..].try_into().unwrap()),
+            max_pdu_payload: self.metadata.acb_length,
+            // These queries do not establish connection count, MTU or these
+            // policy capabilities. Never borrow standard USB defaults.
+            max_connections: 0, max_mtu: 0, max_mps: 0,
+            transport_modes: 0, measurement_cap: 0, security_cap: 0,
+        }
+    }
+
+    fn open(&self) -> Result {
+        // SAFETY: registration assigned this identity before opening RX.
+        Self::result(unsafe {
+            sparklink_native_transport_open(self.transport, self.identity.id, self.identity.generation)
+        })?;
+        self.opened.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn close(&self) {
+        if self.opened.swap(false, Ordering::AcqRel) {
+            // SAFETY: close joins callbacks while the context is retained.
+            unsafe { sparklink_native_transport_close(self.transport) };
+        }
+    }
+
+    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
+        self.validate_command(opcode as u16, params)?;
+        let owner = super::sle_usb::ingress_owner(self.identity).ok_or(ENODEV)?;
+        let gate = owner.schedule_gate.lock();
+        if *gate { return Err(ENODEV); }
+        owner.host.lock().enqueue(opcode as u16, params, 0)?;
+        drop(gate);
+        owner.kick_commands();
+        Ok(())
+    }
+
+    fn send_data(&self, _handle: u16, _data: &[u8]) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
+    fn poll_event(&self) -> Option<SleEvent> { None }
+    fn reset(&self) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
+}
+
+/// C wrapper validates pointers and transfers its retained transport on every
+/// return path. Register actual metadata without synthesizing capabilities.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
+    info: *const NativeInfo, transport: *mut c_void, out: *mut NativeIdentity,
+) -> i32 {
+    // SAFETY: C wrapper requires live metadata/out and an owned transport.
+    let metadata = unsafe { *info };
+    let mut controller = NativeController {
+        transport, metadata, identity: DeviceIdentity { id: u16::MAX, generation: 0 },
+        opened: AtomicBool::new(false),
+    };
+    let result = (|| -> Result {
+        if metadata.profile != 1 { return Err(Error::from_errno(UNSUPPORTED)); }
+        if metadata.address == [0; 6] || metadata.address == [255; 6]
+            || metadata.acb_length > 2047 || metadata.icb_length > 2047
+            || (metadata.acb_length == 0) != (metadata.acb_count == 0)
+            || (metadata.icb_length == 0) != (metadata.icb_count == 0)
+        { return Err(Error::from_errno(PROTOCOL_ERROR)); }
+        let ctrl_info = controller.info();
+        let mut registry = super::SUBSYSTEM.lock();
+        let ss = registry.as_mut().ok_or(ENODEV)?;
+        let id = ss.dev_registry.register_pending(&ctrl_info)?;
+        controller.identity = ss.dev_registry.get(id).ok_or(ENODEV)?.identity();
+        let identity = controller.identity;
+        // No driver callbacks or blocking I/O while holding the registry lock.
+        drop(registry);
+        let installed = (|| -> Result<kernel::sync::Arc<super::ControllerRuntime>> {
+            let mut state = super::ControllerState::new_boxed(
+                metadata.address, super::sle_dli::ControllerBackend::Ws73(controller),
+            )?;
+            state.command_credits = metadata.command_credits;
+            let mut registry = super::SUBSYSTEM.lock();
+            registry.as_mut().ok_or(ENODEV)?.install_runtime(id, state, false)
+        })();
+        let owner = match installed {
+            Ok(owner) => owner,
+            Err(error) => { super::sle_detach_device(id); return Err(error); }
+        };
+        super::sle_usb::publish_runtime(&owner);
+        let opened = {
+            let state = owner.state.lock();
+            state.as_ref().ok_or(ENODEV).and_then(|state| state.controller.open())
+        };
+        if let Err(error) = opened { super::sle_detach_device(id); return Err(error); }
+        owner.start_workers();
+        // SAFETY: output is live for this C call. Written only on success.
+        unsafe { *out = NativeIdentity { id, generation: identity.generation } };
+        pr_info!("sparklink: native WS73 sle{} generation={} registered SETUP, not Ready\n",
+                 id, identity.generation);
+        Ok(())
+    })();
+    NativeController::result_to_errno(result)
+}
+
+impl NativeController {
+    fn result_to_errno(result: Result) -> i32 {
+        match result { Ok(()) => 0, Err(error) => error.to_errno() }
+    }
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn sparklink_native_unregister_rust(id: u16, generation: u64) {
+    let identity = DeviceIdentity { id, generation };
+    let owner = {
+        let mut registry = super::SUBSYSTEM.lock();
+        let Some(ss) = registry.as_mut() else { return };
+        let Some(dev) = ss.dev_registry.get(id) else { return };
+        if dev.identity() != identity { return; }
+        dev.begin_unregister();
+        let Some(owner) = ss.runtimes.get_mut(id as usize).and_then(Option::take) else { return };
+        if ss.active_dev_id == Some(id) { ss.active_dev_id = None; }
+        owner
+    };
+    // Index remains reserved while work and transport callbacks are joined.
+    owner.invalidate();
+    let mut registry = super::SUBSYSTEM.lock();
+    if let Some(ss) = registry.as_mut() {
+        if ss.dev_registry.get(id).is_some_and(|dev| dev.identity() == identity) {
+            let _ = ss.dev_registry.unregister(id);
+        }
+    }
+}
+
+/// Callback receives a validated HCC slot, not a complete USB aggregate.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
+    id: u16, generation: u64, data: *const u8, length: usize,
+) -> i32 {
+    if data.is_null() || !(5..=260).contains(&length) { return PROTOCOL_ERROR; }
+    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
+        return ENODEV.to_errno();
+    };
+    // SAFETY: transport retains a live buffer throughout this callback.
+    let packet = unsafe { core::slice::from_raw_parts(data, length) };
+    let event = u16::from_le_bytes([packet[1], packet[2]]);
+    let count = u16::from_le_bytes([packet[3], packet[4]]) as usize;
+    if packet[0] != 0xa2 || count != length - 5 { return PROTOCOL_ERROR; }
+    let params = &packet[5..];
+    let event = match event {
+        1 | 2 => {
+            if params.len() < 3 { return PROTOCOL_ERROR; }
+            let opcode = u16::from_le_bytes([params[0], params[1]]);
+            if opcode == 0 {
+                if params.len() != 3 { return PROTOCOL_ERROR; }
+                SleEvent::CommandCredits { credits: params[2] }
+            } else {
+                if params.len() < 4 || (event == 1 && params.len() != 4) {
+                    return PROTOCOL_ERROR;
+                }
+                if event == 2 && params[3] == 0 {
+                    let expected = match opcode { 0x0404 => Some(5), 0x0403 => Some(10),
+                                                  0x0402 | 0x0406 => Some(6), _ => None };
+                    if expected.is_some_and(|n| params.len() != n + 4) { return PROTOCOL_ERROR; }
+                }
+                if params.len() - 4 > 240 { return EOVERFLOW.to_errno(); }
+                let mut bytes = KVec::new();
+                if bytes.extend_from_slice(&params[4..], GFP_ATOMIC).is_err() { return ENOMEM.to_errno(); }
+                SleEvent::NativeCommandReply {
+                    opcode, command_credits: params[2], status: params[3], complete: event == 2, data: bytes,
+                }
+            }
+        }
+        0xa => {
+            if params.len() != 1 { return PROTOCOL_ERROR; }
+            SleEvent::HardwareError { code: params[0] }
+        }
+        _ => return UNSUPPORTED,
+    };
+    super::sle_usb::enqueue_rx(&owner, event);
+    0
+}

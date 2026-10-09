@@ -1324,6 +1324,18 @@ pub struct BroadcastRing {
 }
 
 impl BroadcastRing {
+    /// Initialize each slot in its final allocation rather than returning
+    /// the entire ring through a potentially large stack temporary.
+    pub(crate) fn new_in_place() -> impl pin_init::Init<Self> {
+        init!(Self {
+            // SAFETY: one BroadcastEntry contains only integer fields and
+            // byte arrays (including SleWireEvent); zero is valid for all.
+            buf <- pin_init::init_array_from_fn(|_| unsafe { core::mem::zeroed::<BroadcastEntry>() }),
+            write_pos: 0,
+            count: 0,
+        })
+    }
+
     /// Create an empty broadcast ring.
     pub fn new() -> Self {
         Self {

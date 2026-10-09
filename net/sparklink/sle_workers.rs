@@ -2,82 +2,35 @@
 
 //! Background workers for SparkLink subsystem.
 //!
-//! Contains the EventPump (periodic DLI event polling) and CommandWorker
-//! (async command dispatch) extracted from sparklink_core.rs.
+//! Every ControllerRuntime embeds separate RX and TX delayed work. Queue-owned
+//! Arc references keep that registration alive without an owner/worker cycle.
 
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::time::msecs_to_jiffies;
-use kernel::workqueue::{self, impl_has_delayed_work, new_delayed_work, DelayedWork, WorkItem};
+use kernel::workqueue::{self, impl_has_delayed_work, DelayedWork, WorkItem};
+use pin_init::init_array_from_fn;
 
 use super::genl_bridge;
 use super::sle_conn;
-use super::sle_dev;
 use super::sle_dli;
 use super::sle_dli::SleController;
 use super::sle_event;
 use super::sle_ssap;
 use super::sle_uapi::*;
 use super::sle_usb;
-use super::SubsystemShared;
-use super::SUBSYSTEM;
+use super::{ControllerRuntime, ControllerState};
 
-// ---------------------------------------------------------------------------
-// Global EventPump reference for interrupt-driven wakeup
-// ---------------------------------------------------------------------------
-
-kernel::sync::global_lock! {
-    /// Global reference to the EventPump Arc, set during initialisation.
-    /// Accessed from USB completion callbacks (soft IRQ context) via
-    /// `kick_event_pump()` to schedule immediate event processing.
-    unsafe(uninit) static EVENT_PUMP_REF: Mutex<Option<Arc<EventPump>>> = None;
+/// Flush executes the callback so Rust reclaims the queue-owned Arc. Call only
+/// with the scheduling gate closed, retaining the owner and holding no locks.
+fn flush_work<T, const ID: u64>(work: &DelayedWork<T, ID>) {
+    // SAFETY: owner Arc is retained and the initialized delayed work is pinned.
+    let raw = unsafe { workqueue::Work::raw_get(DelayedWork::raw_as_work(work)) };
+    // SAFETY: raw_as_work yields this delayed_work's work field.
+    let delayed = unsafe { kernel::container_of!(raw, kernel::bindings::delayed_work, work) };
+    // SAFETY: no scheduling or self-rearm can occur after the gate closes.
+    unsafe { kernel::bindings::flush_delayed_work(delayed) };
 }
-
-/// Initialise the global EVENT_PUMP_REF lock. Must be called once
-/// during module init before any kick_event_pump() call.
-pub(crate) fn init_event_pump_ref() {
-    // SAFETY: called once from module_init, single-threaded.
-    unsafe { EVENT_PUMP_REF.init() };
-    *EVENT_PUMP_REF.lock() = None;
-}
-
-/// Store a reference to the EventPump in the global slot.
-fn set_event_pump_ref(pump: &Arc<EventPump>) {
-    *EVENT_PUMP_REF.lock() = Some(pump.clone());
-}
-
-/// Schedule the EventPump for immediate execution.
-///
-/// Safe to call from any context including USB soft-IRQ completion
-/// callbacks.  If no EventPump is registered yet, this is a no-op.
-///
-/// Uses an atomic flag to avoid redundant Mutex acquisitions when
-/// multiple producers (USB completions) kick in rapid succession.
-pub(crate) fn kick_event_pump() {
-    // Fast path: if already scheduled, skip the lock entirely.
-    if KICK_SCHEDULED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        return;
-    }
-    if let Some(ref pump) = *EVENT_PUMP_REF.lock() {
-        let _ = workqueue::system().enqueue_delayed(pump.clone(), 0);
-    }
-}
-
-/// Atomic flag to avoid redundant EVENT_PUMP_REF lock acquisitions.
-/// Set by `kick_event_pump()`, cleared by `EventPump::run()`.
-static KICK_SCHEDULED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Fast-poll countdown. When events are processed, this is set to a
-/// positive value. Each subsequent run() that finds no events decrements
-/// it. While non-zero, EventPump rearms at 1 jiffy instead of heartbeat,
-/// giving USB round-trips time to complete during multi-step flows.
-static FAST_POLL_REMAINING: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-// ---------------------------------------------------------------------------
-// Background event pump
-// ---------------------------------------------------------------------------
 
 /// Heartbeat interval for supervision timeouts and cleanup (ms).
 /// The pump no longer self-schedules at this interval for event
@@ -85,26 +38,90 @@ static FAST_POLL_REMAINING: core::sync::atomic::AtomicU32 =
 /// ensures periodic maintenance even when no events arrive.
 const EVENT_PUMP_HEARTBEAT_MS: u32 = 500;
 
-/// Background worker that periodically polls the controller for DLI events
-/// and publishes them to the global broadcast ring.
-///
-/// Without this, DLI events are only consumed when userspace calls the
-/// DLI_POLL_EVENT ioctl — an active polling model. The event pump turns
-/// this into passive delivery: events flow into the broadcast ring
-/// automatically, and per-fd readers pick them up on their next poll/read.
-#[pin_data]
-pub(crate) struct EventPump {
-    #[pin]
-    work: DelayedWork<EventPump>,
+type TaggedEventBatch = [(Option<u16>, Option<sle_dli::SleEvent>); 64];
+
+/// Construct RX staging directly on the heap. Inline draining can run under
+/// an ioctl frame and must leave room for connection creation and allocation.
+fn new_event_batch() -> Result<KBox<TaggedEventBatch>> {
+    KBox::init(init_array_from_fn(|_| (None, None)), GFP_KERNEL)
 }
 
 impl_has_delayed_work! {
-    impl HasDelayedWork<Self> for EventPump { self.work }
+    impl HasDelayedWork<ControllerRuntime, 0> for ControllerRuntime { self.rx_work }
+    impl HasDelayedWork<ControllerRuntime, 1> for ControllerRuntime { self.tx_work }
 }
 
 // ---------------------------------------------------------------------------
 // Unified controller event processing
 // ---------------------------------------------------------------------------
+
+/// Consume the retained management reply under this owner's protocol mutex.
+/// Generic/discovery ingress pressure cannot steal the result or its sequence.
+fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerState) -> bool {
+    let reply = owner.host.lock().take_reply();
+    let Some(reply) = reply else {
+        return false;
+    };
+    match &reply.event {
+        sle_dli::SleEvent::CommandComplete { status, data, .. } => {
+            state
+                .cmd_pending
+                .resolve_seq(reply.seq, *status as u8, data.as_slice());
+        }
+        sle_dli::SleEvent::CommandStatus { status, .. }
+            if *status != sle_dli::SleStatus::Success =>
+        {
+            state.cmd_pending.resolve_seq(reply.seq, *status as u8, &[]);
+            if let Some(addr) = reply.peer_addr {
+                state.conn.abort_controller_connect(&addr);
+            }
+        }
+        sle_dli::SleEvent::NativeCommandReply { status, complete, data, .. }
+            if *complete || *status != 0 =>
+        {
+            state.cmd_pending.resolve_seq(reply.seq, *status, data.as_slice());
+        }
+        _ => {} // Successful Status awaits a domain-specific terminal event.
+    }
+    // A disable or superseded enable response must not confirm a newer
+    // pending start that happens to use the same DLI opcode.
+    if reply.current_intent {
+        if let sle_dli::SleEvent::CommandComplete { opcode, status, .. } = &reply.event {
+            match opcode {
+                sle_dli::SleOpcode::EnableBroadcast => {
+                    if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
+                        state.adv_scan.confirm_advertising();
+                    } else if *status != sle_dli::SleStatus::Success {
+                        state.adv_scan.abort_advertising();
+                    }
+                }
+                sle_dli::SleOpcode::EnableScan => {
+                    if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
+                        state.adv_scan.confirm_scanning();
+                    } else if *status != sle_dli::SleStatus::Success {
+                        state.adv_scan.abort_scanning();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    process_controller_event(state, &reply.event);
+    owner.kick_commands();
+    true
+}
+
+fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error: Error) {
+    let mut host = owner.host.lock();
+    if let Some(seq) = host.fail(error) {
+        state.cmd_pending.resolve_seq(seq, 0x03, &[]);
+    }
+    while let Some(request) = host.cancel_next() {
+        state.cmd_pending.resolve_seq(request.seq, 0x03, &[]);
+    }
+    state.adv_scan.abort_advertising();
+    state.adv_scan.abort_scanning();
+}
 
 /// Send a credit grant PDU on the management channel (CMTC).
 ///
@@ -136,83 +153,97 @@ pub(crate) fn send_credit_grant(
 /// Called from both `EventPump` (periodic background) and inline after
 /// ioctl commands (immediate drain for synchronous controller backends).
 #[inline(never)]
-pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dli::SleEvent) {
-    // 1. Resolve pending management commands.
-    match ev {
-        sle_dli::SleEvent::CommandComplete {
-            opcode,
-            status,
-            data,
-        } => {
-            shared
-                .cmd_pending
-                .resolve(*opcode as u16, *status as u8, data.as_slice());
+pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dli::SleEvent) {
+    // Credits are an absolute controller advertisement, not an increment.
+    // A successful CommandStatus accepts asynchronous work; it does not finish it.
+    // USB raw results are resolved by the Host's captured sequence, below.
+    // Unmatched or internal USB responses must never consume a raw entry.
+    if !shared.controller.uses_command_host() {
+        match ev {
+            sle_dli::SleEvent::CommandCredits { credits } => shared.command_credits = *credits,
+            sle_dli::SleEvent::CommandComplete {
+                opcode,
+                command_credits,
+                status,
+                data,
+            } => {
+                shared.command_credits = *command_credits;
+                shared
+                    .cmd_pending
+                    .resolve(*opcode as u16, *status as u8, data.as_slice());
+            }
+            sle_dli::SleEvent::CommandStatus {
+                opcode,
+                command_credits,
+                status,
+            } => {
+                shared.command_credits = *command_credits;
+                if *status != sle_dli::SleStatus::Success {
+                    shared
+                        .cmd_pending
+                        .resolve(*opcode as u16, *status as u8, &[]);
+                }
+            }
+            _ => {}
         }
-        sle_dli::SleEvent::CommandStatus { opcode, status } => {
-            shared
-                .cmd_pending
-                .resolve(*opcode as u16, *status as u8, &[]);
-        }
-        _ => {}
     }
 
     // 2. Drive pending state machine transitions (DLI async confirmation).
     match ev {
-        sle_dli::SleEvent::CommandComplete { opcode, status, .. } => match opcode {
-            sle_dli::SleOpcode::EnableBroadcast => {
-                if *status == sle_dli::SleStatus::Success {
-                    shared.adv_scan.confirm_advertising();
-                    if let Some(dev) = shared
-                        .active_dev_id
-                        .and_then(|id| shared.dev_registry.get(id))
-                    {
-                        dev.set_flag(sle_dev::SLE_DEV_ADVERTISING);
+        sle_dli::SleEvent::CommandComplete { opcode, status, .. }
+            if !shared.controller.uses_command_host() =>
+        {
+            match opcode {
+                sle_dli::SleOpcode::EnableBroadcast => {
+                    if *status == sle_dli::SleStatus::Success {
+                        shared.adv_scan.confirm_advertising();
+                    } else {
+                        shared.adv_scan.abort_advertising();
                     }
-                } else {
-                    shared.adv_scan.abort_advertising();
                 }
-            }
-            sle_dli::SleOpcode::EnableScan => {
-                if *status == sle_dli::SleStatus::Success {
-                    shared.adv_scan.confirm_scanning();
-                    if let Some(dev) = shared
-                        .active_dev_id
-                        .and_then(|id| shared.dev_registry.get(id))
-                    {
-                        dev.set_flag(sle_dev::SLE_DEV_SCANNING);
+                sle_dli::SleOpcode::EnableScan => {
+                    if *status == sle_dli::SleStatus::Success {
+                        shared.adv_scan.confirm_scanning();
+                    } else {
+                        shared.adv_scan.abort_scanning();
                     }
-                } else {
-                    shared.adv_scan.abort_scanning();
                 }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         sle_dli::SleEvent::ConnComplete {
             handle: evt_handle,
             addr,
             status,
         } => {
             if *status == sle_dli::SleStatus::Success {
-                if shared.conn.confirm_connecting_by_addr(addr).is_none()
-                    && !shared.conn.has_addr(addr)
+                if let Some((host_handle, disconnect_pending)) =
+                    shared.conn.record_controller_handle(addr, *evt_handle)
                 {
+                    if disconnect_pending {
+                        if shared.controller.disconnect(*evt_handle).is_err() {
+                            shared.conn.abort_disconnecting(host_handle);
+                        }
+                    }
+                } else if !shared.conn.has_addr(addr) {
                     // Incoming connection — no prior ConnectPending entry
                     // and no existing entry for this address.
                     let _ = shared.conn.accept_incoming(*evt_handle, addr);
                 }
                 genl_bridge::notify_event(0x01, 0, addr);
             } else {
-                shared.conn.abort_connecting_by_addr(addr);
+                shared.conn.abort_controller_connect(addr);
             }
         }
         sle_dli::SleEvent::Disconnected { handle, .. } => {
+            let host_handle = shared.conn.host_handle(*handle).unwrap_or(*handle);
             let peer_addr = shared
                 .conn
-                .info(*handle)
+                .info(host_handle)
                 .map(|e| e.peer_addr)
                 .unwrap_or([0u8; 6]);
-            shared.conn.confirm_disconnecting_by_handle(*handle);
-            genl_bridge::notify_event(0x01, *handle, &peer_addr);
+            shared.conn.confirm_disconnecting_by_handle(host_handle);
+            genl_bridge::notify_event(0x01, host_handle, &peer_addr);
         }
         sle_dli::SleEvent::AdvReport {
             addr,
@@ -251,9 +282,7 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                     .handle_transport_signaling(*handle, sig_data, &mut resp_buf)
                     .unwrap_or(0);
                 if resp_len > 0 {
-                    let _ = shared
-                        .controller
-                        .send_data(*handle, &resp_buf[..resp_len]);
+                    let _ = shared.controller.send_data(*handle, &resp_buf[..resp_len]);
                 }
             } else if u16::from(raw[0]) == sle_conn::tcid::SERVICE_MGMT && raw.len() > 1 {
                 // SSAP PDU on service management channel (TCID 0x0A).
@@ -264,8 +293,7 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                 let pdu_data = &raw[1..];
                 let mut resp_buf = [0u8; sle_ssap::SSAP_PDU_MAX];
                 let resp_len = shared
-                    .conn
-                    .process_ssap_pdu(*handle, pdu_data, &mut shared.ssap, &mut resp_buf)
+                    .process_ssap_pdu(*handle, pdu_data, &mut resp_buf)
                     .unwrap_or(0);
                 // Send response PDU back with TCID prefix, consuming TX credit.
                 if resp_len > 0
@@ -338,7 +366,9 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                     let cfg = sle_conn::ReliableModeConfig::default();
                     let mut sig_buf = [0u8; 24];
                     if let Ok(sig_len) =
-                        shared.conn.build_tcid_connect_req(*handle, &cfg, &mut sig_buf)
+                        shared
+                            .conn
+                            .build_tcid_connect_req(*handle, &cfg, &mut sig_buf)
                     {
                         let _ = shared.controller.send_data(*handle, &sig_buf[..sig_len]);
                     }
@@ -354,14 +384,11 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                         .unwrap_or(false);
                 if is_ssap_reliable {
                     // SSAP PDU on reliable transport channel.
-                    let needs_grant = shared
-                        .conn
-                        .consume_rx_credit(*handle, first_byte_tcid);
+                    let needs_grant = shared.conn.consume_rx_credit(*handle, first_byte_tcid);
                     let pdu_data = &raw[1..];
                     let mut resp_buf = [0u8; sle_ssap::SSAP_PDU_MAX];
                     let resp_len = shared
-                        .conn
-                        .process_ssap_pdu(*handle, pdu_data, &mut shared.ssap, &mut resp_buf)
+                        .process_ssap_pdu(*handle, pdu_data, &mut resp_buf)
                         .unwrap_or(0);
                     if resp_len > 0
                         && shared
@@ -377,9 +404,8 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                             .send_data(*handle, &tx_buf[..1 + resp_len]);
                     }
                     if needs_grant {
-                        if let Ok((granted, id)) = shared
-                            .conn
-                            .grant_credits(*handle, first_byte_tcid)
+                        if let Ok((granted, id)) =
+                            shared.conn.grant_credits(*handle, first_byte_tcid)
                         {
                             send_credit_grant(
                                 &shared.controller,
@@ -392,7 +418,8 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                     }
                 } else {
                     // User data — strip TCID prefix if present, enqueue to rx_queue.
-                    let tcid = if u16::from(raw[0]) == sle_conn::tcid::DEFAULT_DATA && raw.len() > 1 {
+                    let tcid = if u16::from(raw[0]) == sle_conn::tcid::DEFAULT_DATA && raw.len() > 1
+                    {
                         let _ = shared
                             .conn
                             .consume_rx_credit(*handle, sle_conn::tcid::DEFAULT_DATA);
@@ -421,8 +448,14 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
             crypto_cap,
         } => {
             if let Ok(reply) = shared.security.on_pair_info_exchange(
-                *handle, *io_cap, *oob_flag, *auth_req,
-                *max_key_len, *sec_dist, *psk_ind, crypto_cap,
+                *handle,
+                *io_cap,
+                *oob_flag,
+                *auth_req,
+                *max_key_len,
+                *sec_dist,
+                *psk_ind,
+                crypto_cap,
             ) {
                 let _ = shared.controller.pair_info_exchange_reply(&reply);
             }
@@ -435,7 +468,11 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
             public_key,
         } => {
             if let Ok(accept) = shared.security.on_pair_option_report(
-                *handle, *key_len, *auth_method, crypto_alg, public_key.as_slice(),
+                *handle,
+                *key_len,
+                *auth_method,
+                crypto_alg,
+                public_key.as_slice(),
             ) {
                 let _ = shared.controller.pair_option_accept(&accept);
             }
@@ -450,7 +487,10 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
                 let _ = shared.controller.pair_confirm(&resp);
             }
         }
-        sle_dli::SleEvent::DHKeyCheck { handle, dhkey_check } => {
+        sle_dli::SleEvent::DHKeyCheck {
+            handle,
+            dhkey_check,
+        } => {
             if let Ok(resp) = shared.security.on_dhkey_verify(*handle, dhkey_check) {
                 let _ = shared.controller.dhkey_verify(&resp);
             }
@@ -468,27 +508,37 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
             event_group_id,
         } => {
             let _ = shared.conn.handle_sync_ucast_setup_request(
-                *async_handle, *sync_handle, *event_group_set_id, *event_group_id);
+                *async_handle,
+                *sync_handle,
+                *event_group_set_id,
+                *event_group_id,
+            );
         }
         sle_dli::SleEvent::SyncUcastSetupComplete {
             sync_handle,
             status,
             ..
         } => {
-            let _ = shared.conn.handle_sync_ucast_setup_complete(*sync_handle, *status);
+            let _ = shared
+                .conn
+                .handle_sync_ucast_setup_complete(*sync_handle, *status);
         }
         sle_dli::SleEvent::SyncMcastSetupRequest {
             async_handle,
             sync_handle,
         } => {
-            let _ = shared.conn.handle_sync_mcast_setup_request(*async_handle, *sync_handle);
+            let _ = shared
+                .conn
+                .handle_sync_mcast_setup_request(*async_handle, *sync_handle);
         }
         sle_dli::SleEvent::SyncMcastSetupComplete {
             sync_handle,
             status,
             ..
         } => {
-            let _ = shared.conn.handle_sync_mcast_setup_complete(*sync_handle, *status);
+            let _ = shared
+                .conn
+                .handle_sync_mcast_setup_complete(*sync_handle, *status);
         }
         _ => {}
     }
@@ -507,13 +557,28 @@ pub(crate) fn process_controller_event(shared: &mut SubsystemShared, ev: &sle_dl
 /// next EventPump cycle. Also drains USB event ring entries so that
 /// multi-step protocol exchanges (e.g. pairing) can complete within
 /// a single ioctl call.
-pub(crate) fn drain_controller_events(shared: &mut SubsystemShared) {
+pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
+    let mut tagged = match new_event_batch() {
+        Ok(batch) => batch,
+        Err(_) => {
+            // Leave USB events in their queue for the background worker.
+            pr_err!("sparklink: cannot allocate inline RX staging\n");
+            return;
+        }
+    };
     // Multiple rounds: each round may generate new DLI commands whose
     // responses arrive in a subsequent round. Limit total iterations
     // to bound lock hold time on the ioctl path.
     let mut total = 0u32;
     for _round in 0..4 {
         let mut drained_this_round = 0u32;
+
+        if let Some(owner) = sle_usb::ingress_owner(shared.identity) {
+            if process_host_reply(&owner, shared) {
+                drained_this_round += 1;
+                total += 1;
+            }
+        }
 
         // 1. Inline controller events (UART/SPI synchronous responses)
         while let Some(ev) = shared.controller.poll_event() {
@@ -526,28 +591,14 @@ pub(crate) fn drain_controller_events(shared: &mut SubsystemShared) {
         }
 
         // 2. USB event ring entries (with device-ID filtering)
-        let mut tagged: [(Option<u16>, Option<sle_dli::SleEvent>); 64] =
-            [const { (None, None) }; 64];
-        let count = sle_usb::drain_usb_events(&mut tagged);
-        let active = shared.active_dev_id;
+        // Do not dequeue more events than this invocation can process.
+        let count =
+            sle_usb::drain_usb_events_for(shared.identity, &mut tagged[..(32 - total) as usize]);
         for item in tagged.iter_mut().take(count) {
             let (dev_id, ev_opt) = core::mem::take(item);
             if let Some(ev) = ev_opt {
-                if dev_id.is_none() || dev_id == active {
-                    process_controller_event(shared, &ev);
-                } else {
-                    let is_conn_lifecycle = matches!(
-                        ev,
-                        sle_dli::SleEvent::ConnComplete { .. }
-                            | sle_dli::SleEvent::Disconnected { .. }
-                    );
-                    if is_conn_lifecycle {
-                        drained_this_round += 1;
-                        total += 1;
-                        continue;
-                    }
-                    process_controller_event(shared, &ev);
-                }
+                debug_assert_eq!(dev_id, Some(shared.identity.id));
+                process_controller_event(shared, &ev);
                 drained_this_round += 1;
                 total += 1;
                 if total >= 32 {
@@ -562,260 +613,235 @@ pub(crate) fn drain_controller_events(shared: &mut SubsystemShared) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Background event pump (RX processing)
-// ---------------------------------------------------------------------------
-
-impl EventPump {
-    pub(crate) fn new() -> Result<Arc<Self>> {
-        Arc::pin_init(
-            pin_init!(EventPump {
-                work <- new_delayed_work!("sparklink_event_pump"),
-            }),
-            GFP_KERNEL,
-        )
+impl ControllerRuntime {
+    pub(crate) fn start_workers(self: &Arc<Self>) {
+        sle_usb::publish_runtime(self);
+        self.schedule_rx(msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS));
     }
 
-    /// Schedule the first pump cycle and register the global reference
-    /// so that interrupt-context producers can kick the pump.
-    pub(crate) fn start(self: &Arc<Self>) {
-        set_event_pump_ref(self);
-        let _ = workqueue::system()
-            .enqueue_delayed(self.clone(), msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS));
+    pub(crate) fn schedule_rx(self: &Arc<Self>, delay: kernel::time::Jiffies) {
+        let stopping = self.schedule_gate.lock();
+        if !*stopping {
+            if delay == 0 {
+                // SAFETY: this pinned delayed_work is never disabled and all
+                // scheduling is serialized with stop/flush by this gate.
+                // mod_delayed_work returns false for a NEW queue reference:
+                // __enqueue then transfers the incoming Arc to the trampoline.
+                // If already pending, it returns true: keep the prior queue
+                // reference and return/drop the unused incoming Arc. No raw
+                // callback can run without a corresponding Rust-owned Arc.
+                let _ = unsafe {
+                    <Arc<Self> as workqueue::RawWorkItem<0>>::__enqueue(self.clone(), |work| {
+                        let delayed =
+                            kernel::container_of!(work, kernel::bindings::delayed_work, work);
+                        !kernel::bindings::mod_delayed_work_on(
+                            kernel::bindings::wq_misc_consts_WORK_CPU_UNBOUND as i32,
+                            kernel::bindings::system_wq,
+                            delayed,
+                            0,
+                        )
+                    })
+                };
+            } else {
+                // A heartbeat/self-rearm must not postpone an existing kick.
+                let _ = workqueue::system().enqueue_delayed::<_, 0>(self.clone(), delay);
+            }
+        }
+    }
+
+    pub(crate) fn kick_commands(self: &Arc<Self>) {
+        let stopping = self.schedule_gate.lock();
+        if !*stopping {
+            let _ = workqueue::system().enqueue_delayed::<_, 1>(self.clone(), 0);
+        }
+    }
+
+    pub(crate) fn stop_workers(self: &Arc<Self>) {
+        *self.schedule_gate.lock() = true;
+        flush_work(&self.rx_work);
+        flush_work(&self.tx_work);
     }
 }
 
-impl WorkItem for EventPump {
-    type Pointer = Arc<EventPump>;
+impl WorkItem<0> for ControllerRuntime {
+    type Pointer = Arc<ControllerRuntime>;
 
-    fn run(this: Arc<EventPump>) {
-        // Drain all pending controller events into both the broadcast ring
-        // (for read() delivery) and the DLI event ring (for DLI_POLL_EVENT).
-        // Also resolve pending commands from the management plane.
-        //
-        // The outer loop retries after processing events because
-        // process_controller_event() may send new DLI commands whose
-        // USB responses arrive while we still hold the SUBSYSTEM lock.
-        // Without retrying, those responses would wait until the next
-        // heartbeat (up to 500ms) — too slow for multi-step sequences
-        // like pairing which need sub-millisecond round-trips.
-        let mut _pumped = 0u32;
-        let mut rearm_jiffies = msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS) as u64;
-
-        // Log USB event ring overflow if any events were dropped.
-        {
-            let usb_dropped = sle_usb::take_dropped_count();
-            if usb_dropped > 0 {
-                pr_warn!(
-                    "sparklink: USB event ring overflow: {} event(s) dropped\n",
-                    usb_dropped
-                );
-            }
+    fn run(this: Arc<ControllerRuntime>) {
+        if *this.schedule_gate.lock() {
+            return;
         }
-
-        // Outer retry loop: keep draining until no new events arrive.
-        // Limit iterations to avoid hogging the CPU if events keep arriving.
-        for _pass in 0..16u32 {
-            let mut tagged_events: [(Option<u16>, Option<sle_dli::SleEvent>); 64] =
-                [const { (None, None) }; 64];
-            let tagged_count = sle_usb::drain_usb_events(&mut tagged_events);
-            let mut drained_this_pass = 0u32;
-
+        let mut pumped = 0u32;
+        let mut rearm_jiffies = msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS) as u64;
+        let mut batch = new_event_batch().ok();
+        let drops = sle_usb::take_dropped_stats(&this);
+        if drops.ring > 0 || drops.command_complete > 0 || drops.decode > 0 {
+            pr_warn!("sparklink: sle{} USB RX loss: ring={} command_complete={} mac_complete={} decode={}\n",
+                this.identity.id, drops.ring, drops.command_complete, drops.mac_complete, drops.decode);
+        }
+        for _pass in 0..16 {
+            let tagged: &mut [_] = match batch.as_deref_mut() {
+                Some(events) => events,
+                None => &mut [],
+            };
+            let mut drained = 0;
             {
-                let mut ss = SUBSYSTEM.lock();
-                if let Some(ref mut shared) = *ss {
-                    // Process inline controller events (untagged, always active device).
-                    while let Some(ev) = shared.controller.poll_event() {
-                        process_controller_event(shared, &ev);
-                        _pumped += 1;
-                        drained_this_pass += 1;
-                        if _pumped >= 256 {
-                            break;
+                let mut guard = this.state.lock();
+                let Some(runtime) = Option::as_mut(&mut *guard) else {
+                    return;
+                };
+                if process_host_reply(&this, runtime) {
+                    pumped += 1;
+                    drained += 1;
+                }
+                while let Some(ev) = runtime.controller.poll_event() {
+                    process_controller_event(runtime, &ev);
+                    pumped += 1;
+                    drained += 1;
+                    if pumped >= 256 {
+                        break;
+                    }
+                }
+                // Inline and worker drains share this owner's state lock. Do
+                // not prefetch older events before waiting for that lock: an
+                // ioctl could otherwise process newer events ahead of them.
+                let budget = tagged.len().min((256 - pumped) as usize);
+                let count = sle_usb::drain_runtime_events(&this, &mut tagged[..budget]);
+                for item in tagged.iter_mut().take(count) {
+                    let (id, event) = core::mem::take(item);
+                    if let Some(ev) = event {
+                        debug_assert_eq!(id, Some(this.identity.id));
+                        process_controller_event(runtime, &ev);
+                        pumped += 1;
+                        drained += 1;
+                    }
+                }
+                if drained == 0 || pumped >= 256 {
+                    if runtime.controller.uses_command_host()
+                        && this.host.lock().timed_out()
+                    {
+                        fail_host(&this, runtime, ETIMEDOUT);
+                        pr_warn!(
+                            "sparklink: sle{} USB command Host timed out\n",
+                            this.identity.id
+                        );
+                    }
+                    let expired = runtime.cmd_pending.expire_stale();
+                    if expired > 0 {
+                        pr_warn!(
+                            "sparklink: sle{}: {} pending commands timed out\n",
+                            this.identity.id,
+                            expired
+                        );
+                    }
+                    runtime.cmd_pending.gc();
+                    let mut timeout_buf = [0u16; sle_conn::MAX_CONNECTIONS];
+                    let n = runtime.conn.check_supervision_timeouts(&mut timeout_buf);
+                    for &h in &timeout_buf[..n] {
+                        if let Ok(peer) = runtime.conn.timeout_disconnect(h) {
+                            runtime
+                                .broadcast
+                                .publish(sle_event::SleWireEvent::conn_state(
+                                    h,
+                                    sle_conn::ConnState::Connected as u8,
+                                    sle_conn::ConnState::Idle as u8,
+                                    peer,
+                                    0x08,
+                                ));
                         }
                     }
-
-                    // Process tagged USB events, routing to correct device.
-                    for item in tagged_events.iter_mut().take(tagged_count) {
-                        let (dev_id, ev_opt) = core::mem::take(item);
-                        if let Some(ev) = ev_opt {
-                            let active = shared.active_dev_id;
-                            if dev_id.is_none() || dev_id == active {
-                                process_controller_event(shared, &ev);
-                            } else if let Some(target_id) = dev_id {
-                                // Events from non-active USB devices: skip
-                                // connection lifecycle events (ConnComplete /
-                                // Disconnected) because those are the
-                                // acceptor-side mirrors of connections already
-                                // tracked on the active device.  Processing
-                                // them would create duplicate entries in the
-                                // shared ConnManager.
-                                let is_conn_lifecycle = matches!(
-                                    ev,
-                                    sle_dli::SleEvent::ConnComplete { .. }
-                                        | sle_dli::SleEvent::Disconnected { .. }
-                                );
-                                if is_conn_lifecycle {
-                                    _pumped += 1;
-                                    drained_this_pass += 1;
-                                    continue;
-                                }
-                                if shared.switch_to_device(target_id).is_ok() {
-                                    process_controller_event(shared, &ev);
-                                    if let Some(orig_id) = active {
-                                        let _ = shared.switch_to_device(orig_id);
-                                    }
-                                } else {
-                                    pr_warn!(
-                                        "sparklink: dropped event for device {} (switch failed)\n",
-                                        target_id
-                                    );
-                                }
-                            }
-                            _pumped += 1;
-                            drained_this_pass += 1;
-                        }
-                    }
-
-                    // Only perform maintenance on the final pass.
-                    if drained_this_pass == 0 || _pumped >= 256 {
-                        let expired = shared.cmd_pending.expire_stale();
-                        if expired > 0 {
-                            pr_warn!("sparklink: {} pending command(s) timed out\n", expired);
-                        }
-                        shared.cmd_pending.gc();
-
-                        let mut timeout_buf = [0u16; sle_conn::MAX_CONNECTIONS];
-                        let n = shared.conn.check_supervision_timeouts(&mut timeout_buf);
-                        for &h in &timeout_buf[..n] {
-                            if let Ok(peer) = shared.conn.timeout_disconnect(h) {
-                                shared
-                                    .broadcast
-                                    .publish(sle_event::SleWireEvent::conn_state(
-                                        h,
-                                        sle_conn::ConnState::Connected as u8,
-                                        sle_conn::ConnState::Idle as u8,
-                                        peer,
-                                        0x08,
-                                    ));
-                            }
-                        }
-
-                        let heartbeat = msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS) as u64;
-                        rearm_jiffies = match shared.conn.next_supervision_jiffies() {
-                            Some(j) if j < heartbeat => j,
-                            _ => heartbeat,
-                        };
+                    if let Some(j) = runtime.conn.next_supervision_jiffies() {
+                        rearm_jiffies = rearm_jiffies.min(j);
                     }
                 }
             }
-
-            if drained_this_pass == 0 || _pumped >= 256 {
+            if drained == 0 || pumped >= 256 {
                 break;
             }
         }
-        // Re-arm: if events were processed this cycle, new USB responses
-        // may be in-flight (e.g. pairing multi-step flow).  Set a fast-poll
-        // countdown so subsequent empty runs still rearm at 1 jiffy,
-        // giving USB round-trips (~1-8ms) time to deliver responses.
-        if _pumped > 0 {
-            // Reset countdown: stay in fast-poll for up to 64 more runs.
-            FAST_POLL_REMAINING.store(64, core::sync::atomic::Ordering::Relaxed);
+        if pumped > 0 {
+            this.fast_poll_remaining
+                .store(64, core::sync::atomic::Ordering::Relaxed);
             rearm_jiffies = 1;
         } else {
-            let remaining = FAST_POLL_REMAINING.load(core::sync::atomic::Ordering::Relaxed);
+            let remaining = this
+                .fast_poll_remaining
+                .load(core::sync::atomic::Ordering::Relaxed);
             if remaining > 0 {
-                FAST_POLL_REMAINING.store(remaining - 1, core::sync::atomic::Ordering::Relaxed);
+                this.fast_poll_remaining
+                    .store(remaining - 1, core::sync::atomic::Ordering::Relaxed);
                 rearm_jiffies = 1;
             }
         }
-        // Clear the kick-scheduled flag so new producers can kick again.
-        KICK_SCHEDULED.store(false, core::sync::atomic::Ordering::Release);
-        let _ = workqueue::system()
-            .enqueue_delayed(this, rearm_jiffies as kernel::time::Jiffies);
+        // An inline drain may already have taken the grant; check the owner
+        // state even on an empty RX pass. Queue TX after releasing its mutex.
+        let can_send = {
+            let state = this.state.lock();
+            state.as_ref().is_some_and(|state| {
+                if state.controller.uses_command_host() {
+                    this.host.lock().can_send()
+                } else {
+                    state.command_credits > 0 && !state.cmd_queue.is_empty()
+                }
+            })
+        };
+        if can_send {
+            this.kick_commands();
+        }
+        this.schedule_rx(rearm_jiffies as kernel::time::Jiffies);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Background command worker (TX dispatch)
-// ---------------------------------------------------------------------------
+impl WorkItem<1> for ControllerRuntime {
+    type Pointer = Arc<ControllerRuntime>;
 
-/// Background worker that dequeues command requests from `cmd_queue`
-/// and sends them to the controller in workqueue context.
-///
-/// This decouples command submission (ioctl) from hardware transmission,
-/// following the Bluetooth `hci_cmd_work` pattern. Benefits:
-/// - Reduces ioctl lock hold time
-/// - Enables future flow control (credit-based throttling)
-/// - Makes real hardware latency non-blocking for userspace
-#[pin_data]
-pub(crate) struct CommandWorker {
-    #[pin]
-    work: DelayedWork<CommandWorker>,
-}
-
-impl_has_delayed_work! {
-    impl HasDelayedWork<Self> for CommandWorker { self.work }
-}
-
-impl CommandWorker {
-    pub(crate) fn new() -> Result<Arc<Self>> {
-        Arc::pin_init(
-            pin_init!(CommandWorker {
-                work <- new_delayed_work!("sparklink_cmd_worker"),
-            }),
-            GFP_KERNEL,
-        )
-    }
-
-    /// Schedule the command worker to run immediately.
-    pub(crate) fn kick(self: &Arc<Self>) {
-        let _ = workqueue::system()
-            .enqueue_delayed(self.clone(), 0);
-    }
-}
-
-impl WorkItem for CommandWorker {
-    type Pointer = Arc<CommandWorker>;
-
-    fn run(this: Arc<CommandWorker>) {
-        let mut dispatched = 0u32;
-        {
-            let mut ss = SUBSYSTEM.lock();
-            if let Some(ref mut shared) = *ss {
-                // Dispatch up to 8 commands per cycle.
-                while dispatched < 8 {
-                    match shared.cmd_queue.pop() {
-                        Some(req) => {
-                            let plen = req.param_len as usize;
-                            let result = shared
-                                .controller
-                                .send_command_raw(req.opcode, &req.params[..plen]);
-                            if result.is_err() {
-                                // Immediately resolve the pending entry as
-                                // failed so it does not linger until timeout.
-                                shared.cmd_pending.resolve(
-                                    req.opcode,
-                                    0x03,
-                                    &[], // HardwareFailure
-                                );
-                            }
-                            dispatched += 1;
-                        }
-                        None => break,
+    fn run(this: Arc<ControllerRuntime>) {
+        if *this.schedule_gate.lock() {
+            return;
+        }
+        let more = {
+            let mut guard = this.state.lock();
+            let Some(runtime) = Option::as_mut(&mut *guard) else {
+                return;
+            };
+            if runtime.controller.uses_command_host() {
+                let request = this.host.lock().next(|seq| {
+                    runtime
+                        .cmd_pending
+                        .find_by_seq(seq)
+                        .is_some_and(|entry| entry.is_pending() && !entry.is_expired())
+                });
+                if let Some(request) = request {
+                    if let Err(error) = runtime.controller.send_command_transport(
+                        request.opcode,
+                        &request.params[..request.param_len as usize],
+                    ) {
+                        fail_host(&this, runtime, error);
                     }
                 }
+                // Reply consumption, not bulk acceptance, releases this slot.
+                return;
             }
-        }
-
-        // Re-arm if there are more commands pending.
-        if dispatched > 0 {
-            let ss = SUBSYSTEM.lock();
-            if let Some(ref shared) = *ss {
-                if !shared.cmd_queue.is_empty() {
-                    drop(ss);
-                    this.kick();
+            for _ in 0..8 {
+                if runtime.command_credits == 0 {
+                    break;
+                }
+                let Some(req) = runtime.cmd_queue.pop() else {
+                    break;
+                };
+                let plen = req.param_len as usize;
+                runtime.command_credits -= 1;
+                if runtime
+                    .controller
+                    .send_command_raw(req.opcode, &req.params[..plen])
+                    .is_err()
+                {
+                    runtime.cmd_pending.resolve_seq(req.seq, 0x03, &[]);
                 }
             }
+            runtime.command_credits > 0 && !runtime.cmd_queue.is_empty()
+        };
+        if more {
+            this.kick_commands();
         }
     }
 }
@@ -824,16 +850,27 @@ impl WorkItem for CommandWorker {
 #[inline(never)]
 fn sle_dli_event_to_broadcast(ev: &sle_dli::SleEvent) -> sle_event::SleWireEvent {
     match ev {
+        sle_dli::SleEvent::NativeCommandReply { opcode, status, complete, data, .. } => {
+            if *complete {
+                sle_event::SleWireEvent::command_complete(*opcode, *status, data.as_slice())
+            } else {
+                sle_event::SleWireEvent::command_status(*opcode, *status)
+            }
+        }
+        sle_dli::SleEvent::CommandCredits { credits } => {
+            sle_event::SleWireEvent::command_complete(0, 0, &[*credits])
+        }
         sle_dli::SleEvent::CommandComplete {
             opcode,
             status,
             data,
+            ..
         } => sle_event::SleWireEvent::command_complete(
             *opcode as u16,
             *status as u8,
             data.as_slice(),
         ),
-        sle_dli::SleEvent::CommandStatus { opcode, status } => {
+        sle_dli::SleEvent::CommandStatus { opcode, status, .. } => {
             sle_event::SleWireEvent::command_status(*opcode as u16, *status as u8)
         }
         sle_dli::SleEvent::ConnComplete {

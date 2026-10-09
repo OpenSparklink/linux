@@ -72,6 +72,8 @@ guest 当前使用兼容路径进行初始化（通过 Bulk OUT 发送命令，
 ```bash
 cd tools/testing/selftests/sparklink/qemu-sle-dli
 ./build-qemu.sh
+# Constrain build parallelism on a shared development machine.
+JOBS=4 ./build-qemu.sh
 ```
 
 构建脚本会：
@@ -81,6 +83,12 @@ cd tools/testing/selftests/sparklink/qemu-sle-dli
 4. 编译最小 x86_64-softmmu QEMU
 
 构建产物在 `bin/bin/qemu-system-x86_64`。
+
+构建输出保留完整 configure/compiler/install 诊断。固定的 QEMU 9.2.0
+包含仅用于构建的 libfdt const 声明修正，以兼容 glibc 2.43/GCC 16；
+不改变虚拟控制器的协议行为。无 sudo 环境可使用工作区解包的官方
+开发依赖及静态 BusyBox，设置 PKG_CONFIG_PATH/链接搜索路径；依赖来源、
+版本、签名验证及实际构建环境须随运行记录保存。
 
 ## 使用
 
@@ -122,3 +130,17 @@ qemu-sle-dli/
   build-qemu.sh    构建脚本
   README.md        本文档
 ```
+
+## Synthetic native WS73 fixture
+
+`usb-ws73-test.c` adds `-device usb-ws73-test` independently from the standard
+`usb-sle-dli` model. It implements the runtime-only five-endpoint vendor
+HCC/BSLE and metadata reply fixture. There is no boot ROM, firmware execution
+or RF medium. Never use its synthetic configuration or metadata as hardware
+calibration or real WS73 evidence.
+
+Use `run_runtime_lifecycle.py --native-ws73` for the production driver's native
+URBs, Host credit/status handling and two-owner remove/re-add gate. Add
+`--native-ws73-fault` for a malformed aggregate on A with B left usable. The
+same runner's default standard-DLI test remains independent. See
+`Documentation/networking/ws73-development.rst` for scope and commands.

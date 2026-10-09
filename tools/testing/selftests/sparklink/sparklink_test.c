@@ -16,6 +16,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -28,6 +29,7 @@
 #include <time.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #ifndef __packed
 #define __packed __attribute__((packed))
@@ -39,14 +41,53 @@
 /* IOCTL definitions + data structures from UAPI header               */
 /* ------------------------------------------------------------------ */
 
-#include "sparklink_ioctl.h"
-#include "sparklink.h"
+#include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "../../../../include/uapi/linux/sparklink.h"
 
 /* ------------------------------------------------------------------ */
 /* Test helpers                                                        */
 /* ------------------------------------------------------------------ */
 
 static const char *DEVICE = "/dev/sparklink";
+
+/* KSFT_SKIP: an incomplete suite must never be reported as a full pass. */
+#define TEST_SKIP 4
+
+static unsigned int failed_assertions;
+static unsigned int skipped_checks;
+static unsigned int completed_cases;
+
+static void test_fail(const char *format, ...)
+	__attribute__((format(printf, 1, 2)));
+static void test_skip(const char *format, ...)
+	__attribute__((format(printf, 1, 2)));
+
+static void test_fail(const char *format, ...)
+{
+	va_list args;
+
+	failed_assertions++;
+	va_start(args, format);
+	vprintf(format, args);
+	va_end(args);
+}
+
+static void test_skip(const char *format, ...)
+{
+	va_list args;
+
+	skipped_checks++;
+	va_start(args, format);
+	vprintf(format, args);
+	va_end(args);
+}
+
+static int test_exit_status(void)
+{
+	if (failed_assertions)
+		return EXIT_FAILURE;
+	return skipped_checks ? TEST_SKIP : EXIT_SUCCESS;
+}
 
 static void test_header(const char *name)
 {
@@ -56,11 +97,67 @@ static void test_header(const char *name)
 static int check(const char *op, int ret)
 {
 	if (ret < 0) {
-		printf("  FAIL: %s: %s (errno=%d)\n", op, strerror(errno), errno);
+		test_fail("  FAIL: %s: %s (errno=%d)\n", op, strerror(errno), errno);
 		return -1;
 	}
 	printf("  OK:   %s: ret=%d\n", op, ret);
 	return ret;
+}
+
+/* A successful ioctl queues USB work; require the controller's completion.
+ * Callers drain previous replies before a sequential transaction so an old
+ * response with the same opcode cannot satisfy this wait. */
+static int wait_dli_complete(int fd, uint16_t opcode, struct sle_dli_event *ev)
+{
+	struct timespec start, now;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		memset(ev, 0, sizeof(*ev));
+		if (ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, ev) == 0) {
+			if (ev->opcode == opcode &&
+			    (ev->event_type == 1 || ev->event_type == 2)) {
+				if (ev->status) {
+					errno = EIO;
+					return -1;
+				}
+				if (ev->event_type == 1)
+					return 0;
+			}
+		} else if (errno != EAGAIN) {
+			return -1;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((now.tv_sec - start.tv_sec) * 1000000000LL +
+		    now.tv_nsec - start.tv_nsec >= 2000000000LL) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		usleep(1000);
+	}
+}
+
+static int wait_conn_removed(int fd, uint16_t handle)
+{
+	struct timespec start, now;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		struct sle_conn_info info = { .handle = handle };
+
+		if (ioctl(fd, SL_IOCTL_CONN_INFO, &info) < 0) {
+			if (errno == ENOENT)
+				return 0;
+			return -1;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((now.tv_sec - start.tv_sec) * 1000000000LL +
+		    now.tv_nsec - start.tv_nsec >= 2000000000LL) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		usleep(1000);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -116,10 +213,15 @@ static void disconnect_all(int fd)
 	if (ioctl(fd, SL_IOCTL_CONN_LIST, &cl) == 0) {
 		for (int i = 0; i < cl.count && i < 8; i++)
 			ioctl(fd, SL_IOCTL_DISCONNECT, &cl.handles[i]);
+		for (int i = 0; i < cl.count && i < 8; i++) {
+			if (wait_conn_removed(fd, cl.handles[i]) < 0)
+				test_fail("  FAIL: cleanup handle %u: %s\n",
+					  cl.handles[i], strerror(errno));
+		}
 	}
 }
 
-static void set_role(int fd, uint8_t role)
+static int set_role(int fd, uint8_t role)
 {
 	int ret = ioctl(fd, SL_IOCTL_SET_ROLE, &role);
 
@@ -137,8 +239,9 @@ static void set_role(int fd, uint8_t role)
 		ret = ioctl(fd, SL_IOCTL_SET_ROLE, &role);
 	}
 	if (ret < 0) {
-		printf("  WARN: SET_ROLE(%d): %s (non-fatal)\n", role, strerror(errno));
+		test_fail("  FAIL: SET_ROLE(%d): %s\n", role, strerror(errno));
 	}
+	return ret;
 }
 
 static void test_advertising(int fd)
@@ -282,7 +385,7 @@ static void test_role_management(int fd)
 	if (role == 1)
 		printf("  OK:   role is now GNode (1)\n");
 	else
-		printf("  FAIL: expected GNode(1), got %u\n", role);
+		test_fail("  FAIL: expected GNode(1), got %u\n", role);
 
 	/* Set back to TNode */
 	uint8_t tnode = 0;
@@ -320,7 +423,7 @@ static void test_role_management(int fd)
 		/* Clean up: disconnect */
 		ioctl(fd, SL_IOCTL_DISCONNECT, &conn_handle);
 	} else {
-		printf("  WARN: CONNECT failed, skipping EBUSY test\n");
+		test_skip("  SKIP: CONNECT failed, skipping EBUSY test\n");
 	}
 }
 
@@ -476,7 +579,7 @@ static void test_connect(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT: expected handle > 0, got %d\n", ret);
+		test_fail("  FAIL: CONNECT: expected handle > 0, got %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -568,7 +671,7 @@ static void test_conn_reject(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT: expected handle > 0, got %d\n", ret);
+		test_fail("  FAIL: CONNECT: expected handle > 0, got %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -615,7 +718,7 @@ static void test_conn_data_loopback(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT: expected handle > 0, got %d\n", ret);
+		test_fail("  FAIL: CONNECT: expected handle > 0, got %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -658,6 +761,27 @@ static void test_conn_data_loopback(int fd)
 			printf("  OK:   data_mtu=%u data_mps=%u data_mode=%u svc_mtu=%u\n",
 			       info.data_mtu, info.data_mps, info.data_mode, info.svc_mtu);
 	}
+
+	/* Reject empty and oversized injected frames before TCID/SSAP access.
+	 * A zero-length frame on a valid handle previously panicked in Rust.
+	 */
+	struct sle_conn_data invalid_rx;
+
+	memset(&invalid_rx, 0, sizeof(invalid_rx));
+	invalid_rx.handle = handle;
+	errno = 0;
+	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &invalid_rx);
+	if (ret == -1 && errno == EINVAL)
+		printf("  OK:   zero-length INJECT_CONN_DATA rejected\n");
+	else
+		test_fail("  FAIL: zero-length INJECT_CONN_DATA ret=%d errno=%d\n", ret, errno);
+	invalid_rx.length = sizeof(invalid_rx.data) + 1;
+	errno = 0;
+	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &invalid_rx);
+	if (ret == -1 && errno == EINVAL)
+		printf("  OK:   oversized INJECT_CONN_DATA rejected without truncation\n");
+	else
+		test_fail("  FAIL: oversized INJECT_CONN_DATA ret=%d errno=%d\n", ret, errno);
 
 	/* Step 4: Send data */
 	struct sle_conn_data sd;
@@ -767,7 +891,7 @@ static void test_sm3_hash(int fd)
 		if (memcmp(ht.digest, expected, 32) == 0) {
 			printf("  OK:   SM3 test vector matches\n");
 		} else {
-			printf("  FAIL: SM3 test vector mismatch!\n");
+			test_fail("  FAIL: SM3 test vector mismatch!\n");
 		}
 	}
 }
@@ -811,7 +935,7 @@ static void test_sm4_block(int fd)
 		if (memcmp(bt.output, expected_ct, 16) == 0) {
 			printf("  OK:   SM4 encrypt test vector matches\n");
 		} else {
-			printf("  FAIL: SM4 encrypt test vector mismatch!\n");
+			test_fail("  FAIL: SM4 encrypt test vector mismatch!\n");
 		}
 
 		/* Now decrypt and verify round-trip */
@@ -829,7 +953,7 @@ static void test_sm4_block(int fd)
 			if (memcmp(dt.output, plaintext, 16) == 0) {
 				printf("  OK:   SM4 decrypt round-trip matches\n");
 			} else {
-				printf("  FAIL: SM4 decrypt round-trip mismatch!\n");
+				test_fail("  FAIL: SM4 decrypt round-trip mismatch!\n");
 			}
 		}
 	}
@@ -879,7 +1003,7 @@ static void test_hmac_sm3(int fd)
 		if (nonzero) {
 			printf("  OK:   HMAC-SM3 produced non-zero digest\n");
 		} else {
-			printf("  FAIL: HMAC-SM3 returned all zeros\n");
+			test_fail("  FAIL: HMAC-SM3 returned all zeros\n");
 		}
 
 		/* Verify determinism: same input should produce same output */
@@ -891,7 +1015,7 @@ static void test_hmac_sm3(int fd)
 		if (ret == 0 && memcmp(ht.digest, ht2.digest, 32) == 0) {
 			printf("  OK:   HMAC-SM3 deterministic\n");
 		} else {
-			printf("  FAIL: HMAC-SM3 not deterministic\n");
+			test_fail("  FAIL: HMAC-SM3 not deterministic\n");
 		}
 	}
 }
@@ -1001,7 +1125,7 @@ static void test_security_pairing(int fd)
 			printf("  OK:   Decrypt roundtrip matches: \"%.*s\"\n",
 			       enc_data.length, enc_data.data);
 		} else {
-			printf("  FAIL: decrypt roundtrip mismatch!\n");
+			test_fail("  FAIL: decrypt roundtrip mismatch!\n");
 		}
 	}
 }
@@ -1073,7 +1197,7 @@ static void test_security_ecdh(int fd)
 		if (ret == 0 && memcmp(enc_data.data, original, enc_data.length) == 0)
 			printf("  OK:   ECDH encrypt/decrypt roundtrip passed\n");
 		else
-			printf("  FAIL: ECDH roundtrip mismatch\n");
+			test_fail("  FAIL: ECDH roundtrip mismatch\n");
 	}
 }
 
@@ -1106,7 +1230,7 @@ static void test_security_numeric_comparison(int fd)
 		printf("  OK:   pair method=3 (NumericComparison)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: pair method=3: %s\n", strerror(errno));
+		test_fail("  FAIL: pair method=3: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1122,7 +1246,7 @@ static void test_security_numeric_comparison(int fd)
 		printf("  OK:   state=Paired(2), method=3\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: state=%u method=%u (expected 2/3)\n",
+		test_fail("  FAIL: state=%u method=%u (expected 2/3)\n",
 		       sec.state, sec.method);
 		fail_count++;
 	}
@@ -1133,7 +1257,7 @@ static void test_security_numeric_comparison(int fd)
 		printf("  OK:   encryption enabled after NC pairing\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: encrypt_on: %s\n", strerror(errno));
+		test_fail("  FAIL: encrypt_on: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1158,11 +1282,11 @@ static void test_security_numeric_comparison(int fd)
 			printf("  OK:   SM4 roundtrip after NC pairing\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: SM4 decrypt mismatch after NC\n");
+			test_fail("  FAIL: SM4 decrypt mismatch after NC\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: SM4 encrypt after NC: ret=%d\n", ret);
+		test_fail("  FAIL: SM4 encrypt after NC: ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -1178,7 +1302,7 @@ static void test_security_numeric_comparison(int fd)
 		printf("  OK:   re-pair success (state=Paired)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: re-pair: ret=%d state=%u method=%u\n",
+		test_fail("  FAIL: re-pair: ret=%d state=%u method=%u\n",
 		       ret, sec.state, sec.method);
 		fail_count++;
 	}
@@ -1192,7 +1316,7 @@ static void test_security_numeric_comparison(int fd)
 		printf("  OK:   reject returns to Idle(0)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: after reject: state=%u method=%u\n",
+		test_fail("  FAIL: after reject: state=%u method=%u\n",
 		       sec.state, sec.method);
 		fail_count++;
 	}
@@ -1238,7 +1362,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   pair method=4 (PasskeyEntry)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: pair method=4: %s\n", strerror(errno));
+		test_fail("  FAIL: pair method=4: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1250,7 +1374,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   state=Paired(2), method=4\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: state=%u method=%u (expected 2/4)\n",
+		test_fail("  FAIL: state=%u method=%u (expected 2/4)\n",
 		       sec.state, sec.method);
 		fail_count++;
 	}
@@ -1277,11 +1401,11 @@ static void test_security_oob_pin_password(int fd)
 			printf("  OK:   SM4 roundtrip after passkey entry\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: SM4 roundtrip after passkey entry\n");
+			test_fail("  FAIL: SM4 roundtrip after passkey entry\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: encrypt_on after passkey entry: %s\n",
+		test_fail("  FAIL: encrypt_on after passkey entry: %s\n",
 		       strerror(errno));
 		fail_count++;
 	}
@@ -1297,7 +1421,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   OOB pair without data rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: OOB pair without data: ret=%d\n", ret);
+		test_fail("  FAIL: OOB pair without data: ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -1312,7 +1436,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   OOB data set\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: set OOB data: %s\n", strerror(errno));
+		test_fail("  FAIL: set OOB data: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1324,7 +1448,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   OOB pairing succeeded\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: OOB pair: %s\n", strerror(errno));
+		test_fail("  FAIL: OOB pair: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1336,7 +1460,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   state=Paired(2), method=5 (OOB)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: state=%u method=%u (expected 2/5)\n",
+		test_fail("  FAIL: state=%u method=%u (expected 2/5)\n",
 		       sec.state, sec.method);
 		fail_count++;
 	}
@@ -1363,11 +1487,11 @@ static void test_security_oob_pin_password(int fd)
 			printf("  OK:   SM4 roundtrip after OOB pairing\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: SM4 roundtrip after OOB\n");
+			test_fail("  FAIL: SM4 roundtrip after OOB\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: encrypt_on after OOB: %s\n", strerror(errno));
+		test_fail("  FAIL: encrypt_on after OOB: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1382,7 +1506,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   password pair without password rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: password pair without password: ret=%d\n", ret);
+		test_fail("  FAIL: password pair without password: ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -1396,7 +1520,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   password len=0 rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: password len=0: ret=%d\n", ret);
+		test_fail("  FAIL: password len=0: ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -1409,7 +1533,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   password set (8 bytes)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: set password: %s\n", strerror(errno));
+		test_fail("  FAIL: set password: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1421,7 +1545,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   password pairing succeeded\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: password pair: %s\n", strerror(errno));
+		test_fail("  FAIL: password pair: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1433,7 +1557,7 @@ static void test_security_oob_pin_password(int fd)
 		printf("  OK:   state=Paired(2), method=6 (Password)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: state=%u method=%u (expected 2/6)\n",
+		test_fail("  FAIL: state=%u method=%u (expected 2/6)\n",
 		       sec.state, sec.method);
 		fail_count++;
 	}
@@ -1460,11 +1584,11 @@ static void test_security_oob_pin_password(int fd)
 			printf("  OK:   SM4 roundtrip after password pairing\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: SM4 roundtrip after password\n");
+			test_fail("  FAIL: SM4 roundtrip after password\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: encrypt_on after password: %s\n",
+		test_fail("  FAIL: encrypt_on after password: %s\n",
 		       strerror(errno));
 		fail_count++;
 	}
@@ -1501,7 +1625,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL initial size is 0\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL initial size expected 0, got %u (ret=%d)\n",
+		test_fail("  FAIL: RAL initial size expected 0, got %u (ret=%d)\n",
 		       count, ret);
 		fail_count++;
 	}
@@ -1527,7 +1651,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL add device 1\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL add device 1: %s\n", strerror(errno));
+		test_fail("  FAIL: RAL add device 1: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1538,7 +1662,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL size is 1 after add\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL size expected 1, got %u\n", count);
+		test_fail("  FAIL: RAL size expected 1, got %u\n", count);
 		fail_count++;
 	}
 
@@ -1548,7 +1672,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL duplicate add rejected (EEXIST)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL duplicate add should fail with EEXIST\n");
+		test_fail("  FAIL: RAL duplicate add should fail with EEXIST\n");
 		fail_count++;
 	}
 
@@ -1572,7 +1696,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL add device 2\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL add device 2: %s\n", strerror(errno));
+		test_fail("  FAIL: RAL add device 2: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1583,7 +1707,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL size is 2\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL size expected 2, got %u\n", count);
+		test_fail("  FAIL: RAL size expected 2, got %u\n", count);
 		fail_count++;
 	}
 
@@ -1607,11 +1731,11 @@ static void test_rpa_management(int fd)
 			printf("  OK:   read peer RPA (resolvable marker correct)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: peer RPA format incorrect\n");
+			test_fail("  FAIL: peer RPA format incorrect\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: read peer RPA: %s\n", strerror(errno));
+		test_fail("  FAIL: read peer RPA: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1633,11 +1757,11 @@ static void test_rpa_management(int fd)
 			printf("  OK:   read local RPA (resolvable marker correct)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: local RPA format incorrect\n");
+			test_fail("  FAIL: local RPA format incorrect\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: read local RPA: %s\n", strerror(errno));
+		test_fail("  FAIL: read local RPA: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1646,7 +1770,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   peer RPA differs from local RPA\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: peer and local RPA should differ\n");
+		test_fail("  FAIL: peer and local RPA should differ\n");
 		fail_count++;
 	}
 
@@ -1658,7 +1782,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RPA resolution enabled\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RPA enable: %s\n", strerror(errno));
+		test_fail("  FAIL: RPA enable: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1668,7 +1792,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL add blocked while RPA enabled (EBUSY)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL add should fail with EBUSY when enabled\n");
+		test_fail("  FAIL: RAL add should fail with EBUSY when enabled\n");
 		fail_count++;
 	}
 
@@ -1683,7 +1807,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL remove blocked while RPA enabled (EBUSY)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL remove should fail with EBUSY\n");
+		test_fail("  FAIL: RAL remove should fail with EBUSY\n");
 		fail_count++;
 	}
 
@@ -1693,7 +1817,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL clear blocked while RPA enabled (EBUSY)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL clear should fail with EBUSY\n");
+		test_fail("  FAIL: RAL clear should fail with EBUSY\n");
 		fail_count++;
 	}
 
@@ -1704,7 +1828,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RPA resolution disabled\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RPA disable: %s\n", strerror(errno));
+		test_fail("  FAIL: RPA disable: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1716,7 +1840,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RPA timeout set to 900s\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RPA set timeout: %s\n", strerror(errno));
+		test_fail("  FAIL: RPA set timeout: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1726,7 +1850,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL remove device 1\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL remove device 1: %s\n", strerror(errno));
+		test_fail("  FAIL: RAL remove device 1: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1737,7 +1861,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL size is 1 after remove\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL size expected 1, got %u\n", count);
+		test_fail("  FAIL: RAL size expected 1, got %u\n", count);
 		fail_count++;
 	}
 
@@ -1747,7 +1871,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL remove non-existent device (ENOENT)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL remove non-existent should fail\n");
+		test_fail("  FAIL: RAL remove non-existent should fail\n");
 		fail_count++;
 	}
 
@@ -1757,7 +1881,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL clear\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL clear: %s\n", strerror(errno));
+		test_fail("  FAIL: RAL clear: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1768,7 +1892,7 @@ static void test_rpa_management(int fd)
 		printf("  OK:   RAL size is 0 after clear\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RAL size expected 0, got %u\n", count);
+		test_fail("  FAIL: RAL size expected 0, got %u\n", count);
 		fail_count++;
 	}
 
@@ -1795,7 +1919,7 @@ static void test_encrypted_data_path(int fd)
 	memcpy(psk.psk, "e2e-sec-key-test", 16);
 	ret = ioctl(fd, SL_IOCTL_SEC_SET_PSK, &psk);
 	if (ret != 0) {
-		printf("  FAIL: set PSK: %s\n", strerror(errno));
+		test_fail("  FAIL: set PSK: %s\n", strerror(errno));
 		fail_count++;
 		return;
 	}
@@ -1807,7 +1931,7 @@ static void test_encrypted_data_path(int fd)
 	pair.method = 1; /* PSK */
 	ret = ioctl(fd, SL_IOCTL_SEC_PAIR, &pair);
 	if (ret != 0) {
-		printf("  FAIL: PSK pair: %s\n", strerror(errno));
+		test_fail("  FAIL: PSK pair: %s\n", strerror(errno));
 		fail_count++;
 		return;
 	}
@@ -1817,7 +1941,7 @@ static void test_encrypted_data_path(int fd)
 	/* 2. Enable encryption */
 	ret = ioctl(fd, SL_IOCTL_SEC_ENCRYPT_ON, NULL);
 	if (ret != 0) {
-		printf("  FAIL: encrypt on: %s\n", strerror(errno));
+		test_fail("  FAIL: encrypt on: %s\n", strerror(errno));
 		fail_count++;
 		return;
 	}
@@ -1833,7 +1957,7 @@ static void test_encrypted_data_path(int fd)
 	cp.timeout_10ms = 100;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret < 0) {
-		printf("  FAIL: connect: %s\n", strerror(errno));
+		test_fail("  FAIL: connect: %s\n", strerror(errno));
 		fail_count++;
 		goto cleanup;
 	}
@@ -1851,7 +1975,7 @@ static void test_encrypted_data_path(int fd)
 	resp.supervision_timeout = 200;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret != 0) {
-		printf("  FAIL: accept connection: %s\n", strerror(errno));
+		test_fail("  FAIL: accept connection: %s\n", strerror(errno));
 		fail_count++;
 		goto cleanup;
 	}
@@ -1871,7 +1995,7 @@ static void test_encrypted_data_path(int fd)
 		printf("  OK:   encrypted send succeeded (%d bytes)\n", ret);
 		ok_count++;
 	} else {
-		printf("  FAIL: encrypted send: %s\n", strerror(errno));
+		test_fail("  FAIL: encrypted send: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1887,7 +2011,7 @@ static void test_encrypted_data_path(int fd)
 		printf("  OK:   inject ciphertext succeeded\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: inject ciphertext: %s\n", strerror(errno));
+		test_fail("  FAIL: inject ciphertext: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -1902,10 +2026,10 @@ static void test_encrypted_data_path(int fd)
 		printf("  OK:   encrypted roundtrip: plaintext matches\n");
 		ok_count++;
 	} else if (ret == 0) {
-		printf("  FAIL: decrypted data does not match original\n");
+		test_fail("  FAIL: decrypted data does not match original\n");
 		fail_count++;
 	} else {
-		printf("  FAIL: recv after inject: %s\n", strerror(errno));
+		test_fail("  FAIL: recv after inject: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -2002,7 +2126,7 @@ static void test_ssap_service(int fd)
 	if (ret == 0 && rw.length == 1 && rw.data[0] == 0x42) {
 		printf("  OK:   Status readback matches: 0x%02x\n", rw.data[0]);
 	} else if (ret == 0) {
-		printf("  FAIL: Status readback mismatch: len=%u data[0]=0x%02x\n",
+		test_fail("  FAIL: Status readback mismatch: len=%u data[0]=0x%02x\n",
 		       rw.length, rw.data[0]);
 	}
 
@@ -2322,7 +2446,7 @@ static void test_event_notification(int fd)
 		handle = (uint16_t)ret;
 		printf("  OK:   CONNECT generated event (handle=%u)\n", handle);
 	} else {
-		printf("  FAIL: CONNECT failed\n");
+		test_fail("  FAIL: CONNECT failed\n");
 		return;
 	}
 
@@ -2364,7 +2488,7 @@ static void test_event_notification(int fd)
 		if (n < 0) {
 			if (errno == EAGAIN)
 				break;
-			printf("  FAIL: read() error: %s\n", strerror(errno));
+			test_fail("  FAIL: read() error: %s\n", strerror(errno));
 			break;
 		}
 		if (n == 0)
@@ -2420,7 +2544,7 @@ static void test_event_stats(int fd)
 	int ret = ioctl(fd, SL_IOCTL_EVENT_STATS, &stats);
 
 	if (ret != 0) {
-		printf("  FAIL: EVENT_STATS ioctl: %s\n", strerror(errno));
+		test_fail("  FAIL: EVENT_STATS ioctl: %s\n", strerror(errno));
 		return;
 	}
 	printf("  Pending:   %u\n", stats.pending);
@@ -2440,7 +2564,7 @@ static void test_dli_info(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DLI_INFO, &dli);
 
 	if (ret != 0) {
-		printf("  FAIL: DLI_INFO ioctl: %s\n", strerror(errno));
+		test_fail("  FAIL: DLI_INFO ioctl: %s\n", strerror(errno));
 		return;
 	}
 	printf("  Name:         %.32s\n", dli.name);
@@ -2470,7 +2594,7 @@ static void test_dli_info(int fd)
 	if (dli.max_connections > 0)
 		printf("  OK:   max_connections=%u\n", dli.max_connections);
 	else
-		printf("  FAIL: max_connections=0\n");
+		test_fail("  FAIL: max_connections=0\n");
 
 	/* Capability model fields (P1.9) */
 	printf("  Max MTU:      %u\n", dli.max_mtu);
@@ -2482,7 +2606,7 @@ static void test_dli_info(int fd)
 	if (dli.max_mtu > 0)
 		printf("  OK:   max_mtu=%u\n", dli.max_mtu);
 	else
-		printf("  FAIL: max_mtu=0\n");
+		test_fail("  FAIL: max_mtu=0\n");
 
 	if (dli.transport_modes != 0)
 		printf("  OK:   transport_modes=0x%02x\n", dli.transport_modes);
@@ -2497,7 +2621,7 @@ static void test_usb_discovery(int fd)
 	int ret = ioctl(fd, SL_IOCTL_USB_DEV_COUNT, NULL);
 
 	if (ret < 0) {
-		printf("  FAIL: USB_DEV_COUNT ioctl: %s\n", strerror(errno));
+		test_fail("  FAIL: USB_DEV_COUNT ioctl: %s\n", strerror(errno));
 		return;
 	}
 	printf("  OK:   USB SLE device count = %d\n", ret);
@@ -2523,7 +2647,7 @@ static void test_usb_controller_ops(int fd)
 	uint16_t mask = 0;
 	int ret = ioctl(fd, SL_IOCTL_DEV_LIST, &mask);
 	if (ret < 0) {
-		printf("  SKIP: DEV_LIST failed: %s\n", strerror(errno));
+		test_skip("  SKIP: DEV_LIST failed: %s\n", strerror(errno));
 		return;
 	}
 
@@ -2535,7 +2659,7 @@ static void test_usb_controller_ops(int fd)
 		}
 	}
 	if (usb_dev_id < 0) {
-		printf("  SKIP: no USB device in DEV_LIST (mask=0x%04x)\n", mask);
+		test_skip("  SKIP: no USB device in DEV_LIST (mask=0x%04x)\n", mask);
 		return;
 	}
 	printf("  OK:   found USB device sle%d (mask=0x%04x)\n",
@@ -2545,7 +2669,7 @@ static void test_usb_controller_ops(int fd)
 	int16_t sel = (int16_t)usb_dev_id;
 	ret = ioctl(fd, SL_IOCTL_DEV_SELECT, &sel);
 	if (ret < 0) {
-		printf("  FAIL: DEV_SELECT sle%d: %s\n", usb_dev_id,
+		test_fail("  FAIL: DEV_SELECT sle%d: %s\n", usb_dev_id,
 		       strerror(errno));
 		return;
 	}
@@ -2555,9 +2679,9 @@ static void test_usb_controller_ops(int fd)
 	uint16_t active = 0xFFFF;
 	ret = ioctl(fd, SL_IOCTL_DEV_GET_ACTIVE, &active);
 	if (ret < 0) {
-		printf("  FAIL: DEV_GET_ACTIVE: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_GET_ACTIVE: %s\n", strerror(errno));
 	} else if (active != (uint16_t)usb_dev_id) {
-		printf("  FAIL: DEV_GET_ACTIVE: expected %d, got %u\n",
+		test_fail("  FAIL: DEV_GET_ACTIVE: expected %d, got %u\n",
 		       usb_dev_id, active);
 	} else {
 		printf("  OK:   DEV_GET_ACTIVE = sle%d\n", active);
@@ -2568,7 +2692,7 @@ static void test_usb_controller_ops(int fd)
 	memset(&dli, 0, sizeof(dli));
 	ret = ioctl(fd, SL_IOCTL_DLI_INFO, &dli);
 	if (ret != 0) {
-		printf("  FAIL: DLI_INFO on USB device: %s\n", strerror(errno));
+		test_fail("  FAIL: DLI_INFO on USB device: %s\n", strerror(errno));
 	} else {
 		printf("  OK:   DLI_INFO: bus=%u fw=0x%08x max_conn=%u\n",
 		       dli.bus, dli.firmware_version, dli.max_connections);
@@ -2588,7 +2712,7 @@ static void test_usb_controller_ops(int fd)
 	sel = 0;
 	ret = ioctl(fd, SL_IOCTL_DEV_SELECT, &sel);
 	if (ret < 0) {
-		printf("  FAIL: DEV_SELECT sle0: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_SELECT sle0: %s\n", strerror(errno));
 	} else {
 		printf("  OK:   switched back to sle0\n");
 	}
@@ -2617,7 +2741,7 @@ static void test_dli_event_poll(int fd)
 	if (ret < 0 && errno == EAGAIN)
 		printf("  OK:   poll_event returns EAGAIN on empty queue\n");
 	else
-		printf("  FAIL: expected EAGAIN, got ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EAGAIN, got ret=%d errno=%d\n", ret, errno);
 
 	/* 2. Trigger a DLI command that generates a CommandComplete event */
 	struct sle_adv_params adv;
@@ -2627,14 +2751,14 @@ static void test_dli_event_poll(int fd)
 	adv.interval_ms = 100;
 	ret = ioctl(fd, SL_IOCTL_START_ADV, &adv);
 	if (ret != 0) {
-		printf("  FAIL: START_ADV for event trigger: %s\n", strerror(errno));
+		test_fail("  FAIL: START_ADV for event trigger: %s\n", strerror(errno));
 		return;
 	}
 	printf("  OK:   START_ADV dispatched (triggers EnableBroadcast cmd)\n");
 
 	/* 3. Now poll_event should return CommandComplete for EnableBroadcast */
 	memset(&ev, 0, sizeof(ev));
-	ret = ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &ev);
+	ret = wait_dli_complete(fd, 0x0C05, &ev);
 	if (ret == 0) {
 		printf("  OK:   poll_event returned event\n");
 		if (ev.event_type == 0x01)
@@ -2645,10 +2769,10 @@ static void test_dli_event_poll(int fd)
 			printf("  OK:   status=0 (Success)\n");
 		else
 			printf("  WARN: status=%u\n", ev.status);
-		/* EnableBroadcast opcode = OGF=0x03, OCF=0x03 → (3<<10)|3 = 0x0C03 */
+	/* EnableBroadcast opcode = OGF=0x03, OCF=0x05 = 0x0C05. */
 		printf("  OK:   opcode=0x%04x\n", ev.opcode);
 	} else {
-		printf("  FAIL: poll_event after START_ADV: %s\n", strerror(errno));
+		test_fail("  FAIL: poll_event after START_ADV: %s\n", strerror(errno));
 	}
 
 	/* 4. Stop advertising (generates another event) */
@@ -2694,7 +2818,7 @@ static void test_dli_routing(int fd)
 		else
 			printf("  OK:   EnableScan event not polled (timing-dependent)\n");
 	} else {
-		printf("  FAIL: START_SCAN: %s\n", strerror(errno));
+		test_fail("  FAIL: START_SCAN: %s\n", strerror(errno));
 	}
 
 	ioctl(fd, SL_IOCTL_STOP_SCAN, NULL);
@@ -2727,7 +2851,7 @@ static void test_dli_routing(int fd)
 		else
 			printf("  OK:   Disconnect event not polled (timing-dependent)\n");
 	} else {
-		printf("  FAIL: CONNECT: %s\n", strerror(errno));
+		test_fail("  FAIL: CONNECT: %s\n", strerror(errno));
 	}
 
 	/* 4. PHY SET_MCS → SetCodingModulation command */
@@ -2744,7 +2868,7 @@ static void test_dli_routing(int fd)
 		else
 			printf("  OK:   SetCodingModulation event not polled (timing-dependent)\n");
 	} else {
-		printf("  FAIL: PHY_SET_MCS: %s\n", strerror(errno));
+		test_fail("  FAIL: PHY_SET_MCS: %s\n", strerror(errno));
 	}
 
 	/* 5. DLI_RESET */
@@ -2752,7 +2876,7 @@ static void test_dli_routing(int fd)
 	if (ret == 0)
 		printf("  OK:   DLI_RESET succeeded\n");
 	else
-		printf("  FAIL: DLI_RESET: %s\n", strerror(errno));
+		test_fail("  FAIL: DLI_RESET: %s\n", strerror(errno));
 
 	/* Restore PHY MCS to default (4) since we changed it above */
 	mcs_cmd.mcs_index = 4;
@@ -2795,7 +2919,7 @@ static void test_poll_epoll(int fd)
 		handle = (uint16_t)ret;
 		printf("  OK:   connected handle=%u\n", handle);
 	} else {
-		printf("  FAIL: connect failed (%d)\n", ret);
+		test_fail("  FAIL: connect failed (%d)\n", ret);
 		return;
 	}
 
@@ -2907,7 +3031,7 @@ static void test_ring_buffer_stress(int fd)
 		if (n < 0) {
 			if (errno == EAGAIN)
 				break;
-			printf("  FAIL: read error: %s\n", strerror(errno));
+			test_fail("  FAIL: read error: %s\n", strerror(errno));
 			break;
 		}
 		if (n == 0)
@@ -2951,7 +3075,7 @@ static void test_multi_conn_concurrent(int fd)
 		int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 		if (ret <= 0) {
-			printf("  FAIL: CONNECT #%d: ret=%d\n", i, ret);
+			test_fail("  FAIL: CONNECT #%d: ret=%d\n", i, ret);
 			goto cleanup;
 		}
 		handles[i] = (uint16_t)ret;
@@ -2997,7 +3121,7 @@ static void test_multi_conn_concurrent(int fd)
 
 		ret = ioctl(fd, SL_IOCTL_CONN_SEND, &sd);
 		if (ret < 0)
-			printf("  FAIL: CONN_SEND handle=%u: %s\n",
+			test_fail("  FAIL: CONN_SEND handle=%u: %s\n",
 			       handles[i], strerror(errno));
 	}
 
@@ -3038,7 +3162,7 @@ static void test_multi_conn_concurrent(int fd)
 				       handles[i]);
 			}
 		} else {
-			printf("  FAIL: CONN_RECV handle=%u: %s\n",
+			test_fail("  FAIL: CONN_RECV handle=%u: %s\n",
 			       handles[i], strerror(errno));
 		}
 	}
@@ -3344,7 +3468,7 @@ static void test_phy_layer(int fd)
 		printf("  OK:   PHY default params: MCS=%u BW=%u TX=%d dBm\n",
 		       info.mcs_index, info.bandwidth_mhz, info.tx_power_dbm);
 	} else {
-		printf("  FAIL: PHY default params: MCS=%u BW=%u TX=%d (expected 4/1/10)\n",
+		test_fail("  FAIL: PHY default params: MCS=%u BW=%u TX=%d (expected 4/1/10)\n",
 		       info.mcs_index, info.bandwidth_mhz, info.tx_power_dbm);
 	}
 
@@ -3352,7 +3476,7 @@ static void test_phy_layer(int fd)
 	if (info.data_rate_kbps == 500) {
 		printf("  OK:   PHY data rate: %u kbps\n", info.data_rate_kbps);
 	} else {
-		printf("  FAIL: PHY data rate: %u (expected 500)\n", info.data_rate_kbps);
+		test_fail("  FAIL: PHY data rate: %u (expected 500)\n", info.data_rate_kbps);
 	}
 
 	/* Check hopping: 79 channels all used */
@@ -3360,7 +3484,7 @@ static void test_phy_layer(int fd)
 		printf("  OK:   PHY hopping: %u channels, increment=%u\n",
 		       info.hop_used_channels, info.hop_increment);
 	} else {
-		printf("  FAIL: PHY hopping: ch=%u inc=%u (expected 79/7)\n",
+		test_fail("  FAIL: PHY hopping: ch=%u inc=%u (expected 79/7)\n",
 		       info.hop_used_channels, info.hop_increment);
 	}
 
@@ -3377,7 +3501,7 @@ static void test_phy_layer(int fd)
 	if (info.mcs_index == 9 && info.ofdm == 1) {
 		printf("  OK:   PHY MCS updated: index=%u ofdm=%u\n", info.mcs_index, info.ofdm);
 	} else {
-		printf("  FAIL: PHY MCS update: index=%u ofdm=%u (expected 9/1)\n",
+		test_fail("  FAIL: PHY MCS update: index=%u ofdm=%u (expected 9/1)\n",
 		       info.mcs_index, info.ofdm);
 	}
 
@@ -3387,7 +3511,7 @@ static void test_phy_layer(int fd)
 	if (ret < 0 && errno == EINVAL) {
 		printf("  OK:   PHY_SET_MCS(13) rejected: EINVAL\n");
 	} else {
-		printf("  FAIL: PHY_SET_MCS(13) should fail: ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: PHY_SET_MCS(13) should fail: ret=%d errno=%d\n", ret, errno);
 	}
 
 	/* 4. Set bandwidth to 2 MHz */
@@ -3402,7 +3526,7 @@ static void test_phy_layer(int fd)
 	if (info.bandwidth_mhz == 2 && info.data_rate_kbps == 2000) {
 		printf("  OK:   PHY BW=2MHz rate=%u kbps\n", info.data_rate_kbps);
 	} else {
-		printf("  FAIL: PHY BW=%u rate=%u (expected 2/2000)\n",
+		test_fail("  FAIL: PHY BW=%u rate=%u (expected 2/2000)\n",
 		       info.bandwidth_mhz, info.data_rate_kbps);
 	}
 
@@ -3412,7 +3536,7 @@ static void test_phy_layer(int fd)
 	if (ret < 0 && errno == EINVAL) {
 		printf("  OK:   PHY_SET_BW(3) rejected: EINVAL\n");
 	} else {
-		printf("  FAIL: PHY_SET_BW(3) should fail: ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: PHY_SET_BW(3) should fail: ret=%d errno=%d\n", ret, errno);
 	}
 
 	/* 6. Set TX power */
@@ -3426,7 +3550,7 @@ static void test_phy_layer(int fd)
 	if (info.tx_power_dbm == -10) {
 		printf("  OK:   PHY TX power: %d dBm\n", info.tx_power_dbm);
 	} else {
-		printf("  FAIL: PHY TX power: %d (expected -10)\n", info.tx_power_dbm);
+		test_fail("  FAIL: PHY TX power: %d (expected -10)\n", info.tx_power_dbm);
 	}
 
 	/* Invalid TX power (+30) should fail */
@@ -3435,7 +3559,7 @@ static void test_phy_layer(int fd)
 	if (ret < 0 && errno == EINVAL) {
 		printf("  OK:   PHY_SET_TXPOWER(30) rejected: EINVAL\n");
 	} else {
-		printf("  FAIL: PHY_SET_TXPOWER(30) should fail: ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: PHY_SET_TXPOWER(30) should fail: ret=%d errno=%d\n", ret, errno);
 	}
 
 	/* 7. MCS selection */
@@ -3451,7 +3575,7 @@ static void test_phy_layer(int fd)
 		printf("  OK:   PHY MCS select: mcs=%u rate=%u kbps (min 600)\n",
 		       sel.selected_mcs, sel.effective_kbps);
 	} else {
-		printf("  FAIL: PHY MCS select: mcs=%u rate=%u\n",
+		test_fail("  FAIL: PHY MCS select: mcs=%u rate=%u\n",
 		       sel.selected_mcs, sel.effective_kbps);
 	}
 
@@ -3465,7 +3589,7 @@ static void test_phy_layer(int fd)
 		printf("  OK:   PHY hop: ch=%u freq=%u MHz counter=%u\n",
 		       hop.channel, hop.freq_mhz, hop.event_counter);
 	} else {
-		printf("  FAIL: PHY hop: ch=%u freq=%u (invalid)\n", hop.channel, hop.freq_mhz);
+		test_fail("  FAIL: PHY hop: ch=%u freq=%u (invalid)\n", hop.channel, hop.freq_mhz);
 	}
 
 	/* Hop multiple times and verify channel changes */
@@ -3482,7 +3606,7 @@ static void test_phy_layer(int fd)
 	if (hops_changed > 0) {
 		printf("  OK:   PHY hop sequence: %d channel changes in 10 hops\n", hops_changed);
 	} else {
-		printf("  FAIL: PHY hop sequence: no channel changes in 10 hops\n");
+		test_fail("  FAIL: PHY hop sequence: no channel changes in 10 hops\n");
 	}
 
 	/* Restore defaults for other tests */
@@ -3510,34 +3634,34 @@ static void test_configfs(void)
 	if (read_configfs_attr("version", buf, sizeof(buf)) == 0) {
 		printf("  OK:   version = %s\n", buf);
 	} else {
-		printf("  FAIL: cannot read version attribute\n");
+		test_fail("  FAIL: cannot read version attribute\n");
 	}
 
 	test_header("configfs: read defaults");
 	if (read_configfs_attr("max_connections", buf, sizeof(buf)) == 0)
 		printf("  OK:   max_connections = %s (default)\n", buf);
 	else
-		printf("  FAIL: cannot read max_connections\n");
+		test_fail("  FAIL: cannot read max_connections\n");
 
 	if (read_configfs_attr("adv_interval_ms", buf, sizeof(buf)) == 0)
 		printf("  OK:   adv_interval_ms = %s (default)\n", buf);
 	else
-		printf("  FAIL: cannot read adv_interval_ms\n");
+		test_fail("  FAIL: cannot read adv_interval_ms\n");
 
 	if (read_configfs_attr("scan_window_ms", buf, sizeof(buf)) == 0)
 		printf("  OK:   scan_window_ms = %s (default)\n", buf);
 	else
-		printf("  FAIL: cannot read scan_window_ms\n");
+		test_fail("  FAIL: cannot read scan_window_ms\n");
 
 	if (read_configfs_attr("power_mode", buf, sizeof(buf)) == 0)
 		printf("  OK:   power_mode = %s (default)\n", buf);
 	else
-		printf("  FAIL: cannot read power_mode\n");
+		test_fail("  FAIL: cannot read power_mode\n");
 
 	if (read_configfs_attr("controller_type", buf, sizeof(buf)) == 0)
 		printf("  OK:   controller_type = %s (default)\n", buf);
 	else
-		printf("  FAIL: cannot read controller_type\n");
+		test_fail("  FAIL: cannot read controller_type\n");
 
 	test_header("configfs: write and readback");
 	if (write_configfs_attr("max_connections", "4") == 0 &&
@@ -3545,53 +3669,53 @@ static void test_configfs(void)
 	    strcmp(buf, "4") == 0)
 		printf("  OK:   max_connections set to 4\n");
 	else
-		printf("  FAIL: max_connections write/readback\n");
+		test_fail("  FAIL: max_connections write/readback\n");
 
 	if (write_configfs_attr("adv_interval_ms", "500") == 0 &&
 	    read_configfs_attr("adv_interval_ms", buf, sizeof(buf)) == 0 &&
 	    strcmp(buf, "500") == 0)
 		printf("  OK:   adv_interval_ms set to 500\n");
 	else
-		printf("  FAIL: adv_interval_ms write/readback\n");
+		test_fail("  FAIL: adv_interval_ms write/readback\n");
 
 	if (write_configfs_attr("scan_window_ms", "300") == 0 &&
 	    read_configfs_attr("scan_window_ms", buf, sizeof(buf)) == 0 &&
 	    strcmp(buf, "300") == 0)
 		printf("  OK:   scan_window_ms set to 300\n");
 	else
-		printf("  FAIL: scan_window_ms write/readback\n");
+		test_fail("  FAIL: scan_window_ms write/readback\n");
 
 	if (write_configfs_attr("power_mode", "sniff") == 0 &&
 	    read_configfs_attr("power_mode", buf, sizeof(buf)) == 0 &&
 	    strcmp(buf, "sniff") == 0)
 		printf("  OK:   power_mode set to sniff\n");
 	else
-		printf("  FAIL: power_mode write/readback\n");
+		test_fail("  FAIL: power_mode write/readback\n");
 
 	test_header("configfs: boundary validation");
 	/* max_connections: 0 should fail */
 	if (write_configfs_attr("max_connections", "0") != 0)
 		printf("  OK:   max_connections=0 rejected\n");
 	else
-		printf("  FAIL: max_connections=0 should be rejected\n");
+		test_fail("  FAIL: max_connections=0 should be rejected\n");
 
 	/* max_connections: 9 should fail */
 	if (write_configfs_attr("max_connections", "9") != 0)
 		printf("  OK:   max_connections=9 rejected\n");
 	else
-		printf("  FAIL: max_connections=9 should be rejected\n");
+		test_fail("  FAIL: max_connections=9 should be rejected\n");
 
 	/* adv_interval_ms: 10 should fail (min is 20) */
 	if (write_configfs_attr("adv_interval_ms", "10") != 0)
 		printf("  OK:   adv_interval_ms=10 rejected (min 20)\n");
 	else
-		printf("  FAIL: adv_interval_ms=10 should be rejected\n");
+		test_fail("  FAIL: adv_interval_ms=10 should be rejected\n");
 
 	/* power_mode: invalid string */
 	if (write_configfs_attr("power_mode", "turbo") != 0)
 		printf("  OK:   power_mode=turbo rejected\n");
 	else
-		printf("  FAIL: power_mode=turbo should be rejected\n");
+		test_fail("  FAIL: power_mode=turbo should be rejected\n");
 
 	/* controller_type: write and readback */
 	if (write_configfs_attr("controller_type", "uart") == 0 &&
@@ -3599,20 +3723,20 @@ static void test_configfs(void)
 	    strcmp(buf, "uart") == 0)
 		printf("  OK:   controller_type set to uart\n");
 	else
-		printf("  FAIL: controller_type uart write/readback\n");
+		test_fail("  FAIL: controller_type uart write/readback\n");
 
 	if (write_configfs_attr("controller_type", "spi") == 0 &&
 	    read_configfs_attr("controller_type", buf, sizeof(buf)) == 0 &&
 	    strcmp(buf, "spi") == 0)
 		printf("  OK:   controller_type set to spi\n");
 	else
-		printf("  FAIL: controller_type spi write/readback\n");
+		test_fail("  FAIL: controller_type spi write/readback\n");
 
 	/* Invalid controller_type */
 	if (write_configfs_attr("controller_type", "i2c") != 0)
 		printf("  OK:   controller_type=i2c rejected\n");
 	else
-		printf("  FAIL: controller_type=i2c should be rejected\n");
+		test_fail("  FAIL: controller_type=i2c should be rejected\n");
 
 	/* Restore defaults */
 	write_configfs_attr("max_connections", "8");
@@ -3628,14 +3752,14 @@ static void test_configfs_ioctl_integration(int fd)
 
 	/* Set configfs adv_interval_ms to 250 */
 	if (write_configfs_attr("adv_interval_ms", "250") != 0) {
-		printf("  FAIL: cannot set adv_interval_ms=250\n");
+		test_fail("  FAIL: cannot set adv_interval_ms=250\n");
 		return;
 	}
 	printf("  OK:   configfs adv_interval_ms set to 250\n");
 
 	/* Set configfs scan_window_ms to 150 */
 	if (write_configfs_attr("scan_window_ms", "150") != 0) {
-		printf("  FAIL: cannot set scan_window_ms=150\n");
+		test_fail("  FAIL: cannot set scan_window_ms=150\n");
 		return;
 	}
 	printf("  OK:   configfs scan_window_ms set to 150\n");
@@ -3783,7 +3907,7 @@ static void test_ioctl_throughput(int fd)
 	printf("  OK:   SSAP_READ x%d: %lu ns total, %lu ns/call\n",
 	       iterations, (unsigned long)ns, (unsigned long)(ns / iterations));
 
-	/* 8. Advertise start+stop cycle latency */
+	/* 8. Completed advertise start+stop cycle latency (not enqueue latency). */
 	set_role(fd, 1); /* GNode for ADV */
 	struct sle_adv_params adv;
 
@@ -3791,20 +3915,31 @@ static void test_ioctl_throughput(int fd)
 	adv.discovery_level = 1;
 	adv.interval_ms = 100;
 	int adv_cycles = 1000;
+	int completed = 0;
+	struct sle_dli_event ev;
+
+	while (ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &ev) == 0)
+		;
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int i = 0; i < adv_cycles; i++) {
-		ioctl(fd, SL_IOCTL_START_ADV, &adv);
-		ioctl(fd, SL_IOCTL_STOP_ADV, NULL);
+		if (ioctl(fd, SL_IOCTL_START_ADV, &adv) < 0 ||
+		    wait_dli_complete(fd, 0x0C05, &ev) < 0 ||
+		    ioctl(fd, SL_IOCTL_STOP_ADV, NULL) < 0 ||
+		    wait_dli_complete(fd, 0x0C05, &ev) < 0) {
+			test_fail("  FAIL: ADV cycle %d: %s\n", i, strerror(errno));
+			break;
+		}
+		completed++;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	ns = elapsed_ns(&t0, &t1);
-	printf("  OK:   ADV start+stop x%d: %lu ns total, %lu ns/cycle\n",
-	       adv_cycles, (unsigned long)ns, (unsigned long)(ns / adv_cycles));
+	if (completed == adv_cycles)
+		printf("  OK:   ADV start+stop completed x%d: %lu ns total, %lu ns/cycle\n",
+		       adv_cycles, (unsigned long)ns, (unsigned long)(ns / adv_cycles));
 	set_role(fd, 0); /* restore TNode */
 
 	/* Drain DLI events generated by ADV cycles */
-	struct sle_dli_event ev;
 
 	for (int i = 0; i < 64; i++) {
 		if (ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &ev) < 0)
@@ -3828,14 +3963,14 @@ static void test_multi_controller(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DEV_LIST, &mask);
 
 	if (ret < 0) {
-		printf("  FAIL: DEV_LIST ioctl: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_LIST ioctl: %s\n", strerror(errno));
 		return;
 	}
 	/* At least one device (USB controller) should be registered. */
 	int count = __builtin_popcount(mask);
 
 	if (count < 1) {
-		printf("  FAIL: DEV_LIST returned 0 devices\n");
+		test_fail("  FAIL: DEV_LIST returned 0 devices\n");
 		return;
 	}
 	printf("  OK:   DEV_LIST: mask=0x%04x (%d devices)\n", mask, count);
@@ -3847,11 +3982,11 @@ static void test_multi_controller(int fd)
 
 	ret = ioctl(fd, SL_IOCTL_DEV_SWITCH, &bad_id);
 	if (ret == 0) {
-		printf("  FAIL: DEV_SWITCH to non-existent dev15 succeeded\n");
+		test_fail("  FAIL: DEV_SWITCH to non-existent dev15 succeeded\n");
 	} else if (errno == ENODEV || errno == EINVAL) {
 		printf("  OK:   DEV_SWITCH to dev15 rejected (errno=%d)\n", errno);
 	} else {
-		printf("  FAIL: DEV_SWITCH to dev15: unexpected errno=%d\n", errno);
+		test_fail("  FAIL: DEV_SWITCH to dev15: unexpected errno=%d\n", errno);
 	}
 
 	/*
@@ -3863,7 +3998,7 @@ static void test_multi_controller(int fd)
 
 	ret = ioctl(fd, SL_IOCTL_DEV_SWITCH, &cur_id);
 	if (ret < 0) {
-		printf("  FAIL: DEV_SWITCH to current device (sle%d): %s\n",
+		test_fail("  FAIL: DEV_SWITCH to current device (sle%d): %s\n",
 		       first_id, strerror(errno));
 	} else {
 		printf("  OK:   DEV_SWITCH to current device sle%d\n", first_id);
@@ -3876,7 +4011,7 @@ static void test_multi_controller(int fd)
 	if (ret == count) {
 		printf("  OK:   DEV_COUNT=%d after switch (consistent)\n", ret);
 	} else {
-		printf("  FAIL: DEV_COUNT changed after switch: %d -> %d\n",
+		test_fail("  FAIL: DEV_COUNT changed after switch: %d -> %d\n",
 		       count, ret);
 	}
 
@@ -3896,7 +4031,7 @@ static void test_multi_controller(int fd)
 
 		ret = ioctl(fd, SL_IOCTL_DEV_SWITCH, &target);
 		if (ret < 0) {
-			printf("  FAIL: DEV_SWITCH to sle%d: %s\n",
+			test_fail("  FAIL: DEV_SWITCH to sle%d: %s\n",
 			       id_b, strerror(errno));
 		} else {
 			printf("  OK:   DEV_SWITCH to sle%d succeeded\n", id_b);
@@ -3907,13 +4042,13 @@ static void test_multi_controller(int fd)
 
 		ret = ioctl(fd, SL_IOCTL_DEV_LIST, &new_mask);
 		if (ret < 0) {
-			printf("  FAIL: DEV_LIST after switch: %s\n",
+			test_fail("  FAIL: DEV_LIST after switch: %s\n",
 			       strerror(errno));
 		} else if (new_mask == mask) {
 			printf("  OK:   DEV_LIST consistent after switch (0x%04x)\n",
 			       new_mask);
 		} else {
-			printf("  FAIL: DEV_LIST changed: 0x%04x -> 0x%04x\n",
+			test_fail("  FAIL: DEV_LIST changed: 0x%04x -> 0x%04x\n",
 			       mask, new_mask);
 		}
 
@@ -3921,7 +4056,7 @@ static void test_multi_controller(int fd)
 		target = (uint16_t)id_a;
 		ret = ioctl(fd, SL_IOCTL_DEV_SWITCH, &target);
 		if (ret < 0) {
-			printf("  FAIL: DEV_SWITCH back to sle%d: %s\n",
+			test_fail("  FAIL: DEV_SWITCH back to sle%d: %s\n",
 			       id_a, strerror(errno));
 		} else {
 			printf("  OK:   DEV_SWITCH back to sle%d succeeded\n", id_a);
@@ -3932,7 +4067,7 @@ static void test_multi_controller(int fd)
 		if (ret == count) {
 			printf("  OK:   DEV_COUNT=%d after round-trip switch\n", ret);
 		} else {
-			printf("  FAIL: DEV_COUNT after round-trip: %d -> %d\n",
+			test_fail("  FAIL: DEV_COUNT after round-trip: %d -> %d\n",
 			       count, ret);
 		}
 	} else {
@@ -3964,7 +4099,7 @@ static void test_e2e_data_path(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DEV_LIST, &mask);
 
 	if (ret < 0) {
-		printf("  FAIL: DEV_LIST: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_LIST: %s\n", strerror(errno));
 		return;
 	}
 	int dev_count = __builtin_popcount(mask);
@@ -3984,7 +4119,7 @@ static void test_e2e_data_path(int fd)
 		}
 	}
 	if (id_other < 0) {
-		printf("  FAIL: cannot find second controller in mask 0x%04x\n", mask);
+		test_fail("  FAIL: cannot find second controller in mask 0x%04x\n", mask);
 		return;
 	}
 	printf("  OK:   Using sle0 and sle%d for state isolation test\n", id_other);
@@ -4006,7 +4141,7 @@ static void test_e2e_data_path(int fd)
 	cp0.gt_role = 0;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp0);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT on sle0: ret=%d %s\n",
+		test_fail("  FAIL: CONNECT on sle0: ret=%d %s\n",
 		       ret, ret < 0 ? strerror(errno) : "zero handle");
 		goto cleanup;
 	}
@@ -4037,7 +4172,7 @@ static void test_e2e_data_path(int fd)
 	memcpy(sd0.data, msg0, sd0.length);
 	ret = ioctl(fd, SL_IOCTL_CONN_SEND, &sd0);
 	if (ret < 0) {
-		printf("  FAIL: CONN_SEND sle0: %s\n", strerror(errno));
+		test_fail("  FAIL: CONN_SEND sle0: %s\n", strerror(errno));
 	} else {
 		printf("  OK:   sle0 sent %d bytes\n", sd0.length);
 		ok_count++;
@@ -4065,7 +4200,7 @@ static void test_e2e_data_path(int fd)
 		       recv0.length, recv0.data);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle0 receive mismatch: ret=%d len=%u\n",
+		test_fail("  FAIL: sle0 receive mismatch: ret=%d len=%u\n",
 		       ret, recv0.length);
 	}
 
@@ -4081,7 +4216,7 @@ static void test_e2e_data_path(int fd)
 	target = (uint16_t)id_other;
 	ret = ioctl(fd, SL_IOCTL_DEV_SWITCH, &target);
 	if (ret < 0) {
-		printf("  FAIL: DEV_SWITCH to sle%d: %s\n", id_other, strerror(errno));
+		test_fail("  FAIL: DEV_SWITCH to sle%d: %s\n", id_other, strerror(errno));
 		goto cleanup;
 	}
 	printf("  OK:   switched to sle%d\n", id_other);
@@ -4093,7 +4228,7 @@ static void test_e2e_data_path(int fd)
 		printf("  OK:   sle%d CONN_COUNT=0 (isolated from sle0)\n", id_other);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle%d CONN_COUNT=%d (expected 0 — state leaked!)\n",
+		test_fail("  FAIL: sle%d CONN_COUNT=%d (expected 0 — state leaked!)\n",
 		       id_other, ret);
 	}
 
@@ -4142,7 +4277,7 @@ static void test_e2e_data_path(int fd)
 	target = 0;
 	ret = ioctl(fd, SL_IOCTL_DEV_SWITCH, &target);
 	if (ret < 0) {
-		printf("  FAIL: DEV_SWITCH back to sle0: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_SWITCH back to sle0: %s\n", strerror(errno));
 		goto cleanup;
 	}
 
@@ -4152,7 +4287,7 @@ static void test_e2e_data_path(int fd)
 		printf("  OK:   sle0 CONN_COUNT=1 after round-trip (state preserved)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: sle0 CONN_COUNT=%d after round-trip (expected 1)\n", ret);
+		test_fail("  FAIL: sle0 CONN_COUNT=%d after round-trip (expected 1)\n", ret);
 	}
 
 	/* Verify connection info is intact */
@@ -4166,7 +4301,7 @@ static void test_e2e_data_path(int fd)
 		printf("  OK:   sle0 connection info preserved (handle=%u peer=e0:...:01)\n", h0);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle0 connection info corrupted (ret=%d handle=%u)\n",
+		test_fail("  FAIL: sle0 connection info corrupted (ret=%d handle=%u)\n",
 		       ret, info0.handle);
 	}
 
@@ -4176,7 +4311,7 @@ static void test_e2e_data_path(int fd)
 		       (unsigned long)info0.tx_bytes);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle0 tx_bytes=0 (send state lost during switch)\n");
+		test_fail("  FAIL: sle0 tx_bytes=0 (send state lost during switch)\n");
 	}
 
 	/*
@@ -4220,13 +4355,13 @@ static void test_air_medium_connect(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DEV_LIST, &mask);
 
 	if (ret < 0) {
-		printf("  FAIL: DEV_LIST: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_LIST: %s\n", strerror(errno));
 		return;
 	}
 	int dev_count = __builtin_popcount(mask);
 
 	if (dev_count < 3) {
-		printf("  OK:   Skipped (need 3+ controllers, have %d)\n", dev_count);
+		test_skip("  SKIP: need 3+ controllers, have %d\n", dev_count);
 		return;
 	}
 
@@ -4292,7 +4427,7 @@ static void test_air_medium_connect(int fd)
 		printf("  OK:   sle%d broadcasting\n", id_a);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle%d START_ADV: %s\n", id_a, strerror(errno));
+		test_fail("  FAIL: sle%d START_ADV: %s\n", id_a, strerror(errno));
 	}
 
 	/* Step 2: sle_b scans and discovers sle_a */
@@ -4313,7 +4448,7 @@ static void test_air_medium_connect(int fd)
 		printf("  OK:   sle%d scanning\n", id_b);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle%d START_SCAN: %s\n", id_b, strerror(errno));
+		test_fail("  FAIL: sle%d START_SCAN: %s\n", id_b, strerror(errno));
 	}
 
 	/* Allow EventPump to process AdvReport events from INT URB */
@@ -4445,7 +4580,7 @@ static void test_air_medium_connect(int fd)
 		ioctl(fd, SL_IOCTL_DEV_SWITCH, &target);
 		ioctl(fd, SL_IOCTL_DISCONNECT, &handle_b);
 	} else {
-		printf("  FAIL: sle%d CONNECT to air medium peer: %s\n",
+		test_fail("  FAIL: sle%d CONNECT to air medium peer: %s\n",
 		       id_b, ret < 0 ? strerror(errno) : "zero handle");
 	}
 
@@ -4481,7 +4616,7 @@ static void test_conn_invalid_handle(int fd)
 	if (ret < 0 && errno == ENOENT) {
 		printf("  OK:   CONN_INFO(0xBEEF): ENOENT\n");
 	} else {
-		printf("  FAIL: CONN_INFO(0xBEEF): expected ENOENT, got ret=%d errno=%d\n",
+		test_fail("  FAIL: CONN_INFO(0xBEEF): expected ENOENT, got ret=%d errno=%d\n",
 		       ret, errno);
 	}
 
@@ -4496,7 +4631,7 @@ static void test_conn_invalid_handle(int fd)
 	if (ret < 0 && errno == ENOENT) {
 		printf("  OK:   CONN_SEND(0xBEEF): ENOENT\n");
 	} else {
-		printf("  FAIL: CONN_SEND(0xBEEF): expected ENOENT, got ret=%d errno=%d\n",
+		test_fail("  FAIL: CONN_SEND(0xBEEF): expected ENOENT, got ret=%d errno=%d\n",
 		       ret, errno);
 	}
 
@@ -4509,7 +4644,7 @@ static void test_conn_invalid_handle(int fd)
 	if (ret < 0 && errno == ENOENT) {
 		printf("  OK:   CONN_RECV(0xBEEF): ENOENT\n");
 	} else {
-		printf("  FAIL: CONN_RECV(0xBEEF): expected ENOENT, got ret=%d errno=%d\n",
+		test_fail("  FAIL: CONN_RECV(0xBEEF): expected ENOENT, got ret=%d errno=%d\n",
 		       ret, errno);
 	}
 
@@ -4520,7 +4655,7 @@ static void test_conn_invalid_handle(int fd)
 	if (ret < 0) {
 		printf("  OK:   DISCONNECT(0xBEEF): rejected (errno=%d)\n", errno);
 	} else {
-		printf("  FAIL: DISCONNECT(0xBEEF): expected error, got ret=%d\n", ret);
+		test_fail("  FAIL: DISCONNECT(0xBEEF): expected error, got ret=%d\n", ret);
 	}
 
 	/* Step 5: INJECT_CONN_RESP on non-existent handle */
@@ -4533,7 +4668,7 @@ static void test_conn_invalid_handle(int fd)
 	if (ret < 0) {
 		printf("  OK:   INJECT_CONN_RESP(0xBEEF): rejected (errno=%d)\n", errno);
 	} else {
-		printf("  FAIL: INJECT_CONN_RESP(0xBEEF): expected error, got ret=%d\n", ret);
+		test_fail("  FAIL: INJECT_CONN_RESP(0xBEEF): expected error, got ret=%d\n", ret);
 	}
 
 	/* Step 6: Create-then-disconnect, then operate on stale handle */
@@ -4552,7 +4687,9 @@ static void test_conn_invalid_handle(int fd)
 
 	printf("  OK:   Created connection handle=%u for stale test\n", stale);
 
-	ioctl(fd, SL_IOCTL_DISCONNECT, &stale);
+	if (check("stale disconnect submission", ioctl(fd, SL_IOCTL_DISCONNECT, &stale)) < 0 ||
+	    check("stale disconnect completion", wait_conn_removed(fd, stale)) < 0)
+		return;
 
 	/* Now the handle is stale */
 	memset(&info, 0, sizeof(info));
@@ -4561,7 +4698,7 @@ static void test_conn_invalid_handle(int fd)
 	if (ret < 0 && errno == ENOENT) {
 		printf("  OK:   CONN_INFO(stale %u): ENOENT\n", stale);
 	} else {
-		printf("  FAIL: CONN_INFO(stale %u): expected ENOENT, got ret=%d\n",
+		test_fail("  FAIL: CONN_INFO(stale %u): expected ENOENT, got ret=%d\n",
 		       stale, ret);
 	}
 }
@@ -4583,13 +4720,13 @@ static void test_air_medium_bidir(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DEV_LIST, &mask);
 
 	if (ret < 0) {
-		printf("  FAIL: DEV_LIST: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_LIST: %s\n", strerror(errno));
 		return;
 	}
 	int dev_count = __builtin_popcount(mask);
 
 	if (dev_count < 3) {
-		printf("  OK:   Skipped (need 3+ controllers, have %d)\n", dev_count);
+		test_skip("  SKIP: need 3+ controllers, have %d\n", dev_count);
 		return;
 	}
 
@@ -4656,7 +4793,7 @@ static void test_air_medium_bidir(int fd)
 	cp.peer_addr[4] = 0x00; cp.peer_addr[5] = 0x01;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: sle%d CONNECT: %s\n", id_b, strerror(errno));
+		test_fail("  FAIL: sle%d CONNECT: %s\n", id_b, strerror(errno));
 		goto bidir_cleanup;
 	}
 	uint16_t hb = (uint16_t)ret;
@@ -4860,7 +4997,7 @@ static void test_conn_max_capacity(int fd)
 		if (ret < 0) {
 			printf("  OK:   9th connection rejected (errno=%d)\n", errno);
 		} else {
-			printf("  FAIL: 9th connection should have been rejected (got handle=%d)\n", ret);
+			test_fail("  FAIL: 9th connection should have been rejected (got handle=%d)\n", ret);
 			/* Clean up the unexpected handle */
 			uint16_t h9 = (uint16_t)ret;
 
@@ -4908,7 +5045,7 @@ static void test_ssap_indication(int fd)
 	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
 
 	if (ret < 0) {
-		printf("  FAIL: SSAP_ADD_SVC: %s\n", strerror(errno));
+		test_fail("  FAIL: SSAP_ADD_SVC: %s\n", strerror(errno));
 		return;
 	}
 
@@ -4921,7 +5058,7 @@ static void test_ssap_indication(int fd)
 	p_ntf.value[0] = 0x00;
 	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ntf);
 	if (ret < 0) {
-		printf("  FAIL: add notify property: %s\n", strerror(errno));
+		test_fail("  FAIL: add notify property: %s\n", strerror(errno));
 		return;
 	}
 	uint16_t h_ntf = p_ntf.handle;
@@ -4937,7 +5074,7 @@ static void test_ssap_indication(int fd)
 	p_ind.value[0] = 0x00;
 	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ind);
 	if (ret < 0) {
-		printf("  FAIL: add indicate property: %s\n", strerror(errno));
+		test_fail("  FAIL: add indicate property: %s\n", strerror(errno));
 		return;
 	}
 	uint16_t h_ind = p_ind.handle;
@@ -5039,7 +5176,7 @@ static void test_ssap_service_discovery(int fd)
 		int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
 
 		if (ret < 0) {
-			printf("  FAIL: add service 0x%04x: %s\n", uuids[i], strerror(errno));
+			test_fail("  FAIL: add service 0x%04x: %s\n", uuids[i], strerror(errno));
 			goto sd_cleanup;
 		}
 		svc_handles[i] = svc.start_handle;
@@ -5082,7 +5219,7 @@ static void test_ssap_service_discovery(int fd)
 			if (found) {
 				printf("  OK:   UUID 0x%04x found\n", uuids[i]);
 			} else {
-				printf("  FAIL: UUID 0x%04x missing\n", uuids[i]);
+				test_fail("  FAIL: UUID 0x%04x missing\n", uuids[i]);
 			}
 		}
 	}
@@ -5153,7 +5290,7 @@ static void test_dev_switch_isolation(int fd)
 		printf("  OK:   sle%d role=TNode\n", id_other);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle%d expected role=0, got %u\n", id_other, r);
+		test_fail("  FAIL: sle%d expected role=0, got %u\n", id_other, r);
 	}
 
 	target = 0;
@@ -5163,7 +5300,7 @@ static void test_dev_switch_isolation(int fd)
 		printf("  OK:   sle0 role=GNode (preserved)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: sle0 expected role=1, got %u\n", r);
+		test_fail("  FAIL: sle0 expected role=1, got %u\n", r);
 	}
 
 	/* Create a connection on sle0 only */
@@ -5190,7 +5327,7 @@ static void test_dev_switch_isolation(int fd)
 		printf("  OK:   sle%d CONN_COUNT=0 (no leak from sle0)\n", id_other);
 		ok_count++;
 	} else {
-		printf("  FAIL: sle%d CONN_COUNT=%d (leaked from sle0)\n", id_other, ret);
+		test_fail("  FAIL: sle%d CONN_COUNT=%d (leaked from sle0)\n", id_other, ret);
 	}
 
 	/* Switch back to sle0: connection should still be there */
@@ -5201,7 +5338,7 @@ static void test_dev_switch_isolation(int fd)
 		printf("  OK:   sle0 CONN_COUNT=1 (preserved after switch)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: sle0 CONN_COUNT=%d (expected 1)\n", ret);
+		test_fail("  FAIL: sle0 CONN_COUNT=%d (expected 1)\n", ret);
 	}
 
 	/* Invalid DEV_SWITCH target */
@@ -5211,7 +5348,7 @@ static void test_dev_switch_isolation(int fd)
 		printf("  OK:   DEV_SWITCH(15) rejected (errno=%d)\n", errno);
 		ok_count++;
 	} else {
-		printf("  FAIL: DEV_SWITCH(15) should have been rejected\n");
+		test_fail("  FAIL: DEV_SWITCH(15) should have been rejected\n");
 	}
 
 	/* Cleanup */
@@ -5253,7 +5390,7 @@ static void test_per_fd_device_select(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DEV_GET_ACTIVE, &active);
 
 	if (ret < 0) {
-		printf("  FAIL: DEV_GET_ACTIVE: %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_GET_ACTIVE: %s\n", strerror(errno));
 		return;
 	}
 	printf("  OK:   DEV_GET_ACTIVE (initial) = sle%u\n", active);
@@ -5267,7 +5404,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   DEV_SELECT(15) rejected\n");
 		ok++;
 	} else {
-		printf("  FAIL: DEV_SELECT(15) should fail, ret=%d errno=%d\n",
+		test_fail("  FAIL: DEV_SELECT(15) should fail, ret=%d errno=%d\n",
 		       ret, errno);
 	}
 
@@ -5279,7 +5416,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   DEV_SELECT(-1) accepted (follow global)\n");
 		ok++;
 	} else {
-		printf("  FAIL: DEV_SELECT(-1): %s\n", strerror(errno));
+		test_fail("  FAIL: DEV_SELECT(-1): %s\n", strerror(errno));
 	}
 
 	/* DEV_SELECT to current global device works */
@@ -5290,7 +5427,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   DEV_SELECT(sle%d) accepted\n", (int)cur);
 		ok++;
 	} else {
-		printf("  FAIL: DEV_SELECT(sle%d): %s\n", (int)cur, strerror(errno));
+		test_fail("  FAIL: DEV_SELECT(sle%d): %s\n", (int)cur, strerror(errno));
 	}
 
 	/* DEV_GET_ACTIVE should now return the bound device */
@@ -5301,7 +5438,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   DEV_GET_ACTIVE = sle%u (matches DEV_SELECT)\n", check);
 		ok++;
 	} else {
-		printf("  FAIL: DEV_GET_ACTIVE = %u, expected %u\n",
+		test_fail("  FAIL: DEV_GET_ACTIVE = %u, expected %u\n",
 		       check, (__u16)cur);
 	}
 
@@ -5341,7 +5478,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   sle%d role=TNode (via DEV_SELECT)\n", id_b);
 		ok++;
 	} else {
-		printf("  FAIL: sle%d role=%u (expected TNode=0)\n", id_b, r);
+		test_fail("  FAIL: sle%d role=%u (expected TNode=0)\n", id_b, r);
 	}
 
 	/* Switch affinity to device A → role should be GNode */
@@ -5352,7 +5489,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   sle%d role=GNode (preserved via DEV_SELECT)\n", id_a);
 		ok++;
 	} else {
-		printf("  FAIL: sle%d role=%u (expected GNode=1)\n", id_a, r);
+		test_fail("  FAIL: sle%d role=%u (expected GNode=1)\n", id_a, r);
 	}
 
 	/* Create connection on device A */
@@ -5379,7 +5516,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   sle%d CONN_COUNT=0 (isolated via DEV_SELECT)\n", id_b);
 		ok++;
 	} else {
-		printf("  FAIL: sle%d CONN_COUNT=%d (expected 0)\n", id_b, ret);
+		test_fail("  FAIL: sle%d CONN_COUNT=%d (expected 0)\n", id_b, ret);
 	}
 
 	/* Back to device A: connection still there */
@@ -5389,7 +5526,7 @@ static void test_per_fd_device_select(int fd)
 		printf("  OK:   sle%d CONN_COUNT=1 (preserved via DEV_SELECT)\n", id_a);
 		ok++;
 	} else {
-		printf("  FAIL: sle%d CONN_COUNT=%d (expected 1)\n", id_a, ret);
+		test_fail("  FAIL: sle%d CONN_COUNT=%d (expected 1)\n", id_a, ret);
 	}
 
 	/* Phase 3: reset to global */
@@ -5423,7 +5560,7 @@ static void test_ssap_prop_edge_cases(int fd)
 	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
 
 	if (ret < 0) {
-		printf("  FAIL: add service: %s\n", strerror(errno));
+		test_fail("  FAIL: add service: %s\n", strerror(errno));
 		return;
 	}
 	uint16_t svc_h = svc.start_handle;
@@ -5438,7 +5575,7 @@ static void test_ssap_prop_edge_cases(int fd)
 	memcpy(p_ro.value, "RDONLY", 4);
 	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ro);
 	if (ret < 0) {
-		printf("  FAIL: add read-only prop\n");
+		test_fail("  FAIL: add read-only prop\n");
 		goto edge_cleanup;
 	}
 	uint16_t h_ro = p_ro.handle;
@@ -5452,7 +5589,7 @@ static void test_ssap_prop_edge_cases(int fd)
 	p_rw.value_len = 0;
 	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_rw);
 	if (ret < 0) {
-		printf("  FAIL: add read-write prop\n");
+		test_fail("  FAIL: add read-write prop\n");
 		goto edge_cleanup;
 	}
 	uint16_t h_rw = p_rw.handle;
@@ -5883,6 +6020,177 @@ static int dli_send_cmd_retry(int fd, struct sle_dli_cmd *cmd)
 	return ret;
 }
 
+/* Check actual command completion ownership, not just selected role values. */
+static void test_runtime_command_isolation(int fd)
+{
+	test_header("Runtime: independent command queues and DLI completions");
+	__u16 mask = 0, original = 0xffff;
+	int fds[2] = { -1, -1 };
+	int default_fd = -1;
+	struct sle_mgmt_stats before[2] = { 0 }, after[2] = { 0 };
+	struct sci_dev_info infos[2] = { 0 };
+	int received[2] = { 0, 0 };
+
+	if (check("Runtime DEV_LIST", ioctl(fd, SL_IOCTL_DEV_LIST, &mask)) < 0)
+		return;
+	if (__builtin_popcount(mask) < 2) {
+		test_skip("  SKIP: command ownership requires two controllers\n");
+		return;
+	}
+	default_fd = open(DEVICE, O_RDWR | O_NONBLOCK);
+	if (check("Runtime default-route observer", default_fd) < 0)
+		goto out;
+	if (check("Runtime original selection",
+		  ioctl(default_fd, SL_IOCTL_DEV_GET_ACTIVE, &original)) < 0)
+		goto out;
+	for (int i = 0; i < 2; i++) {
+		__s16 id = (__s16)__builtin_ctz(mask);
+		mask &= ~(1u << id);
+		fds[i] = open(DEVICE, O_RDWR | O_NONBLOCK);
+		if (check("Runtime open", fds[i]) < 0 ||
+		    check("Runtime bind", ioctl(fds[i], SL_IOCTL_DEV_SELECT, &id)) < 0 ||
+		    check("Runtime info", ioctl(fds[i], SL_IOCTL_DEV_INFO, &infos[i])) < 0 ||
+		    check("Runtime baseline", ioctl(fds[i], SL_IOCTL_MGMT_STATS, &before[i])) < 0)
+			goto out;
+		struct sle_dli_event event = { 0 };
+		for (int n = 0; n < 256; n++) {
+			if (ioctl(fds[i], SL_IOCTL_DLI_POLL_EVENT, &event) < 0)
+				break;
+		}
+	}
+	if (!memcmp(infos[0].addr, infos[1].addr, 6)) {
+		test_fail("  FAIL: two Runtime addresses are identical\n");
+		goto out;
+	}
+	/* Bound-fd operations must not rewrite the compatibility default route.
+	 * The observer has never selected a device, so GET_ACTIVE reads that route. */
+	__u16 route = 0xffff;
+	if (check("Runtime observe default route",
+		  ioctl(default_fd, SL_IOCTL_DEV_GET_ACTIVE, &route)) < 0)
+		goto out;
+	if (route != original) {
+		test_fail("  FAIL: bound Runtime queries changed default sle%u to sle%u\n",
+			  original, route);
+		goto out;
+	}
+	printf("  OK:   bound Runtime queries leave default sle%u unchanged\n", route);
+	/* Two processes repeatedly query different bound fds on an SMP guest.
+	 * This exercises the old select/unlock/execute window without changing RF
+	 * state or weakening the pre-existing connection assertions. */
+	pid_t children[2] = { -1, -1 };
+
+	fflush(stdout);
+	for (int i = 0; i < 2; i++) {
+		children[i] = fork();
+		if (children[i] < 0) {
+			test_fail("  FAIL: Runtime query fork: %s\n", strerror(errno));
+			break;
+		}
+		if (children[i] == 0) {
+			for (int n = 0; n < 10000; n++) {
+				struct sci_dev_info info = { 0 };
+				if (ioctl(fds[i], SL_IOCTL_DEV_INFO, &info) < 0 ||
+				    info.index != infos[i].index || memcmp(info.addr, infos[i].addr, 6))
+					_exit(EXIT_FAILURE);
+			}
+			_exit(EXIT_SUCCESS);
+		}
+	}
+	for (int i = 0; i < 2; i++) {
+		int status = 0;
+		if (children[i] < 0)
+			continue;
+		if (waitpid(children[i], &status, 0) != children[i] ||
+		    !WIFEXITED(status) || WEXITSTATUS(status)) {
+			test_fail("  FAIL: Runtime %d parallel queries reached another owner or failed\n", i);
+		} else {
+			printf("  OK:   Runtime %d: 10000 parallel queries retained index and MAC\n", i);
+		}
+	}
+	/* Establish a quiet tracked-command baseline. Otherwise an older command
+	 * resolving could satisfy a loose total_resolved >= baseline + 1 check. */
+	struct sle_mgmt_stats settled[2] = { 0 };
+	int quiet = 0;
+
+	for (int tick = 0; tick < 200; tick++) {
+		for (int i = 0; i < 2; i++)
+			if (check("Runtime settle stats", ioctl(fds[i], SL_IOCTL_MGMT_STATS, &settled[i])) < 0)
+				goto out;
+		if (!settled[0].pending && !settled[1].pending) {
+			quiet = 1;
+			break;
+		}
+		usleep(10000);
+	}
+	if (!quiet) {
+		test_fail("  FAIL: Runtime tracked queues did not settle: pending=%u/%u\n",
+			  settled[0].pending, settled[1].pending);
+		goto out;
+	}
+	for (int i = 0; i < 2; i++) {
+		if (settled[i].total_timeouts != before[i].total_timeouts) {
+			test_fail("  FAIL: Runtime %d settled by losing/timing out older commands\n", i);
+			goto out;
+		}
+		before[i] = settled[i];
+		struct sle_dli_event event = { 0 };
+		for (int n = 0; n < 256; n++) {
+			if (ioctl(fds[i], SL_IOCTL_DLI_POLL_EVENT, &event) < 0)
+				break;
+		}
+	}
+	/* Same opcode on both owners: completions must resolve their own queue. */
+	for (int i = 0; i < 2; i++) {
+		struct sle_dli_cmd cmd = { .opcode = 0x0406 };
+		if (check("Runtime ReadMacAddr", dli_send_cmd_retry(fds[i], &cmd)) < 0)
+			goto out;
+	}
+	for (int tick = 0; tick < 200 && (!received[0] || !received[1]); tick++) {
+		for (int i = 0; i < 2; i++) {
+			struct sle_dli_event event = { 0 };
+			for (int n = 0; n < 64; n++) {
+				if (ioctl(fds[i], SL_IOCTL_DLI_POLL_EVENT, &event) < 0) {
+					if (errno != EAGAIN) {
+						test_fail("  FAIL: Runtime event poll: %s\n", strerror(errno));
+						goto out;
+					}
+					break;
+				}
+				if (event.event_type != 1 || event.opcode != 0x0406)
+					continue;
+				if (event.status || event.data_len != 6 ||
+				    memcmp(event.data, infos[i].addr, 6)) {
+					test_fail("  FAIL: Runtime %d received another owner's MAC or failed response\n", i);
+					goto out;
+				}
+				received[i]++;
+			}
+		}
+		usleep(10000);
+	}
+	for (int i = 0; i < 2; i++) {
+		if (check("Runtime final stats", ioctl(fds[i], SL_IOCTL_MGMT_STATS, &after[i])) < 0)
+			goto out;
+		if (received[i] != 1 || after[i].total_submitted != before[i].total_submitted + 1 ||
+		    after[i].total_resolved != before[i].total_resolved + 1 || after[i].pending ||
+		    after[i].total_timeouts != before[i].total_timeouts) {
+			test_fail("  FAIL: Runtime %d completion=%d submitted=%u->%u resolved=%u->%u\n",
+				  i, received[i], before[i].total_submitted, after[i].total_submitted,
+				  before[i].total_resolved, after[i].total_resolved);
+		} else {
+			printf("  OK:   Runtime %d resolved its own ReadMacAddr with matching MAC\n", i);
+		}
+	}
+out:
+	if (default_fd >= 0)
+		close(default_fd);
+	for (int i = 0; i < 2; i++)
+		if (fds[i] >= 0)
+			close(fds[i]);
+	if (original != 0xffff)
+		check("Runtime restore selection", ioctl(fd, SL_IOCTL_DEV_SWITCH, &original));
+}
+
 static void test_dli_mgmt_plane(int fd)
 {
 	test_header("DLI management plane: SEND_CMD + MGMT_STATS (§9)");
@@ -5996,7 +6304,7 @@ static void test_conn_info_fields(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d (%s)\n", ret, strerror(errno));
+		test_fail("  FAIL: CONNECT returned %d (%s)\n", ret, strerror(errno));
 		return;
 	}
 	uint16_t h = (uint16_t)ret;
@@ -6116,7 +6424,7 @@ static void test_channel_tcid_standard(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d\n", ret);
+		test_fail("  FAIL: CONNECT returned %d\n", ret);
 		return;
 	}
 	uint16_t h = (uint16_t)ret;
@@ -6131,7 +6439,7 @@ static void test_channel_tcid_standard(int fd)
 	rsp.supervision_timeout = 100;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &rsp);
 	if (ret != 0) {
-		printf("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
+		test_fail("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
 		ioctl(fd, SL_IOCTL_DISCONNECT, &h);
 		return;
 	}
@@ -6142,7 +6450,7 @@ static void test_channel_tcid_standard(int fd)
 	info.handle = h;
 	ret = ioctl(fd, SL_IOCTL_CONN_INFO, &info);
 	if (ret != 0) {
-		printf("  FAIL: CONN_INFO: %s\n", strerror(errno));
+		test_fail("  FAIL: CONN_INFO: %s\n", strerror(errno));
 		ioctl(fd, SL_IOCTL_DISCONNECT, &h);
 		return;
 	}
@@ -6151,7 +6459,7 @@ static void test_channel_tcid_standard(int fd)
 	if (info.data_mode == 0)
 		printf("  OK:   data_mode=0 (Unreliable, SLE-DUDTC)\n");
 	else
-		printf("  FAIL: data_mode=%u, expected 0 (Unreliable)\n",
+		test_fail("  FAIL: data_mode=%u, expected 0 (Unreliable)\n",
 		       info.data_mode);
 
 	/* data_mtu must be non-zero and equal to data_mps after negotiate */
@@ -6159,21 +6467,21 @@ static void test_channel_tcid_standard(int fd)
 		printf("  OK:   data_mtu=%u == data_mps=%u\n",
 		       info.data_mtu, info.data_mps);
 	else
-		printf("  FAIL: data_mtu=%u data_mps=%u (expected equal, >0)\n",
+		test_fail("  FAIL: data_mtu=%u data_mps=%u (expected equal, >0)\n",
 		       info.data_mtu, info.data_mps);
 
 	/* SLE-SMTC (0x0A): service management channel MTU must be >0 */
 	if (info.svc_mtu > 0)
 		printf("  OK:   svc_mtu=%u (SLE-SMTC active)\n", info.svc_mtu);
 	else
-		printf("  FAIL: svc_mtu=0 (SLE-SMTC channel inactive)\n");
+		test_fail("  FAIL: svc_mtu=0 (SLE-SMTC channel inactive)\n");
 
 	/* SMTC initial credits = 16 */
 	if (info.smtc_tx_credits == 16 && info.smtc_rx_credits == 16)
 		printf("  OK:   SMTC credits: tx=%u rx=%u\n",
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 	else
-		printf("  FAIL: SMTC credits: tx=%u rx=%u (expected 16/16)\n",
+		test_fail("  FAIL: SMTC credits: tx=%u rx=%u (expected 16/16)\n",
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 
 	/* DUDTC: Unreliable mode does not use credit flow control */
@@ -6188,7 +6496,7 @@ static void test_channel_tcid_standard(int fd)
 			printf("  OK:   DUDTC credits: tx=%u rx=%u\n",
 			       info.dudtc_tx_credits, info.dudtc_rx_credits);
 		else
-			printf("  FAIL: DUDTC credits: tx=%u rx=%u (expected 16/16)\n",
+			test_fail("  FAIL: DUDTC credits: tx=%u rx=%u (expected 16/16)\n",
 			       info.dudtc_tx_credits, info.dudtc_rx_credits);
 	}
 
@@ -6196,7 +6504,7 @@ static void test_channel_tcid_standard(int fd)
 	if (info.svc_mtu > 0 && info.svc_mtu <= 512)
 		printf("  OK:   svc_mtu=%u in valid range\n", info.svc_mtu);
 	else
-		printf("  FAIL: svc_mtu=%u out of range\n", info.svc_mtu);
+		test_fail("  FAIL: svc_mtu=%u out of range\n", info.svc_mtu);
 
 	/* ssap_mtu should be set to default when no SSAP exchange occurred */
 	printf("  INFO: ssap_info_exchanged=%u ssap_mtu=%u\n",
@@ -6224,7 +6532,7 @@ static void test_dli_info_consistency(int fd)
 	int ret = ioctl(fd, SL_IOCTL_DLI_INFO, &dli);
 
 	if (ret != 0) {
-		printf("  FAIL: DLI_INFO ioctl: %s\n", strerror(errno));
+		test_fail("  FAIL: DLI_INFO ioctl: %s\n", strerror(errno));
 		return;
 	}
 
@@ -6270,7 +6578,7 @@ static void test_dli_info_consistency(int fd)
 			    dli.security_cap == dbg_sec)
 				printf("  OK:   ioctl vs debugfs: 6/6 fields consistent\n");
 			else
-				printf("  FAIL: ioctl vs debugfs mismatch\n");
+				test_fail("  FAIL: ioctl vs debugfs mismatch\n");
 		}
 	}
 
@@ -6306,7 +6614,7 @@ static void test_dli_info_consistency(int fd)
 	close(nlfd);
 
 	if (len <= 0) {
-		printf("  FAIL: GET_DLI_INFO genetlink failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_DLI_INFO genetlink failed (len=%d)\n", len);
 		return;
 	}
 
@@ -6338,7 +6646,7 @@ static void test_dli_info_consistency(int fd)
 		printf("  OK:   ioctl vs genetlink: %d/%d fields consistent\n",
 		       ok, ok);
 	else
-		printf("  FAIL: ioctl vs genetlink: %d OK, %d mismatch "
+		test_fail("  FAIL: ioctl vs genetlink: %d OK, %d mismatch "
 		       "(bus=%u/%u conn=%u/%u mtu=%u/%u mps=%u/%u)\n",
 		       ok, fail, dli.bus, gnl_bus,
 		       dli.max_connections, gnl_max_conn,
@@ -6557,7 +6865,7 @@ static void test_conn_data_counters(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT: %s\n", strerror(errno));
+		test_fail("  FAIL: CONNECT: %s\n", strerror(errno));
 		return;
 	}
 	uint16_t h = (uint16_t)ret;
@@ -6933,7 +7241,7 @@ static void test_conn_send_bounds(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT: %s\n", strerror(errno));
+		test_fail("  FAIL: CONNECT: %s\n", strerror(errno));
 		return;
 	}
 	uint16_t h = (uint16_t)ret;
@@ -7195,7 +7503,7 @@ static void test_conn_stale_handle_ops(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT: %s\n", strerror(errno));
+		test_fail("  FAIL: CONNECT: %s\n", strerror(errno));
 		return;
 	}
 	uint16_t h = (uint16_t)ret;
@@ -7801,7 +8109,7 @@ static void test_ssap_air_interface(int fd)
 	cp.peer_addr[5] = 0x01;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d\n", ret);
+		test_fail("  FAIL: CONNECT returned %d\n", ret);
 		fail_count++;
 		return;
 	}
@@ -7849,7 +8157,7 @@ static void test_ssap_air_interface(int fd)
 			printf("  OK:   ssap_info_exchanged=1\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_info_exchanged=%u, expected 1\n",
+			test_fail("  FAIL: ssap_info_exchanged=%u, expected 1\n",
 			       info.ssap_info_exchanged);
 			fail_count++;
 		}
@@ -7858,7 +8166,7 @@ static void test_ssap_air_interface(int fd)
 			       info.ssap_mtu);
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_mtu=%u, expected 100\n",
+			test_fail("  FAIL: ssap_mtu=%u, expected 100\n",
 			       info.ssap_mtu);
 			fail_count++;
 		}
@@ -7867,7 +8175,7 @@ static void test_ssap_air_interface(int fd)
 			printf("  OK:   ssap_reliable_mode=0 (old format)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_reliable_mode=%u, expected 0\n",
+			test_fail("  FAIL: ssap_reliable_mode=%u, expected 0\n",
 			       info.ssap_reliable_mode);
 			fail_count++;
 		}
@@ -7901,7 +8209,7 @@ static void test_ssap_air_interface(int fd)
 			       info.ssap_mtu);
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_mtu=%u, expected 100\n",
+			test_fail("  FAIL: ssap_mtu=%u, expected 100\n",
 			       info.ssap_mtu);
 			fail_count++;
 		}
@@ -7909,7 +8217,7 @@ static void test_ssap_air_interface(int fd)
 			printf("  OK:   ssap_reliable_mode=1 (new format)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_reliable_mode=%u, expected 1\n",
+			test_fail("  FAIL: ssap_reliable_mode=%u, expected 1\n",
 			       info.ssap_reliable_mode);
 			fail_count++;
 		}
@@ -7918,7 +8226,7 @@ static void test_ssap_air_interface(int fd)
 			       info.ssap_version_major);
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_version_major=%u, expected 1\n",
+			test_fail("  FAIL: ssap_version_major=%u, expected 1\n",
 			       info.ssap_version_major);
 			fail_count++;
 		}
@@ -7972,7 +8280,7 @@ static void test_ssap_air_interface(int fd)
 			printf("  OK:   ssap_reliable_mode=1 (after TCID_Connect_Req)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: ssap_reliable_mode=%u, expected 1\n",
+			test_fail("  FAIL: ssap_reliable_mode=%u, expected 1\n",
 			       info.ssap_reliable_mode);
 			fail_count++;
 		}
@@ -8002,7 +8310,7 @@ static void test_ssap_air_interface(int fd)
 	test_svc.primary = 1;
 	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &test_svc);
 	if (ret < 0) {
-		printf("  FAIL: SSAP_ADD_SVC for air test: %s\n",
+		test_fail("  FAIL: SSAP_ADD_SVC for air test: %s\n",
 		       strerror(errno));
 		fail_count++;
 		goto cleanup;
@@ -8017,7 +8325,7 @@ static void test_ssap_air_interface(int fd)
 	test_prop.value_len = 1;
 	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &test_prop);
 	if (ret < 0) {
-		printf("  FAIL: SSAP_ADD_PROP for air test: %s\n",
+		test_fail("  FAIL: SSAP_ADD_PROP for air test: %s\n",
 		       strerror(errno));
 		fail_count++;
 		goto cleanup;
@@ -8052,7 +8360,7 @@ static void test_ssap_air_interface(int fd)
 		printf("  OK:   WriteReq via air changed property to 0xAA\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: property read after WriteReq: ret=%d len=%u val=0x%02x\n",
+		test_fail("  FAIL: property read after WriteReq: ret=%d len=%u val=0x%02x\n",
 		       ret, rw.length, rw.data[0]);
 		fail_count++;
 	}
@@ -8083,7 +8391,7 @@ static void test_ssap_air_interface(int fd)
 		       ssap_info.service_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: SSAP_INFO post FindStructure: ret=%d svc=%u\n",
+		test_fail("  FAIL: SSAP_INFO post FindStructure: ret=%d svc=%u\n",
 		       ret, ssap_info.service_count);
 		fail_count++;
 	}
@@ -8108,7 +8416,7 @@ static void test_ssap_air_interface(int fd)
 		printf("  OK:   regular data routed to rx_queue\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: regular data recv: ret=%d len=%u\n",
+		test_fail("  FAIL: regular data recv: ret=%d len=%u\n",
 		       ret, recv_buf.length);
 		fail_count++;
 	}
@@ -8148,7 +8456,7 @@ static void test_credit_flow_control(int fd)
 	cp.peer_addr[5] = 0x01;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d\n", ret);
+		test_fail("  FAIL: CONNECT returned %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -8163,7 +8471,7 @@ static void test_credit_flow_control(int fd)
 	resp.supervision_timeout = 100;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
+		test_fail("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
 		goto cleanup;
 	}
 	ok_count++;
@@ -8180,7 +8488,7 @@ static void test_credit_flow_control(int fd)
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 		ok_count++;
 	} else {
-		printf("  FAIL: initial SMTC credits tx=%u rx=%u (expect 16/16)\n",
+		test_fail("  FAIL: initial SMTC credits tx=%u rx=%u (expect 16/16)\n",
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 		fail_count++;
 	}
@@ -8190,7 +8498,7 @@ static void test_credit_flow_control(int fd)
 		printf("  OK:   DUDTC credits 0/0 (Unreliable)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: DUDTC tx=%u rx=%u (expect 0/0)\n",
+		test_fail("  FAIL: DUDTC tx=%u rx=%u (expect 0/0)\n",
 		       info.dudtc_tx_credits, info.dudtc_rx_credits);
 		fail_count++;
 	}
@@ -8211,7 +8519,7 @@ static void test_credit_flow_control(int fd)
 		inj.length = 4;
 		ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
 		if (ret < 0) {
-			printf("  FAIL: INJECT #%d: %s\n", i + 1, strerror(errno));
+			test_fail("  FAIL: INJECT #%d: %s\n", i + 1, strerror(errno));
 			fail_count++;
 			goto cleanup;
 		}
@@ -8226,7 +8534,7 @@ static void test_credit_flow_control(int fd)
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 		ok_count++;
 	} else {
-		printf("  FAIL: after 5 PDUs: tx=%u rx=%u (expect 11/11)\n",
+		test_fail("  FAIL: after 5 PDUs: tx=%u rx=%u (expect 11/11)\n",
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 		fail_count++;
 	}
@@ -8246,7 +8554,7 @@ static void test_credit_flow_control(int fd)
 		inj.length = 4;
 		ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
 		if (ret < 0) {
-			printf("  FAIL: INJECT batch #%d: %s\n",
+			test_fail("  FAIL: INJECT batch #%d: %s\n",
 			       i + 1, strerror(errno));
 			fail_count++;
 			goto cleanup;
@@ -8262,7 +8570,7 @@ static void test_credit_flow_control(int fd)
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 		ok_count++;
 	} else {
-		printf("  FAIL: after 13 PDUs: tx=%u rx=%u (expect 3/19)\n",
+		test_fail("  FAIL: after 13 PDUs: tx=%u rx=%u (expect 3/19)\n",
 		       info.smtc_tx_credits, info.smtc_rx_credits);
 		fail_count++;
 	}
@@ -8298,7 +8606,7 @@ static void test_credit_flow_control(int fd)
 		       info.smtc_tx_credits);
 		ok_count++;
 	} else {
-		printf("  FAIL: after credit grant: tx=%u (expect 19)\n",
+		test_fail("  FAIL: after credit grant: tx=%u (expect 19)\n",
 		       info.smtc_tx_credits);
 		fail_count++;
 	}
@@ -8316,7 +8624,7 @@ static void test_credit_flow_control(int fd)
 			printf("  OK:   DUDTC send succeeds without credits\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: DUDTC send: %s\n", strerror(errno));
+			test_fail("  FAIL: DUDTC send: %s\n", strerror(errno));
 			fail_count++;
 		}
 	}
@@ -8358,7 +8666,7 @@ static void test_supervision_timeout(int fd)
 	cp.timeout_10ms = 10; /* 100ms */
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d\n", ret);
+		test_fail("  FAIL: CONNECT returned %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -8373,7 +8681,7 @@ static void test_supervision_timeout(int fd)
 	resp.supervision_timeout = 10; /* 100ms */
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
+		test_fail("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
 		return;
 	}
 
@@ -8387,7 +8695,7 @@ static void test_supervision_timeout(int fd)
 		printf("  OK:   connection active (state=%u)\n", info.state);
 		ok_count++;
 	} else {
-		printf("  FAIL: expected Connected(2), got state=%u ret=%d\n",
+		test_fail("  FAIL: expected Connected(2), got state=%u ret=%d\n",
 		       info.state, ret);
 		fail_count++;
 		goto cleanup;
@@ -8407,7 +8715,7 @@ static void test_supervision_timeout(int fd)
 			printf("  OK:   keepalive send resets activity timer\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: keepalive send: %s\n", strerror(errno));
+			test_fail("  FAIL: keepalive send: %s\n", strerror(errno));
 			fail_count++;
 		}
 	}
@@ -8446,7 +8754,7 @@ static void test_supervision_timeout(int fd)
 		printf("  OK:   supervision timeout: state=Idle\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected disconnected, got state=%u\n", info.state);
+		test_fail("  FAIL: expected disconnected, got state=%u\n", info.state);
 		fail_count++;
 	}
 
@@ -8458,7 +8766,7 @@ static void test_supervision_timeout(int fd)
 	cp.timeout_10ms = 3200; /* 32 seconds */
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: second CONNECT returned %d\n", ret);
+		test_fail("  FAIL: second CONNECT returned %d\n", ret);
 		goto done;
 	}
 	uint16_t handle2 = (uint16_t)ret;
@@ -8471,7 +8779,7 @@ static void test_supervision_timeout(int fd)
 	resp.supervision_timeout = 3200;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  FAIL: second INJECT_CONN_RESP: %s\n", strerror(errno));
+		test_fail("  FAIL: second INJECT_CONN_RESP: %s\n", strerror(errno));
 		goto done;
 	}
 
@@ -8483,7 +8791,7 @@ static void test_supervision_timeout(int fd)
 		printf("  OK:   long-timeout connection still alive after 200ms\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: long-timeout state=%u (expected Connected)\n",
+		test_fail("  FAIL: long-timeout state=%u (expected Connected)\n",
 		       info.state);
 		fail_count++;
 	}
@@ -8609,7 +8917,7 @@ static void test_crc12_verification(int fd)
 	sp.filter_discovery_level = 0;
 	ret = ioctl(fd, SL_IOCTL_START_SCAN, &sp);
 	if (ret < 0) {
-		printf("  FAIL: START_SCAN failed: %s\n", strerror(errno));
+		test_fail("  FAIL: START_SCAN failed: %s\n", strerror(errno));
 		return;
 	}
 
@@ -8633,7 +8941,7 @@ static void test_crc12_verification(int fd)
 		printf("  OK:   raw ADV with valid CRC accepted\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: raw ADV with valid CRC rejected: %s\n",
+		test_fail("  FAIL: raw ADV with valid CRC rejected: %s\n",
 		       strerror(errno));
 		fail_count++;
 	}
@@ -8648,7 +8956,7 @@ static void test_crc12_verification(int fd)
 		printf("  OK:   raw ADV with bad CRC rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for bad CRC, got ret=%d errno=%d\n",
+		test_fail("  FAIL: expected EINVAL for bad CRC, got ret=%d errno=%d\n",
 		       ret, errno);
 		fail_count++;
 	}
@@ -8661,7 +8969,7 @@ static void test_crc12_verification(int fd)
 		       initial_crc_errors, ss.crc_errors);
 		ok_count++;
 	} else {
-		printf("  FAIL: crc_errors not incremented (initial=%u, now=%u)\n",
+		test_fail("  FAIL: crc_errors not incremented (initial=%u, now=%u)\n",
 		       initial_crc_errors, ret == 0 ? ss.crc_errors : 0);
 		fail_count++;
 	}
@@ -8678,7 +8986,7 @@ static void test_crc12_verification(int fd)
 		printf("  OK:   second bad CRC also rejected\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: second bad CRC not rejected\n");
+		test_fail("  FAIL: second bad CRC not rejected\n");
 		fail_count++;
 	}
 
@@ -8688,7 +8996,7 @@ static void test_crc12_verification(int fd)
 		printf("  OK:   crc_errors=%u after two bad PDUs\n", ss.crc_errors);
 		ok_count++;
 	} else {
-		printf("  FAIL: crc_errors=%u expected >=%u\n",
+		test_fail("  FAIL: crc_errors=%u expected >=%u\n",
 		       ret == 0 ? ss.crc_errors : 0, initial_crc_errors + 2);
 		fail_count++;
 	}
@@ -8707,7 +9015,7 @@ static void test_crc12_verification(int fd)
 		printf("  OK:   valid CRC does not increment error counter\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: crc_errors changed on valid PDU (%u -> %u)\n",
+		test_fail("  FAIL: crc_errors changed on valid PDU (%u -> %u)\n",
 		       before, ss.crc_errors);
 		fail_count++;
 	}
@@ -8738,7 +9046,7 @@ static void test_mtu_mps_negotiation(int fd)
 	cp.peer_addr[5] = 0x01;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d\n", ret);
+		test_fail("  FAIL: CONNECT returned %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -8755,7 +9063,7 @@ static void test_mtu_mps_negotiation(int fd)
 	resp.data_mps = 0;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
+		test_fail("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
 		goto cleanup;
 	}
 
@@ -8769,7 +9077,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   data_mtu=64 after INJECT_CONN_RESP\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: data_mtu=%u (expected 64)\n", info.data_mtu);
+		test_fail("  FAIL: data_mtu=%u (expected 64)\n", info.data_mtu);
 		fail_count++;
 	}
 
@@ -8785,7 +9093,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   send 32 bytes (within MTU=64) succeeded\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: send 32 bytes rejected: errno=%d (%s) handle=%u\n",
+		test_fail("  FAIL: send 32 bytes rejected: errno=%d (%s) handle=%u\n",
 		       errno, strerror(errno), handle);
 		fail_count++;
 	}
@@ -8800,7 +9108,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   send 100 bytes rejected (EFBIG, MTU=64)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EFBIG, got ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EFBIG, got ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -8815,7 +9123,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   SET_CONN_MTU to 128 succeeded\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: SET_CONN_MTU: %s\n", strerror(errno));
+		test_fail("  FAIL: SET_CONN_MTU: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -8827,7 +9135,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   data_mtu=128 after SET_CONN_MTU\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: data_mtu=%u (expected 128)\n", info.data_mtu);
+		test_fail("  FAIL: data_mtu=%u (expected 128)\n", info.data_mtu);
 		fail_count++;
 	}
 
@@ -8841,7 +9149,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   send 100 bytes succeeded (MTU=128)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: send 100 bytes rejected after MTU increase: %s\n",
+		test_fail("  FAIL: send 100 bytes rejected after MTU increase: %s\n",
 		       strerror(errno));
 		fail_count++;
 	}
@@ -8855,7 +9163,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   SET_CONN_MTU mtu=10 rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for mtu=10, got ret=%d\n", ret);
+		test_fail("  FAIL: expected EINVAL for mtu=10, got ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -8872,7 +9180,7 @@ static void test_mtu_mps_negotiation(int fd)
 		printf("  OK:   MTU=100, MPS=50 set correctly\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: MTU=%u MPS=%u (expected 100/50)\n",
+		test_fail("  FAIL: MTU=%u MPS=%u (expected 100/50)\n",
 		       info.data_mtu, info.data_mps);
 		fail_count++;
 	}
@@ -8908,7 +9216,7 @@ static void test_afh_channel_map(int fd)
 	cp.peer_addr[5] = 0x01;
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT returned %d\n", ret);
+		test_fail("  FAIL: CONNECT returned %d\n", ret);
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -8923,7 +9231,7 @@ static void test_afh_channel_map(int fd)
 	resp.supervision_timeout = 3200;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
+		test_fail("  FAIL: INJECT_CONN_RESP: %s\n", strerror(errno));
 		goto cleanup;
 	}
 
@@ -8937,7 +9245,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   default channel map: %u channels\n", map_p.used_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: default map used_count=%u (expected 79), ret=%d\n",
+		test_fail("  FAIL: default map used_count=%u (expected 79), ret=%d\n",
 		       map_p.used_count, ret);
 		fail_count++;
 	}
@@ -8958,7 +9266,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   set channel map (channels 0-39)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: AFH_SET_MAP: %s\n", strerror(errno));
+		test_fail("  FAIL: AFH_SET_MAP: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -8970,7 +9278,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   channel map updated: %u channels\n", map_p.used_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: expected 40 channels, got %u\n", map_p.used_count);
+		test_fail("  FAIL: expected 40 channels, got %u\n", map_p.used_count);
 		fail_count++;
 	}
 
@@ -8984,7 +9292,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   hop ch=%u freq=%u within map\n", hop.channel, hop.freq_mhz);
 		ok_count++;
 	} else {
-		printf("  FAIL: hop ch=%u freq=%u (expected 0-39, 2402-2441)\n",
+		test_fail("  FAIL: hop ch=%u freq=%u (expected 0-39, 2402-2441)\n",
 		       hop.channel, hop.freq_mhz);
 		fail_count++;
 	}
@@ -8999,7 +9307,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   map with 3 channels rejected (min_channels=5)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for insufficient channels, ret=%d\n", ret);
+		test_fail("  FAIL: expected EINVAL for insufficient channels, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9033,7 +9341,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   reported RSSI for 40 channels\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: RSSI report failed\n");
+		test_fail("  FAIL: RSSI report failed\n");
 		fail_count++;
 	}
 
@@ -9050,7 +9358,7 @@ static void test_afh_channel_map(int fd)
 			printf("  OK:   RSSI for ch=80 rejected (EINVAL)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: expected EINVAL for ch=80, ret=%d\n", ret);
+			test_fail("  FAIL: expected EINVAL for ch=80, ret=%d\n", ret);
 			fail_count++;
 		}
 	}
@@ -9069,7 +9377,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   classify: %u good channels (threshold=-60)\n", cls.used_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: classify used_count=%u (expected 20), ret=%d\n",
+		test_fail("  FAIL: classify used_count=%u (expected 20), ret=%d\n",
 		       cls.used_count, ret);
 		fail_count++;
 	}
@@ -9082,7 +9390,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   classified map active: %u channels\n", map_p.used_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: active map used_count=%u (expected 20)\n", map_p.used_count);
+		test_fail("  FAIL: active map used_count=%u (expected 20)\n", map_p.used_count);
 		fail_count++;
 	}
 
@@ -9094,7 +9402,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   post-classify hop ch=%u (within 0-19)\n", hop.channel);
 		ok_count++;
 	} else {
-		printf("  FAIL: post-classify hop ch=%u (expected 0-19)\n", hop.channel);
+		test_fail("  FAIL: post-classify hop ch=%u (expected 0-19)\n", hop.channel);
 		fail_count++;
 	}
 
@@ -9126,7 +9434,7 @@ static void test_afh_channel_map(int fd)
 		printf("  OK:   min_channels enforced: kept %u (min 10)\n", cls.used_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: min_channels: used=%u (expected >=10)\n", cls.used_count);
+		test_fail("  FAIL: min_channels: used=%u (expected >=10)\n", cls.used_count);
 		fail_count++;
 	}
 
@@ -9166,11 +9474,11 @@ static void test_afh_channel_map(int fd)
 			       cls.used_count);
 			ok_count++;
 		} else {
-			printf("  FAIL: ch0 should be excluded by retx rate\n");
+			test_fail("  FAIL: ch0 should be excluded by retx rate\n");
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: retx classify ret=%d used=%u\n", ret, cls.used_count);
+		test_fail("  FAIL: retx classify ret=%d used=%u\n", ret, cls.used_count);
 		fail_count++;
 	}
 
@@ -9214,7 +9522,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   configure set 0 (SID=5, 1M/2M)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: configure set 0: %s\n", strerror(errno));
+		test_fail("  FAIL: configure set 0: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9228,7 +9536,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   set 0 state=Configured, SID=%u\n", info.sid);
 		ok_count++;
 	} else {
-		printf("  FAIL: info state=%u sid=%u (expected 1/5)\n", info.state, info.sid);
+		test_fail("  FAIL: info state=%u sid=%u (expected 1/5)\n", info.state, info.sid);
 		fail_count++;
 	}
 
@@ -9244,7 +9552,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   set data (16 bytes)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: set data: %s\n", strerror(errno));
+		test_fail("  FAIL: set data: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9260,7 +9568,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   set scan response data (8 bytes)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: set scan response data: %s\n", strerror(errno));
+		test_fail("  FAIL: set scan response data: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9272,7 +9580,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   data_len=%u confirmed\n", info.data_len);
 		ok_count++;
 	} else {
-		printf("  FAIL: data_len=%u (expected 16)\n", info.data_len);
+		test_fail("  FAIL: data_len=%u (expected 16)\n", info.data_len);
 		fail_count++;
 	}
 
@@ -9284,7 +9592,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   enable set 0\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: enable set 0: %s\n", strerror(errno));
+		test_fail("  FAIL: enable set 0: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9296,7 +9604,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   set 0 state=Active\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: state=%u (expected 2)\n", info.state);
+		test_fail("  FAIL: state=%u (expected 2)\n", info.state);
 		fail_count++;
 	}
 
@@ -9307,7 +9615,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   remove active set rejected (EBUSY)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EBUSY for removing active set, ret=%d\n", ret);
+		test_fail("  FAIL: expected EBUSY for removing active set, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9318,7 +9626,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   disable set 0\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: disable set 0: %s\n", strerror(errno));
+		test_fail("  FAIL: disable set 0: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9329,7 +9637,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   remove set 0\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: remove set 0: %s\n", strerror(errno));
+		test_fail("  FAIL: remove set 0: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9341,7 +9649,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   info on removed set returns ENOENT\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected ENOENT, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected ENOENT, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9363,7 +9671,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   configured 4 sets concurrently\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: multi-set configure failed\n");
+		test_fail("  FAIL: multi-set configure failed\n");
 		fail_count++;
 	}
 
@@ -9376,7 +9684,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   handle=4 rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for handle=4, ret=%d\n", ret);
+		test_fail("  FAIL: expected EINVAL for handle=4, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9390,7 +9698,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   SID=16 rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for SID=16, ret=%d\n", ret);
+		test_fail("  FAIL: expected EINVAL for SID=16, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9415,7 +9723,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   configure set 0 (timing=3)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: configure with timing: %s\n", strerror(errno));
+		test_fail("  FAIL: configure with timing: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9427,7 +9735,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   ext_adv_timing=%u confirmed\n", info.ext_adv_timing);
 		ok_count++;
 	} else {
-		printf("  FAIL: ext_adv_timing=%u (expected 3)\n",
+		test_fail("  FAIL: ext_adv_timing=%u (expected 3)\n",
 		       info.ext_adv_timing);
 		fail_count++;
 	}
@@ -9444,7 +9752,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   enable_ex (max_events=5)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: enable_ex: %s\n", strerror(errno));
+		test_fail("  FAIL: enable_ex: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9458,7 +9766,7 @@ static void test_ext_advertising(int fd)
 		       info.max_adv_events, info.events_sent);
 		ok_count++;
 	} else {
-		printf("  FAIL: state=%u max=%u sent=%u\n",
+		test_fail("  FAIL: state=%u max=%u sent=%u\n",
 		       info.state, info.max_adv_events, info.events_sent);
 		fail_count++;
 	}
@@ -9474,7 +9782,7 @@ static void test_ext_advertising(int fd)
 		       info.events_sent);
 		ok_count++;
 	} else {
-		printf("  FAIL: after 3 ticks: state=%u events=%u\n",
+		test_fail("  FAIL: after 3 ticks: state=%u events=%u\n",
 		       info.state, info.events_sent);
 		fail_count++;
 	}
@@ -9490,7 +9798,7 @@ static void test_ext_advertising(int fd)
 		       info.state);
 		ok_count++;
 	} else {
-		printf("  FAIL: expected auto-disable: state=%u events=%u\n",
+		test_fail("  FAIL: expected auto-disable: state=%u events=%u\n",
 		       info.state, info.events_sent);
 		fail_count++;
 	}
@@ -9505,7 +9813,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   enable_ex (duration=30ms)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: enable_ex duration: %s\n", strerror(errno));
+		test_fail("  FAIL: enable_ex duration: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9519,7 +9827,7 @@ static void test_ext_advertising(int fd)
 		printf("  OK:   after 2 ticks: still active\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected active after 2 ticks, state=%u\n",
+		test_fail("  FAIL: expected active after 2 ticks, state=%u\n",
 		       info.state);
 		fail_count++;
 	}
@@ -9534,7 +9842,7 @@ static void test_ext_advertising(int fd)
 		       info.state);
 		ok_count++;
 	} else {
-		printf("  FAIL: expected auto-disable by duration: state=%u\n",
+		test_fail("  FAIL: expected auto-disable by duration: state=%u\n",
 		       info.state);
 		fail_count++;
 	}
@@ -9641,7 +9949,7 @@ static void test_sync_link_management(int fd)
 
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT for sync test: ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: CONNECT for sync test: ret=%d errno=%d\n", ret, errno);
 		printf("sync_link_management: 0 OK / 15 FAIL\n");
 		return;
 	}
@@ -9656,7 +9964,7 @@ static void test_sync_link_management(int fd)
 	inject.data_mps = 247;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &inject);
 	if (ret < 0) {
-		printf("  FAIL: INJECT_CONN_RESP for sync test: ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: INJECT_CONN_RESP for sync test: ret=%d errno=%d\n", ret, errno);
 		printf("sync_link_management: 0 OK / 15 FAIL\n");
 		return;
 	}
@@ -9682,7 +9990,7 @@ static void test_sync_link_management(int fd)
 		       cig.cig_id, cig.link_count, cig.handles_out[0], cig.handles_out[1]);
 		ok_count++;
 	} else {
-		printf("  FAIL: CIG configure ret=%d link_count=%d\n", ret, cig.link_count);
+		test_fail("  FAIL: CIG configure ret=%d link_count=%d\n", ret, cig.link_count);
 		fail_count++;
 	}
 	uint16_t cis_h0 = cig.handles_out[0];
@@ -9699,7 +10007,7 @@ static void test_sync_link_management(int fd)
 		       info.group_id);
 		ok_count++;
 	} else {
-		printf("  FAIL: sync info ret=%d state=%d group=%d type=%d\n",
+		test_fail("  FAIL: sync info ret=%d state=%d group=%d type=%d\n",
 		       ret, info.state, info.group_id, info.link_type);
 		fail_count++;
 	}
@@ -9717,7 +10025,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   CIG create: %d links activated\n", ret);
 		ok_count++;
 	} else {
-		printf("  FAIL: CIG create ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: CIG create ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9729,7 +10037,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   sync link active: acl_handle=%u\n", info.acl_handle);
 		ok_count++;
 	} else {
-		printf("  FAIL: expected active state=%d acl=%d\n", info.state, info.acl_handle);
+		test_fail("  FAIL: expected active state=%d acl=%d\n", info.state, info.acl_handle);
 		fail_count++;
 	}
 
@@ -9746,7 +10054,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   datapath config: dir=2, codec=0x%02x\n", dp.codec_id);
 		ok_count++;
 	} else {
-		printf("  FAIL: datapath config ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: datapath config ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9758,7 +10066,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   datapath_configured=1\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: datapath_configured=%d\n", info.datapath_configured);
+		test_fail("  FAIL: datapath_configured=%d\n", info.datapath_configured);
 		fail_count++;
 	}
 
@@ -9770,7 +10078,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   datapath removed\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: datapath remove ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: datapath remove ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9782,7 +10090,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   active CIG remove rejected (EBUSY)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EBUSY, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EBUSY, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9801,7 +10109,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   CIG reconfigure: 1 link, interval=7500us\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: CIG reconfigure ret=%d\n", ret);
+		test_fail("  FAIL: CIG reconfigure ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9812,7 +10120,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   inactive CIG removed\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: CIG remove ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: CIG remove ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9823,7 +10131,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   nonexistent CIG remove rejected (ENOENT)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected ENOENT, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected ENOENT, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9845,7 +10153,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   BIG configure: id=0x%02x, links=%d\n", big.big_id, big.link_count);
 		ok_count++;
 	} else {
-		printf("  FAIL: BIG configure ret=%d\n", ret);
+		test_fail("  FAIL: BIG configure ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9860,7 +10168,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   BIG create: %d links activated\n", ret);
 		ok_count++;
 	} else {
-		printf("  FAIL: BIG create ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: BIG create ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -9875,7 +10183,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   invalid CIG ID 0xF0 rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for cig_id=0xF0, ret=%d\n", ret);
+		test_fail("  FAIL: expected EINVAL for cig_id=0xF0, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9888,7 +10196,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   zero link_count rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL for link_count=0, ret=%d\n", ret);
+		test_fail("  FAIL: expected EINVAL for link_count=0, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9900,7 +10208,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   active BIG remove rejected (EBUSY)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: BIG remove active: expected EBUSY, ret=%d\n", ret);
+		test_fail("  FAIL: BIG remove active: expected EBUSY, ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -9918,12 +10226,12 @@ static void test_sync_link_management(int fd)
 			printf("  OK:   BIG remove (after reconfigure)\n");
 			ok_count++;
 		} else {
-			printf("  FAIL: BIG remove after reconfig: %s\n",
+			test_fail("  FAIL: BIG remove after reconfig: %s\n",
 			       strerror(errno));
 			fail_count++;
 		}
 	} else {
-		printf("  FAIL: BIG reconfigure: %s\n", strerror(errno));
+		test_fail("  FAIL: BIG reconfigure: %s\n", strerror(errno));
 		fail_count++;
 	}
 
@@ -9935,7 +10243,7 @@ static void test_sync_link_management(int fd)
 		printf("  OK:   BIG remove nonexistent (ENOENT)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: BIG remove nonexistent expected ENOENT\n");
+		test_fail("  FAIL: BIG remove nonexistent expected ENOENT\n");
 		fail_count++;
 	}
 
@@ -9972,7 +10280,7 @@ static void test_sync_mcast_bis(int fd)
 
 	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (ret <= 0) {
-		printf("  FAIL: CONNECT for BIS test: ret=%d\n", ret);
+		test_fail("  FAIL: CONNECT for BIS test: ret=%d\n", ret);
 		printf("sync_mcast_bis: 0 OK / 10 FAIL\n");
 		return;
 	}
@@ -9987,7 +10295,7 @@ static void test_sync_mcast_bis(int fd)
 	inject.data_mps = 247;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &inject);
 	if (ret < 0) {
-		printf("  FAIL: INJECT_CONN_RESP for BIS test\n");
+		test_fail("  FAIL: INJECT_CONN_RESP for BIS test\n");
 		printf("sync_mcast_bis: 0 OK / 10 FAIL\n");
 		return;
 	}
@@ -10013,7 +10321,7 @@ static void test_sync_mcast_bis(int fd)
 		       big.big_id, big.link_count, big.handles_out[0], big.handles_out[1]);
 		ok_count++;
 	} else {
-		printf("  FAIL: BIG configure ret=%d\n", ret);
+		test_fail("  FAIL: BIG configure ret=%d\n", ret);
 		fail_count++;
 	}
 	uint16_t bis_h0 = big.handles_out[0];
@@ -10032,7 +10340,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   BIG create: %d links activated\n", ret);
 		ok_count++;
 	} else {
-		printf("  FAIL: BIG create ret=%d\n", ret);
+		test_fail("  FAIL: BIG create ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -10049,7 +10357,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   BIS datapath configured: dir=1, codec=0x%02x\n", dp.codec_id);
 		ok_count++;
 	} else {
-		printf("  FAIL: BIS datapath config ret=%d\n", ret);
+		test_fail("  FAIL: BIS datapath config ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -10072,7 +10380,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   BIS data send: ENODEV (no controller, expected)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: BIS data send: ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: BIS data send: ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -10086,7 +10394,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   data send without datapath rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EINVAL, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -10101,7 +10409,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   reject nonexistent mcast link (ENOENT)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected ENOENT, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected ENOENT, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -10113,7 +10421,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   accept Active mcast link rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EINVAL, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -10128,7 +10436,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   BIS info: Active, multicast, datapath=1\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: BIS info: state=%d type=%d dp=%d\n",
+		test_fail("  FAIL: BIS info: state=%d type=%d dp=%d\n",
 		       info.state, info.link_type, info.datapath_configured);
 		fail_count++;
 	}
@@ -10141,7 +10449,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   BIS datapath removed\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: BIS datapath remove ret=%d\n", ret);
+		test_fail("  FAIL: BIS datapath remove ret=%d\n", ret);
 		fail_count++;
 	}
 
@@ -10152,7 +10460,7 @@ static void test_sync_mcast_bis(int fd)
 		printf("  OK:   ucast accept on mcast link rejected (EINVAL)\n");
 		ok_count++;
 	} else {
-		printf("  FAIL: expected EINVAL, ret=%d errno=%d\n", ret, errno);
+		test_fail("  FAIL: expected EINVAL, ret=%d errno=%d\n", ret, errno);
 		fail_count++;
 	}
 
@@ -10277,7 +10585,7 @@ static void test_phy_extreme_params(int fd)
 		printf("  OK:   SINR get default: mcs0=%d mcs4=%d\n",
 		       sinr.thresholds[0], sinr.thresholds[4]);
 	} else {
-		printf("  FAIL: SINR get default ret=%d t0=%d t4=%d\n",
+		test_fail("  FAIL: SINR get default ret=%d t0=%d t4=%d\n",
 		       ret, sinr.thresholds[0], sinr.thresholds[4]);
 	}
 
@@ -10292,7 +10600,7 @@ static void test_phy_extreme_params(int fd)
 	if (ret == 0 && sinr.thresholds[4] == 30) {
 		printf("  OK:   SINR custom persisted: mcs4=%d\n", sinr.thresholds[4]);
 	} else {
-		printf("  FAIL: SINR custom not persisted: t4=%d\n", sinr.thresholds[4]);
+		test_fail("  FAIL: SINR custom not persisted: t4=%d\n", sinr.thresholds[4]);
 	}
 
 	/* Verify MCS select uses custom thresholds */
@@ -10304,7 +10612,7 @@ static void test_phy_extreme_params(int fd)
 		printf("  OK:   MCS select with custom SINR: mcs=%u (sinr=35, threshold=30)\n",
 		       sel.selected_mcs);
 	} else {
-		printf("  FAIL: MCS select with custom SINR: mcs=%u expected>=4\n",
+		test_fail("  FAIL: MCS select with custom SINR: mcs=%u expected>=4\n",
 		       sel.selected_mcs);
 	}
 
@@ -10361,7 +10669,7 @@ static void test_ssap_remote_ioctls(int fd)
 	if (ret < 0) {
 		printf("  OK:   EXCHANGE_INFO rejected (no conn): errno=%d\n", errno);
 	} else {
-		printf("  FAIL: EXCHANGE_INFO should fail without connection\n");
+		test_fail("  FAIL: EXCHANGE_INFO should fail without connection\n");
 	}
 
 	/* REMOTE_DISCOVER: should fail with no active connection */
@@ -10374,7 +10682,7 @@ static void test_ssap_remote_ioctls(int fd)
 	if (ret < 0) {
 		printf("  OK:   REMOTE_DISCOVER rejected (no conn): errno=%d\n", errno);
 	} else {
-		printf("  FAIL: REMOTE_DISCOVER should fail without connection\n");
+		test_fail("  FAIL: REMOTE_DISCOVER should fail without connection\n");
 	}
 
 	/* REMOTE_READ: should fail with no active connection */
@@ -10386,7 +10694,7 @@ static void test_ssap_remote_ioctls(int fd)
 	if (ret < 0) {
 		printf("  OK:   REMOTE_READ rejected (no conn): errno=%d\n", errno);
 	} else {
-		printf("  FAIL: REMOTE_READ should fail without connection\n");
+		test_fail("  FAIL: REMOTE_READ should fail without connection\n");
 	}
 
 	/* REMOTE_WRITE: should fail with no active connection */
@@ -10402,7 +10710,7 @@ static void test_ssap_remote_ioctls(int fd)
 	if (ret < 0) {
 		printf("  OK:   REMOTE_WRITE rejected (no conn): errno=%d\n", errno);
 	} else {
-		printf("  FAIL: REMOTE_WRITE should fail without connection\n");
+		test_fail("  FAIL: REMOTE_WRITE should fail without connection\n");
 	}
 
 	/* REMOTE_EVENT: should return EAGAIN when no events queued */
@@ -10414,7 +10722,7 @@ static void test_ssap_remote_ioctls(int fd)
 	} else if (ret < 0) {
 		printf("  OK:   REMOTE_EVENT rejected: errno=%d\n", errno);
 	} else {
-		printf("  FAIL: REMOTE_EVENT should fail with no events\n");
+		test_fail("  FAIL: REMOTE_EVENT should fail with no events\n");
 	}
 }
 
@@ -10446,7 +10754,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   READ_PEER_FEATURES rejects no connection: errno=%d\n", errno);
 		ok++;
 	} else {
-		printf("  FAIL: READ_PEER_FEATURES should fail without connection\n");
+		test_fail("  FAIL: READ_PEER_FEATURES should fail without connection\n");
 		fail++;
 	}
 
@@ -10458,7 +10766,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   READ_PEER_VERSION rejects no connection: errno=%d\n", errno);
 		ok++;
 	} else {
-		printf("  FAIL: READ_PEER_VERSION should fail without connection\n");
+		test_fail("  FAIL: READ_PEER_VERSION should fail without connection\n");
 		fail++;
 	}
 
@@ -10475,7 +10783,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_UPDATE_PARAMS rejects no connection: errno=%d\n", errno);
 		ok++;
 	} else {
-		printf("  FAIL: CONN_UPDATE_PARAMS should fail without connection\n");
+		test_fail("  FAIL: CONN_UPDATE_PARAMS should fail without connection\n");
 		fail++;
 	}
 
@@ -10490,7 +10798,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_PHY_UPDATE rejects no connection: errno=%d\n", errno);
 		ok++;
 	} else {
-		printf("  FAIL: CONN_PHY_UPDATE should fail without connection\n");
+		test_fail("  FAIL: CONN_PHY_UPDATE should fail without connection\n");
 		fail++;
 	}
 
@@ -10504,7 +10812,7 @@ static void test_capability_negotiation(int fd)
 	int handle = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (handle < 0) {
-		printf("  SKIP: cannot create connection for cap test\n");
+		test_skip("  SKIP: cannot create connection for cap test\n");
 		return;
 	}
 
@@ -10519,7 +10827,7 @@ static void test_capability_negotiation(int fd)
 	resp.data_mtu = 247;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  SKIP: cannot inject conn resp: %s\n", strerror(errno));
+		test_skip("  SKIP: cannot inject conn resp: %s\n", strerror(errno));
 		ioctl(fd, SL_IOCTL_DISCONNECT, &handle);
 		return;
 	}
@@ -10533,7 +10841,7 @@ static void test_capability_negotiation(int fd)
 		       pcap.features_valid);
 		ok++;
 	} else {
-		printf("  FAIL: READ_PEER_FEATURES errno=%d\n", errno);
+		test_fail("  FAIL: READ_PEER_FEATURES errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10546,7 +10854,7 @@ static void test_capability_negotiation(int fd)
 		       pcap.version_valid, pcap.version, pcap.manufacturer);
 		ok++;
 	} else {
-		printf("  FAIL: READ_PEER_VERSION errno=%d\n", errno);
+		test_fail("  FAIL: READ_PEER_VERSION errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10562,7 +10870,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_UPDATE_PARAMS succeeded\n");
 		ok++;
 	} else {
-		printf("  FAIL: CONN_UPDATE_PARAMS errno=%d\n", errno);
+		test_fail("  FAIL: CONN_UPDATE_PARAMS errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10575,11 +10883,11 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_INFO confirms timeout=200 after update\n");
 		ok++;
 	} else if (ret == 0) {
-		printf("  FAIL: CONN_INFO timeout=%u (expected 200)\n",
+		test_fail("  FAIL: CONN_INFO timeout=%u (expected 200)\n",
 		       ci.supervision_timeout);
 		fail++;
 	} else {
-		printf("  FAIL: CONN_INFO errno=%d\n", errno);
+		test_fail("  FAIL: CONN_INFO errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10593,7 +10901,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_PHY_UPDATE succeeded (mcs=8 bw=4)\n");
 		ok++;
 	} else {
-		printf("  FAIL: CONN_PHY_UPDATE errno=%d\n", errno);
+		test_fail("  FAIL: CONN_PHY_UPDATE errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10605,11 +10913,11 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_INFO confirms mcs=8 bw=4 after PHY update\n");
 		ok++;
 	} else if (ret == 0) {
-		printf("  FAIL: CONN_INFO mcs=%u bw=%u (expected 8, 4)\n",
+		test_fail("  FAIL: CONN_INFO mcs=%u bw=%u (expected 8, 4)\n",
 		       ci.mcs_index, ci.bandwidth_mhz);
 		fail++;
 	} else {
-		printf("  FAIL: CONN_INFO errno=%d\n", errno);
+		test_fail("  FAIL: CONN_INFO errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10623,7 +10931,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_PHY_UPDATE no-op accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: CONN_PHY_UPDATE no-op errno=%d\n", errno);
+		test_fail("  FAIL: CONN_PHY_UPDATE no-op errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10635,7 +10943,7 @@ static void test_capability_negotiation(int fd)
 		printf("  OK:   CONN_INFO still mcs=8 bw=4 after no-op\n");
 		ok++;
 	} else if (ret == 0) {
-		printf("  FAIL: params changed after no-op mcs=%u bw=%u\n",
+		test_fail("  FAIL: params changed after no-op mcs=%u bw=%u\n",
 		       ci.mcs_index, ci.bandwidth_mhz);
 		fail++;
 	}
@@ -10643,7 +10951,8 @@ static void test_capability_negotiation(int fd)
 	/* Cleanup: disconnect */
 	uint16_t h16 = (uint16_t)handle;
 
-	ioctl(fd, SL_IOCTL_DISCONNECT, &h16);
+	if (check("capability disconnect", ioctl(fd, SL_IOCTL_DISCONNECT, &h16)) >= 0)
+		check("capability disconnect completion", wait_conn_removed(fd, h16));
 
 	printf("  Capability negotiation: %d OK, %d FAIL\n", ok, fail);
 }
@@ -10687,7 +10996,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ReadAvailChannels (0x1809) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ReadAvailChannels (0x1809) errno=%d\n", errno);
+		test_fail("  FAIL: ReadAvailChannels (0x1809) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10701,7 +11010,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   SetCodingModulation (0x180A) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SetCodingModulation (0x180A) errno=%d\n", errno);
+		test_fail("  FAIL: SetCodingModulation (0x180A) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10717,7 +11026,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   SetBcastParam (0x0C02) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SetBcastParam (0x0C02) errno=%d\n", errno);
+		test_fail("  FAIL: SetBcastParam (0x0C02) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10738,7 +11047,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   SetBcastData (0x0C03) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SetBcastData (0x0C03) errno=%d\n", errno);
+		test_fail("  FAIL: SetBcastData (0x0C03) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10751,7 +11060,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ReadMaxBcastLen (0x0C06) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ReadMaxBcastLen (0x0C06) errno=%d\n", errno);
+		test_fail("  FAIL: ReadMaxBcastLen (0x0C06) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10764,7 +11073,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ReadBcastSetSize (0x0C07) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ReadBcastSetSize (0x0C07) errno=%d\n", errno);
+		test_fail("  FAIL: ReadBcastSetSize (0x0C07) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10778,7 +11087,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   DeleteBcastSet (0x0C08) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: DeleteBcastSet (0x0C08) errno=%d\n", errno);
+		test_fail("  FAIL: DeleteBcastSet (0x0C08) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10795,7 +11104,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   SetScanParam (0x1001) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SetScanParam (0x1001) errno=%d\n", errno);
+		test_fail("  FAIL: SetScanParam (0x1001) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10808,7 +11117,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   CancelConnection (0x1402) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: CancelConnection (0x1402) errno=%d\n", errno);
+		test_fail("  FAIL: CancelConnection (0x1402) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10821,7 +11130,7 @@ static void test_dli_extended_commands(int fd)
 	cp.gt_role = 1;
 	int handle = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 	if (handle < 0) {
-		printf("  SKIP: cannot create connection for power tests\n");
+		test_fail("  FAIL: cannot create connection for power tests: %s\n", strerror(errno));
 		printf("  Extended DLI commands: %d OK, %d FAIL\n", ok, fail);
 		return;
 	}
@@ -10837,7 +11146,7 @@ static void test_dli_extended_commands(int fd)
 	resp.data_mtu = 247;
 	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
 	if (ret < 0) {
-		printf("  SKIP: cannot inject conn resp\n");
+		test_fail("  FAIL: cannot inject power-test conn resp: %s\n", strerror(errno));
 		uint16_t dh = (uint16_t)handle;
 		ioctl(fd, SL_IOCTL_DISCONNECT, &dh);
 		printf("  Extended DLI commands: %d OK, %d FAIL\n", ok, fail);
@@ -10858,7 +11167,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   SetTxPower (0x180D) -5 dBm accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SetTxPower (0x180D) errno=%d\n", errno);
+		test_fail("  FAIL: SetTxPower (0x180D) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10873,7 +11182,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ReadTxPower (0x180E) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ReadTxPower (0x180E) errno=%d\n", errno);
+		test_fail("  FAIL: ReadTxPower (0x180E) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10888,7 +11197,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ReadPeerTxPower (0x180F) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ReadPeerTxPower (0x180F) errno=%d\n", errno);
+		test_fail("  FAIL: ReadPeerTxPower (0x180F) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10904,7 +11213,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ConfigPowerReport (0x1810) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ConfigPowerReport (0x1810) errno=%d\n", errno);
+		test_fail("  FAIL: ConfigPowerReport (0x1810) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10926,7 +11235,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   ConnParamReqReply (0x1808) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: ConnParamReqReply (0x1808) errno=%d\n", errno);
+		test_fail("  FAIL: ConnParamReqReply (0x1808) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10945,7 +11254,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   SetCtrlSignalData (0x1812) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SetCtrlSignalData (0x1812) errno=%d\n", errno);
+		test_fail("  FAIL: SetCtrlSignalData (0x1812) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -10962,7 +11271,7 @@ static void test_dli_extended_commands(int fd)
 		printf("  OK:   EnableRssiPowerCtrl (0x1813) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: EnableRssiPowerCtrl (0x1813) errno=%d\n", errno);
+		test_fail("  FAIL: EnableRssiPowerCtrl (0x1813) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11028,7 +11337,7 @@ static void test_dli_security_commands(int fd)
 	uint16_t h16 = (ret >= 0) ? (uint16_t)ret : 0;
 
 	if (ret < 0) {
-		printf("  WARN: connect for security tests failed, skipping conn-based tests\n");
+		test_skip("  SKIP: connect for security tests failed, skipping conn-based tests\n");
 	}
 
 	/* ---- Phase 1: Pairing exchange commands (need connection) ---- */
@@ -11055,7 +11364,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairInfoExchReply (0x1C09) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairInfoExchReply (0x1C09) errno=%d\n", errno);
+			test_fail("  FAIL: PairInfoExchReply (0x1C09) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11076,7 +11385,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairOptConfirm (0x1C0A) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairOptConfirm (0x1C0A) errno=%d\n", errno);
+			test_fail("  FAIL: PairOptConfirm (0x1C0A) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11093,7 +11402,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairOptAccept (0x1C0B) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairOptAccept (0x1C0B) errno=%d\n", errno);
+			test_fail("  FAIL: PairOptAccept (0x1C0B) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11110,7 +11419,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairExtData (0x1C0C) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairExtData (0x1C0C) errno=%d\n", errno);
+			test_fail("  FAIL: PairExtData (0x1C0C) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11126,7 +11435,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairPasskeyKey (0x1C0D) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairPasskeyKey (0x1C0D) errno=%d\n", errno);
+			test_fail("  FAIL: PairPasskeyKey (0x1C0D) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11143,7 +11452,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairRandom (0x1C0E) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairRandom (0x1C0E) errno=%d\n", errno);
+			test_fail("  FAIL: PairRandom (0x1C0E) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11160,7 +11469,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairConfirm (0x1C0F) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairConfirm (0x1C0F) errno=%d\n", errno);
+			test_fail("  FAIL: PairConfirm (0x1C0F) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11177,7 +11486,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   DhkeyVerify (0x1C10) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: DhkeyVerify (0x1C10) errno=%d\n", errno);
+			test_fail("  FAIL: DhkeyVerify (0x1C10) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11193,7 +11502,7 @@ static void test_dli_security_commands(int fd)
 			printf("  OK:   PairFail (0x1C11) accepted\n");
 			ok++;
 		} else {
-			printf("  FAIL: PairFail (0x1C11) errno=%d\n", errno);
+			test_fail("  FAIL: PairFail (0x1C11) errno=%d\n", errno);
 			fail++;
 		}
 
@@ -11220,7 +11529,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalReadSize (0x1C15) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalReadSize (0x1C15) errno=%d\n", errno);
+		test_fail("  FAIL: RalReadSize (0x1C15) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11247,7 +11556,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalAdd (0x1C12) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalAdd (0x1C12) errno=%d\n", errno);
+		test_fail("  FAIL: RalAdd (0x1C12) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11260,7 +11569,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalReadSize (0x1C15) after add\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalReadSize (0x1C15) errno=%d\n", errno);
+		test_fail("  FAIL: RalReadSize (0x1C15) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11280,7 +11589,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalReadPeerRpa (0x1C16) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalReadPeerRpa (0x1C16) errno=%d\n", errno);
+		test_fail("  FAIL: RalReadPeerRpa (0x1C16) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11300,7 +11609,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalReadLocalRpa (0x1C17) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalReadLocalRpa (0x1C17) errno=%d\n", errno);
+		test_fail("  FAIL: RalReadLocalRpa (0x1C17) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11314,7 +11623,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RpaSetEnable (0x1C18) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RpaSetEnable (0x1C18) errno=%d\n", errno);
+		test_fail("  FAIL: RpaSetEnable (0x1C18) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11329,7 +11638,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RpaSetTimeout (0x1C19) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RpaSetTimeout (0x1C19) errno=%d\n", errno);
+		test_fail("  FAIL: RpaSetTimeout (0x1C19) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11356,7 +11665,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalRemove (0x1C13) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalRemove (0x1C13) errno=%d\n", errno);
+		test_fail("  FAIL: RalRemove (0x1C13) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11369,7 +11678,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   RalClear (0x1C14) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: RalClear (0x1C14) errno=%d\n", errno);
+		test_fail("  FAIL: RalClear (0x1C14) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11402,7 +11711,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   SlbCfgAuthPsk (0x1C1A) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SlbCfgAuthPsk (0x1C1A) errno=%d\n", errno);
+		test_fail("  FAIL: SlbCfgAuthPsk (0x1C1A) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11421,7 +11730,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   SlbDelAuthPsk (0x1C1B) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SlbDelAuthPsk (0x1C1B) errno=%d\n", errno);
+		test_fail("  FAIL: SlbDelAuthPsk (0x1C1B) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11442,7 +11751,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   SlbCfgAuthPwd (0x1C1C) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SlbCfgAuthPwd (0x1C1C) errno=%d\n", errno);
+		test_fail("  FAIL: SlbCfgAuthPwd (0x1C1C) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11461,7 +11770,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   SlbDelAuthPwd (0x1C1D) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SlbDelAuthPwd (0x1C1D) errno=%d\n", errno);
+		test_fail("  FAIL: SlbDelAuthPwd (0x1C1D) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11478,7 +11787,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   SlbCfgCipher (0x1C1E) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SlbCfgCipher (0x1C1E) errno=%d\n", errno);
+		test_fail("  FAIL: SlbCfgCipher (0x1C1E) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11493,7 +11802,7 @@ static void test_dli_security_commands(int fd)
 		printf("  OK:   SlbReadCipher (0x1C1F) accepted\n");
 		ok++;
 	} else {
-		printf("  FAIL: SlbReadCipher (0x1C1F) errno=%d\n", errno);
+		test_fail("  FAIL: SlbReadCipher (0x1C1F) errno=%d\n", errno);
 		fail++;
 	}
 
@@ -11522,7 +11831,7 @@ static void test_async_event_pump(int fd)
 	int ret = ioctl(fd, SL_IOCTL_EVENT_STATS, &es0);
 
 	if (ret < 0) {
-		printf("  FAIL: EVENT_STATS baseline: %s\n", strerror(errno));
+		test_fail("  FAIL: EVENT_STATS baseline: %s\n", strerror(errno));
 		return;
 	}
 	printf("  OK:   EVENT_STATS baseline: enqueued=%lu dropped=%lu\n",
@@ -11559,7 +11868,7 @@ static void test_async_event_pump(int fd)
 	memset(&es1, 0, sizeof(es1));
 	ret = ioctl(fd, SL_IOCTL_EVENT_STATS, &es1);
 	if (ret < 0) {
-		printf("  FAIL: EVENT_STATS post-burst: %s\n", strerror(errno));
+		test_fail("  FAIL: EVENT_STATS post-burst: %s\n", strerror(errno));
 	} else {
 		uint64_t new_events = es1.total_enqueued - es0.total_enqueued;
 
@@ -11586,7 +11895,7 @@ static void test_async_event_pump(int fd)
 		printf("  OK:   DLI_POLL_EVENT: no events pending (EAGAIN)\n");
 		ok++;
 	} else {
-		printf("  FAIL: DLI_POLL_EVENT: %s\n", strerror(errno));
+		test_fail("  FAIL: DLI_POLL_EVENT: %s\n", strerror(errno));
 	}
 
 	/* Disconnect all handles */
@@ -11624,7 +11933,8 @@ static void test_rapid_connect_disconnect(int fd)
 	int created = 0, failed = 0;
 	struct timespec t0, t1;
 
-	set_role(fd, 0);
+	if (set_role(fd, 0) < 0)
+		return;
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int i = 0; i < cycles; i++) {
@@ -11643,8 +11953,11 @@ static void test_rapid_connect_disconnect(int fd)
 		if (ret > 0) {
 			uint16_t h = (uint16_t)ret;
 
-			ioctl(fd, SL_IOCTL_DISCONNECT, &h);
-			created++;
+			if (ioctl(fd, SL_IOCTL_DISCONNECT, &h) < 0 ||
+			    wait_conn_removed(fd, h) < 0)
+				failed++;
+			else
+				created++;
 		} else {
 			failed++;
 		}
@@ -11652,16 +11965,21 @@ static void test_rapid_connect_disconnect(int fd)
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	uint64_t ns = elapsed_ns(&t0, &t1);
 
-	printf("  OK:   %d/%d connect+disconnect cycles in %lu us\n",
-	       created, cycles, (unsigned long)(ns / 1000));
+	if (failed)
+		test_fail("  FAIL: %d/%d connect+disconnect cycles failed\n",
+			  failed, cycles);
+	else
+		printf("  OK:   %d/%d connect+disconnect cycles in %lu us\n",
+		       created, cycles, (unsigned long)(ns / 1000));
 
 	/* Verify no leaked connections */
 	int ret = ioctl(fd, SL_IOCTL_CONN_COUNT, NULL);
 
-	if (ret <= 0) {
+	if (ret == 0) {
 		printf("  OK:   No leaked connections (count=%d)\n", ret);
 	} else {
-		printf("  WARN: %d leaked connections after rapid cycling\n", ret);
+		test_fail("  FAIL: CONN_COUNT=%d after rapid cycling (errno=%d)\n",
+			  ret, errno);
 		disconnect_all(fd);
 	}
 
@@ -11670,7 +11988,7 @@ static void test_rapid_connect_disconnect(int fd)
 	if (ret >= 1) {
 		printf("  OK:   Subsystem healthy after rapid cycling\n");
 	} else {
-		printf("  WARN: DEV_COUNT=%d after rapid cycling\n", ret);
+		test_fail("  FAIL: DEV_COUNT=%d after rapid cycling\n", ret);
 	}
 }
 
@@ -11694,7 +12012,7 @@ static void test_multi_fd_stress(int fd)
 	}
 
 	if (opened < 2) {
-		printf("  FAIL: Could only open %d fds\n", opened);
+		test_fail("  FAIL: Could only open %d fds\n", opened);
 		for (i = 0; i < opened; i++)
 			close(fds[i]);
 		return;
@@ -11797,7 +12115,7 @@ static void test_data_path_saturation(int fd)
 	int ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
 
 	if (ret <= 0) {
-		printf("  FAIL: Cannot create connection for saturation test\n");
+		test_fail("  FAIL: Cannot create connection for saturation test\n");
 		return;
 	}
 	uint16_t handle = (uint16_t)ret;
@@ -11893,6 +12211,10 @@ static void test_state_machine_torture(int fd)
 	const int transitions = 30;
 	int ok = 0;
 	struct timespec t0, t1;
+	struct sle_dli_event ev;
+
+	while (ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &ev) == 0)
+		;
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -11901,19 +12223,27 @@ static void test_state_machine_torture(int fd)
 		struct sle_scan_params scan;
 
 		/* Cycle: TNode → scan → stop → GNode → adv → stop → TNode */
-		set_role(fd, 0); /* TNode */
+		if (set_role(fd, 0) < 0) /* TNode */
+			continue;
 		memset(&scan, 0, sizeof(scan));
 		scan.window_ms = 20;
 		scan.interval_ms = 40;
-		ioctl(fd, SL_IOCTL_START_SCAN, &scan);
-		ioctl(fd, SL_IOCTL_STOP_SCAN, NULL);
+		if (check("stress START_SCAN", ioctl(fd, SL_IOCTL_START_SCAN, &scan)) < 0 ||
+		    check("stress scan enabled", wait_dli_complete(fd, 0x1002, &ev)) < 0 ||
+		    check("stress STOP_SCAN", ioctl(fd, SL_IOCTL_STOP_SCAN, NULL)) < 0 ||
+		    check("stress scan disabled", wait_dli_complete(fd, 0x1002, &ev)) < 0)
+			continue;
 
-		set_role(fd, 1); /* GNode */
+		if (set_role(fd, 1) < 0) /* GNode */
+			continue;
 		memset(&adv, 0, sizeof(adv));
 		adv.discovery_level = 1;
 		adv.interval_ms = 50;
-		ioctl(fd, SL_IOCTL_START_ADV, &adv);
-		ioctl(fd, SL_IOCTL_STOP_ADV, NULL);
+		if (check("stress START_ADV", ioctl(fd, SL_IOCTL_START_ADV, &adv)) < 0 ||
+		    check("stress adv enabled", wait_dli_complete(fd, 0x0C05, &ev)) < 0 ||
+		    check("stress STOP_ADV", ioctl(fd, SL_IOCTL_STOP_ADV, NULL)) < 0 ||
+		    check("stress adv disabled", wait_dli_complete(fd, 0x0C05, &ev)) < 0)
+			continue;
 		ok++;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -11921,8 +12251,12 @@ static void test_state_machine_torture(int fd)
 
 	set_role(fd, 0);
 
-	printf("  OK:   %d role/adv/scan cycles in %lu ms\n",
-	       transitions, (unsigned long)(ns / 1000000));
+	if (ok != transitions)
+		test_fail("  FAIL: only %d/%d role/adv/scan cycles completed\n",
+			  ok, transitions);
+	else
+		printf("  OK:   %d role/adv/scan cycles in %lu ms\n",
+		       ok, (unsigned long)(ns / 1000000));
 
 	/* Mixed connect during transitions */
 	int connects = 0;
@@ -11938,13 +12272,16 @@ static void test_state_machine_torture(int fd)
 		if (ret > 0) {
 			uint16_t h = (uint16_t)ret;
 
-			connects++;
 			/* Immediately disconnect */
-			ioctl(fd, SL_IOCTL_DISCONNECT, &h);
+			if (check("stress DISCONNECT", ioctl(fd, SL_IOCTL_DISCONNECT, &h)) >= 0 &&
+			    check("stress disconnected", wait_conn_removed(fd, h)) >= 0)
+				connects++;
 		}
 	}
-	printf("  OK:   %d/20 connect+disconnect during transitions\n",
-	       connects);
+	if (connects != 20)
+		test_fail("  FAIL: only %d/20 connections during transitions\n", connects);
+	else
+		printf("  OK:   %d/20 connect+disconnect during transitions\n", connects);
 
 	/* Final health check */
 	int ret = ioctl(fd, SL_IOCTL_DEV_COUNT, NULL);
@@ -11953,12 +12290,10 @@ static void test_state_machine_torture(int fd)
 		printf("  OK:   Subsystem stable after %d transitions\n",
 		       transitions);
 	} else {
-		printf("  WARN: DEV_COUNT=%d after torture\n", ret);
+		test_fail("  FAIL: DEV_COUNT=%d after torture\n", ret);
 	}
 
 	/* Drain residual events */
-	struct sle_dli_event ev;
-
 	for (int i = 0; i < 64; i++) {
 		if (ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &ev) < 0)
 			break;
@@ -12170,7 +12505,7 @@ static void test_genetlink(void)
 	int nlfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 
 	if (nlfd < 0) {
-		printf("  FAIL: cannot open NETLINK_GENERIC socket: %s\n",
+		test_fail("  FAIL: cannot open NETLINK_GENERIC socket: %s\n",
 		       strerror(errno));
 		return;
 	}
@@ -12180,7 +12515,7 @@ static void test_genetlink(void)
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
 	if (bind(nlfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		printf("  FAIL: bind() failed: %s\n", strerror(errno));
+		test_fail("  FAIL: bind() failed: %s\n", strerror(errno));
 		close(nlfd);
 		return;
 	}
@@ -12189,7 +12524,7 @@ static void test_genetlink(void)
 	int family_id = genl_resolve_family(nlfd, SL_GENL_NAME);
 
 	if (family_id < 0) {
-		printf("  FAIL: cannot resolve genetlink family '%s'\n",
+		test_fail("  FAIL: cannot resolve genetlink family '%s'\n",
 		       SL_GENL_NAME);
 		close(nlfd);
 		return;
@@ -12207,10 +12542,10 @@ static void test_genetlink(void)
 		if (count != 0xDEAD) {
 			printf("  OK:   GET_DEV_INFO: dev_count=%u\n", count);
 		} else {
-			printf("  FAIL: GET_DEV_INFO: missing DEV_COUNT attr\n");
+			test_fail("  FAIL: GET_DEV_INFO: missing DEV_COUNT attr\n");
 		}
 	} else {
-		printf("  FAIL: GET_DEV_INFO failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_DEV_INFO failed (len=%d)\n", len);
 	}
 
 	/* Step 3: GET_VERSION command */
@@ -12225,10 +12560,10 @@ static void test_genetlink(void)
 			printf("  OK:   GET_VERSION: proto=0x%06x genl=%u\n",
 			       proto_ver, genl_ver);
 		} else {
-			printf("  FAIL: GET_VERSION: missing version attrs\n");
+			test_fail("  FAIL: GET_VERSION: missing version attrs\n");
 		}
 	} else {
-		printf("  FAIL: GET_VERSION failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_VERSION failed (len=%d)\n", len);
 	}
 
 	/* Step 4: GET_ROLE — query current role */
@@ -12241,10 +12576,10 @@ static void test_genetlink(void)
 			printf("  OK:   GET_ROLE: role=%u (%s)\n", role,
 			       role == 0 ? "TNode" : "GNode");
 		} else {
-			printf("  FAIL: GET_ROLE: missing GT_ROLE attr\n");
+			test_fail("  FAIL: GET_ROLE: missing GT_ROLE attr\n");
 		}
 	} else {
-		printf("  FAIL: GET_ROLE failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_ROLE failed (len=%d)\n", len);
 	}
 
 	/* Step 5: SET_ROLE to GNode (1) */
@@ -12279,9 +12614,9 @@ static void test_genetlink(void)
 		if (pm_state != 0xFF)
 			printf("  OK:   GET_PM_INFO: pm_state=%u\n", pm_state);
 		else
-			printf("  FAIL: GET_PM_INFO: missing PM_STATE attr\n");
+			test_fail("  FAIL: GET_PM_INFO: missing PM_STATE attr\n");
 	} else {
-		printf("  FAIL: GET_PM_INFO failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_PM_INFO failed (len=%d)\n", len);
 	}
 
 	/* Step 8: GET_DLI_INFO — controller information */
@@ -12293,9 +12628,9 @@ static void test_genetlink(void)
 		if (bus != 0xFF)
 			printf("  OK:   GET_DLI_INFO: bus=%u\n", bus);
 		else
-			printf("  FAIL: GET_DLI_INFO: missing DLI_BUS attr\n");
+			test_fail("  FAIL: GET_DLI_INFO: missing DLI_BUS attr\n");
 	} else {
-		printf("  FAIL: GET_DLI_INFO failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_DLI_INFO failed (len=%d)\n", len);
 	}
 
 	/* Step 9: START_ADV via genetlink */
@@ -12341,24 +12676,141 @@ static void test_genetlink(void)
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
 
-int main(void)
+#define SPARKLINK_TEST_CASES(X) \
+	X(test_dev_count, fd) \
+	X(test_dev_info, fd) \
+	X(test_dev_register, fd) \
+	X(test_role_management, fd) \
+	X(test_advertising, fd) \
+	X(test_scanning, fd) \
+	X(test_mutual_exclusion, fd) \
+	X(test_loopback, fd) \
+	X(test_loopback_filter, fd) \
+	X(test_connect, fd) \
+	X(test_conn_reject, fd) \
+	X(test_conn_data_loopback, fd) \
+	X(test_sm3_hash, fd) \
+	X(test_sm4_block, fd) \
+	X(test_hmac_sm3, fd) \
+	X(test_security_pairing, fd) \
+	X(test_security_ecdh, fd) \
+	X(test_security_numeric_comparison, fd) \
+	X(test_security_oob_pin_password, fd) \
+	X(test_rpa_management, fd) \
+	X(test_encrypted_data_path, fd) \
+	X(test_ssap_service, fd) \
+	X(test_ssap_dynamic_registration, fd) \
+	X(test_power_management, fd) \
+	X(test_unknown_ioctl, fd) \
+	X(test_event_notification, fd) \
+	X(test_event_stats, fd) \
+	X(test_dli_info, fd) \
+	X(test_usb_discovery, fd) \
+	X(test_dli_event_poll, fd) \
+	X(test_dli_routing, fd) \
+	X(test_poll_epoll, fd) \
+	X(test_ring_buffer_stress, fd) \
+	X(test_multi_conn_concurrent, fd) \
+	X(test_phy_layer, fd) \
+	X(test_ioctl_throughput, fd) \
+	X(test_configfs,) \
+	X(test_configfs_ioctl_integration, fd) \
+	X(test_multi_controller, fd) \
+	X(test_e2e_data_path, fd) \
+	X(test_air_medium_connect, fd) \
+	X(test_conn_invalid_handle, fd) \
+	X(test_air_medium_bidir, fd) \
+	X(test_conn_max_capacity, fd) \
+	X(test_ssap_indication, fd) \
+	X(test_ssap_service_discovery, fd) \
+	X(test_dev_switch_isolation, fd) \
+	X(test_per_fd_device_select, fd) \
+	X(test_ssap_prop_edge_cases, fd) \
+	X(test_scan_filter_reject, fd) \
+	X(test_scan_uuid_filter, fd) \
+	X(test_scan_filter_bounds, fd) \
+	X(test_measurement_stubs, fd) \
+	X(test_dli_mgmt_plane, fd) \
+	X(test_runtime_command_isolation, fd) \
+	X(test_conn_info_fields, fd) \
+	X(test_channel_tcid_standard, fd) \
+	X(test_dli_info_consistency, fd) \
+	X(test_ssap_multi_notify, fd) \
+	X(test_ssap_write_readonly, fd) \
+	X(test_conn_data_counters, fd) \
+	X(test_pm_state_transitions, fd) \
+	X(test_subsys_stats, fd) \
+	X(test_pm_param_validation, fd) \
+	X(test_conn_send_bounds, fd) \
+	X(test_ssap_permission_matrix, fd) \
+	X(test_conn_stale_handle_ops, fd) \
+	X(test_dli_opcode_validation, fd) \
+	X(test_event_overflow, fd) \
+	X(test_security_state_machine, fd) \
+	X(test_adv_scan_role_enforcement, fd) \
+	X(test_conn_list_accuracy, fd) \
+	X(test_dli_reset_behavior, fd) \
+	X(test_ssap_capacity_stress, fd) \
+	X(test_ssap_air_interface, fd) \
+	X(test_credit_flow_control, fd) \
+	X(test_supervision_timeout, fd) \
+	X(test_crc12_verification, fd) \
+	X(test_mtu_mps_negotiation, fd) \
+	X(test_afh_channel_map, fd) \
+	X(test_ext_advertising, fd) \
+	X(test_sync_link_management, fd) \
+	X(test_sync_mcast_bis, fd) \
+	X(test_phy_extreme_params, fd) \
+	X(test_ssap_remote_ioctls, fd) \
+	X(test_capability_negotiation, fd) \
+	X(test_dli_extended_commands, fd) \
+	X(test_dli_security_commands, fd) \
+	X(test_async_event_pump, fd) \
+	X(test_rapid_connect_disconnect, fd) \
+	X(test_multi_fd_stress, fd) \
+	X(test_data_path_saturation, fd) \
+	X(test_state_machine_torture, fd) \
+	X(test_usb_controller_ops, fd) \
+	X(test_ioctl_fuzz, fd) \
+	X(test_genetlink,)
+
+#define LIST_TEST(name, ...) puts(#name);
+#define RUN_TEST(name, ...) do { \
+	unsigned int failures_before = failed_assertions; \
+	unsigned int skips_before = skipped_checks; \
+	printf("SPARKLINK_CASE_BEGIN: %s\n", #name); \
+	name(__VA_ARGS__); \
+	completed_cases++; \
+	printf("SPARKLINK_CASE_END: %s %s\n", #name, \
+	       failed_assertions != failures_before ? "FAIL" : \
+	       skipped_checks != skips_before ? "SKIP" : "PASS"); \
+} while (0);
+
+int main(int argc, char **argv)
 {
+	int fd;
+
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (argc == 2 && !strcmp(argv[1], "--list-tests")) {
+		SPARKLINK_TEST_CASES(LIST_TEST)
+		return EXIT_SUCCESS;
+	}
+	if (argc != 1) {
+		fprintf(stderr, "Usage: %s [--list-tests]\n", argv[0]);
+		return EXIT_FAILURE;
+	}
+
 	printf("SparkLink userspace test program\n");
 	printf("Device: %s\n", DEVICE);
-
-	int fd = open(DEVICE, O_RDWR | O_NONBLOCK);
-
+	fd = open(DEVICE, O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
 		fprintf(stderr, "Cannot open %s: %s\n", DEVICE, strerror(errno));
 		fprintf(stderr, "Make sure the sparklink module is loaded and you have appropriate permissions.\n");
-		return 1;
+		return EXIT_FAILURE;
 	}
 	printf("Opened %s (fd=%d)\n", DEVICE, fd);
 
-	/*
-	 * Try switching to sle0 so that tests run against the first
-	 * registered USB controller (from QEMU usb-sle-dli).
-	 */
+	/* Run against the first QEMU USB controller when it is present. */
 	{
 		uint16_t dev0 = 0;
 
@@ -12366,104 +12818,10 @@ int main(void)
 			printf("Switched to sle0\n");
 	}
 
-	test_dev_count(fd);
-	test_dev_info(fd);
-	test_dev_register(fd);
-	test_role_management(fd);
-	test_advertising(fd);
-	test_scanning(fd);
-	test_mutual_exclusion(fd);
-	test_loopback(fd);
-	test_loopback_filter(fd);
-	test_connect(fd);
-	test_conn_reject(fd);
-	test_conn_data_loopback(fd);
-	test_sm3_hash(fd);
-	test_sm4_block(fd);
-	test_hmac_sm3(fd);
-	test_security_pairing(fd);
-	test_security_ecdh(fd);
-	test_security_numeric_comparison(fd);
-	test_security_oob_pin_password(fd);
-	test_rpa_management(fd);
-	test_encrypted_data_path(fd);
-	test_ssap_service(fd);
-	test_ssap_dynamic_registration(fd);
-	test_power_management(fd);
-	test_unknown_ioctl(fd);
-	test_event_notification(fd);
-	test_event_stats(fd);
-	test_dli_info(fd);
-	test_usb_discovery(fd);
-	test_dli_event_poll(fd);
-	test_dli_routing(fd);
-	test_poll_epoll(fd);
-	test_ring_buffer_stress(fd);
-	test_multi_conn_concurrent(fd);
-	test_phy_layer(fd);
-	test_ioctl_throughput(fd);
-	test_configfs();
-	test_configfs_ioctl_integration(fd);
-	test_multi_controller(fd);
-	test_e2e_data_path(fd);
-	test_air_medium_connect(fd);
-	test_conn_invalid_handle(fd);
-	test_air_medium_bidir(fd);
-	test_conn_max_capacity(fd);
-	test_ssap_indication(fd);
-	test_ssap_service_discovery(fd);
-	test_dev_switch_isolation(fd);
-	test_per_fd_device_select(fd);
-	test_ssap_prop_edge_cases(fd);
-	test_scan_filter_reject(fd);
-	test_scan_uuid_filter(fd);
-	test_scan_filter_bounds(fd);
-	test_measurement_stubs(fd);
-	test_dli_mgmt_plane(fd);
-	test_conn_info_fields(fd);
-	test_channel_tcid_standard(fd);
-	test_dli_info_consistency(fd);
-	test_ssap_multi_notify(fd);
-	test_ssap_write_readonly(fd);
-	test_conn_data_counters(fd);
-	test_pm_state_transitions(fd);
-	test_subsys_stats(fd);
-	test_pm_param_validation(fd);
-	test_conn_send_bounds(fd);
-	test_ssap_permission_matrix(fd);
-	test_conn_stale_handle_ops(fd);
-	test_dli_opcode_validation(fd);
-	test_event_overflow(fd);
-	test_security_state_machine(fd);
-	test_adv_scan_role_enforcement(fd);
-	test_conn_list_accuracy(fd);
-	test_dli_reset_behavior(fd);
-	test_ssap_capacity_stress(fd);
-	test_ssap_air_interface(fd);
-	test_credit_flow_control(fd);
-	test_supervision_timeout(fd);
-	test_crc12_verification(fd);
-	test_mtu_mps_negotiation(fd);
-	test_afh_channel_map(fd);
-	test_ext_advertising(fd);
-	test_sync_link_management(fd);
-	test_sync_mcast_bis(fd);
-	test_phy_extreme_params(fd);
-	test_ssap_remote_ioctls(fd);
-	test_capability_negotiation(fd);
-	test_dli_extended_commands(fd);
-	test_dli_security_commands(fd);
-	test_async_event_pump(fd);
-	test_rapid_connect_disconnect(fd);
-	test_multi_fd_stress(fd);
-	test_data_path_saturation(fd);
-	test_state_machine_torture(fd);
-	test_usb_controller_ops(fd);
-	test_ioctl_fuzz(fd);
-	test_genetlink();
-
+	SPARKLINK_TEST_CASES(RUN_TEST)
 	printf("\n=== All tests completed ===\n");
-
+	printf("SPARKLINK_TEST_SUMMARY: cases=%u failed=%u skipped=%u\n",
+	       completed_cases, failed_assertions, skipped_checks);
 	close(fd);
-	return 0;
+	return test_exit_status();
 }

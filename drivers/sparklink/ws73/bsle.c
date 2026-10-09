@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#ifdef __KERNEL__
+#include <linux/errno.h>
+#else
+#include <errno.h>
+#endif
+
+#include "bsle.h"
+
+#define WS73_BSLE_STAGE_MS 10000U
+#define WS73_BSLE_POLL_MS 500U
+#define WS73_BSLE_PANIC (1U << 6)
+
+struct ws73_ack {
+	unsigned int type;
+	unsigned int message;
+	int found;
+};
+
+static int ws73_ack_receive(void *context, unsigned int service, unsigned int queue,
+			    const unsigned char *data, size_t size)
+{
+	struct ws73_ack *ack = context;
+	unsigned int type, message;
+	int ret;
+
+	if (service != WS73_WIRE_BSLE_SERVICE || queue != WS73_WIRE_BSLE_QUEUE)
+		return 0;
+	ret = ws73_wire_status(data, size, &type, &message);
+	if (ret == -ENOMSG)
+		return 0;
+	if (ret)
+		return ret;
+	if (type == ack->type && message == ack->message)
+		ack->found = 1;
+	return 0;
+}
+
+static int ws73_wait(struct ws73_bsle_io *io, int bsp, unsigned int message)
+{
+	unsigned long long deadline = io->now_ms(io->context) + WS73_BSLE_STAGE_MS;
+	struct ws73_ack ack = { .type = 2, .message = message };
+
+	for (;;) {
+		unsigned long long now = io->now_ms(io->context);
+		unsigned int timeout, bits = 0;
+		int ret;
+
+		if (now >= deadline)
+			return -ETIMEDOUT;
+		timeout = deadline - now;
+		if (timeout > WS73_BSLE_POLL_MS)
+			timeout = WS73_BSLE_POLL_MS;
+		if (!bsp) {
+			ret = io->receive(io->context, timeout);
+			if (ret < 0 && ret != -ETIMEDOUT)
+				return ret;
+			if (ret > 0) {
+				if ((size_t)ret > io->rx_capacity)
+					return -EOVERFLOW;
+				ret = ws73_wire_receive(io->rx, ret, ws73_ack_receive, &ack);
+				if (ret)
+					return ret;
+			}
+			/* Check panic even under continuous bulk traffic. */
+			now = io->now_ms(io->context);
+			if (now >= deadline)
+				return -ETIMEDOUT;
+			timeout = deadline - now;
+			if (timeout > 20)
+				timeout = 20;
+		}
+		ret = io->notification(io->context, timeout, &bits);
+		if (ret < 0 && ret != -ETIMEDOUT)
+			return ret;
+		if (!ret && bits & WS73_BSLE_PANIC)
+			return -EIO;
+		if (io->now_ms(io->context) >= deadline)
+			return -ETIMEDOUT;
+		if ((bsp && !ret && (bits & 1)) || (!bsp && ack.found))
+			return 0;
+	}
+}
+
+static int ws73_send_control(struct ws73_bsle_io *io, unsigned int descriptor,
+			     unsigned int queue)
+{
+	int ret = ws73_wire_control(io->tx, io->tx_capacity, *io->sequence,
+				    descriptor, queue);
+
+	if (ret < 0)
+		return ret;
+	(*io->sequence)++;
+	return io->send(io->context, ret);
+}
+
+int ws73_bsle_start(struct ws73_bsle_io *io, const unsigned char *pm, size_t pm_size,
+		    const unsigned char *custom, size_t custom_size)
+{
+	int ret;
+
+	if (!io || !io->tx || !io->rx || !io->sequence || !io->now_ms ||
+	    !io->send || !io->receive || !io->notification || !io->open || !io->phase ||
+	    io->tx_capacity < WS73_WIRE_CUSTOM_SIZE || io->rx_capacity < WS73_WIRE_RX_HEADER_SIZE ||
+	    io->rx_capacity > WS73_WIRE_RX_MAX || !pm || pm_size != 4 ||
+	    !custom || custom_size != WS73_WIRE_CUSTOM_DATA_SIZE)
+		return -EINVAL;
+	io->phase(io->context, WS73_BSLE_WAIT_BSP);
+	ret = ws73_wait(io, 1, 0);
+	if (ret)
+		return ret;
+
+	io->phase(io->context, WS73_BSLE_CONFIGURING);
+	ret = ws73_send_control(io, 1, 9);
+	if (ret)
+		return ret;
+	ret = ws73_send_control(io, 0, 0);
+	if (ret)
+		return ret;
+	ret = ws73_wire_pm(io->tx, io->tx_capacity, *io->sequence, pm, pm_size);
+	if (ret < 0)
+		return ret;
+	(*io->sequence)++;
+	ret = io->send(io->context, ret);
+	if (ret)
+		return ret;
+	ret = ws73_send_control(io, 1, WS73_WIRE_BSLE_QUEUE);
+	if (ret)
+		return ret;
+	ret = ws73_send_control(io, 0, 0);
+	if (ret)
+		return ret;
+	ret = ws73_wire_customize(io->tx, io->tx_capacity, *io->sequence, custom, custom_size);
+	if (ret < 0)
+		return ret;
+	(*io->sequence)++;
+	ret = io->send(io->context, ret);
+	if (ret)
+		return ret;
+
+	io->phase(io->context, WS73_BSLE_WAIT_CUSTOMIZE);
+	ret = ws73_wait(io, 0, 2);
+	if (ret)
+		return ret;
+	io->phase(io->context, WS73_BSLE_OPENING);
+	ret = io->open(io->context);
+	if (ret)
+		return ret;
+	io->phase(io->context, WS73_BSLE_WAIT_BOOT);
+	/* DEVICE_ACTION_STATUS(SLE_OPEN) is not BOOT_FINISH. */
+	ret = ws73_wait(io, 0, 1);
+	if (!ret)
+		io->phase(io->context, WS73_BSLE_TRANSPORT_OPEN);
+	return ret;
+}

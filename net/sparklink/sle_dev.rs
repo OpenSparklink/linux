@@ -66,6 +66,13 @@ pub(crate) struct SleDevStats {
 /// Maximum device name length (including NUL terminator).
 const SLE_DEV_NAME_LEN: usize = 16;
 
+/// A registration identity. An index may be reused; a generation never is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeviceIdentity {
+    pub(crate) id: u16,
+    pub(crate) generation: u64,
+}
+
 /// Per-controller device object, analogous to Bluetooth's `hci_dev`.
 ///
 /// Tracks device identity (index, name, address, bus type), lifecycle
@@ -78,6 +85,7 @@ const SLE_DEV_NAME_LEN: usize = 16;
 pub(crate) struct SleDev {
     /// Unique device index (0-based), allocated from `SleDevRegistry`.
     pub(crate) id: u16,
+    generation: u64,
     /// Device name, e.g. `"sle0"`, NUL-terminated.
     pub(crate) name: [u8; SLE_DEV_NAME_LEN],
     /// Transport bus type.
@@ -99,7 +107,7 @@ pub(crate) struct SleDev {
 impl SleDev {
     /// Create a new `SleDev` from controller info. The device starts in
     /// the `SETUP` state with no flags set until `setup_complete()` is called.
-    pub(crate) fn new(id: u16, info: &SleControllerInfo) -> Self {
+    pub(crate) fn new(id: u16, generation: u64, info: &SleControllerInfo) -> Self {
         let mut name = [0u8; SLE_DEV_NAME_LEN];
         // Format name as "sleN\0".
         let prefix = b"sle";
@@ -119,6 +127,7 @@ impl SleDev {
 
         Self {
             id,
+            generation,
             name,
             bus: info.bus,
             addr: info.addr,
@@ -135,6 +144,10 @@ impl SleDev {
     /// Device index.
     pub(crate) fn id(&self) -> u16 {
         self.id
+    }
+
+    pub(crate) fn identity(&self) -> DeviceIdentity {
+        DeviceIdentity { id: self.id, generation: self.generation }
     }
 
     /// Device name as a byte slice (without trailing NUL bytes).
@@ -236,6 +249,7 @@ pub(crate) struct SleDevRegistry {
     slots: [Option<SleDev>; SLE_DEV_MAX],
     /// Bitmask of allocated IDs (bit N = 1 means slot N is occupied).
     allocated: u16,
+    next_generation: u64,
 }
 
 impl SleDevRegistry {
@@ -245,22 +259,35 @@ impl SleDevRegistry {
         Self {
             slots: [NONE; SLE_DEV_MAX],
             allocated: 0,
+            next_generation: 1,
         }
     }
 
     /// Register a new device from controller info. Returns the allocated
     /// device index on success, or `ENOSPC` if the registry is full.
     pub(crate) fn register(&mut self, info: &SleControllerInfo) -> Result<u16> {
+        self.register_state(info, true)
+    }
+
+    /// Reserve an identity without claiming initialization/Ready succeeded.
+    pub(crate) fn register_pending(&mut self, info: &SleControllerInfo) -> Result<u16> {
+        self.register_state(info, false)
+    }
+
+    fn register_state(&mut self, info: &SleControllerInfo, ready: bool) -> Result<u16> {
         // Find first free bit.
         let free = (!self.allocated).trailing_zeros();
         if free as usize >= SLE_DEV_MAX {
             return Err(ENOSPC);
         }
         let id = free as u16;
+        let generation = self.next_generation;
+        // Exhaustion must fail closed instead of reviving an old fd identity.
+        self.next_generation = generation.checked_add(1).ok_or(ENOSPC)?;
         self.allocated |= 1 << id;
 
-        let dev = SleDev::new(id, info);
-        dev.setup_complete();
+        let dev = SleDev::new(id, generation, info);
+        if ready { dev.setup_complete(); }
         self.slots[id as usize] = Some(dev);
 
         pr_info!("sparklink: registered device sle{} (bus={:?}, addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})\n",

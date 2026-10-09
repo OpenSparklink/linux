@@ -496,6 +496,7 @@ impl SleController for UartController {
         pr_debug!("sparklink-uart: cmd 0x{:04x} len={}\n", opcode as u16, len);
         self.enqueue_event(SleEvent::CommandComplete {
             opcode,
+            command_credits: 1,
             status: SleStatus::Success,
             data: KVec::new(),
         });

@@ -56,6 +56,16 @@ impl ControllerEventRing {
         }
     }
 
+    /// Initialize the ingress array in its final heap allocation.
+    pub(crate) fn new_boxed() -> Result<KBox<Self>> {
+        KBox::init(init!(Self {
+            events <- pin_init::init_array_from_fn(|_| (None, None)),
+            head: 0,
+            tail: 0,
+            dropped: 0,
+        }), GFP_KERNEL)
+    }
+
     /// Push an event with an optional source device id.
     /// Returns `true` if the event was stored, `false` if dropped (ring full).
     pub(crate) fn push_tagged(&mut self, dev_id: Option<u16>, ev: SleEvent) -> bool {
@@ -86,6 +96,10 @@ impl ControllerEventRing {
 
     pub(crate) fn pop(&mut self) -> Option<SleEvent> {
         self.pop_tagged().map(|(_, ev)| ev)
+    }
+
+    pub(crate) fn pending(&self) -> usize {
+        (self.tail + CTRL_EVENT_RING_SIZE - self.head) % CTRL_EVENT_RING_SIZE
     }
 }
 
@@ -804,16 +818,28 @@ pub enum DliEventCode {
 
 /// An event from the controller to the host.
 pub enum SleEvent {
+    /// Unsolicited opcode-zero command credit update; not a transaction result.
+    CommandCredits { credits: u8 },
     /// Command completed with status and optional return data.
     CommandComplete {
         opcode: SleOpcode,
+        command_credits: u8,
         status: SleStatus,
         data: KVec<u8>,
     },
     /// Command pending (asynchronous processing started).
     CommandStatus {
         opcode: SleOpcode,
+        command_credits: u8,
         status: SleStatus,
+    },
+    /// Native dialect command result: exact opcode and status, without enum aliases.
+    NativeCommandReply {
+        opcode: u16,
+        command_credits: u8,
+        status: u8,
+        complete: bool,
+        data: KVec<u8>,
     },
     /// Advertising / broadcast report received during scanning.
     AdvReport {
@@ -1164,6 +1190,7 @@ pub enum ControllerBackend {
     Spi(super::sle_spi::SpiController),
     Usb(super::sle_usb::UsbController),
     Serdev(super::sle_serdev::SerdevController),
+    Ws73(super::sle_native::NativeController),
 }
 
 // SAFETY: ControllerBackend is always stored inside Mutex<ControllerBackend>
@@ -1194,8 +1221,8 @@ impl ControllerBackend {
         Self::Spi(super::sle_spi::SpiController::new(addr, config))
     }
 
-    pub fn new_usb(addr: [u8; 6], dev_id: u16) -> Self {
-        Self::Usb(super::sle_usb::UsbController::new(addr, dev_id))
+    pub fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
+        Self::Usb(super::sle_usb::UsbController::new(addr, identity))
     }
 
     pub fn new_serdev(addr: [u8; 6], dev_id: u16) -> Self {
@@ -1340,6 +1367,25 @@ pub fn sle_opcode_from_u16(v: u16) -> Option<SleOpcode> {
 }
 
 impl ControllerBackend {
+    pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
+        match self {
+            Self::Ws73(c) => c.validate_command(opcode, params),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn uses_command_host(&self) -> bool {
+        matches!(self, Self::Usb(_) | Self::Ws73(_))
+    }
+
+    pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {
+        match self {
+            Self::Usb(c) => c.send_command_transport(opcode, params),
+            Self::Ws73(c) => c.send_command_transport(opcode, params),
+            _ => Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
+        }
+    }
+
     /// Send a command using a raw opcode value (u16).
     ///
     /// Used by the management plane DLI_SEND_CMD ioctl where the opcode
@@ -1437,6 +1483,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.info(),
             Self::Spi(c) => c.info(),
             Self::Usb(c) => c.info(),
+            Self::Ws73(c) => c.info(),
             Self::Serdev(c) => c.info(),
         }
     }
@@ -1447,6 +1494,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.open(),
             Self::Spi(c) => c.open(),
             Self::Usb(c) => c.open(),
+            Self::Ws73(c) => c.open(),
             Self::Serdev(c) => c.open(),
         }
     }
@@ -1457,6 +1505,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.close(),
             Self::Spi(c) => c.close(),
             Self::Usb(c) => c.close(),
+            Self::Ws73(c) => c.close(),
             Self::Serdev(c) => c.close(),
         }
     }
@@ -1467,6 +1516,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.send_command(opcode, params),
             Self::Spi(c) => c.send_command(opcode, params),
             Self::Usb(c) => c.send_command(opcode, params),
+            Self::Ws73(c) => c.send_command(opcode, params),
             Self::Serdev(c) => c.send_command(opcode, params),
         }
     }
@@ -1477,6 +1527,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.send_data(handle, data),
             Self::Spi(c) => c.send_data(handle, data),
             Self::Usb(c) => c.send_data(handle, data),
+            Self::Ws73(c) => c.send_data(handle, data),
             Self::Serdev(c) => c.send_data(handle, data),
         }
     }
@@ -1487,6 +1538,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.poll_event(),
             Self::Spi(c) => c.poll_event(),
             Self::Usb(c) => c.poll_event(),
+            Self::Ws73(c) => c.poll_event(),
             Self::Serdev(c) => c.poll_event(),
         }
     }
@@ -1497,6 +1549,7 @@ impl SleController for ControllerBackend {
             Self::Uart(c) => c.reset(),
             Self::Spi(c) => c.reset(),
             Self::Usb(c) => c.reset(),
+            Self::Ws73(c) => c.reset(),
             Self::Serdev(c) => c.reset(),
         }
     }

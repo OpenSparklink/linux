@@ -76,7 +76,10 @@ impl CmdPendingEntry {
 
     /// Check whether this entry has been resolved (complete or timeout).
     pub(crate) fn is_resolved(&self) -> bool {
-        self.status.load(Ordering::Acquire) & CMD_RESOLVED_BIT != 0
+        let status = self.status.load(Ordering::Acquire);
+        // The pending sentinel is u32::MAX, so its high bit is also set.
+        // It must be excluded before testing the resolved-status bit.
+        status != CMD_STATUS_PENDING && status & CMD_RESOLVED_BIT != 0
     }
 
     /// Resolve this entry with a CommandComplete result.
@@ -101,7 +104,7 @@ impl CmdPendingEntry {
     /// Returns `None` if still pending.
     pub(crate) fn result_status(&self) -> Option<u8> {
         let v = self.status.load(Ordering::Acquire);
-        if v & CMD_RESOLVED_BIT != 0 {
+        if v != CMD_STATUS_PENDING && v & CMD_RESOLVED_BIT != 0 {
             if v == CMD_TIMEOUT_STATUS {
                 None // timeout — no DLI status
             } else {
@@ -152,6 +155,20 @@ pub(crate) struct CmdPendingQueue {
 }
 
 impl CmdPendingQueue {
+    /// Build entries directly in the owner's allocation, without a large
+    /// temporary array whose elimination would depend on optimization.
+    pub(crate) fn new_in_place() -> impl pin_init::Init<Self> {
+        init!(Self {
+            entries <- pin_init::init_array_from_fn(|_| None),
+            tail: 0,
+            next_seq: 1,
+            pending_count: 0,
+            total_submitted: 0,
+            total_resolved: 0,
+            total_timeouts: 0,
+        })
+    }
+
     /// Create an empty queue.
     pub(crate) const fn new() -> Self {
         const NONE: Option<CmdPendingEntry> = None;
@@ -177,12 +194,22 @@ impl CmdPendingQueue {
         if self.pending_count as usize >= CMD_QUEUE_DEPTH {
             return Err(EBUSY);
         }
+        // A resolved hole must not cause tail to overwrite another live
+        // transaction. Find an available slot before assigning a sequence.
+        let slot = (0..CMD_QUEUE_DEPTH)
+            .map(|offset| (self.tail + offset) % CMD_QUEUE_DEPTH)
+            .find(|&index| {
+                self.entries[index]
+                    .as_ref()
+                    .is_none_or(|entry| entry.is_resolved())
+            })
+            .ok_or(EBUSY)?;
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
 
         let entry = CmdPendingEntry::new(opcode, seq, timeout_ms);
-        self.entries[self.tail] = Some(entry);
-        self.tail = (self.tail + 1) % CMD_QUEUE_DEPTH;
+        self.entries[slot] = Some(entry);
+        self.tail = (slot + 1) % CMD_QUEUE_DEPTH;
         self.pending_count += 1;
         self.total_submitted += 1;
         Ok(seq)
@@ -201,6 +228,39 @@ impl CmdPendingQueue {
             }
         }
         false
+    }
+
+    /// Resolve only the sequence captured when this owner's command was
+    /// issued. Internal/unmatched USB replies cannot consume a raw entry.
+    pub(crate) fn resolve_seq(&mut self, seq: u32, status: u8, data: &[u8]) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        for entry in self.entries.iter_mut().flatten() {
+            if entry.seq == seq && entry.is_pending() {
+                entry.resolve(status, data);
+                self.pending_count = self.pending_count.saturating_sub(1);
+                self.total_resolved += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Roll back a submission rejected by the bounded transmit queue. The
+    /// caller holds the protocol mutex, so no other consumer can resolve it.
+    pub(crate) fn rollback(&mut self, seq: u32) {
+        for slot in &mut self.entries {
+            if slot
+                .as_ref()
+                .is_some_and(|entry| entry.seq == seq && entry.is_pending())
+            {
+                *slot = None;
+                self.pending_count = self.pending_count.saturating_sub(1);
+                self.total_submitted = self.total_submitted.saturating_sub(1);
+                return;
+            }
+        }
     }
 
     /// Expire all entries whose deadline has passed.
@@ -252,10 +312,14 @@ impl CmdPendingQueue {
 // ---------------------------------------------------------------------------
 
 /// Maximum parameter length per command request.
-const CMD_REQ_PARAM_MAX: usize = 240;
+const CMD_REQ_PARAM_MAX: usize = 255;
 
 /// Command request to be sent to the controller asynchronously.
 pub(crate) struct CmdRequest {
+    /// Raw pending sequence; zero is an internal typed command.
+    pub(crate) seq: u32,
+    pub(crate) cookie: u64,
+    pub(crate) deadline: u64,
     /// DLI opcode (raw u16).
     pub(crate) opcode: u16,
     /// Parameter data.
@@ -279,6 +343,16 @@ pub(crate) struct CmdRequestQueue {
 }
 
 impl CmdRequestQueue {
+    /// Initialize the 64 request slots at their final heap addresses.
+    pub(crate) fn new_in_place() -> impl pin_init::Init<Self> {
+        init!(Self {
+            entries <- pin_init::init_array_from_fn(|_| None),
+            head: 0,
+            tail: 0,
+            count: 0,
+        })
+    }
+
     /// Create an empty queue.
     pub(crate) const fn new() -> Self {
         const NONE: Option<CmdRequest> = None;
@@ -292,13 +366,35 @@ impl CmdRequestQueue {
 
     /// Enqueue a command request. Returns `EBUSY` if the queue is full.
     pub(crate) fn push(&mut self, opcode: u16, params: &[u8]) -> Result {
+        self.push_tracked(opcode, params, 0)
+    }
+
+    pub(crate) fn push_tracked(&mut self, opcode: u16, params: &[u8], seq: u32) -> Result {
+        self.push_cookie(opcode, params, seq, 0)
+    }
+
+    pub(crate) fn push_cookie(
+        &mut self,
+        opcode: u16,
+        params: &[u8],
+        seq: u32,
+        cookie: u64,
+    ) -> Result {
+        if params.len() > CMD_REQ_PARAM_MAX {
+            return Err(EINVAL);
+        }
         if self.count as usize >= CMD_REQ_QUEUE_DEPTH {
             return Err(EBUSY);
         }
         let mut req = CmdRequest {
+            seq,
+            cookie,
+            // SAFETY: reading jiffies is safe; queued work has a bounded lifetime.
+            deadline: unsafe { kernel::bindings::jiffies_64 }
+                .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64),
             opcode,
             params: [0u8; CMD_REQ_PARAM_MAX],
-            param_len: params.len().min(CMD_REQ_PARAM_MAX) as u16,
+            param_len: params.len() as u16,
         };
         let copy_len = req.param_len as usize;
         req.params[..copy_len].copy_from_slice(&params[..copy_len]);
@@ -319,6 +415,12 @@ impl CmdRequestQueue {
             self.count -= 1;
         }
         req
+    }
+
+    pub(crate) fn first_deadline(&self) -> Option<u64> {
+        self.entries[self.head]
+            .as_ref()
+            .map(|request| request.deadline)
     }
 
     /// Number of queued requests.

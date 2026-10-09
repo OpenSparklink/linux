@@ -29,60 +29,138 @@ use kernel::usb;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::sle_dli::{
-    ControllerEventRing, DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent,
-    SleFeature, SleOpcode, SleStatus, SLE_MEAS_PATH_LOSS, SLE_MEAS_RSSI, SLE_SEC_AES_CCM,
-    SLE_SEC_ECDH_P256, SLE_SEC_SC, SLE_TRANSPORT_FRAGMENTED, SLE_TRANSPORT_RELIABLE,
-    SLE_TRANSPORT_UNRELIABLE,
+    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleFeature, SleOpcode,
+    SleStatus, SLE_MEAS_PATH_LOSS, SLE_MEAS_RSSI, SLE_SEC_AES_CCM, SLE_SEC_ECDH_P256, SLE_SEC_SC,
+    SLE_TRANSPORT_FRAGMENTED, SLE_TRANSPORT_RELIABLE, SLE_TRANSPORT_UNRELIABLE,
 };
 use super::sle_transport::{SleAttachInfo, SleProtoId};
 
 // ---------------------------------------------------------------------------
-// Global USB event ring — receives events from C completion callbacks
+// IRQ-safe route lookup; ingress storage and work belong to the retained owner.
 // ---------------------------------------------------------------------------
 
-kernel::sync::global_lock! {
-    // SAFETY: Initialized once in module_init via init_usb_event_ring().
-    unsafe(uninit) static USB_EVENT_RING: Mutex<Option<ControllerEventRing>> = None;
-}
+super::sle_irq_lock::irq_global_lock!(RUNTIME_ROUTES: [Option<kernel::sync::Arc<super::ControllerRuntime>>; super::sle_dev::SLE_DEV_MAX] = [const { None }; super::sle_dev::SLE_DEV_MAX]);
 
-/// Initialize the global USB event ring.
-///
 /// # Safety
-///
-/// Must be called exactly once during module init.
+/// Call exactly once before publishing any transport owner.
 pub(crate) unsafe fn init_usb_event_ring() {
-    // SAFETY: Called exactly once during module init; no concurrent access.
-    unsafe { USB_EVENT_RING.init() };
-    *USB_EVENT_RING.lock() = Some(ControllerEventRing::new());
+    // SAFETY: module initialization is single-threaded.
+    unsafe { RUNTIME_ROUTES.init() };
 }
 
-/// Drain up to `max` tagged events from the global USB event ring.
-/// Returns a fixed-size array and the number of valid entries.
-pub(crate) fn drain_usb_events(out: &mut [(Option<u16>, Option<SleEvent>)]) -> usize {
-    let max = out.len();
-    let mut count = 0usize;
-    if let Some(ref mut ring) = *USB_EVENT_RING.lock() {
-        while count < max {
-            if let Some((dev_id, ev)) = ring.pop_tagged() {
-                out[count] = (dev_id, Some(ev));
-                count += 1;
-            } else {
-                break;
-            }
+pub(crate) fn publish_runtime(owner: &kernel::sync::Arc<super::ControllerRuntime>) {
+    let previous = {
+        let mut routes = RUNTIME_ROUTES.lock();
+        routes[owner.identity.id as usize].replace(owner.clone())
+    };
+    drop(previous);
+}
+
+pub(crate) fn unpublish_runtime(owner: &kernel::sync::Arc<super::ControllerRuntime>) {
+    let previous = {
+        let mut routes = RUNTIME_ROUTES.lock();
+        let slot = &mut routes[owner.identity.id as usize];
+        if slot.as_ref().is_some_and(|r| r.identity == owner.identity) {
+            slot.take()
+        } else {
+            None
         }
+    };
+    drop(previous);
+}
+
+pub(crate) fn ingress_owner(
+    identity: super::sle_dev::DeviceIdentity,
+) -> Option<kernel::sync::Arc<super::ControllerRuntime>> {
+    RUNTIME_ROUTES
+        .lock()
+        .get(identity.id as usize)
+        .and_then(|slot| {
+            slot.as_ref()
+                .filter(|owner| owner.identity == identity)
+                .cloned()
+        })
+}
+
+pub(crate) fn drain_runtime_events(
+    owner: &super::ControllerRuntime,
+    out: &mut [(Option<u16>, Option<SleEvent>)],
+) -> usize {
+    let mut count = 0;
+    let mut ring = owner.ingress.lock();
+    while count < out.len() {
+        let Some((id, event)) = ring.pop_tagged() else {
+            break;
+        };
+        out[count] = (id, Some(event));
+        count += 1;
     }
     count
 }
 
-/// Take and reset the cumulative dropped-event count from the USB event ring.
-pub(crate) fn take_dropped_count() -> u32 {
-    if let Some(ref mut ring) = *USB_EVENT_RING.lock() {
-        let d = ring.dropped;
-        ring.dropped = 0;
-        d
-    } else {
-        0
+/// Inline draining never removes events belonging to another device.
+pub(crate) fn drain_usb_events_for(
+    identity: super::sle_dev::DeviceIdentity,
+    out: &mut [(Option<u16>, Option<SleEvent>)],
+) -> usize {
+    ingress_owner(identity).map_or(0, |owner| drain_runtime_events(&owner, out))
+}
+
+static DECODE_DROPS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) struct RxDropStats {
+    pub(crate) ring: u32,
+    pub(crate) command_complete: u32,
+    pub(crate) mac_complete: u32,
+    pub(crate) decode: u32,
+}
+
+pub(crate) fn take_dropped_stats(owner: &super::ControllerRuntime) -> RxDropStats {
+    let ring = core::mem::take(&mut owner.ingress.lock().dropped);
+    RxDropStats {
+        ring,
+        command_complete: owner.dropped_commands.swap(0, Ordering::Relaxed),
+        mac_complete: owner.dropped_mac.swap(0, Ordering::Relaxed),
+        // Decode failures before attribution remain a transport diagnostic.
+        decode: DECODE_DROPS.swap(0, Ordering::Relaxed),
     }
+}
+
+pub(crate) fn enqueue_rx(owner: &kernel::sync::Arc<super::ControllerRuntime>, event: SleEvent) {
+    let command = matches!(&event, SleEvent::CommandComplete { .. } | SleEvent::NativeCommandReply { .. });
+    let mac = matches!(
+        &event,
+        SleEvent::CommandComplete {
+            opcode: SleOpcode::ReadMacAddr,
+            ..
+        }
+    );
+    let stopping = owner.schedule_gate.lock();
+    if *stopping {
+        return;
+    }
+    let event = owner.host.lock().receive(event);
+    let Some(event) = event else {
+        // A matching reply is retained in the Host's reserved slot. It
+        // cannot be lost when discovery/data fill the ordinary RX ring.
+        drop(stopping);
+        owner.schedule_rx(0);
+        return;
+    };
+    let accepted = owner
+        .ingress
+        .lock()
+        .push_tagged(Some(owner.identity.id), event);
+    if !accepted {
+        if command {
+            owner.dropped_commands.fetch_add(1, Ordering::Relaxed);
+        }
+        if mac {
+            owner.dropped_mac.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    drop(stopping);
+    owner.schedule_rx(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +218,7 @@ extern "C" {
     ) -> i32;
 
     // Per-device USB state table: high-level send functions
-    fn sle_usb_dev_register(dev_id: i32, intf_ptr: *mut core::ffi::c_void) -> i32;
+    fn sle_usb_dev_register(dev_id: i32, intf_ptr: *mut core::ffi::c_void, generation: u64) -> i32;
     fn sle_usb_dev_unregister(dev_id: i32);
     fn sle_usb_dev_send_cmd(dev_id: i32, opcode: u16, params: *const u8, plen: i32) -> i32;
     fn sle_usb_dev_send_data(dev_id: i32, handle: u16, data: *const u8, len: i32) -> i32;
@@ -150,6 +228,7 @@ extern "C" {
     fn sle_usb_dev_stop_data(dev_id: i32);
     fn sle_usb_dev_init_controller(dev_id: i32) -> i32;
     fn sle_usb_dev_get_fw_version(dev_id: i32) -> u32;
+    fn sle_usb_dev_get_command_credits(dev_id: i32) -> u8;
     fn sle_usb_dev_get_mac(dev_id: i32, mac: *mut u8) -> i32;
     fn sle_usb_dev_suspend(dev_id: i32) -> i32;
     fn sle_usb_dev_resume(dev_id: i32) -> i32;
@@ -312,37 +391,46 @@ pub(crate) fn sync_bulk_in(
 // Completion callback from C — receives URB completion events
 // ---------------------------------------------------------------------------
 
-/// Called from C (`sle_usb_bulk_cb` / `sle_usb_intr_cb`) when a USB
-/// transfer completes. The `ctx` pointer identifies which Rust-side
-/// operation completed.
-///
-/// Currently logs the completion and feeds events into the subsystem.
-/// A full implementation would match `ctx` to a pending command or
-/// data transfer and wake the corresponding waiter.
+/// Generic transfer completion has no registration identity. It may report
+/// transport status but must never infer an RX owner from an opaque pointer.
 #[no_mangle]
 pub(crate) extern "C" fn sparklink_usb_complete(
     _ctx: *mut core::ffi::c_void,
+    _data: *const u8,
+    length: i32,
+    status: i32,
+) {
+    pr_debug!(
+        "sparklink-usb: unregistered completion status={} len={}\n",
+        status,
+        length
+    );
+}
+
+/// Registered RX endpoints carry identity copied into their C URB allocation
+/// before first submission. This never reads identity from a reusable C slot.
+#[no_mangle]
+pub(crate) extern "C" fn sparklink_usb_registered_complete(
+    dev_id: u32,
+    generation: u64,
     data: *const u8,
     length: i32,
     status: i32,
 ) {
-    if status != 0 {
-        pr_debug!("sparklink-usb: complete status={} len={}\n", status, length);
+    if status != 0 || length <= 0 || data.is_null() {
         return;
     }
-
-    if length <= 0 || data.is_null() {
+    if dev_id >= super::sle_dev::SLE_DEV_MAX as u32 || generation == 0 {
         return;
     }
-
-    // Decode dev_id from context: ctx = (dev_id + 1), 0 means unknown
-    let dev_id: Option<u16> = {
-        let raw = _ctx as usize;
-        if raw > 0 {
-            Some((raw - 1) as u16)
-        } else {
-            None
-        }
+    let identity = super::sle_dev::DeviceIdentity {
+        id: dev_id as u16,
+        generation,
+    };
+    // The retained owner stays the same through decoding and enqueue. A remove
+    // that races decoding closes its scheduling gate, never selects a new slot.
+    let Some(owner) = ingress_owner(identity) else {
+        return;
     };
 
     let len = length as usize;
@@ -358,17 +446,15 @@ pub(crate) extern "C" fn sparklink_usb_complete(
         let handle = (link_id_seg >> 4) & 0x0FFF;
         let payload = &slice[5..];
         let mut data_vec = KVec::new();
-        for &b in payload {
-            let _ = data_vec.push(b, GFP_KERNEL);
+        if data_vec.extend_from_slice(payload, GFP_ATOMIC).is_err() {
+            DECODE_DROPS.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         let sle_evt = SleEvent::DataReceived {
             handle,
             data: data_vec,
         };
-        if let Some(ref mut ring) = *USB_EVENT_RING.lock() {
-            ring.push_tagged(dev_id, sle_evt);
-        }
-        super::sle_workers::kick_event_pump();
+        enqueue_rx(&owner, sle_evt);
         return;
     }
 
@@ -376,11 +462,9 @@ pub(crate) extern "C" fn sparklink_usb_complete(
     match parse_event_packet(slice) {
         Ok(evt) => {
             if let Some(sle_evt) = event_to_sle(&evt) {
-                if let Some(ref mut ring) = *USB_EVENT_RING.lock() {
-                    ring.push_tagged(dev_id, sle_evt);
-                }
-                super::sle_workers::kick_event_pump();
+                enqueue_rx(&owner, sle_evt);
             } else {
+                DECODE_DROPS.fetch_add(1, Ordering::Relaxed);
                 pr_debug!(
                     "sparklink-usb: unknown event code=0x{:04x} len={}\n",
                     evt.event_code,
@@ -389,6 +473,7 @@ pub(crate) extern "C" fn sparklink_usb_complete(
             }
         }
         Err(_) => {
+            DECODE_DROPS.fetch_add(1, Ordering::Relaxed);
             pr_debug!(
                 "sparklink-usb: parse failed len={} first={:02x}\n",
                 len,
@@ -561,9 +646,9 @@ pub fn parse_event_packet(data: &[u8]) -> Result<DliUsbEvent> {
         return Err(EINVAL);
     }
 
-    let mut params = KVec::with_capacity(param_len, GFP_KERNEL)?;
+    let mut params = KVec::with_capacity(param_len, GFP_ATOMIC)?;
     for &b in &data[4..4 + param_len] {
-        params.push(b, GFP_KERNEL)?;
+        params.push(b, GFP_ATOMIC)?;
     }
 
     Ok(DliUsbEvent { event_code, params })
@@ -624,41 +709,50 @@ pub fn parse_async_data_header(data: &[u8]) -> Result<DliAsyncHeader> {
 /// Convert a raw event code and parameters into an [`SleEvent`].
 pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
     match evt.event_code {
-        // CmdComplete (0x0002): [opcode:2] [status:1] [return_params:N]
+        // T/XS 10003-2025 9.1.2: opcode(2), credits(1), return params.
+        // Nonzero-opcode return params start with that command's status byte.
         0x0002 => {
             if evt.params.len() < 3 {
                 return None;
             }
             let opcode_raw = u16::from_le_bytes([evt.params[0], evt.params[1]]);
-            let status_raw = evt.params[2];
-            let data = if evt.params.len() > 3 {
-                let mut v = KVec::new();
-                for &b in &evt.params[3..] {
-                    let _ = v.push(b, GFP_KERNEL);
+            let command_credits = evt.params[2];
+            if opcode_raw == 0 {
+                if evt.params.len() != 3 {
+                    return None;
                 }
-                v
-            } else {
-                KVec::new()
-            };
-            // Reinterpret opcode — if unknown, use VendorBase as fallback
-            let opcode = raw_to_opcode(opcode_raw);
-            let status = raw_to_status(status_raw);
+                return Some(SleEvent::CommandCredits {
+                    credits: command_credits,
+                });
+            }
+            if evt.params.len() < 4 {
+                return None;
+            }
+            let mut data = KVec::new();
+            data.extend_from_slice(&evt.params[4..], GFP_ATOMIC).ok()?;
             Some(SleEvent::CommandComplete {
-                opcode,
-                status,
+                opcode: super::sle_dli::sle_opcode_from_u16(opcode_raw)?,
+                command_credits,
+                status: raw_to_status(evt.params[3]),
                 data,
             })
         }
-        // CmdStatus (0x0001): [status:1] [opcode:2]
+        // T/XS 10003-2025 9.1.1: opcode(2), credits(1), status(1).
         0x0001 => {
-            if evt.params.len() < 3 {
+            if evt.params.len() != 4 {
                 return None;
             }
-            let status_raw = evt.params[0];
-            let opcode_raw = u16::from_le_bytes([evt.params[1], evt.params[2]]);
+            let opcode_raw = u16::from_le_bytes([evt.params[0], evt.params[1]]);
+            let command_credits = evt.params[2];
+            if opcode_raw == 0 {
+                return Some(SleEvent::CommandCredits {
+                    credits: command_credits,
+                });
+            }
             Some(SleEvent::CommandStatus {
-                opcode: raw_to_opcode(opcode_raw),
-                status: raw_to_status(status_raw),
+                opcode: super::sle_dli::sle_opcode_from_u16(opcode_raw)?,
+                command_credits,
+                status: raw_to_status(evt.params[3]),
             })
         }
         // ConnEstablished (0x0015): [status:1] [handle:2] [addr:6]
@@ -694,10 +788,13 @@ pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
             addr.copy_from_slice(&evt.params[..6]);
             let rssi = evt.params[6] as i8;
             let data_len = evt.params[7] as usize;
-            let data_end = (8 + data_len).min(evt.params.len());
+            let data_end = 8 + data_len;
+            if data_end > evt.params.len() {
+                return None;
+            }
             let mut data = KVec::new();
             for &b in &evt.params[8..data_end] {
-                let _ = data.push(b, GFP_KERNEL);
+                data.push(b, GFP_ATOMIC).ok()?;
             }
             let discovery_level = extract_discovery_level(data.as_slice());
             Some(SleEvent::AdvReport {
@@ -791,7 +888,7 @@ pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
             crypto_alg.copy_from_slice(&evt.params[4..8]);
             let mut public_key = KVec::new();
             for &b in &evt.params[8..] {
-                let _ = public_key.push(b, GFP_KERNEL);
+                public_key.push(b, GFP_ATOMIC).ok()?;
             }
             Some(SleEvent::PairOptionReport {
                 handle,
@@ -809,7 +906,7 @@ pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
             let handle = u16::from_le_bytes([evt.params[0], evt.params[1]]);
             let mut public_key = KVec::new();
             for &b in &evt.params[2..] {
-                let _ = public_key.push(b, GFP_KERNEL);
+                public_key.push(b, GFP_ATOMIC).ok()?;
             }
             Some(SleEvent::PeerPublicKey { handle, public_key })
         }
@@ -823,11 +920,11 @@ pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
             let half = rest.len() / 2;
             let mut ext_pubkey_x = KVec::new();
             for &b in &rest[..half] {
-                let _ = ext_pubkey_x.push(b, GFP_KERNEL);
+                ext_pubkey_x.push(b, GFP_ATOMIC).ok()?;
             }
             let mut ext_pubkey_y = KVec::new();
             for &b in &rest[half..] {
-                let _ = ext_pubkey_y.push(b, GFP_KERNEL);
+                ext_pubkey_y.push(b, GFP_ATOMIC).ok()?;
             }
             Some(SleEvent::PairExtData {
                 handle,
@@ -873,7 +970,10 @@ pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
             let handle = u16::from_le_bytes([evt.params[0], evt.params[1]]);
             let mut dhkey_check = [0u8; 16];
             dhkey_check.copy_from_slice(&evt.params[2..18]);
-            Some(SleEvent::DHKeyCheck { handle, dhkey_check })
+            Some(SleEvent::DHKeyCheck {
+                handle,
+                dhkey_check,
+            })
         }
         // PairFailure (0x0027): [handle:2][reason:1]
         0x0027 => {
@@ -1146,147 +1246,6 @@ pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
 // Raw value conversion helpers
 // ---------------------------------------------------------------------------
 
-fn raw_to_opcode(raw: u16) -> SleOpcode {
-    // Return the opcode if it matches a known variant, otherwise VendorBase
-    match raw {
-        // Group 1: Basic (0x04xx)
-        0x0401 => SleOpcode::ReadCmdLen,
-        0x0402 => SleOpcode::ReadCtrlBuffer,
-        0x0403 => SleOpcode::ReadLocalFeatures,
-        0x0404 => SleOpcode::ReadLocalVersion,
-        0x0405 => SleOpcode::SetMacAddr,
-        0x0406 => SleOpcode::ReadMacAddr,
-        0x0407 => SleOpcode::SetNonUniqueMac,
-        0x0408 => SleOpcode::Reset,
-        0x0409 => SleOpcode::AvailChannelInd,
-        0x040A => SleOpcode::ReadWhitelistSize,
-        0x040B => SleOpcode::ClearWhitelist,
-        0x040C => SleOpcode::AddWhitelist,
-        0x040D => SleOpcode::DeleteWhitelist,
-        0x040E => SleOpcode::SetSlbNodeRole,
-        0x040F => SleOpcode::ReadSlbNodeRole,
-        0x0410 => SleOpcode::SetSlbWorkChannel,
-        0x0411 => SleOpcode::ReadSlbWorkChannel,
-        0x0412 => SleOpcode::ReadSlbCtrlBuffer,
-        0x0413 => SleOpcode::ConfigFisaChannels,
-        0x0414 => SleOpcode::EnableFisa,
-        0x0415 => SleOpcode::ConfigSlbSyncSignal,
-        0x0416 => SleOpcode::ReadSlbSyncSignal,
-        0x0417 => SleOpcode::ReadSlbLocalPower,
-        0x0418 => SleOpcode::EnableSlbCtrl,
-        0x0419 => SleOpcode::IndicateTimeSync,
-        0x041A => SleOpcode::TimeSyncRequest,
-        0x041B => SleOpcode::TimeSyncResponse,
-        0x0420 => SleOpcode::AddWhitelistExt,
-        // Group 3: Broadcast (0x0Cxx)
-        0x0C02 => SleOpcode::SetBroadcastParam,
-        0x0C03 => SleOpcode::SetBroadcastData,
-        0x0C04 => SleOpcode::SetBroadcastScanRsp,
-        0x0C05 => SleOpcode::EnableBroadcast,
-        0x0C06 => SleOpcode::ReadMaxBcastDataLen,
-        0x0C07 => SleOpcode::ReadBcastSetSize,
-        0x0C08 => SleOpcode::DeleteBcastSet,
-        0x0C09 => SleOpcode::ConfigSlbDomainName,
-        0x0C0A => SleOpcode::ReadSlbDomainName,
-        0x0C0B => SleOpcode::ConfigSlbBcastParam,
-        0x0C0C => SleOpcode::ReadSlbBcastParam,
-        // Group 4: Scan (0x10xx)
-        0x1001 => SleOpcode::SetScanParam,
-        0x1002 => SleOpcode::EnableScan,
-        0x1003 => SleOpcode::SetScanReqData,
-        0x1004 => SleOpcode::SetSlbScanParam,
-        // Group 5: Connection (0x14xx)
-        0x1401 => SleOpcode::CreateConnection,
-        0x1402 => SleOpcode::CancelConnection,
-        0x1403 => SleOpcode::Disconnect,
-        0x1404 => SleOpcode::SlbCreateConnection,
-        // Group 6: Link control (0x18xx)
-        0x1801 => SleOpcode::ReadFeatures,
-        0x1802 => SleOpcode::ReadVersion,
-        0x1804 => SleOpcode::SetMaxDataLen,
-        0x1805 => SleOpcode::ReadPhyParam,
-        0x1806 => SleOpcode::SetPhyParam,
-        0x1807 => SleOpcode::ConnParamUpdate,
-        0x1808 => SleOpcode::ConnParamReqReply,
-        0x1809 => SleOpcode::ReadAvailChannels,
-        0x180A => SleOpcode::SetCodingModulation,
-        0x180C => SleOpcode::ReadRssi,
-        0x180D => SleOpcode::SetTxPower,
-        0x180E => SleOpcode::ReadTxPower,
-        0x180F => SleOpcode::ReadPeerTxPower,
-        0x1810 => SleOpcode::ConfigPowerReport,
-        0x1812 => SleOpcode::SetCtrlSignalData,
-        0x1813 => SleOpcode::EnableRssiPowerCtrl,
-        0x1814 => SleOpcode::SetSlbCodingMod,
-        0x1815 => SleOpcode::ReadSlbCodingMod,
-        // Group 7: Security (0x1Cxx)
-        0x1C01 => SleOpcode::HashCompute,
-        0x1C02 => SleOpcode::GenSecureRandom,
-        0x1C03 => SleOpcode::StartEncrypt,
-        0x1C04 => SleOpcode::RequestPair,
-        0x1C05 => SleOpcode::ReplyEncParamReq,
-        0x1C06 => SleOpcode::RejectEncParamReq,
-        0x1C07 => SleOpcode::ReadLocalEncAlgo,
-        0x1C08 => SleOpcode::StartPairing,
-        0x1C09 => SleOpcode::PairInfoExchange,
-        0x1C0A => SleOpcode::PairOptionConfirm,
-        0x1C0B => SleOpcode::PairOptionAccept,
-        0x1C0C => SleOpcode::PairExtData,
-        0x1C0D => SleOpcode::PairPasskey,
-        0x1C0E => SleOpcode::PairRandom,
-        0x1C0F => SleOpcode::PairConfirm,
-        0x1C10 => SleOpcode::DhkeyVerify,
-        0x1C11 => SleOpcode::PairFail,
-        0x1C12 => SleOpcode::AddRalDevice,
-        0x1C13 => SleOpcode::RemoveRalDevice,
-        0x1C14 => SleOpcode::ClearRal,
-        0x1C15 => SleOpcode::ReadRalSize,
-        0x1C16 => SleOpcode::ReadRemoteRpa,
-        0x1C17 => SleOpcode::ReadLocalRpa,
-        0x1C18 => SleOpcode::SetRpaEnable,
-        0x1C19 => SleOpcode::SetRpaTimeout,
-        0x1C1A => SleOpcode::ConfigSlbAuthPsk,
-        0x1C1B => SleOpcode::DeleteSlbAuthPsk,
-        0x1C1C => SleOpcode::ConfigSlbAuthPwd,
-        0x1C1D => SleOpcode::DeleteSlbAuthPwd,
-        0x1C1E => SleOpcode::ConfigSlbCipherAlgo,
-        0x1C1F => SleOpcode::ReadSlbCipherAlgo,
-        0x1C20 => SleOpcode::ConfigSlbSecAssoc,
-        0x1C21 => SleOpcode::ReadSlbSecAssoc,
-        0x1C22 => SleOpcode::ConfigSlbSecTimeout,
-        0x1C23 => SleOpcode::ReadSlbSecTimeout,
-        // Group 8: Measurement (0x20xx)
-        0x2001 => SleOpcode::ReadLocalMeasCap,
-        0x2003 => SleOpcode::SetMeasLinkParam,
-        0x2005 => SleOpcode::MeasAction,
-        0x200B => SleOpcode::EnableMeas,
-        // Group 9: SLB Logical Channel (0x24xx)
-        0x2401 => SleOpcode::SlbCreateLogChannel,
-        0x2402 => SleOpcode::SlbUpdateLogChannel,
-        0x2403 => SleOpcode::SlbDeleteLogChannel,
-        // Group 10: Sync link (0x28xx)
-        0x2801 => SleOpcode::SyncUcastParam,
-        0x2803 => SleOpcode::SyncUcastCreate,
-        0x2804 => SleOpcode::SyncUcastRemove,
-        0x2805 => SleOpcode::SyncUcastAccept,
-        0x2806 => SleOpcode::SyncUcastReject,
-        0x2807 => SleOpcode::SyncMcastParam,
-        0x2808 => SleOpcode::SyncMcastInfo,
-        0x2809 => SleOpcode::SyncMcastCreate,
-        0x280A => SleOpcode::SyncMcastRemove,
-        0x280B => SleOpcode::SyncMcastAccept,
-        0x280C => SleOpcode::SyncMcastReject,
-        0x280D => SleOpcode::SyncDataPathConfig,
-        0x280E => SleOpcode::SyncDataPathRemove,
-        // Group 62: Test (0xF8xx)
-        0xF801 => SleOpcode::TestModeEnable,
-        0xF802 => SleOpcode::TestRx,
-        0xF803 => SleOpcode::TestTx,
-        0xF804 => SleOpcode::TestRxResult,
-        _ => SleOpcode::VendorBase,
-    }
-}
-
 fn raw_to_status(raw: u8) -> SleStatus {
     match raw {
         0x00 => SleStatus::Success,
@@ -1320,6 +1279,7 @@ pub struct UsbController {
     /// Device ID in the sle_dev registry. Used to index the C-side
     /// USB device table for actual I/O.
     dev_id: u16,
+    identity: super::sle_dev::DeviceIdentity,
 }
 
 impl UsbController {
@@ -1328,11 +1288,32 @@ impl UsbController {
     /// `addr` is the 6-byte SLE MAC address read from the controller
     /// during probe via the ReadLocalAddr (0x0404) command.
     /// `dev_id` is the device ID returned by `sle_attach_device`.
-    pub fn new(addr: [u8; 6], dev_id: u16) -> Self {
+    pub fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
         Self {
             addr,
             opened: false,
-            dev_id,
+            dev_id: identity.id,
+            identity,
+        }
+    }
+
+    /// Only the owner's TX worker may call this transport operation after
+    /// reserving its command slot and a controller credit.
+    pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {
+        // SAFETY: worker retains its registration owner; removal drains the
+        // worker before unregistering/freeing the C transport. Data is live.
+        let ret = unsafe {
+            sle_usb_dev_send_cmd(
+                i32::from(self.dev_id),
+                opcode,
+                params.as_ptr(),
+                params.len() as i32,
+            )
+        };
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(())
         }
     }
 }
@@ -1368,12 +1349,15 @@ impl SleController for UsbController {
         let ret = unsafe { sle_usb_dev_start_evt(i32::from(self.dev_id)) };
         if ret < 0 {
             pr_warn!("sparklink-usb: event listener start failed: {}\n", ret);
-            // Non-fatal: controller can still send commands.
+            return Err(Error::from_errno(ret));
         }
         // Start bulk IN listener for async data (T/XS 10003-2025 §7.4).
         let ret = unsafe { sle_usb_dev_start_data(i32::from(self.dev_id)) };
         if ret < 0 {
             pr_warn!("sparklink-usb: data listener start failed: {}\n", ret);
+            // SAFETY: no binding can survive failed open; join its first listener.
+            unsafe { sle_usb_dev_stop_evt(i32::from(self.dev_id)) };
+            return Err(Error::from_errno(ret));
         }
         pr_info!("sparklink-usb: open dev_id={}\n", self.dev_id);
         Ok(())
@@ -1387,33 +1371,14 @@ impl SleController for UsbController {
     }
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
-        let pkt = build_command_packet(opcode, params)?;
-        // Use the C device table for actual USB bulk OUT.
-        // dev_send_cmd builds the DLI packet internally, but we
-        // already have the raw opcode — pass it directly.
-        // SAFETY: dev_id is valid, params pointer and length are consistent,
-        // opcode is validated by the caller.
-        let ret = unsafe {
-            sle_usb_dev_send_cmd(
-                i32::from(self.dev_id),
-                opcode as u16,
-                params.as_ptr(),
-                params.len() as i32,
-            )
-        };
-        if ret < 0 {
-            pr_debug!(
-                "sparklink-usb: cmd 0x{:04x} failed: {}\n",
-                opcode as u16,
-                ret
-            );
-            return Err(Error::from_errno(ret));
+        let owner = ingress_owner(self.identity).ok_or(ENODEV)?;
+        let stopping = owner.schedule_gate.lock();
+        if *stopping {
+            return Err(ENODEV);
         }
-        pr_debug!(
-            "sparklink-usb: cmd 0x{:04x} sent ({} bytes)\n",
-            opcode as u16,
-            pkt.len()
-        );
+        owner.host.lock().enqueue(opcode as u16, params, 0)?;
+        drop(stopping);
+        owner.kick_commands();
         Ok(())
     }
 
@@ -1440,9 +1405,8 @@ impl SleController for UsbController {
     }
 
     fn poll_event(&self) -> Option<SleEvent> {
-        // USB events are now drained via drain_usb_events() with device
-        // routing in EventPump. This avoids processing events on the
-        // wrong device due to the shared USB_EVENT_RING.
+        // USB events are drained from the owner's ingress with device
+        // routing in the owner RX worker, without a shared ingress ring.
         None
     }
 
@@ -1486,6 +1450,95 @@ pub(crate) struct SleUsbDriver {
     dev_id: u16,
 }
 
+/// Prepare a binding in process context; failed preparation is not a device.
+fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<u16> {
+    pr_info!("sparklink-usb: SLE controller discovered\n");
+
+    // Build attach info for the transport framework.
+    // In a real driver this would read the MAC address and firmware
+    // version from the device via control transfers.
+    let count = USB_DEV_COUNT.load(Ordering::Relaxed) + 1;
+    let mut addr = [0x5E, 0x00, 0x00, 0x00, 0x01, count as u8];
+    let attach = SleAttachInfo::new(SleProtoId::UsbBulk, addr);
+
+    let dev_id = super::sle_attach_device(&attach)?;
+    let mut fw_version: u32 = 0;
+    let result = (|| -> Result {
+        pr_info!("sparklink-usb: attached as sle{}\n", dev_id);
+
+        // Register the USB interface in the C-side device table so
+        // send_command / send_data can perform actual I/O.
+        //
+        // The interface pointer survives as long as the driver is
+        // bound (guaranteed by USB core).
+        let intf_ptr = core::ptr::from_ref::<usb::Interface<device::Core>>(interface)
+            as *mut core::ffi::c_void;
+        // SAFETY: dev_id is valid; intf_ptr points to a live USB
+        // interface that outlives this driver binding.
+        let generation = super::registration_identity(dev_id)
+            .ok_or(ENODEV)?
+            .generation;
+        let reg_ret = unsafe { sle_usb_dev_register(i32::from(dev_id), intf_ptr, generation) };
+        if reg_ret < 0 {
+            return Err(Error::from_errno(reg_ret));
+        } else {
+            // Run the init sequence: Reset → ReadLocalVersion → ReadMacAddr.
+            // Require matching successful replies; a failed bootstrap
+            // cannot publish a usable placeholder Runtime.
+            // SAFETY: dev_id is valid; init sequence is idempotent.
+            let init_ret = unsafe { sle_usb_dev_init_controller(i32::from(dev_id)) };
+            if init_ret < 0 {
+                return Err(Error::from_errno(init_ret));
+            }
+            if init_ret == 0 {
+                // Read back real MAC address and firmware version
+                // from the C device table and update the device info.
+                let mut real_mac = [0u8; 6];
+                // SAFETY: dev_id is valid, real_mac buffer is 6 bytes.
+                let mac_ret =
+                    unsafe { sle_usb_dev_get_mac(i32::from(dev_id), real_mac.as_mut_ptr()) };
+                if mac_ret == 0 && real_mac != [0u8; 6] {
+                    // Use real MAC from controller
+                    addr = real_mac;
+                }
+                // SAFETY: dev_id is valid.
+                fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(dev_id)) };
+                pr_info!(
+                        "sparklink-usb: init OK fw=0x{:08x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                        fw_version,
+                        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+                    );
+
+                // Attempt firmware download (non-fatal if firmware
+                // blob is absent or already programmed).
+                let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
+                let kern_dev: &kernel::device::Device<kernel::device::Core> = interface.as_ref();
+                match super::sle_fw::load_usb_firmware(dev_id, fw_name, kern_dev) {
+                    Ok(r) => pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", r.size),
+                    Err(_) => pr_debug!("sparklink-usb: firmware load skipped\n"),
+                }
+            }
+        }
+
+        // Switch the subsystem controller backend to USB and sync
+        // the device registry with real hardware info.
+        // SAFETY: mandatory bootstrap completed on this still-live binding.
+        let credits = unsafe { sle_usb_dev_get_command_credits(i32::from(dev_id)) };
+        super::sle_switch_controller_usb(dev_id, addr, fw_version, credits)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        super::sle_quiesce_device(dev_id);
+        // SAFETY: probe owns this index; joins URBs before releasing it.
+        unsafe { sle_usb_dev_unregister(i32::from(dev_id)) };
+        super::sle_detach_device(dev_id);
+        return Err(error);
+    }
+    USB_DEV_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    Ok(dev_id)
+}
+
 impl usb::Driver for SleUsbDriver {
     type IdInfo = ();
     const ID_TABLE: usb::IdTable<Self::IdInfo> = &SLE_USB_IDS;
@@ -1495,79 +1548,9 @@ impl usb::Driver for SleUsbDriver {
         _id: &usb::DeviceId,
         _info: &Self::IdInfo,
     ) -> impl PinInit<Self, Error> {
-        pr_info!("sparklink-usb: SLE controller discovered\n");
-        USB_DEV_COUNT.fetch_add(1, Ordering::Relaxed);
-
-        // Build attach info for the transport framework.
-        // In a real driver this would read the MAC address and firmware
-        // version from the device via control transfers.
-        let count = USB_DEV_COUNT.load(Ordering::Relaxed);
-        let mut addr = [0x5E, 0x00, 0x00, 0x00, 0x01, count as u8];
-        let attach = SleAttachInfo::new(SleProtoId::UsbBulk, addr);
-
-        let dev_id = super::sle_attach_device(&attach).unwrap_or(u16::MAX);
-        let mut fw_version: u32 = 0;
-        if dev_id != u16::MAX {
-            pr_info!("sparklink-usb: attached as sle{}\n", dev_id);
-
-            // Register the USB interface in the C-side device table so
-            // send_command / send_data can perform actual I/O.
-            //
-            // The interface pointer survives as long as the driver is
-            // bound (guaranteed by USB core).
-            let intf_ptr = core::ptr::from_ref::<usb::Interface<device::Core>>(interface)
-                as *mut core::ffi::c_void;
-            // SAFETY: dev_id is valid; intf_ptr points to a live USB
-            // interface that outlives this driver binding.
-            let reg_ret = unsafe { sle_usb_dev_register(i32::from(dev_id), intf_ptr) };
-            if reg_ret < 0 {
-                pr_warn!(
-                    "sparklink-usb: C device table register failed: {}\n",
-                    reg_ret
-                );
-            } else {
-                // Run the init sequence: Reset → ReadLocalVersion → ReadMacAddr.
-                // Failures are non-fatal: the driver continues with placeholder
-                // values from sle_attach_device.
-                // SAFETY: dev_id is valid; init sequence is idempotent.
-                let init_ret = unsafe { sle_usb_dev_init_controller(i32::from(dev_id)) };
-                if init_ret == 0 {
-                    // Read back real MAC address and firmware version
-                    // from the C device table and update the device info.
-                    let mut real_mac = [0u8; 6];
-                    // SAFETY: dev_id is valid, real_mac buffer is 6 bytes.
-                    let mac_ret =
-                        unsafe { sle_usb_dev_get_mac(i32::from(dev_id), real_mac.as_mut_ptr()) };
-                    if mac_ret == 0 && real_mac != [0u8; 6] {
-                        // Use real MAC from controller
-                        addr = real_mac;
-                    }
-                    // SAFETY: dev_id is valid.
-                    fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(dev_id)) };
-                    pr_info!(
-                        "sparklink-usb: init OK fw=0x{:08x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                        fw_version,
-                        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
-                    );
-
-                    // Attempt firmware download (non-fatal if firmware
-                    // blob is absent or already programmed).
-                    let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
-                    let kern_dev: &kernel::device::Device<kernel::device::Core> =
-                        interface.as_ref();
-                    match super::sle_fw::load_usb_firmware(dev_id, fw_name, kern_dev) {
-                        Ok(r) => pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", r.size),
-                        Err(_) => pr_debug!("sparklink-usb: firmware load skipped\n"),
-                    }
-                }
-            }
-
-            // Switch the subsystem controller backend to USB and sync
-            // the device registry with real hardware info.
-            super::sle_switch_controller_usb(dev_id, addr, fw_version);
-        }
-
-        try_pin_init!(Self { dev_id })
+        try_pin_init!(Self {
+            dev_id: probe_usb_device(interface)?
+        })
     }
 
     fn disconnect(_interface: &usb::Interface<device::Core>, data: Pin<&Self>) {
@@ -1576,6 +1559,9 @@ impl usb::Driver for SleUsbDriver {
 
         let dev_id = data.dev_id;
         if dev_id != u16::MAX {
+            // Reject new protocol access and join workers while C resources
+            // are still live. Keep the registry index reserved through free.
+            super::sle_quiesce_device(dev_id);
             // Stop URBs and unregister from C device table.
             // SAFETY: dev_id is valid; unregister kills URBs and frees C resources.
             unsafe { sle_usb_dev_unregister(i32::from(dev_id)) };

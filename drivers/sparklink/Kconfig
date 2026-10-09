@@ -11,6 +11,27 @@ menuconfig SPARKLINK_DRIVERS
 
 if SPARKLINK_DRIVERS
 
+config SPARKLINK_WS73_USB
+	tristate "HiSilicon WS73 USB firmware and BSLE transport (experimental)"
+	depends on USB
+	select FW_LOADER
+	select CRYPTO_LIB_SHA256
+	help
+	  Bind WS73 USB interfaces (ffff:3733), validate and download the
+	  three boot images, and track re-enumeration into runtime mode.
+	  Images are loaded from sparklink/ws73/{ws73,wifi_cali,btc_cali}.bin.
+	  Runtime mode also requires raw board configuration files:
+	  sparklink/ws73/bsle_custom.bin (140 bytes) and pm_config.bin (4 bytes).
+	  Wait for BSP_READY, send configuration and open SLE, requiring actual
+	  CUSTOMIZE_RECEIVED and BOOT_FINISH replies. This experimental driver
+	  queries actual DLI metadata and registers an independent native
+	  Runtime in SETUP with bulk/notification URBs. Only metadata commands
+	  are supported so far; full discovery transactions and real RF
+	  validation remain required before Ready. Native fault recovery/PM
+	  are not implemented.
+
+	  The module is called sparklink_ws73_usb.
+
 config SPARKLINK_VIRTUAL
 	tristate "Virtual SparkLink controller (testing)"
 	help

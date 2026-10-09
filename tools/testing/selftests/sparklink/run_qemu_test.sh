@@ -18,6 +18,9 @@
 #   QEMU_BIN=/path/to/custom/qemu-system-x86_64 ./run_qemu_test.sh
 #   SLE_DLI_DEVICE=1 ./run_qemu_test.sh  # Enable usb-sle-dli device
 #   SLE_DLI_DEVICE=2 ./run_qemu_test.sh  # Enable 2 usb-sle-dli devices (multi-device)
+#   python3 test_verdict.py      # Validate verdicts without booting a guest
+#
+# Exit status: 0 complete pass, 1 failure, 4 skipped/incomplete suite.
 
 set -euo pipefail
 
@@ -26,12 +29,19 @@ LINUX_SRC="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 KBUILD="${KBUILD:-$LINUX_SRC/build}"
 BZIMAGE="$KBUILD/arch/x86/boot/bzImage"
 WORKDIR="$SCRIPT_DIR/.qemu_test"
+QEMU_BIN_EXPLICIT="${QEMU_BIN+x}"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 SLE_DLI_DEVICE="${SLE_DLI_DEVICE:-2}"
 
 VERBOSE=0
-if [[ "${1:-}" == "--verbose" ]]; then
-    VERBOSE=1
+case "${1:-}" in
+    --verbose) VERBOSE=1 ;;
+    "") ;;
+    *) echo "Usage: $0 [--verbose]" >&2; exit 1 ;;
+esac
+if (( $# > 1 )); then
+    echo "Usage: $0 [--verbose]" >&2
+    exit 1
 fi
 
 # Colors for output
@@ -44,8 +54,11 @@ info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[FAIL]${NC}  $*"; }
 
+TEST_BIN=""
 cleanup() {
-    rm -f "$SCRIPT_DIR/sparklink_test_static"
+    if [[ -n "$TEST_BIN" ]]; then
+        rm -f "$TEST_BIN"
+    fi
 }
 trap cleanup EXIT
 
@@ -55,11 +68,52 @@ trap cleanup EXIT
 
 info "Checking prerequisites..."
 
+# A requested controller model is a prerequisite, never an optional fallback.
+if [[ ! "$SLE_DLI_DEVICE" =~ ^(0|[1-9]|1[0-6])$ ]]; then
+    error "SLE_DLI_DEVICE must be an integer from 0 to 16"
+    exit 1
+fi
+SLE_DEV_COUNT="$SLE_DLI_DEVICE"
+if (( SLE_DEV_COUNT == 0 )); then
+    warn "SKIP: the full integration suite requires a USB controller; SLE_DLI_DEVICE=0 disables it"
+    exit 4
+fi
+CUSTOM_QEMU_DIR="$SCRIPT_DIR/qemu-sle-dli/bin/bin"
+if [[ -z "$QEMU_BIN_EXPLICIT" && -x "$CUSTOM_QEMU_DIR/qemu-system-x86_64" ]]; then
+    QEMU_BIN="$CUSTOM_QEMU_DIR/qemu-system-x86_64"
+fi
+if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+    error "QEMU executable not found: $QEMU_BIN"
+    exit 1
+fi
+if ! MODEL_HELP=$("$QEMU_BIN" -device help 2>&1); then
+    error "Cannot query device models from $QEMU_BIN"
+    exit 1
+fi
+if ! grep -q 'name "usb-sle-dli"' <<< "$MODEL_HELP"; then
+    warn "SKIP: $QEMU_BIN does not provide the requested usb-sle-dli model"
+    warn "Build custom QEMU: cd qemu-sle-dli && ./build-qemu.sh"
+    exit 4
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    error "python3 is required to validate the run verdict"
+    exit 1
+fi
+
 if [[ ! -f "$BZIMAGE" ]]; then
     error "Kernel image not found: $BZIMAGE"
     echo "  Build the kernel first: make O=build -j\$(nproc)"
     exit 1
 fi
+
+# Kconfig can silently drop Rust-dependent drivers when rust-src is missing.
+# This runner loads no modules, so the tested subsystem must be built in.
+for option in RUST SPARKLINK; do
+    if ! grep -Fxq "CONFIG_$option=y" "$KBUILD/.config"; then
+        error "CONFIG_$option=y is required in $KBUILD/.config"
+        exit 1
+    fi
+done
 
 BUSYBOX="$(which busybox 2>/dev/null || true)"
 if [[ -z "$BUSYBOX" ]]; then
@@ -70,12 +124,6 @@ fi
 
 if ! file "$BUSYBOX" | grep -q "statically linked"; then
     error "busybox must be statically linked"
-    exit 1
-fi
-
-if ! command -v qemu-system-x86_64 &>/dev/null; then
-    error "qemu-system-x86_64 not found"
-    echo "  Install: sudo apt install qemu-system-x86"
     exit 1
 fi
 
@@ -91,20 +139,13 @@ info "Building sparklink_test (static)..."
 TEST_SRC="$SCRIPT_DIR/sparklink_test.c"
 TEST_BIN="$SCRIPT_DIR/sparklink_test_static"
 
-# Resolve kernel source tree root (four levels up from selftests/sparklink)
-KERNEL_SRC="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-
-# Symlink UAPI header into the test directory for local include
-UAPI_HEADER="$KERNEL_SRC/include/uapi/linux/sparklink_ioctl.h"
-SYMLINK_TARGET="$SCRIPT_DIR/sparklink_ioctl.h"
-if [ ! -e "$SYMLINK_TARGET" ] && [ -f "$UAPI_HEADER" ]; then
-	ln -sf "$UAPI_HEADER" "$SYMLINK_TARGET"
-fi
-
 gcc -Wall -Wextra -O2 -static \
     -o "$TEST_BIN" "$TEST_SRC"
 
 info "  Built: $TEST_BIN"
+mkdir -p "$WORKDIR"
+EXPECTED_CASES="$WORKDIR/expected-cases.txt"
+"$TEST_BIN" --list-tests > "$EXPECTED_CASES"
 
 # ---------------------------------------------------------------------------
 # Step 3: Create minimal initramfs
@@ -119,7 +160,7 @@ cp "$BUSYBOX" "$WORKDIR/initramfs/bin/busybox"
 chmod 755 "$WORKDIR/initramfs/bin/busybox"
 
 # Create busybox symlinks
-for cmd in sh cat echo ls mkdir mount umount mdev sleep poweroff; do
+for cmd in sh cat echo ls mkdir mount umount mdev sleep poweroff find grep wc head readlink dmesg; do
     ln -sf busybox "$WORKDIR/initramfs/bin/$cmd"
 done
 
@@ -157,7 +198,7 @@ if [ ! -c /dev/sparklink ]; then
     ls -la /dev/ 2>/dev/null | head -20
     echo ""
     echo "Kernel log:"
-    cat /proc/kmsg 2>/dev/null | head -30 || dmesg 2>/dev/null | head -30
+    dmesg 2>/dev/null | head -30
     poweroff -f
     exit 1
 fi
@@ -165,29 +206,70 @@ fi
 echo "Device /dev/sparklink found"
 echo ""
 
-# If USB SLE DLI devices are expected, wait for them to enumerate
-# Check if any USB SLE DLI devices appear in /sys
+# Require all requested USB controllers to enumerate and bind before testing.
+EXPECTED_USB=0
+for option in $(cat /proc/cmdline); do
+    case "$option" in
+        sparklink.expected_usb=*) EXPECTED_USB=${option#*=} ;;
+    esac
+done
 RETRY=0
 MAX_USB_RETRY=50
 while [ $RETRY -lt $MAX_USB_RETRY ]; do
-    USB_COUNT=$(find /sys/bus/usb/devices/ -name "idProduct" -exec cat {} \; 2>/dev/null | grep -c "5678" || true)
-    BOUND_COUNT=$(find /sys/bus/usb/drivers/sparklink_usb/ -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l || echo 0)
-    if [ "$USB_COUNT" -gt 0 ] && [ "$BOUND_COUNT" -ge "$USB_COUNT" ]; then
-        echo "USB SLE DLI devices: $USB_COUNT found, $BOUND_COUNT bound"
+    USB_COUNT=0
+    BOUND_COUNT=0
+    for device in /sys/bus/usb/devices/*; do
+        [ -f "$device/idVendor" ] || continue
+        [ "$(cat "$device/idVendor")" = "1234" ] || continue
+        [ "$(cat "$device/idProduct")" = "5678" ] || continue
+        USB_COUNT=$((USB_COUNT + 1))
+        DRIVER=$(readlink "$device:1.0/driver")
+        if [ "${DRIVER##*/}" = "sparklink_usb" ]; then
+            BOUND_COUNT=$((BOUND_COUNT + 1))
+        fi
+    done
+    if [ "$EXPECTED_USB" -gt 0 ] && [ "$USB_COUNT" -eq "$EXPECTED_USB" ] && \
+       [ "$BOUND_COUNT" -eq "$EXPECTED_USB" ]; then
         break
     fi
     sleep 0.1
     RETRY=$((RETRY + 1))
 done
+if [ "$EXPECTED_USB" -le 0 ] || [ "$USB_COUNT" -ne "$EXPECTED_USB" ] || \
+   [ "$BOUND_COUNT" -ne "$EXPECTED_USB" ]; then
+    echo "SPARKLINK_USB_GATE: FAIL expected=$EXPECTED_USB found=$USB_COUNT bound=$BOUND_COUNT"
+    echo "QEMU_TEST_RESULT: FAIL (USB enumeration or binding timeout)"
+    poweroff -f
+    exit 1
+fi
+echo "SPARKLINK_USB_GATE: PASS expected=$EXPECTED_USB found=$USB_COUNT bound=$BOUND_COUNT"
+
+# Keep serial case records intact. All printk levels remain in the ring and
+# are required below; faults still reject the host verdict after the suite.
+if ! dmesg -n 1; then
+    echo "QEMU_TEST_RESULT: FAIL (cannot isolate serial case records)"
+    poweroff -f
+    exit 1
+fi
 
 # Run the test suite
 /bin/sparklink_test 2>&1
 TEST_EXIT=$?
 
+# Require the full ring even after failed assertions. The host verifier scans
+# it for warnings/faults and rejects absent or incomplete dump markers.
+echo "SPARKLINK_KERNEL_LOG_BEGIN"
+if ! dmesg; then
+    TEST_EXIT=1
+fi
+echo "SPARKLINK_KERNEL_LOG_END"
+
 echo ""
 echo "========================================"
 if [ $TEST_EXIT -eq 0 ]; then
     echo "QEMU_TEST_RESULT: PASS (exit=$TEST_EXIT)"
+elif [ $TEST_EXIT -eq 4 ]; then
+    echo "QEMU_TEST_RESULT: SKIP (exit=$TEST_EXIT)"
 else
     echo "QEMU_TEST_RESULT: FAIL (exit=$TEST_EXIT)"
 fi
@@ -215,53 +297,32 @@ TIMEOUT=120
 info "Starting QEMU (timeout=${TIMEOUT}s)..."
 
 # Detect KVM support
-KVM_OPTS=""
-if [[ -r /dev/kvm ]]; then
-    KVM_OPTS="-enable-kvm"
+KVM_OPTS=()
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    KVM_OPTS=(-enable-kvm)
 fi
 
-# Detect custom QEMU with usb-sle-dli support
-SLE_USB_OPTS=""
-CUSTOM_QEMU_DIR="$SCRIPT_DIR/qemu-sle-dli/bin/bin"
-if [[ "$SLE_DLI_DEVICE" != "0" ]]; then
-    # Determine number of SLE DLI devices (1 if just "1", otherwise the value)
-    SLE_DEV_COUNT=1
-    if [[ "$SLE_DLI_DEVICE" =~ ^[0-9]+$ ]] && (( SLE_DLI_DEVICE > 1 )); then
-        SLE_DEV_COUNT="$SLE_DLI_DEVICE"
-    fi
+SLE_USB_OPTS=(-device qemu-xhci,id=xhci)
+for (( i=0; i<SLE_DEV_COUNT; i++ )); do
+    SLE_USB_OPTS+=(-device usb-sle-dli,bus=xhci.0)
+done
+info "Using $QEMU_BIN with $SLE_DEV_COUNT usb-sle-dli device(s)"
 
-    # Use custom QEMU if built, otherwise warn
-    if [[ -x "$CUSTOM_QEMU_DIR/qemu-system-x86_64" ]]; then
-        QEMU_BIN="$CUSTOM_QEMU_DIR/qemu-system-x86_64"
-        SLE_USB_OPTS="-device qemu-xhci,id=xhci"
-        for (( i=0; i<SLE_DEV_COUNT; i++ )); do
-            SLE_USB_OPTS+=" -device usb-sle-dli,bus=xhci.0"
-        done
-        info "Using custom QEMU with $SLE_DEV_COUNT usb-sle-dli device(s)"
-    elif "$QEMU_BIN" -device help 2>&1 | grep -q usb-sle-dli; then
-        SLE_USB_OPTS="-device qemu-xhci,id=xhci"
-        for (( i=0; i<SLE_DEV_COUNT; i++ )); do
-            SLE_USB_OPTS+=" -device usb-sle-dli,bus=xhci.0"
-        done
-        info "System QEMU supports usb-sle-dli"
-    else
-        warn "usb-sle-dli device not available; running without virtual controller"
-        warn "Build custom QEMU: cd qemu-sle-dli && ./build-qemu.sh"
-    fi
-fi
+# A failed launch must not reuse a preceding run's successful console log.
+: > "$CONSOLE_LOG"
 
 set +e
 timeout "$TIMEOUT" "$QEMU_BIN" \
     -kernel "$BZIMAGE" \
     -initrd "$WORKDIR/initramfs.cpio.gz" \
-    -append "console=ttyS0 earlyprintk=serial panic=1 oops=panic" \
+    -append "console=ttyS0 earlyprintk=serial loglevel=5 log_buf_len=4M panic=1 oops=panic sparklink.expected_usb=$SLE_DEV_COUNT" \
     -serial "file:$CONSOLE_LOG" \
     -display none \
     -no-reboot \
     -m 256M \
     -smp 2 \
-    $KVM_OPTS \
-    $SLE_USB_OPTS \
+    "${KVM_OPTS[@]}" \
+    "${SLE_USB_OPTS[@]}" \
     2>"$WORKDIR/qemu_stderr.log"
 QEMU_EXIT=$?
 set -e
@@ -277,26 +338,6 @@ fi
 echo ""
 info "Analyzing results..."
 
-if [[ $QEMU_EXIT -eq 124 ]]; then
-    error "QEMU timed out after ${TIMEOUT}s"
-    if [[ $VERBOSE -eq 1 ]]; then
-        echo "--- Console log ---"
-        cat "$CONSOLE_LOG"
-        echo "--- End log ---"
-    fi
-    exit 1
-fi
-
-# Extract test result
-RESULT_LINE=$(grep "QEMU_TEST_RESULT:" "$CONSOLE_LOG" 2>/dev/null || true)
-if [[ -z "$RESULT_LINE" ]]; then
-    error "No test result found in console output"
-    if [[ $VERBOSE -eq 0 ]]; then
-        echo "  Run with --verbose to see full output"
-    fi
-    exit 1
-fi
-
 # Count OK/FAIL/WARN lines (anchor to line start to avoid kernel log noise)
 OK_COUNT=$(grep -c "^  OK:" "$CONSOLE_LOG" 2>/dev/null || true)
 FAIL_COUNT=$(grep -c "^  FAIL:" "$CONSOLE_LOG" 2>/dev/null || true)
@@ -305,12 +346,6 @@ WARN_COUNT=$(grep -c "^  WARN:" "$CONSOLE_LOG" 2>/dev/null || true)
 echo ""
 echo "Test results: ${OK_COUNT} OK, ${FAIL_COUNT} FAIL, ${WARN_COUNT} WARN"
 
-if echo "$RESULT_LINE" | grep -q "PASS"; then
-    info "All tests PASSED"
-    exit 0
-else
-    error "Tests FAILED"
-    # Show failed lines
-    grep "  FAIL:" "$CONSOLE_LOG" 2>/dev/null || true
-    exit 1
-fi
+python3 "$SCRIPT_DIR/qemu_verdict.py" \
+    --console "$CONSOLE_LOG" --expected-cases "$EXPECTED_CASES" \
+    --qemu-exit "$QEMU_EXIT" --expected-usb "$SLE_DEV_COUNT"

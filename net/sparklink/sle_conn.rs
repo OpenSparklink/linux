@@ -1010,6 +1010,9 @@ pub struct SyncBigResult {
 pub struct ConnEntry {
     /// Connection handle (assigned by ConnManager).
     pub handle: u16,
+    /// Controller handle learned from ConnectionEstablished. Host handles
+    /// remain stable even when the controller allocates a different number.
+    pub controller_handle: Option<u16>,
     /// Current connection state.
     pub state: ConnState,
     /// Peer SLE address.
@@ -1057,6 +1060,7 @@ impl ConnEntry {
     fn try_new(handle: u16) -> Result<Self> {
         Ok(Self {
             handle,
+            controller_handle: None,
             state: ConnState::Idle,
             peer_addr: [0u8; 6],
             local_role: GtRole::TNode,
@@ -1258,6 +1262,57 @@ impl ConnManager {
         self.connections.iter().any(|e| e.peer_addr == *addr)
     }
 
+    /// Attach an actual controller completion to the retained outgoing entry.
+    /// A queued disconnect keeps its entry until this mapping is available;
+    /// the completion must not manufacture a new incoming connection.
+    pub(crate) fn record_controller_handle(
+        &mut self,
+        addr: &[u8; 6],
+        controller_handle: u16,
+    ) -> Option<(u16, bool)> {
+        let entry = self.connections.iter_mut().find(|e| e.peer_addr == *addr)?;
+        entry.controller_handle = Some(controller_handle);
+        if entry.state == ConnState::ConnectPending {
+            entry.state = ConnState::Connecting;
+        } else if entry.state == ConnState::Idle {
+            // A local diagnostic rejection can precede the queued controller
+            // completion. Retain the address and close that actual link.
+            entry.state = ConnState::DisconnectPending;
+        }
+        Some((entry.handle, entry.state == ConnState::DisconnectPending))
+    }
+
+    pub(crate) fn controller_handle(&self, handle: u16) -> Result<Option<u16>> {
+        Ok(self.find(handle)?.controller_handle)
+    }
+
+    pub(crate) fn host_handle(&self, controller_handle: u16) -> Option<u16> {
+        self.connections.iter()
+            .find(|entry| entry.controller_handle == Some(controller_handle))
+            .map(|entry| entry.handle)
+    }
+
+    /// A failed CreateConnection response names the Host's captured peer,
+    /// never the latest request or another established controller link.
+    pub(crate) fn abort_controller_connect(&mut self, addr: &[u8; 6]) {
+        if let Some(index) = self.connections.iter()
+            .position(|entry| entry.peer_addr == *addr && entry.controller_handle.is_none())
+        {
+            let _ = self.connections.remove(index);
+        }
+    }
+
+    /// Diagnostic rejection must also retire the real controller link. If
+    /// its handle is not known yet, ConnectionEstablished will finish this.
+    pub(crate) fn retire_rejected_link(&mut self, handle: u16) -> Option<u16> {
+        let entry = self.find_mut(handle).ok()?;
+        if entry.state != ConnState::Idle {
+            return None;
+        }
+        entry.state = ConnState::DisconnectPending;
+        entry.controller_handle
+    }
+
     /// Accept an incoming connection from a remote peer.
     /// Creates a Connected entry using the controller-provided handle.
     pub fn accept_incoming(&mut self, handle: u16, addr: &[u8; 6]) -> Result {
@@ -1270,6 +1325,7 @@ impl ConnManager {
             }
         }
         let mut entry = ConnEntry::try_new(handle)?;
+        entry.controller_handle = Some(handle);
         entry.peer_addr = *addr;
         entry.state = ConnState::Connected;
         entry.last_activity = jiffies_now();

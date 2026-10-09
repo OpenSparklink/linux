@@ -1878,10 +1878,24 @@ unsafe impl FromBytes for SleSubsysStats {}
 pub(crate) fn sle_dli_event_to_wire(ev: &sle_dli::SleEvent) -> SleDliEvent {
     let mut out = SleDliEvent::default();
     match ev {
+        sle_dli::SleEvent::NativeCommandReply { opcode, status, complete, data, .. } => {
+            out.event_type = if *complete { 1 } else { 2 };
+            out.opcode = *opcode;
+            out.status = *status;
+            let n = data.len().min(out.data.len());
+            out.data_len = n as u16;
+            out.data[..n].copy_from_slice(&data[..n]);
+        }
+        sle_dli::SleEvent::CommandCredits { credits } => {
+            out.event_type = 1;
+            out.data_len = 1;
+            out.data[0] = *credits;
+        }
         sle_dli::SleEvent::CommandComplete {
             opcode,
             status,
             data,
+            ..
         } => {
             out.event_type = 0x01;
             out.status = *status as u8;
@@ -1890,7 +1904,7 @@ pub(crate) fn sle_dli_event_to_wire(ev: &sle_dli::SleEvent) -> SleDliEvent {
             out.data_len = len as u16;
             out.data[..len].copy_from_slice(&data[..len]);
         }
-        sle_dli::SleEvent::CommandStatus { opcode, status } => {
+        sle_dli::SleEvent::CommandStatus { opcode, status, .. } => {
             out.event_type = 0x02;
             out.status = *status as u8;
             out.opcode = *opcode as u16;

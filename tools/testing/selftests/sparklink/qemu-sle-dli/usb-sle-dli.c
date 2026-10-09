@@ -733,19 +733,20 @@ static int sle_dli_dequeue_data(USBSleDliState *s,
 /*
  * Build a CommandComplete event packet.
  *
- * Wire format (T/XS 10003-2025 §7.3):
+ * Wire format (T/XS 10003-2025 §9.1.2):
  *   [0..1] event_code = 0x0002 (LE16)
  *   [2..3] total_param_len (LE16)
  *   [4..5] opcode (LE16)
- *   [6]    status
- *   [7..N] return params
+ *   [6]    command credits
+ *   [7]    status (first command-specific return parameter)
+ *   [8..N] remaining return parameters
  */
 static void sle_dli_cmd_complete(USBSleDliState *s, uint16_t opcode,
                                  uint8_t status,
                                  const uint8_t *params, int plen)
 {
     uint8_t buf[MAX_EVENT_SIZE];
-    int total_plen = 3 + plen; /* opcode(2) + status(1) + return_params */
+    int total_plen = 4 + plen; /* opcode(2) + credits(1) + status(1) + returns */
 
     buf[0] = DLI_EVT_CMD_COMPLETE & 0xFF;
     buf[1] = (DLI_EVT_CMD_COMPLETE >> 8) & 0xFF;
@@ -753,34 +754,37 @@ static void sle_dli_cmd_complete(USBSleDliState *s, uint16_t opcode,
     buf[3] = (uint8_t)(total_plen >> 8);
     buf[4] = opcode & 0xFF;
     buf[5] = (opcode >> 8) & 0xFF;
-    buf[6] = status;
+    buf[6] = 1; /* Controller can accept one further command. */
+    buf[7] = status;
     if (plen > 0 && params) {
-        memcpy(&buf[7], params, MIN(plen, MAX_EVENT_SIZE - 7));
+        memcpy(&buf[8], params, MIN(plen, MAX_EVENT_SIZE - 8));
     }
-    sle_dli_queue_event(s, buf, 7 + plen);
+    sle_dli_queue_event(s, buf, 8 + plen);
 }
 
 /*
  * Build a CommandStatus event packet.
  *
- * Wire format (T/XS 10003-2025 §7.3):
+ * Wire format (T/XS 10003-2025 §9.1.1):
  *   [0..1] event_code = 0x0001 (LE16)
- *   [2..3] param_len = 3 (LE16)
- *   [4]    status
- *   [5..6] opcode (LE16)
+ *   [2..3] param_len = 4 (LE16)
+ *   [4..5] opcode (LE16)
+ *   [6]    command credits
+ *   [7]    status
  */
 static void sle_dli_cmd_status(USBSleDliState *s, uint16_t opcode,
                                uint8_t status)
 {
-    uint8_t buf[7];
+    uint8_t buf[8];
     buf[0] = DLI_EVT_CMD_STATUS & 0xFF;
     buf[1] = (DLI_EVT_CMD_STATUS >> 8) & 0xFF;
-    buf[2] = 3;
+    buf[2] = 4;
     buf[3] = 0;
-    buf[4] = status;
-    buf[5] = opcode & 0xFF;
-    buf[6] = (opcode >> 8) & 0xFF;
-    sle_dli_queue_event(s, buf, 7);
+    buf[4] = opcode & 0xFF;
+    buf[5] = (opcode >> 8) & 0xFF;
+    buf[6] = 1;
+    buf[7] = status;
+    sle_dli_queue_event(s, buf, sizeof(buf));
 }
 
 /*
@@ -1079,12 +1083,9 @@ static void sle_dli_process_command(USBSleDliState *s,
          * Return:
          *   version(1) + company_id(2) + sub_version(2)
          *
-         * The guest parses this as a 4-byte fw_version at offset [7..10]
-         * in the raw event response. Since the event is:
-         *   [0..1] evt_code  [2..3] plen  [4..5] opcode
-         *   [6] status  [7] version  [8..9] company_id  [10..11] sub_version
-         * The guest reads le32 from offset 7, which spans
-         * version(1) + company_id(2) + sub_version[0](1).
+         * Raw DLI retains the entire five-byte version tuple. The legacy
+         * kernel fw_version metadata projects only the first four bytes
+         * from offset 8 (after opcode, credits and status).
          */
         uint8_t rp[5];
         rp[0] = s->protocol_version;
