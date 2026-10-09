@@ -251,6 +251,65 @@ static void command_tests(void)
 	CHECK(ws73_wire_command(tx, 328, 0, 0x0406, NULL, 1) == -EINVAL);
 }
 
+static void reply_tests(void)
+{
+	static const struct { unsigned int opcode, returns; } cases[] = {
+		{ 0x0402, 6 }, { 0x0403, 10 }, { 0x0404, 5 }, { 0x0406, 6 },
+		{ 0x0c02, 1 }, { 0x0c03, 0 }, { 0x0c04, 0 }, { 0x0c05, 0 },
+		{ 0x1001, 0 }, { 0x1002, 0 },
+	};
+	unsigned char event[260] = { 0xa2, 2, 0, 4, 0, 2, 0x0c, 1, 0 };
+
+	/* 0C02 must contain exactly the selected signed power byte. */
+	CHECK(ws73_dli_validate_reply(event, 9) == -EPROTO);
+	event[3] = 5;
+	event[9] = 0xd6;
+	CHECK(ws73_dli_validate_reply(event, 10) == 0);
+	for (unsigned int i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		for (unsigned int complete = 0; complete <= 1; complete++) {
+			for (unsigned int length = 0; length <= 20; length++) {
+				event[1] = complete ? 2 : 1;
+				event[3] = length;
+				event[5] = cases[i].opcode;
+				event[6] = cases[i].opcode >> 8;
+				for (unsigned int status = 0; status < 256; status++) {
+					int expected;
+
+					event[8] = status;
+					expected = complete ? (length >= 4 &&
+						(status || length == 4 + cases[i].returns) ? 0 : -EPROTO) :
+						(length == 4 ? 0 : -EPROTO);
+					CHECK(ws73_dli_validate_reply(event, length + 5) == expected);
+				}
+			}
+		}
+	}
+	/* Unknown return data is opaque; it does not add command support. */
+	event[1] = 2;
+	event[3] = 244;
+	event[5] = 0xfe;
+	event[6] = 0xfc;
+	event[8] = 0;
+	CHECK(ws73_dli_validate_reply(event, 249) == 0);
+	CHECK(ws73_dli_validate_reply(event, 248) == -EPROTO);
+	CHECK(ws73_dli_validate_reply(event, 250) == -EPROTO);
+	CHECK(ws73_dli_validate_reply(event, (size_t)-1) == -EPROTO);
+	event[5] = event[6] = 0;
+	for (unsigned int event_code = 0; event_code <= 3; event_code++) {
+		event[1] = event_code;
+		for (unsigned int length = 0; length <= 5; length++) {
+			event[3] = length;
+			CHECK(ws73_dli_validate_reply(event, 5 + length) ==
+			      ((event_code == 1 || event_code == 2) && length == 3 ? 0 : -EPROTO));
+		}
+	}
+	event[0] = 0xa1;
+	CHECK(ws73_dli_validate_reply(event, 8) == -EPROTO);
+	CHECK(ws73_dli_validate_reply(NULL, 8) == -EINVAL);
+	for (unsigned int length = 0; length < 5; length++)
+		CHECK(ws73_dli_validate_reply(event, length) == -EPROTO);
+}
+
 static void query_tests(void)
 {
 	static const int expected[] = {
@@ -302,6 +361,7 @@ static void query_tests(void)
 
 int main(void)
 {
+	reply_tests();
 	command_tests();
 	query_tests();
 	printf("WS73_NATIVE_DLI_TEST: %s (%u checks, %u failures; synthetic IO only)\n",

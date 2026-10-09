@@ -20,6 +20,75 @@ static void disc_put16(unsigned char *p, unsigned int value)
 	p[1] = value >> 8;
 }
 
+int ws73_discovery_ms_slots(unsigned long long ms, unsigned int bits,
+			    unsigned int *slots)
+{
+	unsigned int max;
+
+	if (!slots || (bits != 16 && bits != 24) || !ms)
+		return -EINVAL;
+	max = (1U << bits) - 1;
+	if (ms > max / 8U)
+		return -ERANGE;
+	*slots = ms * 8U;
+	return 0;
+}
+
+int ws73_discovery_adv_params(unsigned char *out, size_t capacity,
+			      const struct ws73_discovery_adv_params *p)
+{
+	if (!out || !p || p->handle > 0xef || p->mode > 0xff ||
+	    p->gt_role > 0xff || p->interval_min > 0xffffff ||
+	    p->interval_max > 0xffffff || p->channel_map > 0xff ||
+	    p->own_address_type > 0xff || p->peer_address_type > 0xff ||
+	    p->filter > 0xff || p->tx_power < -128 || p->tx_power > 127 ||
+	    p->primary_frame > 0xff || p->secondary_frame > 0xff ||
+	    p->secondary_phy > 0xff || p->secondary_pilot > 0xff ||
+	    p->secondary_mcs > 0xff || p->secondary_max_skip > 0xff ||
+	    p->sid > 0xff || p->request_notification > 0xff ||
+	    p->max_requests > 0xff || p->request_rx_duration > 0xffff ||
+	    p->conn_interval_min > 0xffff || p->conn_interval_max > 0xffff ||
+	    p->conn_max_latency > 0xffff || p->supervision_timeout > 0xffff ||
+	    p->min_event_length > 0xffff || p->max_event_length > 0xffff)
+		return -EINVAL;
+	if (capacity < WS73_DISC_ADV_PARAM_SIZE)
+		return -EMSGSIZE;
+
+	out[0] = p->handle;
+	out[1] = p->mode;
+	out[2] = p->gt_role;
+	out[3] = p->interval_min;
+	out[4] = p->interval_min >> 8;
+	out[5] = p->interval_min >> 16;
+	out[6] = p->interval_max;
+	out[7] = p->interval_max >> 8;
+	out[8] = p->interval_max >> 16;
+	out[9] = p->channel_map;
+	out[10] = p->own_address_type;
+	out[11] = p->peer_address_type;
+	memcpy(out + 12, p->own_address, sizeof(p->own_address));
+	memcpy(out + 18, p->peer_address, sizeof(p->peer_address));
+	out[24] = p->filter;
+	out[25] = (unsigned char)p->tx_power;
+	out[26] = p->primary_frame;
+	out[27] = p->secondary_frame;
+	out[28] = p->secondary_phy;
+	out[29] = p->secondary_pilot;
+	out[30] = p->secondary_mcs;
+	out[31] = p->secondary_max_skip;
+	out[32] = p->sid;
+	out[33] = p->request_notification;
+	out[34] = p->max_requests;
+	disc_put16(out + 35, p->request_rx_duration);
+	disc_put16(out + 37, p->conn_interval_min);
+	disc_put16(out + 39, p->conn_interval_max);
+	disc_put16(out + 41, p->conn_max_latency);
+	disc_put16(out + 43, p->supervision_timeout);
+	disc_put16(out + 45, p->min_event_length);
+	disc_put16(out + 47, p->max_event_length);
+	return WS73_DISC_ADV_PARAM_SIZE;
+}
+
 int ws73_discovery_validate_command(unsigned int opcode, const unsigned char *params,
 				    size_t size)
 {
@@ -27,10 +96,10 @@ int ws73_discovery_validate_command(unsigned int opcode, const unsigned char *pa
 		return -EINVAL;
 	switch (opcode) {
 	case 0x0c02:
-		/* Structural size only. Parameter capability/range errors belong
+		/* Structural size and handle. Parameter capability/range errors belong
 		 * to the controller; no standard address enum is imposed on WS73.
 		 */
-		return size == WS73_DISC_ADV_PARAM_SIZE ? 0 : -EINVAL;
+		return size == WS73_DISC_ADV_PARAM_SIZE && params[0] <= 0xef ? 0 : -EINVAL;
 	case 0x0c03:
 	case 0x0c04:
 		if (size < WS73_DISC_ADV_DATA_HEADER || params[0] > 0xef ||

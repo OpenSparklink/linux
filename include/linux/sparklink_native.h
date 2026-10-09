@@ -52,6 +52,9 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 void sparklink_native_unregister(u16 id, u64 generation);
 /* Valid during the callback; the core copies data and never retains its pointer.
  * Returns 0 if accepted, -ENODEV for a retired owner, -EPROTO for bad framing.
+ * The driver must validate its dialect's management return schema before
+ * calling receive; the core checks common framing and does not interpret
+ * vendor opcode-specific result layouts. A malformed Complete is not ingress.
  */
 int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t length);
 

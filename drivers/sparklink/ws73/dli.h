@@ -25,6 +25,13 @@ struct ws73_dli_result {
 int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
 			      size_t size);
 
+/* Validate one A2 management event slot, not an HCC aggregate. WS73 owns the
+ * successful Complete return schemas (including 0C02's selected TX power).
+ * Unknown opcode returns remain opaque; Status, credit-only and framing are
+ * still checked. A rejected reply must never release a Host transaction.
+ */
+int ws73_dli_validate_reply(const unsigned char *data, size_t size);
+
 /* Fresh BSLE-open instance only. The caller provides its initial probe
  * window (one); every subsequent grant is an absolute controller credit.
  * Do not call again after an uncertain send/timeout. Publish info only on

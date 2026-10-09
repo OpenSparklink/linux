@@ -165,8 +165,10 @@ streaming/fault state and unsupported-event counters. Bulk/notification URBs
 carry the binding's immutable identity. RX callbacks validate the complete
 HCC aggregate before passing SLE slots to the attributed owner. Native
 management replies preserve exact opcode and status; successful Status does
-not release the active slot before Complete. Metadata Complete lengths are
-validated, oversized results fail instead of being truncated, and zero-credit
+not release the active slot before Complete. The driver validates metadata
+and discovery successful Complete return lengths before invoking native
+ingress; the generic core does not own a WS73 opcode/return-length table.
+Oversized results fail instead of being truncated, and zero-credit
 grants update the same bounded Host used by typed/raw requests. Unsupported
 operations, including standard ReadCmdLen at WS73 opcode 0x0401, are rejected
 before reserving pending state or credit. Domain/data decoding and full
@@ -187,9 +189,33 @@ three-byte complete-data header (handle, operation, length), five-byte
 advertising enable, eight-byte single-frame-type scanning parameters and
 two-byte scanning enable. It never inserts defaults for power, addresses or
 timing, and rejects unsupported multiple frame types rather than choosing
-one. Advertising-parameter validation checks framing only; the controller
+one. Advertising-parameter validation checks framing and the handle; the controller
 must still reject unsupported values. The reference shares the data schema
 with scan response, whose actual hardware behavior remains unverified here.
+
+``ws73_discovery_adv_params`` now serializes every field of the 49-byte
+configuration from a wide host-value structure. It bounds each numeric field
+before writing any output, writes both intervals as little-endian 24-bit
+values and all seven duration/connection fields as little-endian 16-bit
+values, and copies both addresses exactly. Zero TX power stays zero;
+``127`` is explicit no preference. Request notification/count (bytes 33/34)
+are independent caller values, not a role-derived vendor default. This is
+serialization, not controller capability or board/calibration validation.
+Address types remain explicit WS73 bytes. ``ws73_discovery_ms_slots`` rejects
+zero/overflow before converting milliseconds to 125-us slots: the largest
+integral millisecond scan interval is 8191, and advertising interval is
+2097151. It never narrows an overflowing interval.
+
+``ws73_dli_validate_reply`` requires one exact A2 management event with
+matching declared length. Opcode-zero credit events carry exactly three
+parameters; Status carries exactly four, and acceptance is not Complete.
+Known successful metadata replies have their exact query return sizes.
+Successful advertising-parameter Complete carries one selected TX power
+byte; data/scan-response/advertising-enable/scan-parameter/scan-enable
+Complete carries no additional return data. Controller failure status and
+its opaque data are retained; unknown successful return bodies do not add
+command support. Runtime still rejects all discovery commands pending the
+typed, stepwise Host transaction. No firmware is sent by these pure codecs.
 
 The decoder for WS73 event 0x180b accepts exactly a 23-byte header plus its
 declared 0..255 data bytes, preserves all header bytes and exposes raw signed
@@ -207,6 +233,16 @@ RSSI values and unchanged outputs on failure. It also feeds the data codec
 through production HCC command framing. Run it using the selftests Makefile
 or compile its C source with ``discovery.c`` and ``wire.c``. These are
 synthetic memory tests, not real dual-controller discovery or RF evidence.
+The parameter tests include a distinct 49-byte golden vector, every field's
+width/overflow boundary, every signed TX power byte, empty configurations,
+all short output capacities, and exact scan timing conversion boundaries.
+``ws73_dli_test`` additionally checks known Complete schemas, all 256 failure
+statuses, credit-only/Status framing and unknown opaque return data.
+The native lifecycle runner accepts ``--native-ws73-fault-mode short-reply``
+or ``trailing-reply`` together with ``--native-ws73 --native-ws73-fault``:
+these fixtures send valid HCC/DLI framing but a mismatched successful address
+return length. The existing exact one-owner EPROTO withdrawal and surviving
+owner queries are required in both modes; this is synthetic fault evidence.
 
 Complete native controller event stream
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

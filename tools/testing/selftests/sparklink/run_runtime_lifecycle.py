@@ -138,11 +138,15 @@ def main():
                         help='synthetic WS73 HCC/BSLE/URB bootstrap; never real WS73/RF')
     parser.add_argument('--native-ws73-fault', action='store_true',
                         help='inject one malformed native aggregate, retaining the other owner')
+    parser.add_argument('--native-ws73-fault-mode', choices=['hcc', 'short-reply', 'trailing-reply'],
+                        default='hcc', help='fault boundary: HCC aggregate or successful Complete schema')
     parser.add_argument('--native-ws73-events', action='store_true',
                         help='synthetic maximum reports, fanout/loss/poll/copy-fault and replug')
     args = parser.parse_args()
     if args.native_ws73_fault and not args.native_ws73:
         parser.error('--native-ws73-fault requires --native-ws73')
+    if args.native_ws73_fault_mode != 'hcc' and not args.native_ws73_fault:
+        parser.error('--native-ws73-fault-mode requires --native-ws73-fault')
     if args.native_ws73_events and (not args.native_ws73 or args.native_ws73_fault):
         parser.error('--native-ws73-events requires --native-ws73 without --native-ws73-fault')
     output = args.output.resolve()
@@ -153,6 +157,7 @@ def main():
     scope = ('synthetic WS73 USB HCC/BSLE/native SETUP lifetime; no ROM/RF/slkd/no-sudo acceptance'
              if args.native_ws73 else 'virtual standard-DLI Runtime lifetime; not WS73/RF/slkd/no-sudo acceptance')
     manifest = dict(scope=scope, native_fault_injection=args.native_ws73_fault,
+                    native_fault_mode=args.native_ws73_fault_mode if args.native_ws73_fault else None,
                     native_event_stream=args.native_ws73_events,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
     process = monitor = None
@@ -245,7 +250,8 @@ poweroff -f
                        '-m', '256M', '-smp', '2', '-qmp', f'unix:{sock},server=on,wait=off',
                        '-device', 'qemu-xhci,id=xhci',
                        '-device', f'{model},id=sle0,bus=xhci.0,port=1' +
-                       (',runtime-fault=1' if args.native_ws73_fault else
+                       (',runtime-fault=' + str({'hcc': 1, 'short-reply': 2, 'trailing-reply': 3}[
+                            args.native_ws73_fault_mode]) if args.native_ws73_fault else
                         ',runtime-status=254' if args.native_ws73 else '') +
                        (',runtime-reports=40' if args.native_ws73_events else '')]
             if os.access('/dev/kvm', os.R_OK | os.W_OK):

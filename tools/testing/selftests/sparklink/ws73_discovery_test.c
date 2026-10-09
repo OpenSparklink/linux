@@ -2,6 +2,7 @@
 /* Production WS73 profile codecs. Synthetic vectors; no RF/Ready claim. */
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -12,9 +13,140 @@ static unsigned int checks, failures;
 	failures++; fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); \
 } } while (0)
 
+static void adv_params_tests(void)
+{
+	/* Independent wire vector: every address/tail byte has a distinct value.
+	 * Reserved values here exercise serialization, not controller support.
+	 */
+	static const unsigned char expected[49] = {
+		0x12, 0x03, 0x02, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab,
+		0x07, 0x06, 0x04, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+		0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x03, 0xd6, 0x01,
+		0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+		0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde,
+		0x57, 0x13, 0x68, 0x24, 0x79, 0x35,
+	};
+	struct ws73_discovery_adv_params params = {
+		.handle = 0x12, .mode = 3, .gt_role = 2,
+		.interval_min = 0x123456, .interval_max = 0xabcdef,
+		.channel_map = 7, .own_address_type = 6, .peer_address_type = 4,
+		.own_address = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15 },
+		.peer_address = { 0x20, 0x21, 0x22, 0x23, 0x24, 0x25 },
+		.filter = 3, .tx_power = -42, .primary_frame = 1,
+		.secondary_frame = 2, .secondary_phy = 3, .secondary_pilot = 4,
+		.secondary_mcs = 5, .secondary_max_skip = 6, .sid = 7,
+		.request_notification = 8, .max_requests = 9,
+		.request_rx_duration = 0x1234, .conn_interval_min = 0x5678,
+		.conn_interval_max = 0x9abc, .conn_max_latency = 0xdef0,
+		.supervision_timeout = 0x1357, .min_event_length = 0x2468,
+		.max_event_length = 0x3579,
+	};
+	struct field {
+		size_t host_offset;
+		unsigned int wire_offset, bytes, max;
+	};
+#define FIELD(name, offset, bytes, max) \
+	{ offsetof(struct ws73_discovery_adv_params, name), offset, bytes, max }
+	static const struct field fields[] = {
+		FIELD(handle, 0, 1, 0xef), FIELD(mode, 1, 1, 0xff),
+		FIELD(gt_role, 2, 1, 0xff), FIELD(interval_min, 3, 3, 0xffffff),
+		FIELD(interval_max, 6, 3, 0xffffff), FIELD(channel_map, 9, 1, 0xff),
+		FIELD(own_address_type, 10, 1, 0xff), FIELD(peer_address_type, 11, 1, 0xff),
+		FIELD(filter, 24, 1, 0xff), FIELD(primary_frame, 26, 1, 0xff),
+		FIELD(secondary_frame, 27, 1, 0xff), FIELD(secondary_phy, 28, 1, 0xff),
+		FIELD(secondary_pilot, 29, 1, 0xff), FIELD(secondary_mcs, 30, 1, 0xff),
+		FIELD(secondary_max_skip, 31, 1, 0xff), FIELD(sid, 32, 1, 0xff),
+		FIELD(request_notification, 33, 1, 0xff), FIELD(max_requests, 34, 1, 0xff),
+		FIELD(request_rx_duration, 35, 2, 0xffff),
+		FIELD(conn_interval_min, 37, 2, 0xffff), FIELD(conn_interval_max, 39, 2, 0xffff),
+		FIELD(conn_max_latency, 41, 2, 0xffff), FIELD(supervision_timeout, 43, 2, 0xffff),
+		FIELD(min_event_length, 45, 2, 0xffff), FIELD(max_event_length, 47, 2, 0xffff),
+	};
+#undef FIELD
+	unsigned char out[64], before[64], vector[49], wire[128];
+	struct ws73_discovery_adv_params candidate;
+	unsigned int slots;
+
+	memset(out, 0xa5, sizeof(out));
+	memcpy(before, out, sizeof(out));
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), &params) == 49);
+	CHECK(!memcmp(out, expected, 49) && !memcmp(out + 49, before + 49, 15));
+	CHECK(ws73_discovery_validate_command(0x0c02, out, 49) == 0);
+	CHECK(ws73_wire_command(wire, sizeof(wire), 0x1234, 0x0c02, out, 49) == 128);
+	CHECK(!memcmp(wire + 68, "\xa1\x02\x0c\x31\x00", 5));
+	CHECK(!memcmp(wire + 73, expected, 49));
+	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		const struct field *field = fields + i;
+		unsigned int values[] = { 0, 1, 0xff, 0x100, 0x1234, 0x123456,
+			field->max, field->max + 1, UINT_MAX };
+
+		for (unsigned int j = 0; j < sizeof(values) / sizeof(values[0]); j++) {
+			unsigned int value = values[j];
+
+			candidate = params;
+			/* Real unsigned-int member, aligned by offsetof. */
+			*(unsigned int *)((unsigned char *)&candidate + field->host_offset) = value;
+			memset(out, 0xa5, sizeof(out));
+			if (value > field->max) {
+				CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == -EINVAL);
+				CHECK(!memcmp(out, before, sizeof(out)));
+				continue;
+			}
+			memcpy(vector, expected, sizeof(vector));
+			for (unsigned int k = 0; k < field->bytes; k++)
+				vector[field->wire_offset + k] = value >> (8 * k);
+			CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == 49);
+			CHECK(!memcmp(out, vector, 49) && !memcmp(out + 49, before + 49, 15));
+		}
+	}
+	for (int power = -128; power <= 127; power++) {
+		candidate = params;
+		candidate.tx_power = power;
+		memcpy(vector, expected, sizeof(vector));
+		vector[25] = (unsigned char)power;
+		CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == 49);
+		CHECK(!memcmp(out, vector, 49));
+	}
+	for (unsigned int capacity = 0; capacity < 49; capacity++) {
+		memset(out, 0xa5, sizeof(out));
+		CHECK(ws73_discovery_adv_params(out, capacity, &params) == -EMSGSIZE);
+		CHECK(!memcmp(out, before, sizeof(out)));
+	}
+	candidate = params;
+	candidate.tx_power = -129;
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == -EINVAL);
+	candidate.tx_power = 128;
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == -EINVAL);
+	candidate.tx_power = INT_MIN;
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == -EINVAL);
+	candidate.tx_power = INT_MAX;
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == -EINVAL);
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), NULL) == -EINVAL);
+	CHECK(ws73_discovery_adv_params(NULL, sizeof(out), &params) == -EINVAL);
+	CHECK(!memcmp(out, before, sizeof(out)));
+	/* No implicit board, role, address, power or interval defaults. */
+	memset(&candidate, 0, sizeof(candidate));
+	memset(vector, 0, sizeof(vector));
+	CHECK(ws73_discovery_adv_params(out, sizeof(out), &candidate) == 49);
+	CHECK(!memcmp(out, vector, sizeof(vector)));
+	for (unsigned int ms = 1; ms <= 8191; ms++) {
+		CHECK(ws73_discovery_ms_slots(ms, 16, &slots) == 0 && slots == ms * 8);
+	}
+	CHECK(ws73_discovery_ms_slots(2097151, 24, &slots) == 0 && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(8192, 16, &slots) == -ERANGE && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(2097152, 24, &slots) == -ERANGE && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(ULLONG_MAX, 24, &slots) == -ERANGE && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(0, 24, &slots) == -EINVAL && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(1, 32, &slots) == -EINVAL && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(1, UINT_MAX, &slots) == -EINVAL && slots == 0xfffff8);
+	CHECK(ws73_discovery_ms_slots(1, 16, NULL) == -EINVAL);
+}
+
 static void data_tests(void)
 {
-	/* A named TLV must start at byte three, not behind a selection byte. */
+	/* Opaque marker starts at byte three, not behind a selection byte.
+	 * This test makes no claim about its outer/inner application TLV format.
+	 */
 	static const unsigned char marker[] = { 5, 9, 'W', 'S', '7', '3' };
 	static const unsigned char expected[] = { 0, 3, 6, 5, 9, 'W', 'S', '7', '3' };
 	static const unsigned char standard[] = { 0, 3, 0, 6, 5, 9, 'W', 'S', '7', '3' };
@@ -100,6 +232,8 @@ static void control_tests(void)
 	CHECK(!memcmp(out, before, sizeof(out)));
 	CHECK(ws73_discovery_validate_command(0x0c02, out, 48) == -EINVAL);
 	CHECK(ws73_discovery_validate_command(0x0c02, out, 49) == 0); /* framing only */
+	out[0] = 0xf0;
+	CHECK(ws73_discovery_validate_command(0x0c02, out, 49) == -EINVAL);
 	CHECK(ws73_discovery_validate_command(0x0c02, NULL, 49) == -EINVAL);
 	CHECK(ws73_discovery_validate_command(0x0401, NULL, 0) == -EOPNOTSUPP);
 	CHECK(ws73_discovery_validate_command(0x1001, scan, 7) == -EINVAL);
@@ -154,6 +288,7 @@ static void report_tests(void)
 
 int main(void)
 {
+	adv_params_tests();
 	data_tests();
 	control_tests();
 	report_tests();

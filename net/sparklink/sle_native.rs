@@ -281,11 +281,8 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
                 if params.len() < 4 || (event == 1 && params.len() != 4) {
                     return PROTOCOL_ERROR;
                 }
-                if event == 2 && params[3] == 0 {
-                    let expected = match opcode { 0x0404 => Some(5), 0x0403 => Some(10),
-                                                  0x0402 | 0x0406 => Some(6), _ => None };
-                    if expected.is_some_and(|n| params.len() != n + 4) { return PROTOCOL_ERROR; }
-                }
+                // The native driver validates its successful return schema
+                // before ingress. Keep its opcode dialect out of the core.
                 if params.len() - 4 > 240 { return EOVERFLOW.to_errno(); }
                 let mut bytes = KVec::new();
                 if bytes.extend_from_slice(&params[4..], GFP_ATOMIC).is_err() { return ENOMEM.to_errno(); }

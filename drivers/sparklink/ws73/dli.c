@@ -43,6 +43,56 @@ static unsigned int dli_u16(const unsigned char *p)
 	return (unsigned int)p[0] | (unsigned int)p[1] << 8;
 }
 
+int ws73_dli_validate_reply(const unsigned char *data, size_t size)
+{
+	unsigned int event, opcode, expected;
+	size_t params;
+
+	if (!data)
+		return -EINVAL;
+	if (size < 5 || data[0] != 0xa2)
+		return -EPROTO;
+	event = dli_u16(data + 1);
+	params = dli_u16(data + 3);
+	if (params != size - 5 || (event != 1 && event != 2) || params < 3)
+		return -EPROTO;
+	opcode = dli_u16(data + 5);
+	if (!opcode)
+		return params == 3 ? 0 : -EPROTO;
+	if (params < 4 || (event == 1 && params != 4))
+		return -EPROTO;
+	/* Status acceptance is not terminal. Failure returns are retained, not
+	 * mapped to the host's enum or interpreted as successful result data.
+	 */
+	if (event == 1 || data[8])
+		return 0;
+	switch (opcode) {
+	case 0x0402:
+	case 0x0406:
+		expected = 6;
+		break;
+	case 0x0403:
+		expected = 10;
+		break;
+	case 0x0404:
+		expected = 5;
+		break;
+	case 0x0c02:
+		expected = 1; /* selected TX power, not another command status */
+		break;
+	case 0x0c03:
+	case 0x0c04:
+	case 0x0c05:
+	case 0x1001:
+	case 0x1002:
+		expected = 0;
+		break;
+	default:
+		return 0; /* no capability or command authorization inferred */
+	}
+	return params == 4 + expected ? 0 : -EPROTO;
+}
+
 static int ws73_query_receive(void *context, unsigned int service, unsigned int queue,
 			      const unsigned char *data, size_t size)
 {
@@ -67,6 +117,8 @@ static int ws73_query_receive(void *context, unsigned int service, unsigned int 
 		return -EIO;
 	if (event != 1 && event != 2)
 		return 0;
+	if (ws73_dli_validate_reply(data, size))
+		return -EPROTO;
 	if (params < 3)
 		return -EPROTO;
 	opcode = dli_u16(data + 5);

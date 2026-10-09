@@ -429,6 +429,12 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 
 	if (service != WS73_WIRE_SLE_SERVICE || queue != WS73_WIRE_SLE_QUEUE)
 		return 0;
+	if (size >= 3 && data[0] == 0xa2 &&
+	    (get_unaligned_le16(data + 1) == 1 || get_unaligned_le16(data + 1) == 2)) {
+		ret = ws73_dli_validate_reply(data, size);
+		if (ret)
+			return ret;
+	}
 	if (size >= 5 && data[0] == 0xa2 && get_unaligned_le16(data + 1) == WS73_DISC_REPORT_EVENT) {
 		struct ws73_discovery_report report;
 

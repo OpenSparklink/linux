@@ -178,11 +178,21 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
     if (s->commands > 4 && s->runtime_fault && !s->failed_once) {
         uint8_t malformed[8] = { 0xa2, 2, 0, 3, 0, 0, 0, 1 };
         s->failed_once = true;
-        queue_frame(s, 10, 8, malformed, sizeof(malformed));
-        /* Later bytes are intentionally inconsistent with the aggregate.
-         * Production wire validation must fail before invoking native RX.
-         */
-        put32(s->packets[(s->head + s->count - 1) % 64] + 4, 155);
+        if (s->runtime_fault == 1) {
+            queue_frame(s, 10, 8, malformed, sizeof(malformed));
+            /* Production HCC validation rejects the inconsistent aggregate. */
+            put32(s->packets[(s->head + s->count - 1) % 64] + 4, 155);
+        } else {
+            /* Valid HCC and declared DLI framing, wrong successful return
+             * length. Only the driver's reply schema can reject this before
+             * the Host publishes a result or advances another command.
+             */
+            assert(size > 0 && size < sizeof(value));
+            s->in_flight = true;
+            command_event(s, 1, op, 1, 0, NULL, 0);
+            command_event(s, 2, op, 1, 0, value,
+                          s->runtime_fault == 2 ? size - 1 : size + 1);
+        }
         return true;
     }
     if (s->commands > 4 && s->runtime_status && !s->failed_once) {
