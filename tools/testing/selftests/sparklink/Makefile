@@ -14,11 +14,14 @@ $(OUTPUT)/sparklink_host_plan_test: sparklink_host_plan_test.rs \
 
 $(OUTPUT)/ws73_discovery_test: ws73_discovery_test.c \
 	../../../../drivers/sparklink/ws73/discovery.c \
+	../../../../drivers/sparklink/ws73/dli.c \
+	../../../../drivers/sparklink/ws73/dli.h \
 	../../../../drivers/sparklink/ws73/discovery.h \
+	../../../../include/linux/sparklink_discovery.h \
 	../../../../drivers/sparklink/ws73/wire.c \
 	../../../../drivers/sparklink/ws73/wire.h
 	$(CC) $(CFLAGS) $< ../../../../drivers/sparklink/ws73/discovery.c \
-		../../../../drivers/sparklink/ws73/wire.c $(LDLIBS) -o $@
+		../../../../drivers/sparklink/ws73/wire.c ../../../../drivers/sparklink/ws73/dli.c $(LDLIBS) -o $@
 
 $(OUTPUT)/ws73_bsle_test: ws73_bsle_test.c \
 	../../../../drivers/sparklink/ws73/wire.c \

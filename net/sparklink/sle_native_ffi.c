@@ -31,7 +31,8 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 	struct sparklink_native_transport *transport;
 
 	if (!info || !ops || !context || !identity || !ops->get || !ops->put ||
-	    !ops->open || !ops->close || !ops->validate_command || !ops->send_command)
+	    !ops->open || !ops->close || !ops->validate_command || !ops->send_command ||
+	    !!ops->prepare_discovery != !!ops->validate_discovery_step)
 		return -EINVAL;
 	transport = kmalloc_obj(*transport);
 	if (!transport)
@@ -72,6 +73,25 @@ int sparklink_native_transport_validate(struct sparklink_native_transport *trans
 					u16 opcode, const u8 *params, size_t length)
 {
 	return transport->ops.validate_command(transport->context, opcode, params, length);
+}
+
+int sparklink_native_transport_prepare(struct sparklink_native_transport *transport,
+	const struct sparklink_discovery_request *request,
+	struct sparklink_discovery_plan *plan)
+{
+	if (!transport->ops.prepare_discovery)
+		return -EOPNOTSUPP;
+	return transport->ops.prepare_discovery(transport->context, request, plan);
+}
+
+int sparklink_native_transport_validate_step(struct sparklink_native_transport *transport,
+	unsigned int operation, unsigned int step, unsigned int count,
+	u16 opcode, const u8 *params, size_t length)
+{
+	if (!transport->ops.validate_discovery_step)
+		return -EOPNOTSUPP;
+	return transport->ops.validate_discovery_step(transport->context,
+		operation, step, count, opcode, params, length);
 }
 
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,

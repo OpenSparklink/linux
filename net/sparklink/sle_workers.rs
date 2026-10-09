@@ -831,6 +831,7 @@ impl WorkItem<1> for ControllerRuntime {
                     if let Err(error) = runtime.controller.send_command_transport(
                         request.opcode,
                         &request.params[..request.param_len as usize],
+                        request.recipe,
                     ) {
                         fail_host(&this, runtime, error);
                     }

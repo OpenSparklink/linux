@@ -3,6 +3,11 @@
 #define _SPARKLINK_WS73_DISCOVERY_H
 
 #include "wire.h"
+#ifdef __KERNEL__
+#include <linux/sparklink_discovery.h>
+#else
+#include "../../../include/linux/sparklink_discovery.h"
+#endif
 
 /* Explicit vendor profile. These sizes are not the standard USB dialect.
  * Framing facts: libws73-usb f4d85d0, checked against T/XS 10003-2025
@@ -28,36 +33,7 @@
  * All values, including zero TX power and the two request-posture bytes,
  * come from the caller. Capability/role policy belongs above this codec.
  */
-struct ws73_discovery_adv_params {
-	unsigned int handle;
-	unsigned int mode;
-	unsigned int gt_role;
-	unsigned int interval_min; /* 125 us units, unsigned 24-bit */
-	unsigned int interval_max;
-	unsigned int channel_map;
-	unsigned int own_address_type;
-	unsigned int peer_address_type;
-	unsigned char own_address[6];
-	unsigned char peer_address[6];
-	unsigned int filter;
-	int tx_power; /* signed wire byte; 127 means no preference */
-	unsigned int primary_frame;
-	unsigned int secondary_frame;
-	unsigned int secondary_phy;
-	unsigned int secondary_pilot;
-	unsigned int secondary_mcs;
-	unsigned int secondary_max_skip;
-	unsigned int sid;
-	unsigned int request_notification;
-	unsigned int max_requests;
-	unsigned int request_rx_duration; /* 125 us units, unsigned 16-bit */
-	unsigned int conn_interval_min; /* 125 us units, unsigned 16-bit */
-	unsigned int conn_interval_max;
-	unsigned int conn_max_latency;
-	unsigned int supervision_timeout; /* 10 ms units, unsigned 16-bit */
-	unsigned int min_event_length; /* 125 us units, unsigned 16-bit */
-	unsigned int max_event_length;
-};
+
 
 /* A borrowed view of exactly one event parameter body, without A2/event/len.
  * header preserves all vendor bytes, including address types, direct address,
@@ -84,7 +60,7 @@ int ws73_discovery_validate_command(unsigned int opcode, const unsigned char *pa
  * Input/output buffers must not overlap.
  */
 int ws73_discovery_adv_params(unsigned char *out, size_t capacity,
-			      const struct ws73_discovery_adv_params *params);
+			      const struct sparklink_discovery_adv_params *params);
 /* Exact millisecond -> 125 us conversion for the scan (16-bit) or advertising
  * (24-bit) interval field. Reject zero/overflow; preserve *slots on failure.
  */
@@ -106,5 +82,15 @@ int ws73_discovery_scan_enable(unsigned char *out, size_t capacity,
  */
 int ws73_discovery_report_decode(const unsigned char *params, size_t size,
 				 struct ws73_discovery_report *report);
+
+/* Output is unchanged on any validation failure. Input must be immutable and
+ * disjoint from output. The driver alone selects opcodes/framing. No I/O,
+ * command permission, Ready transition or RF success follows from preparation.
+ */
+int ws73_discovery_prepare(const struct sparklink_discovery_request *request,
+                          struct sparklink_discovery_plan *out);
+int ws73_discovery_validate_step(unsigned int operation, unsigned int step,
+                                unsigned int count, unsigned int opcode,
+                                const unsigned char *params, size_t size);
 
 #endif

@@ -541,6 +541,20 @@ static int ws73_native_validate(void *context, u16 opcode, const u8 *params, siz
 	return ws73_dli_validate_command(opcode, params, length);
 }
 
+static int ws73_native_prepare(void *context,
+		const struct sparklink_discovery_request *request,
+		struct sparklink_discovery_plan *plan)
+{
+	return ws73_discovery_prepare(request, plan);
+}
+
+static int ws73_native_validate_step(void *context, unsigned int operation,
+		unsigned int step, unsigned int count, u16 opcode,
+		const u8 *params, size_t length)
+{
+	return ws73_discovery_validate_step(operation, step, count, opcode, params, length);
+}
+
 static int ws73_native_command(void *context, u16 opcode, const u8 *params, size_t length)
 {
 	struct ws73_usb *ws = context;
@@ -570,6 +584,8 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.open = ws73_native_open,
 	.close = ws73_native_close,
 	.validate_command = ws73_native_validate,
+	.prepare_discovery = ws73_native_prepare,
+	.validate_discovery_step = ws73_native_validate_step,
 	.send_command = ws73_native_command,
 };
 

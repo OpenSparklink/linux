@@ -285,6 +285,37 @@ does not claim complete native/standard snoop, command/event unification,
 discovery reassembly, Ready, active scanning, or real RF reception. Native
 discovery commands remain disabled until the full Host transactions exist.
 
+Driver-owned typed discovery preparation
+----------------------------------------
+
+The internal ``sparklink_discovery_request`` supplies complete advertising
+or scanning configuration, data and an explicit optional scan response.
+Preparation is an optional retained-driver callback, separate from raw DLI
+validation. WS73 prepares bounded sequences of three/four advertising steps
+(SetParam, SetData, optional ScanRsp, Enable), two scanning steps, or one
+explicit stop. Every caller value survives; no role, power, address or board
+default is inserted. A small scratch buffer preflights all steps before the
+caller's output plan is changed. Inputs must be immutable and disjoint from
+output. Unused bytes/steps are zeroed; invalid late data or enable fields leave
+the previous output intact. This internal interface is not a userspace ABI.
+
+The TX worker retains the Host recipe tag through Backend dispatch. A native
+recipe is checked by the driver against its operation, position, count, wire
+schema and enable value immediately before transfer. Missing typed callbacks
+reject support. Raw commands still use the original metadata-only whitelist;
+preparing a valid discovery frame never grants raw DLI permission. Core does
+not contain WS73 opcode/parameter-layout tables. Preparing a plan performs no
+I/O and does not establish capability, board calibration, Ready or RF success.
+
+The callbacks and production compiler are implemented, but the core submit
+API has not yet called preparation or queued native discovery plans. Public
+operation cookies/results, native configuration policy and fault/stop-state
+handling, dynamic adapters and slctl remain pending. Native registrations
+therefore remain metadata-only SETUP and RF requests are still rejected.
+Standalone selftests cover actual compiler output, whole-output preservation,
+sequence-position/enable validation, and unchanged raw-command rejection;
+they are synthetic, not native on-wire multi-step or real air evidence.
+
 Typed command recipe foundation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

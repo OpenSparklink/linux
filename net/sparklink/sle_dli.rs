@@ -1378,10 +1378,12 @@ impl ControllerBackend {
         matches!(self, Self::Usb(_) | Self::Ws73(_))
     }
 
-    pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {
+    pub(crate) fn send_command_transport(
+        &self, opcode: u16, params: &[u8], recipe: Option<super::sle_command_plan::RecipeTag>,
+    ) -> Result {
         match self {
             Self::Usb(c) => c.send_command_transport(opcode, params),
-            Self::Ws73(c) => c.send_command_transport(opcode, params),
+            Self::Ws73(c) => c.send_command_transport(opcode, params, recipe),
             _ => Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
         }
     }

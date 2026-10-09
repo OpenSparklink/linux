@@ -35,7 +35,7 @@ int ws73_discovery_ms_slots(unsigned long long ms, unsigned int bits,
 }
 
 int ws73_discovery_adv_params(unsigned char *out, size_t capacity,
-			      const struct ws73_discovery_adv_params *p)
+			      const struct sparklink_discovery_adv_params *p)
 {
 	if (!out || !p || p->handle > 0xef || p->mode > 0xff ||
 	    p->gt_role > 0xff || p->interval_min > 0xffffff ||
@@ -207,4 +207,176 @@ int ws73_discovery_report_decode(const unsigned char *params, size_t size,
 	/* Explicit conversion is independent of the compiler's char signedness. */
 	report->rssi = params[21] < 128 ? params[21] : (int)params[21] - 256;
 	return 0;
+}
+
+/* Validate the typed sequence shape independently at transfer time. Raw DLI
+ * still uses its metadata-only whitelist. A recipe tag is kernel-owned and
+ * cannot be supplied by the raw command ioctl.
+ */
+int ws73_discovery_validate_step(unsigned int operation, unsigned int step,
+				 unsigned int count, unsigned int opcode,
+				 const unsigned char *params, size_t size)
+{
+	unsigned int expected;
+	int enable = -1;
+
+	if (step >= count)
+		return -EINVAL;
+	switch (operation) {
+	case SPARKLINK_DISCOVERY_ADV_START:
+		if (count != 3 && count != 4)
+			return -EINVAL;
+		if (step == 0)
+			expected = 0x0c02;
+		else if (step == 1)
+			expected = 0x0c03;
+		else if (step == count - 1)
+			expected = 0x0c05;
+		else
+			expected = 0x0c04;
+		if (step == count - 1)
+			enable = 1;
+		break;
+	case SPARKLINK_DISCOVERY_ADV_STOP:
+		if (count != 1)
+			return -EINVAL;
+		expected = 0x0c05;
+		enable = 0;
+		break;
+	case SPARKLINK_DISCOVERY_SCAN_START:
+		if (count != 2)
+			return -EINVAL;
+		expected = step == 0 ? 0x1001 : 0x1002;
+		if (step == 1)
+			enable = 1;
+		break;
+	case SPARKLINK_DISCOVERY_SCAN_STOP:
+		if (count != 1)
+			return -EINVAL;
+		expected = 0x1002;
+		enable = 0;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	if (opcode != expected)
+		return -EINVAL;
+	if (enable >= 0 && (!params || !size || params[0] != enable))
+		return -EINVAL;
+	return ws73_discovery_validate_command(opcode, params, size);
+}
+
+/* Called twice: preflight into one small scratch buffer, then encode directly
+ * into the caller's (normally heap) plan. No 1KB plan temporary or allocation
+ * is needed. Immutable/disjoint input is an internal interface precondition.
+ */
+static int ws73_discovery_build(const struct sparklink_discovery_request *r,
+				struct sparklink_discovery_plan *out)
+{
+	unsigned char scratch[SPARKLINK_DISCOVERY_PARAMS_MAX];
+	unsigned char *p;
+	unsigned int count, step = 0, opcode;
+	int ret;
+	const struct sparklink_discovery_scan_params *scan = r->scanning;
+
+#define PART(code, expression)                               \
+	do {                                                 \
+		opcode = (code);                             \
+		p = out ? out->steps[step].params : scratch; \
+		ret = (expression);                          \
+		if (ret < 0)                                 \
+			return ret;                          \
+		if (out) {                                   \
+			out->steps[step].opcode = opcode;    \
+			out->steps[step].length = ret;       \
+		}                                            \
+		step++;                                      \
+	} while (0)
+	switch (r->operation) {
+	case SPARKLINK_DISCOVERY_ADV_START:
+		count = r->scan_response_present ? 4 : 3;
+		PART(0x0c02, ws73_discovery_adv_params(p, sizeof(scratch),
+						       r->advertising));
+		PART(0x0c03, ws73_discovery_data(p, sizeof(scratch), r->handle,
+						 r->data, r->data_size));
+		if (r->scan_response_present)
+			PART(0x0c04,
+			     ws73_discovery_data(p, sizeof(scratch), r->handle,
+						 r->scan_response,
+						 r->scan_response_size));
+		PART(0x0c05,
+		     ws73_discovery_adv_enable(p, sizeof(scratch), 1, r->handle,
+					       r->duration, r->max_events));
+		break;
+	case SPARKLINK_DISCOVERY_ADV_STOP:
+		count = 1;
+		PART(0x0c05, ws73_discovery_adv_enable(p, sizeof(scratch), 0,
+						       r->handle, 0, 0));
+		break;
+	case SPARKLINK_DISCOVERY_SCAN_START:
+		count = 2;
+		PART(0x1001,
+		     ws73_discovery_scan_params(
+			     p, sizeof(scratch), scan->own_address_type,
+			     scan->filter, scan->frame_types, scan->active,
+			     scan->interval, scan->window));
+		PART(0x1002,
+		     ws73_discovery_scan_enable(p, sizeof(scratch), 1,
+						scan->filter_duplicates));
+		break;
+	case SPARKLINK_DISCOVERY_SCAN_STOP:
+		count = 1;
+		PART(0x1002,
+		     ws73_discovery_scan_enable(p, sizeof(scratch), 0, 0));
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+#undef PART
+	if (out) {
+		out->operation = r->operation;
+		out->count = count;
+	}
+	return 0;
+}
+
+int ws73_discovery_prepare(const struct sparklink_discovery_request *r,
+			   struct sparklink_discovery_plan *out)
+{
+	int ret;
+
+	if (!r || !out || r->scan_response_present > 1 ||
+	    (!r->scan_response_present &&
+	     (r->scan_response || r->scan_response_size)))
+		return -EINVAL;
+	switch (r->operation) {
+	case SPARKLINK_DISCOVERY_ADV_START:
+		if (!r->advertising || r->scanning ||
+		    r->advertising->handle != r->handle)
+			return -EINVAL;
+		break;
+	case SPARKLINK_DISCOVERY_SCAN_START:
+		if (!r->scanning || r->advertising)
+			return -EINVAL;
+		break;
+	case SPARKLINK_DISCOVERY_ADV_STOP:
+	case SPARKLINK_DISCOVERY_SCAN_STOP:
+		if (r->advertising || r->scanning)
+			return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	if (r->operation != SPARKLINK_DISCOVERY_ADV_START) {
+		if (r->data || r->data_size || r->scan_response_present ||
+		    r->duration || r->max_events)
+			return -EINVAL;
+		if (r->operation != SPARKLINK_DISCOVERY_ADV_STOP && r->handle)
+			return -EINVAL;
+	}
+	ret = ws73_discovery_build(r, NULL);
+	if (ret)
+		return ret;
+	memset(out, 0, sizeof(*out));
+	return ws73_discovery_build(r, out);
 }

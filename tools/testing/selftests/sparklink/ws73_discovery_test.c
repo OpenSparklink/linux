@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "../../../../drivers/sparklink/ws73/discovery.h"
+#include "../../../../drivers/sparklink/ws73/dli.h"
 
 static unsigned int checks, failures;
 #define CHECK(condition) do { checks++; if (!(condition)) { \
@@ -26,7 +27,7 @@ static void adv_params_tests(void)
 		0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde,
 		0x57, 0x13, 0x68, 0x24, 0x79, 0x35,
 	};
-	struct ws73_discovery_adv_params params = {
+	struct sparklink_discovery_adv_params params = {
 		.handle = 0x12, .mode = 3, .gt_role = 2,
 		.interval_min = 0x123456, .interval_max = 0xabcdef,
 		.channel_map = 7, .own_address_type = 6, .peer_address_type = 4,
@@ -46,7 +47,7 @@ static void adv_params_tests(void)
 		unsigned int wire_offset, bytes, max;
 	};
 #define FIELD(name, offset, bytes, max) \
-	{ offsetof(struct ws73_discovery_adv_params, name), offset, bytes, max }
+	{ offsetof(struct sparklink_discovery_adv_params, name), offset, bytes, max }
 	static const struct field fields[] = {
 		FIELD(handle, 0, 1, 0xef), FIELD(mode, 1, 1, 0xff),
 		FIELD(gt_role, 2, 1, 0xff), FIELD(interval_min, 3, 3, 0xffffff),
@@ -64,7 +65,7 @@ static void adv_params_tests(void)
 	};
 #undef FIELD
 	unsigned char out[64], before[64], vector[49], wire[128];
-	struct ws73_discovery_adv_params candidate;
+	struct sparklink_discovery_adv_params candidate;
 	unsigned int slots;
 
 	memset(out, 0xa5, sizeof(out));
@@ -286,12 +287,292 @@ static void report_tests(void)
 	CHECK(!memcmp(&report, &before, sizeof(report)));
 }
 
+static void recipe_tests(void)
+{
+	struct sparklink_discovery_adv_params adv = {
+		.handle = 7,
+		.interval_min = 800,
+		.interval_max = 800,
+		.tx_power = -42,
+		.own_address_type = 6,
+		.peer_address_type = 4,
+		.own_address = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15 },
+		.peer_address = { 0x20, 0x21, 0x22, 0x23, 0x24, 0x25 },
+		.request_notification = 8,
+		.max_requests = 9,
+	};
+	struct sparklink_discovery_scan_params scan = {
+		.own_address_type = 6,
+		.filter = 3,
+		.frame_types = 1,
+		.active = 1,
+		.interval = 0x1234,
+		.window = 0x567,
+		.filter_duplicates = 1,
+	};
+	static const unsigned char scan_expected[] = { 6,    3,	   1,	 1,
+						       0x34, 0x12, 0x67, 5 };
+	static const unsigned char adv_enable_expected[] = { 1, 7, 0x34, 0x12,
+							     0x56 };
+	unsigned char data[252], response[252];
+	struct sparklink_discovery_request request = {
+		.operation = SPARKLINK_DISCOVERY_ADV_START,
+		.advertising = &adv,
+		.handle = 7,
+		.duration = 0x1234,
+		.max_events = 0x56,
+		.data = data,
+	};
+	struct sparklink_discovery_plan plan, before;
+	struct sparklink_discovery_request candidate;
+
+	for (unsigned int i = 0; i < sizeof(data); i++) {
+		data[i] = i;
+		response[i] = 255 - i;
+	}
+	/* Full length range, optional empty or full response, exact sequence shape,
+  * no standard data-selection byte, and cleared unused bytes/steps.
+  */
+	for (unsigned int len = 0; len <= 251; len++) {
+		for (unsigned int present = 0; present <= 1; present++) {
+			request.data_size = len;
+			request.scan_response_present = present;
+			request.scan_response = present ? response : NULL;
+			request.scan_response_size = present ? 251 - len : 0;
+			memset(&plan, 0xa5, sizeof(plan));
+			CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+			CHECK(plan.operation == 1 &&
+			      plan.count == (present ? 4U : 3U));
+			CHECK(plan.steps[0].opcode == 0x0c02 &&
+			      plan.steps[0].length == 49);
+			CHECK(plan.steps[0].params[0] == 7 &&
+			      plan.steps[0].params[25] == 0xd6);
+			CHECK(plan.steps[0].params[10] == 6 &&
+			      plan.steps[0].params[11] == 4);
+			CHECK(!memcmp(plan.steps[0].params + 12,
+				      adv.own_address, 6));
+			CHECK(!memcmp(plan.steps[0].params + 18,
+				      adv.peer_address, 6));
+			CHECK(plan.steps[0].params[33] == 8 &&
+			      plan.steps[0].params[34] == 9);
+			CHECK(plan.steps[1].opcode == 0x0c03 &&
+			      plan.steps[1].length == len + 3);
+			CHECK(plan.steps[1].params[0] == 7 &&
+			      plan.steps[1].params[1] == 3 &&
+			      plan.steps[1].params[2] == len);
+			CHECK(!memcmp(plan.steps[1].params + 3, data, len));
+			if (present) {
+				CHECK(plan.steps[2].opcode == 0x0c04 &&
+				      plan.steps[2].length == 254 - len);
+				CHECK(plan.steps[2].params[0] == 7 &&
+				      plan.steps[2].params[1] == 3 &&
+				      plan.steps[2].params[2] == 251 - len);
+				CHECK(!memcmp(plan.steps[2].params + 3,
+					      response, 251 - len));
+			}
+			CHECK(plan.steps[plan.count - 1].opcode == 0x0c05);
+			CHECK(plan.steps[plan.count - 1].length == 5 &&
+			      !memcmp(plan.steps[plan.count - 1].params,
+				      adv_enable_expected, 5));
+			for (unsigned int i = 0; i < 4; i++) {
+				struct sparklink_discovery_step *part =
+					&plan.steps[i];
+				for (unsigned int j = part->length; j < 255;
+				     j++)
+					CHECK(part->params[j] == 0);
+				if (i < plan.count) {
+					CHECK(ws73_discovery_validate_step(
+						      plan.operation, i,
+						      plan.count, part->opcode,
+						      part->params,
+						      part->length) == 0);
+					/* Preparation never broadens the raw metadata whitelist. */
+					CHECK(ws73_dli_validate_command(
+						      part->opcode,
+						      part->params,
+						      part->length) ==
+					      -EOPNOTSUPP);
+				} else {
+					CHECK(!part->opcode && !part->length);
+				}
+			}
+		}
+	}
+	/* Failure at any later encoder must leave the entire output unchanged. */
+	memset(&plan, 0xa5, sizeof(plan));
+	before = plan;
+	request.data_size = 1;
+	request.scan_response_present = 1;
+	request.scan_response = response;
+	request.scan_response_size = 1;
+#define BAD(field, value)                                             \
+	do {                                                          \
+		candidate = request;                                  \
+		candidate.field = (value);                            \
+		CHECK(ws73_discovery_prepare(&candidate, &plan) < 0); \
+		CHECK(!memcmp(&plan, &before, sizeof(plan)));         \
+	} while (0)
+	BAD(advertising, NULL);
+	BAD(scanning, &scan);
+	BAD(handle, 8);
+	BAD(data, NULL);
+	BAD(data_size, 252);
+	BAD(data_size, UINT_MAX);
+	BAD(scan_response, NULL);
+	BAD(scan_response_size, 252);
+	BAD(scan_response_size, UINT_MAX);
+	BAD(scan_response_present, 2);
+	BAD(duration, 0x10000);
+	BAD(max_events, 0x100);
+	BAD(operation, 0);
+	BAD(operation, UINT_MAX);
+#undef BAD
+	adv.interval_min = 0x1000000;
+	CHECK(ws73_discovery_prepare(&request, &plan) == -EINVAL);
+	CHECK(!memcmp(&plan, &before, sizeof(plan)));
+	adv.interval_min = 800;
+	CHECK(ws73_discovery_prepare(NULL, &plan) == -EINVAL);
+	CHECK(ws73_discovery_prepare(&request, NULL) == -EINVAL);
+	CHECK(!memcmp(&plan, &before, sizeof(plan)));
+
+	request = (struct sparklink_discovery_request){
+		.operation = SPARKLINK_DISCOVERY_SCAN_START,
+		.scanning = &scan,
+	};
+	CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+	CHECK(plan.count == 2 && plan.steps[0].opcode == 0x1001 &&
+	      plan.steps[0].length == 8);
+	CHECK(!memcmp(plan.steps[0].params, scan_expected,
+		      sizeof(scan_expected)));
+	CHECK(plan.steps[1].opcode == 0x1002 && plan.steps[1].length == 2 &&
+	      plan.steps[1].params[0] == 1 && plan.steps[1].params[1] == 1);
+	before = plan;
+	scan.filter_duplicates = 2;
+	CHECK(ws73_discovery_prepare(&request, &plan) == -EINVAL);
+	CHECK(!memcmp(&plan, &before, sizeof(plan)));
+	scan.filter_duplicates = 1;
+	scan.frame_types = 3;
+	CHECK(ws73_discovery_prepare(&request, &plan) == -EOPNOTSUPP);
+	CHECK(!memcmp(&plan, &before, sizeof(plan)));
+	scan.frame_types = 1;
+	request.operation = SPARKLINK_DISCOVERY_ADV_STOP;
+	request.scanning = NULL;
+	request.handle = 7;
+	CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+	CHECK(plan.count == 1 && plan.steps[0].opcode == 0x0c05 &&
+	      plan.steps[0].length == 5);
+	CHECK(plan.steps[0].params[0] == 0 && plan.steps[0].params[1] == 7 &&
+	      !plan.steps[0].params[2] && !plan.steps[0].params[3] &&
+	      !plan.steps[0].params[4]);
+	request.operation = SPARKLINK_DISCOVERY_SCAN_STOP;
+	request.handle = 0;
+	CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+	CHECK(plan.count == 1 && plan.steps[0].opcode == 0x1002 &&
+	      plan.steps[0].length == 2);
+	CHECK(!plan.steps[0].params[0] && !plan.steps[0].params[1]);
+
+	/* Exhaust sequence positions/counts and wrong action/enable combinations.
+  * Only the complete plan's own positions are authorized by this validator.
+  */
+	for (unsigned int op = 1; op <= 4; op++) {
+		request =
+			(struct sparklink_discovery_request){ .operation = op };
+		if (op == 1) {
+			request.advertising = &adv;
+			request.handle = 7;
+		}
+		if (op == 2)
+			request.handle = 7;
+		if (op == 3)
+			request.scanning = &scan;
+		CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+		for (unsigned int i = 0; i < plan.count; i++) {
+			struct sparklink_discovery_step *part = &plan.steps[i];
+			CHECK(ws73_discovery_validate_step(
+				      op, i, plan.count, part->opcode,
+				      part->params, part->length) == 0);
+			for (unsigned int count = 0; count <= 8; count++)
+				for (unsigned int step = 0; step <= 8; step++) {
+					/* ADV_START permits both 3/4 shapes; two common leading positions
+      * can be valid in either shape, enable's terminal position changes.
+      */
+					int valid = count == plan.count &&
+						    step == i;
+					if (op == 1 && count == 4)
+						valid = i < 2 ? step == i :
+								step == 3;
+					CHECK((ws73_discovery_validate_step(
+						       op, step, count,
+						       part->opcode,
+						       part->params,
+						       part->length) == 0) ==
+					      valid);
+				}
+			CHECK(ws73_discovery_validate_step(
+				      op, i, plan.count, 0x0401, part->params,
+				      part->length) == -EINVAL);
+			CHECK(ws73_discovery_validate_step(
+				      op, i, plan.count, part->opcode,
+				      part->params, part->length + 1) < 0);
+			CHECK(ws73_discovery_validate_step(op, i, plan.count,
+							   part->opcode, NULL,
+							   part->length) < 0);
+		}
+		struct sparklink_discovery_step *last =
+			&plan.steps[plan.count - 1];
+		for (unsigned int enable = 0; enable < 256; enable++) {
+			last->params[0] = enable;
+			CHECK((ws73_discovery_validate_step(
+				       op, plan.count - 1, plan.count,
+				       last->opcode, last->params,
+				       last->length) == 0) ==
+			      (enable == (op & 1)));
+		}
+	}
+	/* Reject irrelevant input without changing a prior complete output. */
+	for (unsigned int op = 2; op <= 4; op++) {
+		request =
+			(struct sparklink_discovery_request){ .operation = op };
+		if (op == 2)
+			request.handle = 7;
+		if (op == 3)
+			request.scanning = &scan;
+		CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+		before = plan;
+#define UNUSED(field, value)                                          \
+	do {                                                          \
+		candidate = request;                                  \
+		candidate.field = (value);                            \
+		CHECK(ws73_discovery_prepare(&candidate, &plan) < 0); \
+		CHECK(!memcmp(&plan, &before, sizeof(plan)));         \
+	} while (0)
+		UNUSED(advertising, &adv);
+		UNUSED(data, data);
+		UNUSED(data_size, 1);
+		UNUSED(scan_response, response);
+		UNUSED(scan_response_size, 1);
+		UNUSED(scan_response_present, 1);
+		UNUSED(duration, 1);
+		UNUSED(max_events, 1);
+		if (op != 2) {
+			UNUSED(handle, 1);
+		}
+		if (op != 3) {
+			UNUSED(scanning, &scan);
+		}
+#undef UNUSED
+	}
+	CHECK(ws73_discovery_validate_step(0, 0, 1, 0x1002, data, 2) ==
+	      -EOPNOTSUPP);
+}
+
 int main(void)
 {
 	adv_params_tests();
 	data_tests();
 	control_tests();
 	report_tests();
+	recipe_tests();
 	printf("WS73_DISCOVERY_CODEC_TEST: %s (%u checks, %u failures; synthetic only)\n",
 	       failures ? "FAIL" : "PASS", checks, failures);
 	return failures ? 1 : 0;

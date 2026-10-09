@@ -3,6 +3,7 @@
 #define _LINUX_SPARKLINK_NATIVE_H
 
 #include <linux/types.h>
+#include <linux/sparklink_discovery.h>
 
 struct module;
 
@@ -42,6 +43,17 @@ struct sparklink_native_ops {
 	int (*open)(void *context, u16 id, u64 generation);
 	void (*close)(void *context);
 	int (*validate_command)(void *context, u16 opcode, const u8 *params, size_t length);
+	/* Optional typed discovery path. Raw validate_command stays unchanged.
+	 * Missing callbacks reject typed operations with -EOPNOTSUPP. Prepare
+	 * writes a complete plan without I/O; validate checks a kernel-owned
+	 * operation/step tag before transfer, never grants raw ioctl permission.
+	 */
+	int (*prepare_discovery)(void *context,
+		const struct sparklink_discovery_request *request,
+		struct sparklink_discovery_plan *plan);
+	int (*validate_discovery_step)(void *context, unsigned int operation,
+		unsigned int step, unsigned int count, u16 opcode,
+		const u8 *params, size_t length);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
 };
 
