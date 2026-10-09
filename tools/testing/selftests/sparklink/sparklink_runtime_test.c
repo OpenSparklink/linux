@@ -222,10 +222,78 @@ static int parallel_bursts(int a, const struct sci_dev_info *info_a,
 	return failed ? fail("parallel Host bursts") : 0;
 }
 
-int main(void)
+/* Standard USB one-step typed recipes only. The model grants credit in
+ * Status, delays Complete by 25 ms and aborts on a premature next command.
+ * No native WS73 multi-step recipe, RF or slctl acceptance is inferred.
+ */
+static int recipe_control(int fd, const struct sci_dev_info *info, unsigned int operation)
+{
+	struct sle_dli_cmd query = { .opcode = 0x0406 };
+	struct sle_adv_params adv = { .dev_index = info->index, .interval_ms = 50, .discovery_level = 1 };
+	struct sle_scan_params scan = { .dev_index = info->index, .window_ms = 25, .interval_ms = 50 };
+	uint8_t role = operation < 2 ? 1 : 0;
+	unsigned int opcode = operation < 2 ? 0x0c05 : 0x1002;
+	int status = 0, complete = 0, mac = 0, result;
+	double deadline = now() + 5;
+
+	if (!(operation & 1) && ioctl(fd, SL_IOCTL_SET_ROLE, &role))
+		return fail("recipe role");
+	switch (operation) {
+	case 0: result = ioctl(fd, SL_IOCTL_START_ADV, &adv); break;
+	case 1: result = ioctl(fd, SL_IOCTL_STOP_ADV, 0); break;
+	case 2: result = ioctl(fd, SL_IOCTL_START_SCAN, &scan); break;
+	default: result = ioctl(fd, SL_IOCTL_STOP_SCAN, 0); break;
+	}
+	if (result || ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &query) || !query.seq)
+		return fail("typed recipe and queued raw query");
+	while (now() < deadline && (!complete || !mac)) {
+		struct sle_dli_event event = { 0 };
+
+		if (!ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &event)) {
+			if (event.opcode == opcode && event.event_type == 2) {
+				if (event.status || complete || status++)
+					return fail("recipe acceptance order/count/status");
+			} else if (event.opcode == opcode && event.event_type == 1) {
+				if (event.status || event.data_len || status != 1 || complete++)
+					return fail("recipe Complete order/count/status");
+			} else if (event.opcode == 0x0406 && event.event_type == 1) {
+				if (event.status || event.data_len != 6 || complete != 1 || mac++ ||
+				    memcmp(event.data, info->addr, 6))
+					return fail("recipe next command/owner/order");
+			}
+		} else if (errno != EAGAIN) {
+			return fail("recipe event poll");
+		}
+		usleep(1000);
+	}
+	return status == 1 && complete == 1 && mac == 1 ? 0 : fail("recipe reply deadline");
+}
+
+static int typed_recipes(int fd, const struct sci_dev_info *info)
+{
+	struct sle_mgmt_stats before, after;
+
+	if (ioctl(fd, SL_IOCTL_MGMT_STATS, &before) || before.pending)
+		return fail("recipe quiet baseline");
+	for (unsigned int operation = 0; operation < 4; operation++)
+		if (recipe_control(fd, info, operation))
+			return -1;
+	if (ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || after.pending ||
+	    after.total_submitted != before.total_submitted + 4 ||
+	    after.total_resolved != before.total_resolved + 4 ||
+	    after.total_timeouts != before.total_timeouts)
+		return fail("recipe raw query accounting");
+	printf("RUNTIME_RECIPE: index=%u adv_complete=2 scan_complete=2 status=4 mac=4 isolated=1\n", info->index);
+	return 0;
+}
+
+int main(int argc, char **argv)
 {
 	int control = -1, a = -1, b = -1, replacement = -1;
 	struct sci_dev_info info_a = { 0 }, info_b = { 0 }, info_new = { 0 };
+	int recipe_mode = argc == 2 && !strcmp(argv[1], "--recipes");
+	if (argc != 1 && !recipe_mode)
+		return 2;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	control = open("/dev/sparklink", O_RDWR | O_NONBLOCK);
@@ -241,6 +309,8 @@ int main(void)
 	if (b < 0 || query_mac(b, &info_b) < 0 || same_adapter(a, &info_a) < 0)
 		goto out;
 	if (parallel_bursts(a, &info_a, b, &info_b) < 0)
+		goto out;
+	if (recipe_mode && (typed_recipes(a, &info_a) || typed_recipes(b, &info_b)))
 		goto out;
 	puts("RUNTIME_REMOVE_FIRST");
 	if (wait_mask(control, 2) < 0 || stale_adapter(a) < 0 ||

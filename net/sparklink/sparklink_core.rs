@@ -17,6 +17,8 @@
 mod sle_adv;
 mod sle_configfs;
 mod sle_conn;
+mod sle_command_plan;
+mod sle_command_queue;
 mod sle_controller_event;
 mod sle_crypto;
 mod sle_dev;

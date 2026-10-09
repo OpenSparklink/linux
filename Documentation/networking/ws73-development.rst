@@ -284,6 +284,58 @@ Currently this stream contains validated WS73 discovery reports only. It
 does not claim complete native/standard snoop, command/event unification,
 discovery reassembly, Ready, active scanning, or real RF reception. Native
 discovery commands remain disabled until the full Host transactions exist.
+
+Typed command recipe foundation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The per-registration CommandHost now accepts a contiguous, preflighted
+recipe of one to four typed commands. The preallocated 64-slot queue copies
+all parameters (up to 255 internal bytes) before any transfer; invalid data
+or insufficient capacity leaves the queue and current intent unchanged.
+Each step carries the same non-wrapping cookie and absolute whole-recipe
+deadline. Raw requests keep their independent pending sequence and FIFO
+order. No allocation or transport I/O occurs under the Host's IRQ lock.
+
+A successful Status can grant credit but does not release a recipe's
+on-wire slot. Only opcode-matched Complete advances a step; a nonzero raw
+status removes the remaining same-domain typed steps. Unrelated/raw work
+is retained. New starts supersede older queued starts, while queued stops
+remain physical barriers before a new start's configuration. An already
+on-wire step keeps its reserved reply even if superseded, and its stale
+reply cannot confirm a newer intent. Failure of an older stop barrier also
+aborts a newer pending start. Timeout or uncertain transfer outcome latches
+the existing owner Host fault without inventing credits. Only the final
+successful Complete of the current enabling recipe confirms advertising
+or scanning; intermediate parameter/data completions do not.
+
+The existing standard USB typed advertising/scanning enables now use this
+path as one-step recipes. The WS73 driver still accepts metadata only:
+native parameter preparation, typed transport validation, complete native
+recipes and their public operation-result API remain to be connected.
+This foundation does not mark WS73 Ready or enable its radio. Stop's public
+state/error reporting and native recovery still need the complete operation
+integration; this is not all lifecycle/fault/PM acceptance.
+
+``sparklink_host_plan_test`` compiles the exact production queue/progress
+modules as a Rust test binary. It checks full-batch rejection, FIFO and
+replacement across wraparound, every internal payload length, malformed
+tags, every nonzero status at every step, Status acceptance, duplicate/stale
+steps, cancellation, independent progress and preservation of stop barriers.
+Build its selftests Makefile target with a host Rust compiler.
+
+The lifecycle runner's ``--standard-host-recipes`` mode performs typed
+start/stop advertising and scanning on both standard USB instances, each
+followed by an independently tracked raw address query. The opt-in fixture
+emits credit-bearing Status, delays Complete by 25 ms, and aborts if the
+Host transmits another command before Complete is delivered. Both instances
+must produce exactly two advertising and two scanning Completes, four
+Statuses and four matching-address replies with no raw pending/timeouts;
+the normal removal/replug generation checks still run. The verifier requires
+complete early kernel logs and rejects missing, duplicate, malformed or
+late recipe proofs. The frozen pre-change image #47 fails this gate at the
+premature-command assertion, serving as a negative control. Multi-step
+progress is tested in the production logic selftest; this USB gate exercises
+one-step standard recipes, not native WS73 multi-step/RF/slctl acceptance.
 The synthetic support gate adds forty maximum-length reports per owner to
 exercise loss, independent fanout, poll, copyout retry and replug::
 

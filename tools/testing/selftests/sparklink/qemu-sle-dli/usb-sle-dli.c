@@ -342,6 +342,9 @@ struct USBSleDliState {
     int         evt_head;
     int         evt_tail;
     int         evt_count;
+    int64_t     evt_ready_at[MAX_EVENT_QUEUE];
+    bool        recipe_status;
+    bool        recipe_in_flight;
 
     /* Async data queue (bulk IN) */
     SleDliDataPkt data_queue[MAX_DATA_QUEUE];
@@ -436,7 +439,8 @@ static void sle_dli_schedule_wakeup(USBSleDliState *s)
 {
     if (s->deferred_wakeup) {
         timer_mod(s->deferred_wakeup,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                  MAX(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                      s->evt_count ? s->evt_ready_at[s->evt_head] : 0));
     }
 }
 
@@ -679,6 +683,11 @@ static void sle_dli_queue_event(USBSleDliState *s,
     int copy_len = MIN(len, MAX_EVENT_SIZE);
     memcpy(e->data, data, copy_len);
     e->len = copy_len;
+    s->evt_ready_at[s->evt_tail] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->recipe_status && len >= 8 && data[0] == DLI_EVT_CMD_COMPLETE && !data[1] &&
+        ((data[4] == 5 && data[5] == 0x0c) || (data[4] == 2 && data[5] == 0x10))) {
+        s->evt_ready_at[s->evt_tail] += 25000000; /* Status is not Complete */
+    }
     s->evt_tail = (s->evt_tail + 1) % MAX_EVENT_QUEUE;
     s->evt_count++;
 }
@@ -689,9 +698,17 @@ static int sle_dli_dequeue_event(USBSleDliState *s,
     if (s->evt_count == 0) {
         return 0;
     }
+    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->evt_ready_at[s->evt_head]) {
+        sle_dli_schedule_wakeup(s);
+        return 0;
+    }
     SleDliEvent *e = &s->event_queue[s->evt_head];
     int copy_len = MIN(e->len, buf_size);
     memcpy(buf, e->data, copy_len);
+    if (s->recipe_status && copy_len >= 8 && buf[0] == DLI_EVT_CMD_COMPLETE && !buf[1] &&
+        ((buf[4] == 5 && buf[5] == 0x0c) || (buf[4] == 2 && buf[5] == 0x10))) {
+        s->recipe_in_flight = false;
+    }
     s->evt_head = (s->evt_head + 1) % MAX_EVENT_QUEUE;
     s->evt_count--;
     return copy_len;
@@ -1030,6 +1047,11 @@ static void sle_dli_process_command(USBSleDliState *s,
                                     uint16_t opcode,
                                     const uint8_t *params, int plen)
 {
+    /* Opt-in serial Host gate. A positive Status grants credit but must not
+     * release the recipe's on-wire slot before delayed Complete is delivered.
+     * This fixture is standard USB, not native WS73 or real RF evidence.
+     */
+    g_assert(!s->recipe_status || !s->recipe_in_flight);
     switch (opcode) {
     case DLI_OP_RESET:
         /* Reset controller to initial state */
@@ -1154,6 +1176,10 @@ static void sle_dli_process_command(USBSleDliState *s,
     case DLI_OP_ENABLE_BROADCAST: {
         bool enable = (plen >= 1) ? (params[0] != 0) : true;
         s->broadcasting = enable;
+        if (s->recipe_status) {
+            s->recipe_in_flight = true;
+            sle_dli_cmd_status(s, opcode, 0x00);
+        }
         sle_dli_cmd_complete(s, opcode, 0x00, NULL, 0);
         if (enable) {
             /* Notify all scanning devices on the air medium */
@@ -1195,6 +1221,10 @@ static void sle_dli_process_command(USBSleDliState *s,
     case DLI_OP_ENABLE_SCAN: {
         bool enable = (plen >= 1) ? (params[0] != 0) : true;
         s->scanning = enable;
+        if (s->recipe_status) {
+            s->recipe_in_flight = true;
+            sle_dli_cmd_status(s, opcode, 0x00);
+        }
         sle_dli_cmd_complete(s, opcode, 0x00, NULL, 0);
         if (enable) {
             /* Generate broadcast reports for built-in static peers */
@@ -2546,6 +2576,7 @@ static void usb_sle_dli_handle_reset(USBDevice *dev)
     }
 
     s->evt_head = s->evt_tail = s->evt_count = 0;
+    s->recipe_in_flight = false;
     s->data_head = s->data_tail = s->data_count = 0;
     s->broadcasting = false;
     s->scanning = false;
@@ -2671,6 +2702,7 @@ static void usb_sle_dli_handle_data(USBDevice *dev, USBPacket *p)
 static Property usb_sle_dli_properties[] = {
     DEFINE_PROP_STRING("cmd-path", USBSleDliState, cmd_path),
     DEFINE_PROP_STRING("fw-mode", USBSleDliState, fw_mode),
+    DEFINE_PROP_BOOL("recipe-status", USBSleDliState, recipe_status, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 

@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
 
 
-def assess(console, qemu_exit):
+def assess(console, qemu_exit, recipes=False):
     console = console.replace('\r', '')
     errors = []
     if qemu_exit:
@@ -43,6 +43,25 @@ def assess(console, qemu_exit):
                         r'submitted=13 resolved=13 timeouts=0$', console, re.MULTILINE)
     if sorted(bursts) != ['0', '1']:
         errors.append('missing, duplicate or incorrect per-owner Host burst evidence')
+    proofs = re.findall(r'^RUNTIME_RECIPE: index=(\d+) adv_complete=2 scan_complete=2 '
+                        r'status=4 mac=4 isolated=1$', console, re.MULTILINE)
+    if recipes and sorted(proofs) != ['0', '1']:
+        errors.append('missing, duplicate or incorrect typed recipe proof')
+    if recipes:
+        if len(re.findall(r'^RUNTIME_RECIPE:', console, re.MULTILINE)) != len(proofs):
+            errors.append('malformed typed recipe evidence')
+        remove = console.find('RUNTIME_REMOVE_FIRST')
+        if any(match.start() > remove for match in re.finditer(r'^RUNTIME_RECIPE:', console, re.MULTILINE)):
+            errors.append('typed recipe evidence after removal')
+        if (console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1
+                or console.count('RUNTIME_KERNEL_LOG_END') != 1):
+            errors.append('missing or duplicate complete recipe kernel log')
+        else:
+            log = console.split('RUNTIME_KERNEL_LOG_BEGIN', 1)[1].split('RUNTIME_KERNEL_LOG_END', 1)[0]
+            if '[    0.000000]' not in log:
+                errors.append('recipe kernel log missing early record')
+    if not recipes and 'RUNTIME_RECIPE:' in console:
+        errors.append('unexpected typed recipe evidence')
     if re.findall(r'^RUNTIME_GUEST_EXIT: (\d+)$', console, re.MULTILINE) != ['0']:
         errors.append('missing or unsuccessful guest exit')
     return errors
@@ -136,6 +155,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--native-ws73', action='store_true',
                         help='synthetic WS73 HCC/BSLE/URB bootstrap; never real WS73/RF')
+    parser.add_argument('--standard-host-recipes', action='store_true',
+                        help='standard USB typed controls wait for delayed Complete; not native WS73 RF')
     parser.add_argument('--native-ws73-fault', action='store_true',
                         help='inject one malformed native aggregate, retaining the other owner')
     parser.add_argument('--native-ws73-fault-mode', choices=['hcc', 'short-reply', 'trailing-reply'],
@@ -143,6 +164,8 @@ def main():
     parser.add_argument('--native-ws73-events', action='store_true',
                         help='synthetic maximum reports, fanout/loss/poll/copy-fault and replug')
     args = parser.parse_args()
+    if args.standard_host_recipes and args.native_ws73:
+        parser.error('--standard-host-recipes cannot use --native-ws73')
     if args.native_ws73_fault and not args.native_ws73:
         parser.error('--native-ws73-fault requires --native-ws73')
     if args.native_ws73_fault_mode != 'hcc' and not args.native_ws73_fault:
@@ -157,6 +180,7 @@ def main():
     scope = ('synthetic WS73 USB HCC/BSLE/native SETUP lifetime; no ROM/RF/slkd/no-sudo acceptance'
              if args.native_ws73 else 'virtual standard-DLI Runtime lifetime; not WS73/RF/slkd/no-sudo acceptance')
     manifest = dict(scope=scope, native_fault_injection=args.native_ws73_fault,
+                    standard_host_recipes=args.standard_host_recipes,
                     native_fault_mode=args.native_ws73_fault_mode if args.native_ws73_fault else None,
                     native_event_stream=args.native_ws73_events,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
@@ -229,6 +253,10 @@ poweroff -f
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
                                                           '/bin/sparklink_runtime_test --events\n'))
+        if args.standard_host_recipes:
+            initfile = initroot / 'init'
+            initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
+                                                          '/bin/sparklink_runtime_test --recipes\n'))
         (initroot / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -254,6 +282,8 @@ poweroff -f
                             args.native_ws73_fault_mode]) if args.native_ws73_fault else
                         ',runtime-status=254' if args.native_ws73 else '') +
                        (',runtime-reports=40' if args.native_ws73_events else '')]
+            if args.standard_host_recipes:
+                command[-1] += ',recipe-status=on'
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
                 command.append('-enable-kvm')
             manifest['qemu_args'] = command
@@ -262,6 +292,8 @@ poweroff -f
                 wait_marker(process, console, f'{prefix}_ADD_SECOND')
                 monitor = load_qmp()(sock, output / 'qmp.jsonl')
                 event_properties = {'runtime-reports': 40} if args.native_ws73_events else {}
+                if args.standard_host_recipes:
+                    event_properties['recipe-status'] = True
                 monitor.execute('device_add', dict(driver=model, id='sle1',
                                                     bus='xhci.0', port='2', **event_properties))
                 wait_marker(process, console, f'{prefix}_FAULT_FIRST' if args.native_ws73_fault
@@ -276,7 +308,8 @@ poweroff -f
             verify = assess_native if args.native_ws73 else assess
             errors = (verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
                              args.native_ws73_events)
-                      if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code))
+                      if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code,
+                                                     args.standard_host_recipes))
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'

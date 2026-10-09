@@ -10,6 +10,7 @@ use kernel::time::msecs_to_jiffies;
 
 use super::sle_dli::{SleEvent, SleOpcode};
 use super::sle_mgmt::{CmdRequest, CmdRequestQueue, CMD_TIMEOUT_MS};
+use super::sle_command_plan::{DiscoveryIntent, RecipePart, RecipeProgress, RecipeReply, RecipeTag};
 
 struct InFlight {
     opcode: u16,
@@ -18,6 +19,7 @@ struct InFlight {
     enable: Option<bool>,
     peer_addr: Option<[u8; 6]>,
     deadline: u64,
+    recipe: Option<RecipeTag>,
 }
 
 pub(crate) struct HostReply {
@@ -26,6 +28,7 @@ pub(crate) struct HostReply {
     pub(crate) current_intent: bool,
     pub(crate) enable: Option<bool>,
     pub(crate) peer_addr: Option<[u8; 6]>,
+    pub(crate) recipe: Option<(DiscoveryIntent, RecipeReply)>,
 }
 
 /// Access only under the owner's IRQ-safe host lock. No I/O or allocation
@@ -40,6 +43,7 @@ pub(crate) struct CommandHost {
     next_cookie: u64,
     broadcast_cookie: u64,
     scan_cookie: u64,
+    recipe: Option<(RecipeTag, RecipeProgress)>,
 }
 
 impl CommandHost {
@@ -54,6 +58,7 @@ impl CommandHost {
             next_cookie: 1,
             broadcast_cookie: 0,
             scan_cookie: 0,
+            recipe: None,
             }),
             GFP_KERNEL,
         )
@@ -64,15 +69,61 @@ impl CommandHost {
             return Err(error);
         }
         let cookie = self.next_cookie;
+        let next_cookie = cookie.checked_add(1).ok_or(EOVERFLOW)?;
         self.requests.push_cookie(opcode, params, seq, cookie)?;
-        self.next_cookie = self.next_cookie.wrapping_add(1).max(1);
+        self.next_cookie = next_cookie;
         if opcode == SleOpcode::EnableBroadcast as u16 {
             self.broadcast_cookie = cookie;
+            self.supersede_recipe(DiscoveryIntent::Advertising(false));
         }
         if opcode == SleOpcode::EnableScan as u16 {
             self.scan_cookie = cookie;
+            self.supersede_recipe(DiscoveryIntent::Scanning(false));
         }
         Ok(())
+    }
+
+    fn supersede_recipe(&mut self, intent: DiscoveryIntent) {
+        self.requests.remove_recipes(intent);
+        self.cancel_recipe_progress(intent);
+    }
+
+    fn cancel_recipe_progress(&mut self, intent: DiscoveryIntent) {
+        if let Some((tag, progress)) = &mut self.recipe {
+            if tag.intent.same_domain(intent) && tag.intent.enabled() { progress.cancel(); }
+        }
+    }
+
+    /// Preflight/copy the complete sequence under this owner's Host lock.
+    /// Contiguous requests cannot interleave with an unrelated raw command.
+    /// Each step waits for matching successful Complete, including native
+    /// Status acceptance. A newer same-domain recipe removes old queued
+    /// steps, while its already-on-wire command retains its reply reservation.
+    pub(crate) fn enqueue_recipe(
+        &mut self, intent: DiscoveryIntent, parts: &[RecipePart<'_>],
+    ) -> Result {
+        if let Some(error) = self.fault { return Err(error); }
+        let cookie = self.next_cookie;
+        let next_cookie = cookie.checked_add(1).ok_or(EOVERFLOW)?;
+        // A bounded lifetime for the whole recipe, not four fresh timeouts.
+        // SAFETY: reading the kernel clock does not dereference user memory.
+        let deadline = unsafe { kernel::bindings::jiffies_64 }
+            .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
+        self.requests.push_recipe(parts, cookie, intent, deadline)?;
+        self.cancel_recipe_progress(intent);
+        self.next_cookie = next_cookie;
+        match intent {
+            DiscoveryIntent::Advertising(_) => self.broadcast_cookie = cookie,
+            DiscoveryIntent::Scanning(_) => self.scan_cookie = cookie,
+        }
+        Ok(())
+    }
+
+    fn current_recipe(&self, tag: RecipeTag) -> bool {
+        tag.cookie == match tag.intent {
+            DiscoveryIntent::Advertising(_) => self.broadcast_cookie,
+            DiscoveryIntent::Scanning(_) => self.scan_cookie,
+        }
     }
 
     pub(crate) fn can_send(&self) -> bool {
@@ -82,12 +133,27 @@ impl CommandHost {
             && !self.requests.is_empty()
     }
 
-    pub(crate) fn next(&mut self, valid_raw: impl Fn(u32) -> bool) -> Option<CmdRequest> {
+    pub(crate) fn next(&mut self, valid_raw: impl Fn(u32) -> bool) -> Result<Option<CmdRequest>> {
         if !self.can_send() {
-            return None;
+            return Ok(None);
         }
         let request = loop {
-            let request = self.requests.pop()?;
+            let Some(request) = self.requests.pop() else { return Ok(None) };
+            if let Some(tag) = request.recipe {
+                if tag.intent.enabled() && !self.current_recipe(tag) { continue; }
+                // SAFETY: only reads the kernel clock.
+                if unsafe { kernel::bindings::jiffies_64 } >= request.deadline {
+                    return Err(ETIMEDOUT);
+                }
+                if tag.step == 0 {
+                    let progress = RecipeProgress::new(tag.count).ok_or(EINVAL)?;
+                    self.recipe = Some((tag, progress));
+                }
+                let (root, progress) = self.recipe.as_mut().ok_or(EINVAL)?;
+                if root.cookie != tag.cookie || !progress.sent(tag.step) {
+                    return Err(EINVAL);
+                }
+            }
             if request.seq == 0 || valid_raw(request.seq) {
                 break request;
             }
@@ -118,9 +184,11 @@ impl CommandHost {
             },
             // SAFETY: reading the kernel clock does not dereference user memory.
             deadline: unsafe { kernel::bindings::jiffies_64 }
-                .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64),
+                .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64)
+                .min(if request.recipe.is_some() { request.deadline } else { u64::MAX }),
+            recipe: request.recipe,
         });
-        Some(request)
+        Ok(Some(request))
     }
 
     /// Consume a matching response into its reserved slot. Other events
@@ -135,13 +203,21 @@ impl CommandHost {
                 opcode,
                 command_credits,
                 ..
-            }
-            | SleEvent::CommandStatus {
-                opcode,
-                command_credits,
-                ..
             } => {
                 self.credits = *command_credits;
+                *opcode as u16
+            }
+            SleEvent::CommandStatus {
+                opcode,
+                command_credits,
+                status,
+            } => {
+                self.credits = *command_credits;
+                if *status == super::sle_dli::SleStatus::Success
+                    && self.active.as_ref().is_some_and(|active| active.recipe.is_some())
+                {
+                    return Some(event);
+                }
                 *opcode as u16
             }
             SleEvent::NativeCommandReply { opcode, command_credits, status, complete, .. } => {
@@ -174,19 +250,40 @@ impl CommandHost {
     pub(crate) fn take_reply(&mut self) -> Option<HostReply> {
         let event = self.reply.take()?;
         let active = self.active.take()?;
-        let current_intent = if active.opcode == SleOpcode::EnableBroadcast as u16 {
+        let current_intent = if let Some(tag) = active.recipe {
+            self.current_recipe(tag)
+        } else if active.opcode == SleOpcode::EnableBroadcast as u16 {
             active.cookie == self.broadcast_cookie
         } else if active.opcode == SleOpcode::EnableScan as u16 {
             active.cookie == self.scan_cookie
         } else {
             true
         };
+        let recipe = active.recipe.map(|tag| {
+            let (complete, status) = match &event {
+                SleEvent::CommandComplete { status, .. } => (true, *status as u8),
+                SleEvent::CommandStatus { status, .. } => (false, *status as u8),
+                SleEvent::NativeCommandReply { status, complete, .. } => (*complete, *status),
+                _ => (false, 0),
+            };
+            let outcome = if let Some((root, progress)) = &mut self.recipe {
+                if (!current_intent && tag.intent.enabled()) || root.cookie != tag.cookie {
+                    progress.cancel();
+                    RecipeReply::Ignored
+                } else {
+                    progress.reply(tag.step, complete, status)
+                }
+            } else { RecipeReply::Ignored };
+            if outcome == RecipeReply::Failed { self.requests.remove_recipes(tag.intent); }
+            (tag.intent, outcome)
+        });
         Some(HostReply {
             seq: active.seq,
             event,
             current_intent,
             enable: active.enable,
             peer_addr: active.peer_addr,
+            recipe,
         })
     }
 
@@ -210,6 +307,7 @@ impl CommandHost {
         self.fault = Some(error);
         self.credits = 0;
         self.reply = None;
+        if let Some((_, progress)) = &mut self.recipe { progress.cancel(); }
         self.active.take().map(|active| active.seq)
     }
 

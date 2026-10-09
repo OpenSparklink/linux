@@ -1376,7 +1376,17 @@ impl SleController for UsbController {
         if *stopping {
             return Err(ENODEV);
         }
-        owner.host.lock().enqueue(opcode as u16, params, 0)?;
+        if params.len() == 1 && params[0] <= 1
+            && (opcode == SleOpcode::EnableBroadcast || opcode == SleOpcode::EnableScan)
+        {
+            use super::sle_command_plan::{DiscoveryIntent, RecipePart};
+            let intent = if opcode == SleOpcode::EnableBroadcast {
+                DiscoveryIntent::Advertising(params[0] == 1)
+            } else { DiscoveryIntent::Scanning(params[0] == 1) };
+            owner.host.lock().enqueue_recipe(intent, &[RecipePart { opcode: opcode as u16, params }])?;
+        } else {
+            owner.host.lock().enqueue(opcode as u16, params, 0)?;
+        }
         drop(stopping);
         owner.kick_commands();
         Ok(())

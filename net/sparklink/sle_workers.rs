@@ -85,8 +85,21 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
     }
     // A disable or superseded enable response must not confirm a newer
     // pending start that happens to use the same DLI opcode.
-    if reply.current_intent {
-        if let sle_dli::SleEvent::CommandComplete { opcode, status, .. } = &reply.event {
+    // Failure of an older disable barrier must also abort a newer pending
+    // start whose parameters cannot safely follow that failed disable.
+    let barrier_failed = reply.recipe.is_some_and(|(intent, outcome)|
+        !intent.enabled() && outcome == super::sle_command_plan::RecipeReply::Failed);
+    if reply.current_intent || barrier_failed {
+        if let Some((intent, outcome)) = reply.recipe {
+            use super::sle_command_plan::{DiscoveryIntent, RecipeReply};
+            match (intent, outcome) {
+                (DiscoveryIntent::Advertising(_), RecipeReply::Failed) => state.adv_scan.abort_advertising(),
+                (DiscoveryIntent::Scanning(_), RecipeReply::Failed) => state.adv_scan.abort_scanning(),
+                (DiscoveryIntent::Advertising(true), RecipeReply::Finished) => state.adv_scan.confirm_advertising(),
+                (DiscoveryIntent::Scanning(true), RecipeReply::Finished) => state.adv_scan.confirm_scanning(),
+                _ => {}
+            }
+        } else if let sle_dli::SleEvent::CommandComplete { opcode, status, .. } = &reply.event {
             match opcode {
                 sle_dli::SleOpcode::EnableBroadcast => {
                     if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
@@ -810,6 +823,10 @@ impl WorkItem<1> for ControllerRuntime {
                         .find_by_seq(seq)
                         .is_some_and(|entry| entry.is_pending() && !entry.is_expired())
                 });
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => { fail_host(&this, runtime, error); return; }
+                };
                 if let Some(request) = request {
                     if let Err(error) = runtime.controller.send_command_transport(
                         request.opcode,

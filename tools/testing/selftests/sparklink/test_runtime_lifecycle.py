@@ -24,6 +24,43 @@ RUNTIME_GUEST_EXIT: 0
 
 
 class LifecycleVerdict(unittest.TestCase):
+    @staticmethod
+    def recipe_console():
+        proof = ''.join(f'RUNTIME_RECIPE: index={i} adv_complete=2 scan_complete=2 '
+                        'status=4 mac=4 isolated=1\n' for i in [0, 1])
+        return GOOD.replace('RUNTIME_REMOVE_FIRST', proof + 'RUNTIME_REMOVE_FIRST') + (
+            'RUNTIME_KERNEL_LOG_BEGIN\n[    0.000000] Linux version test\nRUNTIME_KERNEL_LOG_END\n')
+
+    def test_typed_recipe(self):
+        self.assertEqual(assess(self.recipe_console(), 0, recipes=True), [])
+
+    def test_recipe_missing_owner(self):
+        self.assertTrue(assess(self.recipe_console().replace('RUNTIME_RECIPE: index=1', 'MISSING: index=1'), 0, recipes=True))
+
+    def test_recipe_no_status(self):
+        self.assertTrue(assess(self.recipe_console().replace('status=4', 'status=0'), 0, recipes=True))
+
+    def test_recipe_duplicate_owner(self):
+        self.assertTrue(assess(self.recipe_console().replace('RUNTIME_RECIPE: index=1', 'RUNTIME_RECIPE: index=0'), 0, recipes=True))
+
+    def test_recipe_extra_bad_proof(self):
+        self.assertTrue(assess(self.recipe_console() + 'RUNTIME_RECIPE: invalid\n', 0, recipes=True))
+
+    def test_recipe_kernel_log_missing(self):
+        self.assertTrue(assess(self.recipe_console().replace('RUNTIME_KERNEL_LOG_END', 'MISSING'), 0, recipes=True))
+
+    def test_recipe_kernel_log_early_missing(self):
+        self.assertTrue(assess(self.recipe_console().replace('[    0.000000]', '[    1.000000]'), 0, recipes=True))
+
+    def test_recipe_unexpected(self):
+        self.assertTrue(assess(self.recipe_console(), 0))
+
+    def test_recipe_after_removal(self):
+        lines = self.recipe_console().splitlines(keepends=True)
+        late = ''.join(line for line in lines if not line.startswith('RUNTIME_RECIPE:'))
+        late += ''.join(line for line in lines if line.startswith('RUNTIME_RECIPE:'))
+        self.assertTrue(assess(late, 0, recipes=True))
+
     def test_complete_clean_run(self):
         self.assertEqual(assess(GOOD, 0), [])
 
