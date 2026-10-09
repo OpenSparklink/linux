@@ -28,6 +28,7 @@ impl DiscoveryIntent {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct RecipePart<'a> {
     pub(crate) opcode: u16,
     pub(crate) params: &'a [u8],

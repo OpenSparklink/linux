@@ -375,16 +375,231 @@ static int wait_failed_driver(void)
     return fail("single native driver fault stage/errno");
 }
 
+static uint64_t discovery_id = 100;
+static int discovery_read(int fd, unsigned long long gen, uint64_t id,
+			  struct sle_discovery_result *result)
+{
+	*result = (struct sle_discovery_result){ .version = 1,
+						 .generation = gen,
+						 .request_id = id };
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_RESULT, result))
+		return fail("operation result query");
+	return 0;
+}
+static void discovery_request(struct sle_discovery_submit *r,
+			      unsigned long long gen, unsigned int op,
+			      const struct sci_dev_info *info)
+{
+	*r = (struct sle_discovery_submit){ .version = 1,
+					    .profile = 1,
+					    .generation = gen,
+					    .request_id = discovery_id++,
+					    .operation = op };
+	if (op <= 2)
+		r->handle = 7;
+	if (op == 1) {
+		r->advertising.handle = 7;
+		r->advertising.interval_min = 800;
+		r->advertising.interval_max = 800;
+		r->advertising.channel_map = 7;
+		r->advertising.primary_frame = 1;
+		r->advertising.tx_power = 0;
+		memcpy(r->advertising.own_address, info->addr, 6);
+		r->flags = 1;
+		r->data_len = 6;
+		r->scan_response_len = 6;
+		memcpy(r->data, "\x05\x09WS73", 6);
+		memcpy(r->scan_response, "\x05\x09RSP!", 6);
+	}
+	if (op == 3) {
+		r->scanning.frame_types = 1;
+		r->scanning.interval = 800;
+		r->scanning.window = 400;
+	}
+}
+static int discovery_wait(int fd, unsigned long long gen,
+			  struct sle_discovery_submit *r, unsigned int expected,
+			  struct sle_discovery_result *result)
+{
+	double deadline = now() + 8;
+	while (now() < deadline) {
+		if (discovery_read(fd, gen, r->request_id, result))
+			return -1;
+		if (result->operation != r->operation ||
+		    result->generation != gen ||
+		    result->request_id != r->request_id)
+			return fail("operation attribution");
+		if (result->state >= 3) {
+			if (result->state != expected)
+				return fail("operation terminal state");
+			struct sle_discovery_result again;
+			if (discovery_read(fd, gen, r->request_id, &again) ||
+			    memcmp(result, &again, sizeof(again)))
+				return fail("non-destructive stable result");
+			return 0;
+		}
+		usleep(2000);
+	}
+	return fail("operation result deadline");
+}
+static int discovery_do(int fd, unsigned long long gen, unsigned int op,
+			const struct sci_dev_info *info,
+			struct sle_discovery_result *result)
+{
+	struct sle_discovery_submit r;
+	discovery_request(&r, gen, op, info);
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) ||
+	    discovery_wait(fd, gen, &r, 3, result))
+		return fail("typed operation submit/complete");
+	if (result->status || result->error ||
+	    result->step + 1 != result->count)
+		return fail("successful complete fields");
+	if (op == 1 && (!result->power_valid || result->selected_power != -42 ||
+			result->count != 4))
+		return fail("actual selected power/full recipe");
+	return 0;
+}
+static int discovery_gate(int fd, unsigned long long gen,
+			  const struct sci_dev_info *info)
+{
+	struct sle_discovery_result result;
+	struct sle_discovery_submit r, stop;
+	if (discovery_read(fd, 0, 0, &result) || result.generation != gen ||
+	    result.profile != 1 || result.dev_index != info->index ||
+	    result.radio_adv || result.radio_scan || result.flags)
+		return fail("initial identity/unknown radio probe");
+	if (discovery_do(fd, gen, 2, info, &result) ||
+	    discovery_do(fd, gen, 4, info, &result))
+		return -1;
+	for (int round = 0; round < 5; round++) {
+		if (discovery_do(fd, gen, 1, info, &result) ||
+		    result.radio_adv != 2 ||
+		    discovery_do(fd, gen, 2, info, &result) ||
+		    result.radio_adv != 1 ||
+		    discovery_do(fd, gen, 3, info, &result) ||
+		    result.radio_scan != 2 ||
+		    discovery_do(fd, gen, 4, info, &result) ||
+		    result.radio_scan != 1)
+			return fail("radio confirmation/role swap");
+	}
+	discovery_request(&r, gen, 1, info);
+	r.flags = 0; r.scan_response_len = 0; memset(r.scan_response, 0, sizeof(r.scan_response));
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) || discovery_wait(fd, gen, &r, 3, &result) ||
+	    result.count != 3 || !result.power_valid || result.selected_power != -42 ||
+	    discovery_do(fd, gen, 2, info, &result))
+		return fail("optional response omitted -> exact three-step operation");
+	for (unsigned int step = 0; step < 4; step++) {
+		discovery_request(&r, gen, 1, info);
+		r.advertising.mode =
+			0xf0 + step; /* explicit synthetic fixture trigger */
+		if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) ||
+		    discovery_wait(fd, gen, &r, 4, &result) ||
+		    result.status != 0xfd || result.error ||
+		    result.step != step || result.count != 4 ||
+		    result.radio_adv != 1)
+			return fail("failure step/raw status/no enable");
+	}
+	discovery_request(&r, gen, 1, info);
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r))
+		return fail("cancelled start submit");
+	discovery_request(&stop, gen, 2, info);
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &stop) ||
+	    discovery_wait(fd, gen, &r, 5, &result) ||
+	    result.error != -ECANCELED ||
+	    discovery_wait(fd, gen, &stop, 3, &result) || result.radio_adv != 1)
+		return fail("start cancellation/stop barrier");
+	discovery_request(&r, gen, 1, info);
+	r.advertising.mode = 0xee;
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) ||
+	    discovery_wait(fd, gen, &r, 3, &result))
+		return -1;
+	discovery_request(&stop, gen, 2, info);
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &stop))
+		return fail("failed stop submit");
+	if (discovery_wait(fd, gen, &stop, 4, &result) ||
+	    result.status != 0xfd || result.radio_adv != 2 ||
+	    discovery_do(fd, gen, 2, info, &result) || result.radio_adv != 1)
+		return fail("stop failure stays on/retry");
+	/* Invalid submission/duplicate/stale generation never allocate an operation. */
+	errno = 0;
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &stop) != -1 ||
+	    errno != EEXIST)
+		return fail("duplicate request id");
+	discovery_request(&r, gen, 1, info);
+	r.reserved = 1;
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) != -1 || errno != EINVAL)
+		return fail("reserved submit rejected");
+	result = (struct sle_discovery_result){ .version = 1,
+						.generation = gen,
+						.request_id = r.request_id };
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_RESULT, &result) != -1 ||
+	    errno != ENOENT)
+		return fail("invalid submit no result");
+	r.reserved = 0;
+	r.generation = gen + 1000;
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) != -1 || errno != ENODEV)
+		return fail("wrong operation generation");
+	/* A result copyout fault does not consume the entry. */
+	long page = sysconf(_SC_PAGESIZE);
+	void *readonly = mmap(NULL, page, PROT_READ | PROT_WRITE,
+			      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (readonly == MAP_FAILED)
+		return fail("result fault page");
+	*(struct sle_discovery_result *)readonly =
+		(struct sle_discovery_result){ .version = 1,
+					       .generation = gen,
+					       .request_id = stop.request_id };
+	if (mprotect(readonly, page, PROT_READ))
+		return fail("result fault protection");
+	errno = 0;
+	int ret = ioctl(fd, SL_IOCTL_DISCOVERY_RESULT, readonly);
+	munmap(readonly, page);
+	if (ret != -1 || errno != EFAULT ||
+	    discovery_read(fd, gen, stop.request_id, &result) ||
+	    result.state != 4)
+		return fail("result EFAULT retry preserves failed stop");
+	struct sle_dli_cmd raw = { .opcode = 0x0c05, .param_len = 5 };
+	raw.params[1] = 7;
+	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &raw) != -1 ||
+	    errno != EOPNOTSUPP || query(fd, info, 0x0406, 0))
+		return fail("typed support never broadens raw whitelist");
+	printf("NATIVE_DISCOVERY: index=%u cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n",
+	       info->index);
+	return 0;
+}
+static int discovery_timeout(int fd, unsigned long long gen,
+			     const struct sci_dev_info *info)
+{
+	struct sle_discovery_submit r;
+	struct sle_discovery_result result;
+	discovery_id = 10000; /* parent has not consumed child-generated ids */
+	discovery_request(&r, gen, 1, info);
+	r.advertising.mode = 0xed;
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) ||
+	    discovery_wait(fd, gen, &r, 6, &result) ||
+	    result.error != -ETIMEDOUT || result.flags != 1 ||
+	    result.radio_adv || result.radio_scan)
+		return fail("missing Complete -> isolated uncertain fault");
+	discovery_request(&r, gen, 2, info);
+	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) != -1 ||
+	    errno != ETIMEDOUT)
+		return fail("fault cannot invent credits/recover silently");
+	puts("NATIVE_DISCOVERY_TIMEOUT: index=0 errno=110 radio_unknown=1");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct sci_dev_info a_info, b_info, replacement_info;
 	unsigned long long a_gen, b_gen, replacement_gen;
-	int control = open("/dev/sparklink", O_RDWR | O_NONBLOCK), a = -1, b = -1, replacement = -1;
+	int control = open("/dev/sparklink", O_RDWR | O_NONBLOCK), a = -1,
+	    b = -1, replacement = -1;
 	int complete = 0, readers[2] = { -1, -1 };
 	pid_t children[2];
 	int fault_mode = argc == 2 && !strcmp(argv[1], "--fault");
 	int event_mode = argc == 2 && !strcmp(argv[1], "--events");
-	if (argc != 1 && !fault_mode && !event_mode)
+	int discovery_mode = argc == 2 && !strcmp(argv[1], "--discovery");
+	if (argc != 1 && !fault_mode && !event_mode && !discovery_mode)
 		return 2;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -395,74 +610,125 @@ int main(int argc, char **argv)
 		goto out;
 	if (!fault_mode)
 		puts("NATIVE_RAW_STATUS: fe preserved");
+	if (discovery_mode) {
+		struct sle_discovery_result unbound = { .version = 1 };
+		if (ioctl(control, SL_IOCTL_DISCOVERY_RESULT, &unbound) != -1 ||
+		    errno != EINVAL)
+			goto out;
+	}
 	puts("NATIVE_ADD_SECOND");
 	if (mask_wait(control, 3))
 		goto out;
 	b = bind_owner(1, &b_info, &b_gen);
 	if (b < 0 || same(a, &a_info, a_gen))
 		goto out;
-    if (event_mode) {
-        struct sci_dev_info unused;
-        unsigned long long reader_gen;
-        readers[0] = bind_owner(0, &unused, &reader_gen);
-        if (readers[0] < 0 || reader_gen != a_gen)
-            goto out;
-        readers[1] = bind_owner(1, &unused, &reader_gen);
-        if (readers[1] < 0 || reader_gen != b_gen ||
-            events_subscribe(a, a_gen) || events_subscribe(b, b_gen) ||
-            events_subscribe(readers[0], a_gen) || events_subscribe(readers[1], b_gen))
-            goto out;
-    }
-    if (fault_mode) {
-        struct sle_dli_cmd cmd = { .opcode = 0x0406, .param_len = 1 };
-        if (exercise(b, &b_info) || ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||
-            mask_wait(control, 2) || stale(a) || same(b, &b_info, b_gen) ||
-            query(b, &b_info, 0x0406, 0))
-            goto out;
-        if (wait_failed_driver())
-            goto out;
-        puts("NATIVE_FAULT: id=0 removed errno=71");
-        puts("NATIVE_FAULT_FIRST");
-        if (wait_interfaces(1))
-            goto out;
-    } else {
-	for (int i = 0; i < 2; i++) {
-		children[i] = fork();
-		if (!children[i])
-			exit(exercise(i ? b : a, i ? &b_info : &a_info) ? 1 : 0);
+	if (event_mode) {
+		struct sci_dev_info unused;
+		unsigned long long reader_gen;
+		readers[0] = bind_owner(0, &unused, &reader_gen);
+		if (readers[0] < 0 || reader_gen != a_gen)
+			goto out;
+		readers[1] = bind_owner(1, &unused, &reader_gen);
+		if (readers[1] < 0 || reader_gen != b_gen ||
+		    events_subscribe(a, a_gen) || events_subscribe(b, b_gen) ||
+		    events_subscribe(readers[0], a_gen) ||
+		    events_subscribe(readers[1], b_gen))
+			goto out;
 	}
-	for (int i = 0; i < 2; i++) {
-		int status;
-		if (children[i] < 0 || waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status) || WEXITSTATUS(status))
-			failed = 1;
+	if (fault_mode) {
+		struct sle_dli_cmd cmd = { .opcode = 0x0406, .param_len = 1 };
+		if (exercise(b, &b_info) ||
+		    ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||
+		    mask_wait(control, 2) || stale(a) ||
+		    same(b, &b_info, b_gen) || query(b, &b_info, 0x0406, 0))
+			goto out;
+		if (wait_failed_driver())
+			goto out;
+		puts("NATIVE_FAULT: id=0 removed errno=71");
+		puts("NATIVE_FAULT_FIRST");
+		if (wait_interfaces(1))
+			goto out;
+	} else {
+		for (int i = 0; i < 2; i++) {
+			children[i] = fork();
+			if (!children[i])
+				exit((exercise(i ? b : a,
+					       i ? &b_info : &a_info) ||
+				      (discovery_mode &&
+				       discovery_gate(i ? b : a,
+						      i ? b_gen : a_gen,
+						      i ? &b_info : &a_info))) ?
+					     1 :
+					     0);
+		}
+		for (int i = 0; i < 2; i++) {
+			int status;
+			if (children[i] < 0 ||
+			    waitpid(children[i], &status, 0) != children[i] ||
+			    !WIFEXITED(status) || WEXITSTATUS(status))
+				failed = 1;
+		}
+		if (failed)
+			goto out;
+		if (event_mode && (events_gate(a, readers[0], &a_info, a_gen) ||
+				   events_gate(b, readers[1], &b_info, b_gen)))
+			goto out;
+		if (discovery_mode && (discovery_timeout(a, a_gen, &a_info) ||
+				       query(b, &b_info, 0x0406, 0)))
+			goto out;
+		puts("NATIVE_REMOVE_FIRST");
+		if (mask_wait(control, 2) || stale(a) ||
+		    same(b, &b_info, b_gen) || query(b, &b_info, 0x0406, 0))
+			goto out;
 	}
-	if (failed)
-		goto out;
-	if (event_mode && (events_gate(a, readers[0], &a_info, a_gen) ||
-	    events_gate(b, readers[1], &b_info, b_gen)))
-		goto out;
-	puts("NATIVE_REMOVE_FIRST");
-	if (mask_wait(control, 2) || stale(a) || same(b, &b_info, b_gen) || query(b, &b_info, 0x0406, 0))
-		goto out;
-	}
-	if (event_mode && (events_retired(a, a_gen) || events_retired(readers[0], a_gen)))
+	if (event_mode &&
+	    (events_retired(a, a_gen) || events_retired(readers[0], a_gen)))
 		goto out;
 	puts("NATIVE_READD_FIRST");
 	if (mask_wait(control, 3) || stale(a) || same(b, &b_info, b_gen))
 		goto out;
 	replacement = bind_owner(0, &replacement_info, &replacement_gen);
-	if (replacement < 0 || replacement_gen == a_gen || !memcmp(a_info.addr, replacement_info.addr, 6) ||
-	    query(replacement, &replacement_info, 0x0406, 0) || query(b, &b_info, 0x0406, 0) || stale(a))
+	if (replacement < 0 || replacement_gen == a_gen ||
+	    !memcmp(a_info.addr, replacement_info.addr, 6) ||
+	    query(replacement, &replacement_info, 0x0406, 0) ||
+	    query(b, &b_info, 0x0406, 0) || stale(a))
 		goto out;
-    if (event_mode) {
-        struct sle_controller_event first;
-        if (query(replacement, &replacement_info, 0x0404, 0) ||
-            events_read(replacement, &replacement_info, replacement_gen, &first) ||
-            events_retired(a, a_gen))
-            goto out;
-        puts("NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1");
-    }
-	printf("NATIVE_LIFETIME: old=%llu new=%llu unaffected=%llu\n", a_gen, replacement_gen, b_gen);
+	if (event_mode) {
+		struct sle_controller_event first;
+		if (query(replacement, &replacement_info, 0x0404, 0) ||
+		    events_read(replacement, &replacement_info, replacement_gen,
+				&first) ||
+		    events_retired(a, a_gen))
+			goto out;
+		puts("NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1");
+	}
+	if (discovery_mode) {
+		struct sle_discovery_result fresh;
+		if (discovery_read(replacement, 0, 0, &fresh) ||
+		    fresh.generation != replacement_gen || fresh.flags ||
+		    fresh.radio_adv || fresh.radio_scan)
+			goto out;
+		fresh = (struct sle_discovery_result){ .version = 1,
+						       .generation = a_gen,
+						       .request_id = 100 };
+		if (ioctl(replacement, SL_IOCTL_DISCOVERY_RESULT, &fresh) !=
+			    -1 ||
+		    errno != ENODEV)
+			goto out;
+		fresh = (struct sle_discovery_result){ .version = 1,
+						       .generation =
+							       replacement_gen,
+						       .request_id = 100 };
+		if (ioctl(a, SL_IOCTL_DISCOVERY_RESULT, &fresh) != -1 ||
+		    errno != ENODEV ||
+		    ioctl(replacement, SL_IOCTL_DISCOVERY_RESULT, &fresh) !=
+			    -1 ||
+		    errno != ENOENT)
+			goto out;
+		puts("NATIVE_DISCOVERY_REPLUG: fault_reset=1 old_generation=1");
+	}
+	printf("NATIVE_LIFETIME: old=%llu new=%llu unaffected=%llu\n", a_gen,
+	       replacement_gen, b_gen);
 	complete = 1;
 	puts("NATIVE_LIFECYCLE: PASS");
 out:
@@ -477,7 +743,8 @@ out:
 	if (a >= 0)
 		close(a);
 	for (int i = 0; i < 2; i++)
-		if (readers[i] >= 0) close(readers[i]);
+		if (readers[i] >= 0)
+			close(readers[i]);
 	if (control >= 0)
 		close(control);
 	return failed ? 1 : 0;

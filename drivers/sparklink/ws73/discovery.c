@@ -336,6 +336,7 @@ static int ws73_discovery_build(const struct sparklink_discovery_request *r,
 	if (out) {
 		out->operation = r->operation;
 		out->count = count;
+		out->power_step = r->operation == SPARKLINK_DISCOVERY_ADV_START ? 0 : count;
 	}
 	return 0;
 }

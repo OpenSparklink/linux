@@ -54,7 +54,7 @@ struct sparklink_discovery_step {
 };
 
 struct sparklink_discovery_plan {
-	unsigned int operation, count;
+	unsigned int operation, count, power_step;
 	struct sparklink_discovery_step steps[SPARKLINK_DISCOVERY_STEPS_MAX];
 };
 

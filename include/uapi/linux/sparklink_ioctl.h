@@ -548,6 +548,9 @@ struct sle_mgmt_stats {
 	__u32 total_timeouts;
 };
 
+#define SL_IOCTL_DISCOVERY_SUBMIT _IOW(SL_MAGIC, 0x88, struct sle_discovery_submit)
+#define SL_IOCTL_DISCOVERY_RESULT _IOWR(SL_MAGIC, 0x89, struct sle_discovery_result)
+
 /* --- PHY layer ---------------------------------------------------------- */
 
 struct sle_phy_info {
@@ -885,7 +888,119 @@ struct ssap_uuid_op {
 /* --- Subsystem statistics ----------------------------------------------- */
 
 #define SL_IOCTL_SUBSYS_STATS		_IOR(SL_MAGIC, 0x86, struct sle_subsys_stats)
+/* Versioned, per-fd-bound typed controller discovery operations.
+ * Select a device first. Result request_id=0/generation=0 probes identity and
+ * radio state. Submit requires the returned generation and a caller-chosen
+ * nonzero request_id (unique while retained); _IOW has no post-submit copyout.
+ * Successful ioctl means accepted, never radio enabled. Results are copied
+ * non-destructively; 64 records retained, oldest terminal results may evict.
+ * Nonterminal records never evict. Wrong generation/retired fd: ENODEV;
+ * absent/evicted request: ENOENT; retained duplicate id: EEXIST.
+ * Advertising/scan intervals, request_rx_duration, connection intervals and
+ * event lengths use 125us slots; duration/supervision_timeout use 10ms;
+ * conn_max_latency and max_events are counts. Address/type/frame/mode values are explicit
+ * in profile, with no implicit mapping/default. Currently WS73_HCC only.
+ * data/response are opaque complete profile data, not inner/outer AD builders.
+ */
+#define SLE_DISCOVERY_VERSION 1U
+#define SLE_DISCOVERY_ADV_START 1U
+#define SLE_DISCOVERY_ADV_STOP 2U
+#define SLE_DISCOVERY_SCAN_START 3U
+#define SLE_DISCOVERY_SCAN_STOP 4U
+#define SLE_DISCOVERY_SCAN_RESPONSE 1U
+#define SLE_DISCOVERY_FAULT 1U /* result flags, not Ready */
+#define SLE_DISCOVERY_QUEUED 1U
+#define SLE_DISCOVERY_PENDING 2U
+#define SLE_DISCOVERY_SUCCEEDED 3U
+#define SLE_DISCOVERY_FAILED 4U /* raw controller status preserved; error=0 */
+#define SLE_DISCOVERY_CANCELLED 5U
+#define SLE_DISCOVERY_FAULTED 6U /* error is negative errno */
+#define SLE_DISCOVERY_RADIO_UNKNOWN 0U
+#define SLE_DISCOVERY_RADIO_OFF 1U
+#define SLE_DISCOVERY_RADIO_ON 2U
+struct sle_discovery_adv_config {
+	__u32 handle;
+	__u32 mode;
+	__u32 gt_role;
+	__u32 interval_min;
+	__u32 interval_max;
+	__u32 channel_map;
+	__u32 own_address_type;
+	__u32 peer_address_type;
+	__u8 own_address[6];
+	__u8 peer_address[6];
+	__u32 filter;
+	__s32 tx_power;
+	__u32 primary_frame;
+	__u32 secondary_frame;
+	__u32 secondary_phy;
+	__u32 secondary_pilot;
+	__u32 secondary_mcs;
+	__u32 secondary_max_skip;
+	__u32 sid;
+	__u32 request_notification;
+	__u32 max_requests;
+	__u32 request_rx_duration;
+	__u32 conn_interval_min;
+	__u32 conn_interval_max;
+	__u32 conn_max_latency;
+	__u32 supervision_timeout;
+	__u32 min_event_length;
+	__u32 max_event_length;
+};
+struct sle_discovery_scan_config {
+	__u32 own_address_type;
+	__u32 filter;
+	__u32 frame_types;
+	__u32 active;
+	__u32 interval;
+	__u32 window;
+	__u32 filter_duplicates;
+};
+struct sle_discovery_submit {
+	__u32 version;
+	__u32 profile;
+	__u32 operation;
+	__u32 flags;
+	__aligned_u64 generation;
+	__aligned_u64 request_id;
+	struct sle_discovery_adv_config advertising;
+	struct sle_discovery_scan_config scanning;
+	__u32 handle;
+	__u32 duration;
+	__u32 max_events;
+	__u32 data_len;
+	__u32 scan_response_len;
+	__u32 reserved;
+	__u8 data[251];
+	__u8 scan_response[251];
+	__u8 reserved_tail[2];
+};
+struct sle_discovery_result {
+	__aligned_u64 generation;
+	__aligned_u64 request_id;
+	__u32 version;
+	__u32 flags;
+	__u32 profile;
+	__u32 operation;
+	__u32 state;
+	__s32 error;
+	__s32 selected_power;
+	__u32 radio_adv;
+	__u32 radio_scan;
+	__u16 dev_index;
+	__u16 opcode;
+	__u8 step;
+	__u8 count;
+	__u8 status;
+	__u8 power_valid;
+	__u8 reserved[4];
+};
+
 #define SL_IOCTL_CONTROLLER_EVENT_GET	_IOWR(SL_MAGIC, 0x87, struct sle_controller_event_query)
+
+#define SL_IOCTL_DISCOVERY_SUBMIT _IOW(SL_MAGIC, 0x88, struct sle_discovery_submit)
+#define SL_IOCTL_DISCOVERY_RESULT _IOWR(SL_MAGIC, 0x89, struct sle_discovery_result)
 
 /* --- PHY layer ---------------------------------------------------------- */
 

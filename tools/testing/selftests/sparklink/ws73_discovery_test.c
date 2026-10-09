@@ -440,6 +440,7 @@ static void recipe_tests(void)
 		.scanning = &scan,
 	};
 	CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+	CHECK(plan.power_step == plan.count);
 	CHECK(plan.count == 2 && plan.steps[0].opcode == 0x1001 &&
 	      plan.steps[0].length == 8);
 	CHECK(!memcmp(plan.steps[0].params, scan_expected,

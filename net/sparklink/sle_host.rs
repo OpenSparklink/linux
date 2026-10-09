@@ -9,6 +9,7 @@ use kernel::prelude::*;
 use kernel::time::msecs_to_jiffies;
 
 use super::sle_dli::{SleEvent, SleOpcode};
+use super::sle_discovery_operation::{Operations, Operation, State, AdmissionError};
 use super::sle_mgmt::{CmdRequest, CmdRequestQueue, CMD_TIMEOUT_MS};
 use super::sle_command_plan::{DiscoveryIntent, RecipePart, RecipeProgress, RecipeReply, RecipeTag};
 
@@ -44,6 +45,7 @@ pub(crate) struct CommandHost {
     broadcast_cookie: u64,
     scan_cookie: u64,
     recipe: Option<(RecipeTag, RecipeProgress)>,
+    operations: Operations,
 }
 
 impl CommandHost {
@@ -59,6 +61,11 @@ impl CommandHost {
             broadcast_cookie: 0,
             scan_cookie: 0,
             recipe: None,
+                operations <- init!(Operations {
+                    entries <- pin_init::init_array_from_fn(|_| None),
+                    advertising: 0,
+                    scanning: 0,
+                }),
             }),
             GFP_KERNEL,
         )
@@ -119,6 +126,37 @@ impl CommandHost {
         Ok(())
     }
 
+    pub(crate) fn submit_discovery(
+        &mut self, request_id: u64, intent: DiscoveryIntent,
+        parts: &[RecipePart<'_>], power_step: u8,
+    ) -> Result {
+        if power_step as usize > parts.len() { return Err(EINVAL); }
+        let slot = self.operations.slot(request_id).map_err(|error| match error {
+            AdmissionError::Invalid => EINVAL,
+            AdmissionError::Duplicate => EEXIST,
+            AdmissionError::Full => EBUSY,
+        })?;
+        if intent.enabled() && !self.operations.can_start(intent) { return Err(EBUSY); }
+        let cookie = self.next_cookie;
+        self.enqueue_recipe(intent, parts)?;
+        // Queue/cookie admission succeeded. Neither failure path above changed
+        // operation storage. Stop supersedes prior public operations only now.
+        self.operations.cancel_domain(intent, -(kernel::bindings::ECANCELED as i32));
+        self.operations.entries[slot] = Some(Operation {
+            request_id, cookie, intent, state: State::Queued, error: 0,
+            status: 0, opcode: 0, step: 0, count: parts.len() as u8,
+            power_step, selected_power: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn discovery_result(&self, request_id: u64) -> Option<Operation> {
+        self.operations.find(request_id)
+    }
+    pub(crate) fn discovery_radio(&self) -> (u32, u32, Option<Error>) {
+        (self.operations.advertising, self.operations.scanning, self.fault)
+    }
+
     fn current_recipe(&self, tag: RecipeTag) -> bool {
         tag.cookie == match tag.intent {
             DiscoveryIntent::Advertising(_) => self.broadcast_cookie,
@@ -160,6 +198,7 @@ impl CommandHost {
             // A cancelled/expired queued transaction never reaches the wire.
         };
         self.credits -= 1;
+        if request.recipe.is_some() { self.operations.sent(request.cookie, request.recipe.unwrap().step, request.opcode); }
         self.active = Some(InFlight {
             opcode: request.opcode,
             seq: request.seq,
@@ -259,6 +298,15 @@ impl CommandHost {
         } else {
             true
         };
+        if let Some(tag) = active.recipe {
+            let (complete, status, data) = match &event {
+                SleEvent::CommandComplete { status, data, .. } => (true, *status as u8, data.as_slice()),
+                SleEvent::CommandStatus { status, .. } => (false, *status as u8, &[][..]),
+                SleEvent::NativeCommandReply { status, complete, data, .. } => (*complete, *status, data.as_slice()),
+                _ => (false, 0, &[][..]),
+            };
+            self.operations.reply(tag.cookie, tag.step, complete, status, data, current_intent);
+        }
         let recipe = active.recipe.map(|tag| {
             let (complete, status) = match &event {
                 SleEvent::CommandComplete { status, .. } => (true, *status as u8),
@@ -274,7 +322,14 @@ impl CommandHost {
                     progress.reply(tag.step, complete, status)
                 }
             } else { RecipeReply::Ignored };
-            if outcome == RecipeReply::Failed { self.requests.remove_recipes(tag.intent); }
+            if outcome == RecipeReply::Failed {
+                self.requests.remove_recipes(tag.intent);
+                // Failed older stop barrier also invalidates newer queued work.
+                // Preserve the matched operation's raw status as Failed.
+                if !current_intent {
+                    self.operations.cancel_domain(tag.intent, -(kernel::bindings::ECANCELED as i32));
+                }
+            }
             (tag.intent, outcome)
         });
         Some(HostReply {
@@ -305,6 +360,7 @@ impl CommandHost {
     /// The caller drains remaining requests and resolves that owner's entries.
     pub(crate) fn fail(&mut self, error: Error) -> Option<u32> {
         self.fault = Some(error);
+        self.operations.fault(error.to_errno());
         self.credits = 0;
         self.reply = None;
         if let Some((_, progress)) = &mut self.recipe { progress.cancel(); }

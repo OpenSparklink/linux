@@ -2937,3 +2937,118 @@ impl_check_reserved!(SleConnPhyUpdate);
 impl_check_reserved!(SleAfhRssiReport);
 impl_check_reserved!(SleAfhRetxReport);
 impl_check_reserved!(SleConnInfo);
+
+pub(crate) const SL_IOCTL_DISCOVERY_SUBMIT: u32 = _IOW::<SleDiscoverySubmit>(SL_MAGIC, 0x88);
+pub(crate) const SL_IOCTL_DISCOVERY_RESULT: u32 = _IOWR::<SleDiscoveryResult>(SL_MAGIC, 0x89);
+pub(crate) const DISCOVERY_VERSION: u32 = 1;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiscoveryAdvConfig {
+    pub handle: u32,
+    pub mode: u32,
+    pub gt_role: u32,
+    pub interval_min: u32,
+    pub interval_max: u32,
+    pub channel_map: u32,
+    pub own_address_type: u32,
+    pub peer_address_type: u32,
+    pub own_address: [u8; 6],
+    pub peer_address: [u8; 6],
+    pub filter: u32,
+    pub tx_power: i32,
+    pub primary_frame: u32,
+    pub secondary_frame: u32,
+    pub secondary_phy: u32,
+    pub secondary_pilot: u32,
+    pub secondary_mcs: u32,
+    pub secondary_max_skip: u32,
+    pub sid: u32,
+    pub request_notification: u32,
+    pub max_requests: u32,
+    pub request_rx_duration: u32,
+    pub conn_interval_min: u32,
+    pub conn_interval_max: u32,
+    pub conn_max_latency: u32,
+    pub supervision_timeout: u32,
+    pub min_event_length: u32,
+    pub max_event_length: u32,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiscoveryScanConfig {
+    pub own_address_type: u32,
+    pub filter: u32,
+    pub frame_types: u32,
+    pub active: u32,
+    pub interval: u32,
+    pub window: u32,
+    pub filter_duplicates: u32,
+}
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiscoverySubmit {
+    pub version: u32,
+    pub profile: u32,
+    pub operation: u32,
+    pub flags: u32,
+    pub generation: u64,
+    pub request_id: u64,
+    pub advertising: SleDiscoveryAdvConfig,
+    pub scanning: SleDiscoveryScanConfig,
+    pub handle: u32,
+    pub duration: u32,
+    pub max_events: u32,
+    pub data_len: u32,
+    pub scan_response_len: u32,
+    pub reserved: u32,
+    pub data: [u8; 251],
+    pub scan_response: [u8; 251],
+    pub reserved_tail: [u8; 2],
+}
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiscoveryResult {
+    pub generation: u64,
+    pub request_id: u64,
+    pub version: u32,
+    pub flags: u32,
+    pub profile: u32,
+    pub operation: u32,
+    pub state: u32,
+    pub error: i32,
+    pub selected_power: i32,
+    pub radio_adv: u32,
+    pub radio_scan: u32,
+    pub dev_index: u16,
+    pub opcode: u16,
+    pub step: u8,
+    pub count: u8,
+    pub status: u8,
+    pub power_valid: u8,
+    pub reserved: [u8; 4],
+}
+// SAFETY: repr(C) integer-only structure, all bit patterns valid.
+unsafe impl FromBytes for SleDiscoveryAdvConfig {}
+// SAFETY: repr(C) integer-only structure, all bit patterns valid.
+unsafe impl FromBytes for SleDiscoveryScanConfig {}
+// SAFETY: repr(C) integer-only structure, all bit patterns valid.
+unsafe impl FromBytes for SleDiscoverySubmit {}
+// SAFETY: repr(C) integer-only structure, all bit patterns valid.
+unsafe impl FromBytes for SleDiscoveryResult {}
+impl CheckReserved for SleDiscoverySubmit {
+    fn check_reserved(&self) -> Result {
+        if self.reserved != 0 || self.reserved_tail != [0; 2] { Err(EINVAL) } else { Ok(()) }
+    }
+}
+impl CheckReserved for SleDiscoveryResult {
+    fn check_reserved(&self) -> Result {
+        if self.reserved != [0; 4] { Err(EINVAL) } else { Ok(()) }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<SleDiscoveryAdvConfig>() == 116);
+const _: () = assert!(core::mem::size_of::<SleDiscoveryScanConfig>() == 28);
+const _: () = assert!(core::mem::size_of::<SleDiscoverySubmit>() == 704);
+const _: () = assert!(core::mem::offset_of!(SleDiscoverySubmit, data) == 200);
+const _: () = assert!(core::mem::size_of::<SleDiscoveryResult>() == 64);
+const _: () = assert!(core::mem::offset_of!(SleDiscoveryResult, dev_index) == 52);

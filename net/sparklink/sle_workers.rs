@@ -671,6 +671,7 @@ impl ControllerRuntime {
 
     pub(crate) fn stop_workers(self: &Arc<Self>) {
         *self.schedule_gate.lock() = true;
+        self.host.lock().fail(ENODEV);
         flush_work(&self.rx_work);
         flush_work(&self.tx_work);
     }

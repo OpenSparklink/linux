@@ -67,7 +67,7 @@ def assess(console, qemu_exit, recipes=False):
     return errors
 
 
-def assess_native(console, qemu_exit, fault=False, events=False):
+def assess_native(console, qemu_exit, fault=False, events=False, discovery=False):
     console = console.replace('\r', '')
     errors = []
     if qemu_exit:
@@ -113,6 +113,25 @@ def assess_native(console, qemu_exit, fault=False, events=False):
     replug = 'NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1'
     if console.count(replug) != (1 if events else 0):
         errors.append('missing, duplicate or unexpected native event replug evidence')
+    discovery_proofs = re.findall(r'^NATIVE_DISCOVERY: index=(\d+) cycles=5 failures=4 '
+                                 r'stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1$',
+                                 console, re.MULTILINE)
+    if sorted(discovery_proofs) != (['0', '1'] if discovery else []):
+        errors.append('missing, duplicate or unexpected native discovery proof')
+    if len(re.findall(r'^NATIVE_DISCOVERY:', console, re.MULTILINE)) != len(discovery_proofs):
+        errors.append('malformed native discovery proof')
+    timeout = 'NATIVE_DISCOVERY_TIMEOUT: index=0 errno=110 radio_unknown=1'
+    replug_discovery = 'NATIVE_DISCOVERY_REPLUG: fault_reset=1 old_generation=1'
+    if console.count(timeout) != int(discovery) or console.count(replug_discovery) != int(discovery):
+        errors.append('missing/duplicate/unexpected native discovery fault/replug proof')
+    if discovery:
+        remove = console.find('NATIVE_REMOVE_FIRST')
+        proofs = [line for line in console.splitlines() if line.startswith('NATIVE_DISCOVERY:')]
+        if any(console.find(line) > remove for line in proofs) or not (
+                max((console.find(line) for line in proofs), default=len(console)) < console.find(timeout) < remove
+                and console.find('NATIVE_READD_FIRST') < console.find(replug_discovery)
+                    < console.find('NATIVE_LIFECYCLE: PASS')):
+            errors.append('native discovery proof order invalid')
     return errors
 
 
@@ -157,6 +176,8 @@ def main():
                         help='synthetic WS73 HCC/BSLE/URB bootstrap; never real WS73/RF')
     parser.add_argument('--standard-host-recipes', action='store_true',
                         help='standard USB typed controls wait for delayed Complete; not native WS73 RF')
+    parser.add_argument('--native-ws73-discovery', action='store_true',
+                        help='synthetic full typed discovery transactions, never RF')
     parser.add_argument('--native-ws73-fault', action='store_true',
                         help='inject one malformed native aggregate, retaining the other owner')
     parser.add_argument('--native-ws73-fault-mode', choices=['hcc', 'short-reply', 'trailing-reply'],
@@ -172,6 +193,8 @@ def main():
         parser.error('--native-ws73-fault-mode requires --native-ws73-fault')
     if args.native_ws73_events and (not args.native_ws73 or args.native_ws73_fault):
         parser.error('--native-ws73-events requires --native-ws73 without --native-ws73-fault')
+    if args.native_ws73_discovery and (not args.native_ws73 or args.native_ws73_fault or args.native_ws73_events):
+        parser.error('--native-ws73-discovery requires native without fault/events modes')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     build = args.kernel_build.resolve()
@@ -183,6 +206,7 @@ def main():
                     standard_host_recipes=args.standard_host_recipes,
                     native_fault_mode=args.native_ws73_fault_mode if args.native_ws73_fault else None,
                     native_event_stream=args.native_ws73_events,
+                    native_discovery=args.native_ws73_discovery,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
     process = monitor = None
     try:
@@ -253,6 +277,10 @@ poweroff -f
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
                                                           '/bin/sparklink_runtime_test --events\n'))
+        if args.native_ws73_discovery:
+            initfile = initroot / 'init'
+            initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
+                                                          '/bin/sparklink_runtime_test --discovery\n'))
         if args.standard_host_recipes:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
@@ -281,7 +309,8 @@ poweroff -f
                        (',runtime-fault=' + str({'hcc': 1, 'short-reply': 2, 'trailing-reply': 3}[
                             args.native_ws73_fault_mode]) if args.native_ws73_fault else
                         ',runtime-status=254' if args.native_ws73 else '') +
-                       (',runtime-reports=40' if args.native_ws73_events else '')]
+                       (',runtime-reports=40' if args.native_ws73_events else '') +
+                       (',runtime-discovery=on' if args.native_ws73_discovery else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
@@ -292,6 +321,8 @@ poweroff -f
                 wait_marker(process, console, f'{prefix}_ADD_SECOND')
                 monitor = load_qmp()(sock, output / 'qmp.jsonl')
                 event_properties = {'runtime-reports': 40} if args.native_ws73_events else {}
+                if args.native_ws73_discovery:
+                    event_properties['runtime-discovery'] = True
                 if args.standard_host_recipes:
                     event_properties['recipe-status'] = True
                 monitor.execute('device_add', dict(driver=model, id='sle1',
@@ -307,7 +338,7 @@ poweroff -f
             manifest['qemu_exit'] = exit_code
             verify = assess_native if args.native_ws73 else assess
             errors = (verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
-                             args.native_ws73_events)
+                             args.native_ws73_events, args.native_ws73_discovery)
                       if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code,
                                                      args.standard_host_recipes))
             if errors:

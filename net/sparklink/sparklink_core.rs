@@ -18,6 +18,7 @@ mod sle_adv;
 mod sle_configfs;
 mod sle_conn;
 mod sle_command_plan;
+mod sle_discovery_operation;
 mod sle_command_queue;
 mod sle_controller_event;
 mod sle_crypto;
@@ -3163,6 +3164,104 @@ fn ioctl_dli_send_cmd(context: &RuntimeContext, arg: usize) -> Result<isize> {
     Ok(0)
 }
 
+/// Typed discovery is registration-bound, never a global/default route.
+fn discovery_owner(context: &RuntimeContext, me: Pin<&SparkLinkCtl>) -> Result<Arc<ControllerRuntime>> {
+    let selected = me.target.lock().clone().ok_or(EINVAL)?;
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    if selected.identity != owner.identity { return Err(ENODEV); }
+    if owner.protocol_profile == 0 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    Ok(owner.clone())
+}
+
+/// Explicit host fields and unused bytes are checked before any admission.
+fn validate_discovery_submit(request: &SleDiscoverySubmit) -> Result<sle_command_plan::DiscoveryIntent> {
+    use sle_command_plan::DiscoveryIntent;
+    if request.version != DISCOVERY_VERSION { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if request.request_id == 0 || request.generation == 0 || request.flags & !1 != 0
+        || request.data_len > 251 || request.scan_response_len > 251 { return Err(EINVAL); }
+    if request.data[request.data_len as usize..].iter().any(|b| *b != 0)
+        || request.scan_response[request.scan_response_len as usize..].iter().any(|b| *b != 0)
+        || (request.flags & 1 == 0 && request.scan_response_len != 0) { return Err(EINVAL); }
+    // SAFETY: integer-only repr(C) structures, no padding (116/28 bytes).
+    let adv_zero = unsafe { core::slice::from_raw_parts(core::ptr::from_ref(&request.advertising).cast::<u8>(), 116) }.iter().all(|b| *b == 0);
+    let scan_zero = unsafe { core::slice::from_raw_parts(core::ptr::from_ref(&request.scanning).cast::<u8>(), 28) }.iter().all(|b| *b == 0);
+    let intent = match request.operation {
+        1 => { if !scan_zero { return Err(EINVAL); } DiscoveryIntent::Advertising(true) }
+        2 => { if !adv_zero || !scan_zero { return Err(EINVAL); } DiscoveryIntent::Advertising(false) }
+        3 => { if !adv_zero { return Err(EINVAL); } DiscoveryIntent::Scanning(true) }
+        4 => { if !adv_zero || !scan_zero { return Err(EINVAL); } DiscoveryIntent::Scanning(false) }
+        _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+    };
+    if request.operation != 1 && (request.flags != 0 || request.data_len != 0
+        || request.scan_response_len != 0 || request.duration != 0 || request.max_events != 0) { return Err(EINVAL); }
+    if request.operation >= 3 && request.handle != 0 { return Err(EINVAL); }
+    Ok(intent)
+}
+
+/// _IOW avoids losing an accepted cookie to a post-admission EFAULT. The caller
+/// supplies a nonzero correlation id and queries it without destructive reads.
+#[inline(never)]
+fn ioctl_discovery_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let request: SleDiscoverySubmit = read_user_struct(arg)?;
+    let intent = validate_discovery_submit(&request)?;
+    let owner = discovery_owner(context, me)?;
+    if request.generation != owner.identity.generation { return Err(ENODEV); }
+    if request.profile != owner.protocol_profile { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
+    let state_guard = context.lock()?;
+    let state = state_guard.as_ref().ok_or(ENODEV)?;
+    let plan = match &state.controller {
+        sle_dli::ControllerBackend::Ws73(controller) => controller.prepare_discovery(&request)?,
+        _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+    };
+    let mut parts = [sle_command_plan::RecipePart { opcode: 0, params: &[] }; 4];
+    for (i, step) in plan.steps[..plan.count as usize].iter().enumerate() {
+        parts[i] = sle_command_plan::RecipePart { opcode: step.opcode, params: &step.params[..step.length as usize] };
+    }
+    let gate = owner.schedule_gate.lock();
+    if *gate { return Err(ENODEV); }
+    owner.host.lock().submit_discovery(request.request_id, intent, &parts[..plan.count as usize], plan.power_step as u8)?;
+    drop(gate);
+    // Drop the protocol mutex before scheduling TX (and before any transport).
+    drop(state_guard);
+    owner.kick_commands();
+    Ok(0)
+}
+
+#[inline(never)]
+fn ioctl_discovery_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let input: SleDiscoveryResult = read_user_struct(arg)?;
+    if input.version != DISCOVERY_VERSION { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if input.flags != 0 || (input.request_id != 0 && input.generation == 0) { return Err(EINVAL); }
+    let owner = discovery_owner(context, me)?;
+    if input.generation != 0 && input.generation != owner.identity.generation { return Err(ENODEV); }
+    let state = context.lock()?;
+    let host = owner.host.lock();
+    let (advertising, scanning, fault) = host.discovery_radio();
+    // SAFETY: all integers/byte arrays; initialize every output byte.
+    let mut output: SleDiscoveryResult = unsafe { core::mem::zeroed() };
+    output.version = DISCOVERY_VERSION; output.generation = owner.identity.generation;
+    output.request_id = input.request_id; output.profile = owner.protocol_profile;
+    output.dev_index = owner.identity.id; output.radio_adv = advertising; output.radio_scan = scanning;
+    if let Some(error) = fault { output.flags = 1; output.error = error.to_errno(); }
+    if input.request_id != 0 {
+        let record = host.discovery_result(input.request_id).ok_or(ENOENT)?;
+        output.operation = match record.intent {
+            sle_command_plan::DiscoveryIntent::Advertising(true) => 1,
+            sle_command_plan::DiscoveryIntent::Advertising(false) => 2,
+            sle_command_plan::DiscoveryIntent::Scanning(true) => 3,
+            sle_command_plan::DiscoveryIntent::Scanning(false) => 4,
+        };
+        output.state = record.state as u32; output.error = record.error;
+        output.status = record.status; output.opcode = record.opcode;
+        output.step = record.step; output.count = record.count;
+        if let Some(power) = record.selected_power { output.power_valid = 1; output.selected_power = power as i32; }
+    }
+    drop(host); drop(state);
+    write_user_struct(arg, &output)?;
+    Ok(0)
+}
+
 /// Read one complete native record without mutating the controller protocol.
 #[inline(never)]
 fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
@@ -3198,6 +3297,8 @@ fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, 
 #[inline(never)]
 fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
+        SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
+        SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
         SL_IOCTL_CONTROLLER_EVENT_GET => ioctl_controller_event_get(context, me, arg),
         SL_IOCTL_PM_INFO => {
             let info = {
@@ -3731,7 +3832,7 @@ impl MiscDevice for SparkLinkCtl {
             }
         };
         let context = &context;
-        if !registration_only && cmd != SL_IOCTL_CONTROLLER_EVENT_GET {
+        if !registration_only && !matches!(cmd, SL_IOCTL_CONTROLLER_EVENT_GET | SL_IOCTL_DISCOVERY_RESULT) {
             Self::sync_power_mode(context)?;
         }
 
@@ -3839,6 +3940,8 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_EVENT_STATS
             | SL_IOCTL_DLI_INFO
             | SL_IOCTL_CONTROLLER_EVENT_GET
+            | SL_IOCTL_DISCOVERY_SUBMIT
+            | SL_IOCTL_DISCOVERY_RESULT
             | SL_IOCTL_DLI_POLL_EVENT
             | SL_IOCTL_DLI_RESET
             | SL_IOCTL_DLI_SEND_CMD

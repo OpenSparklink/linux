@@ -9,7 +9,9 @@ default. The host kernel is not replaced and the driver is not loaded on it.
 The experimental driver downloads boot firmware, then performs a per-device
 vendor HCC/BSLE handshake and controller metadata queries in runtime mode.
 Its current final state is ``native-runtime-setup``. This is not SparkLink
-Ready: complete native discovery transactions and real RF validation remain required. Transport binding,
+Ready: operational readiness policy and real RF validation remain required.
+Versioned typed discovery submission is available for explicit per-fd testing;
+legacy bare-enable/raw RF commands remain unsupported. Transport binding,
 BSLE completion and wireless readiness are separate milestones.
 
 Prerequisites
@@ -285,6 +287,53 @@ does not claim complete native/standard snoop, command/event unification,
 discovery reassembly, Ready, active scanning, or real RF reception. Native
 discovery commands remain disabled until the full Host transactions exist.
 
+Versioned typed operation submission and results
+-----------------------------------------------
+
+``SL_IOCTL_DISCOVERY_RESULT`` with version 1 and request_id/generation zero
+probes the explicitly selected fd's current identity and last confirmed radio
+command state. ``SL_IOCTL_DISCOVERY_SUBMIT`` requires that generation, profile
+and a caller-chosen nonzero request_id. Its write-only ABI has no copyout after
+admission: a user-memory fault cannot lose an accepted generated cookie. A
+successful ioctl only accepts the complete plan, never confirms RF enabled.
+
+The 704-byte submit contains all wide host parameters plus opaque complete
+data and optional response. No defaults, AD formatting or implicit role/
+address mappings are supplied. Reserved fields, unused configuration/data
+bytes, lengths, profile, registration and operation shape are checked before
+admission. Unsupported profiles reject support, not fall back to USB layouts.
+Use the actual selected controller profile; encoding arbitrary reserved values
+is not evidence of controller capability or board calibration.
+
+Results are bounded to 64 per registration, queried non-destructively by
+request_id/generation. Pending records never evict; the oldest terminal record
+may evict (ENOENT). Retained duplicate ids return EEXIST, so callers must use
+fresh ids while retained. Multiple readers and copyout failure cannot consume
+results. Records contain queued/pending/succeeded/failed/cancelled/faulted,
+matched step/opcode/count, original controller status, negative host errno and
+actual selected TX power from the driver-annotated reply step. Successful
+Status remains pending until matching Complete. Cancelled in-flight enable
+completion marks radio state unknown until the physical stop completes.
+
+Both radio domains begin unknown; issue and await explicit stops for both
+before a start. Stop submission keeps the previous confirmed state; only
+successful Complete confirms off. Failed stop preserves the previous state.
+Start admission requires both domains confirmed off and no pending discovery
+operation; stop can cancel a pending start. A transport/timeout fault cancels
+remaining work, marks both radio states unknown and latches this owner's Host
+fault without inventing credits. A replacement registration has fresh results,
+identity and state; old fds/old generations never follow it. These radio fields
+report confirmed command state, not PHY activity; autonomous termination and
+full native capability/readiness policy still require integration.
+
+The new standalone production result-store tests and the opt-in
+``--native-ws73-discovery`` USB fixture gate verify native typed command groups,
+optional response, delayed Status/Complete, errors at every step, failed stop,
+cancellation, selected power, result EFAULT retry, fault isolation and replug.
+Fixture reserved modes trigger synthetic errors/timeouts; never deploy these
+vectors to a real controller. The fixture performs no firmware execution or RF
+and cannot satisfy any real dual-device North Star criterion.
+
 Driver-owned typed discovery preparation
 ----------------------------------------
 
@@ -307,11 +356,11 @@ preparing a valid discovery frame never grants raw DLI permission. Core does
 not contain WS73 opcode/parameter-layout tables. Preparing a plan performs no
 I/O and does not establish capability, board calibration, Ready or RF success.
 
-The callbacks and production compiler are implemented, but the core submit
-API has not yet called preparation or queued native discovery plans. Public
-operation cookies/results, native configuration policy and fault/stop-state
-handling, dynamic adapters and slctl remain pending. Native registrations
-therefore remain metadata-only SETUP and RF requests are still rejected.
+The versioned discovery submit/result API now invokes retained-driver
+preparation and enqueues the native plan through the per-owner Host. Legacy
+bare-enable and raw RF paths remain rejected. Native readiness/capability
+policy, unsolicited termination tracking, dynamic adapters and slctl remain
+pending; registrations continue to report SETUP, never a fabricated Ready.
 Standalone selftests cover actual compiler output, whole-output preservation,
 sequence-position/enable validation, and unchanged raw-command rejection;
 they are synthetic, not native on-wire multi-step or real air evidence.

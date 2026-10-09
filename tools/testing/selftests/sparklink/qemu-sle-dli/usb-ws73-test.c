@@ -25,6 +25,9 @@ struct USBWs73Test {
     uint8_t runtime_status;
     uint8_t runtime_fault;
     uint8_t runtime_reports;
+    bool runtime_discovery, advertising, scanning, fail_stop;
+    unsigned int adv_phase, scan_phase, adv_handle, fail_step;
+    bool timeout_enable;
     bool reports_emitted;
     bool bsp, pm, custom, opened, failed_once;
 };
@@ -151,7 +154,10 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
     uint8_t value[10] = { 0 };
     unsigned int op, n;
     size_t size = 0;
+    unsigned int typed_status = 0;
+    bool typed = false, timeout = false;
 
+    if (s->runtime_discovery) { g_assert(!s->in_flight); }
     if (s->in_flight || !s->opened || length < 5 || p[0] != 0xa1) { return false; }
     op = le16(p + 1); n = le16(p + 3);
     if (n != length - 5) { return false; }
@@ -172,9 +178,64 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         if (n != 1 || p[5]) { return false; }
         memcpy(value, "\x02\x73\x00\x00\x00", 5); value[5] = s->serial; size = 6;
         break;
+    case 0x0c02:
+        if (!s->runtime_discovery || n != 49 || s->advertising || s->scanning || p[5] > 0xef) { return false; }
+        if (p[5] != 7 || le16(p + 8) != 800 || p[10] || le16(p + 11) != 800 || p[13]
+            || memcmp(p + 17, "\x02\x73\x00\x00\x00", 5) || p[22] != s->serial
+            || p[30] != 0 || p[31] != 1) { return false; }
+        typed = true; s->adv_handle = p[5]; s->adv_phase = 1;
+        s->fail_step = p[6] >= 0xf0 && p[6] <= 0xf3 ? p[6] - 0xf0 : 255;
+        s->fail_stop = p[6] == 0xee; s->timeout_enable = p[6] == 0xed;
+        typed_status = s->fail_step == 0 ? 0xfd : 0;
+        value[0] = 0xd6; size = 1; /* selected -42, independent of requested power */
+        break;
+    case 0x0c03:
+    case 0x0c04:
+        if (!s->runtime_discovery || n < 3 || p[5] != s->adv_handle || p[6] != 3 || n != 3 + p[7]) { return false; }
+        if (p[7] != 6 || memcmp(p + 8, op == 0x0c03 ? "\x05\x09WS73" : "\x05\x09RSP!", 6)) { return false; }
+        g_assert(s->adv_phase == (op == 0x0c03 ? 1 : 2));
+        typed = true; s->adv_phase++;
+        typed_status = s->fail_step == (op == 0x0c03 ? 1 : 2) ? 0xfd : 0;
+        break;
+    case 0x0c05:
+        if (!s->runtime_discovery || n != 5 || p[5] > 1 || p[6] > 0xef) { return false; }
+        typed = true;
+        if (p[5]) {
+            g_assert(s->adv_phase == 2 || s->adv_phase == 3);
+            g_assert(p[6] == s->adv_handle);
+            typed_status = s->fail_step == 3 ? 0xfd : 0;
+            timeout = s->timeout_enable;
+            if (!typed_status && !timeout) { s->advertising = true; }
+        } else if (s->fail_stop) {
+            s->fail_stop = false; typed_status = 0xfd;
+        } else { s->advertising = false; }
+        s->adv_phase = 0;
+        break;
+    case 0x1001:
+        if (!s->runtime_discovery || n != 8 || p[7] != 1 || p[8] > 1
+            || !le16(p + 9) || !le16(p + 11) || le16(p + 11) > le16(p + 9)
+            || le16(p + 9) != 800 || le16(p + 11) != 400 || s->advertising || s->scanning) { return false; }
+        typed = true; s->scan_phase = 1;
+        break;
+    case 0x1002:
+        if (!s->runtime_discovery || n != 2 || p[5] > 1 || p[6] > 1) { return false; }
+        typed = true;
+        if (p[5]) { g_assert(s->scan_phase == 1); s->scanning = true; }
+        else { s->scanning = false; }
+        s->scan_phase = 0;
+        break;
     default: return false; /* especially do not accept 0x0401 as ReadCmdLen */
     }
     s->commands++;
+    if (typed) {
+        if (typed_status) { s->adv_phase = 0; size = 0; }
+        s->in_flight = true;
+        command_event(s, 1, op, 1, 0, NULL, 0);
+        if (timeout) { return true; } /* accepted, missing terminal result */
+        command_event(s, 2, op, 0, typed_status, value, size);
+        command_event(s, 2, 0, 1, 0, NULL, 0);
+        return true;
+    }
     if (s->commands > 4 && s->runtime_fault && !s->failed_once) {
         uint8_t malformed[8] = { 0xa2, 2, 0, 3, 0, 0, 0, 1 };
         s->failed_once = true;
@@ -239,6 +300,8 @@ static void reset(USBDevice *dev)
 {
     USBWs73Test *s = USB_WS73_TEST(dev);
     s->head = s->count = s->sequence = s->commands = 0;
+    s->advertising = s->scanning = s->fail_stop = s->timeout_enable = false;
+    s->adv_phase = s->scan_phase = 0; s->fail_step = 255;
     s->bsp = true; s->pm = s->custom = s->opened = s->failed_once = s->in_flight = false;
     s->reports_emitted = false;
     if (s->wake) { timer_del(s->wake); }
@@ -302,6 +365,7 @@ static void transfer(USBDevice *dev, USBPacket *p)
 }
 
 static Property properties[] = {
+    DEFINE_PROP_BOOL("runtime-discovery", USBWs73Test, runtime_discovery, false),
     DEFINE_PROP_UINT8("runtime-status", USBWs73Test, runtime_status, 0),
     DEFINE_PROP_UINT8("runtime-fault", USBWs73Test, runtime_fault, 0),
     DEFINE_PROP_UINT8("runtime-reports", USBWs73Test, runtime_reports, 0),

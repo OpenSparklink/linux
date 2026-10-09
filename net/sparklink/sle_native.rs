@@ -12,6 +12,7 @@ const PROTOCOL_ERROR: i32 = -(kernel::bindings::EPROTO as i32);
 const UNSUPPORTED: i32 = -(kernel::bindings::EOPNOTSUPP as i32);
 
 use super::sle_command_plan::{DiscoveryIntent, RecipeTag};
+use super::sle_uapi::{SleDiscoveryAdvConfig, SleDiscoveryScanConfig, SleDiscoverySubmit};
 use super::sle_dev::DeviceIdentity;
 use super::sle_dli::{SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode};
 
@@ -40,7 +41,32 @@ pub(crate) struct NativeIdentity {
     generation: u64,
 }
 
+#[repr(C)]
+struct NativeDiscoveryRequest {
+    operation: u32,
+    advertising: *const SleDiscoveryAdvConfig,
+    scanning: *const SleDiscoveryScanConfig,
+    handle: u32, duration: u32, max_events: u32,
+    data: *const u8, data_size: u32, scan_response_present: u32,
+    scan_response: *const u8, scan_response_size: u32,
+}
+#[repr(C)]
+pub(crate) struct NativeDiscoveryStep {
+    pub(crate) opcode: u16, pub(crate) length: u16,
+    pub(crate) params: [u8; 255],
+}
+#[repr(C)]
+pub(crate) struct NativeDiscoveryPlan {
+    pub(crate) operation: u32, pub(crate) count: u32, pub(crate) power_step: u32,
+    pub(crate) steps: [NativeDiscoveryStep; 4],
+}
+const _: () = assert!(core::mem::size_of::<NativeDiscoveryPlan>() == 1052);
+
 extern "C" {
+    fn sparklink_native_transport_prepare(
+        transport: *mut c_void, request: *const NativeDiscoveryRequest,
+        plan: *mut NativeDiscoveryPlan,
+    ) -> i32;
     fn sparklink_native_transport_free(transport: *mut c_void);
     fn sparklink_native_transport_open(transport: *mut c_void, id: u16, generation: u64) -> i32;
     fn sparklink_native_transport_close(transport: *mut c_void);
@@ -82,6 +108,37 @@ impl NativeController {
     pub(crate) fn profile(&self) -> u32 { self.metadata.profile }
     fn result(ret: i32) -> Result {
         if ret < 0 { Err(Error::from_errno(ret)) } else { Ok(()) }
+    }
+
+    pub(crate) fn prepare_discovery(&self, request: &SleDiscoverySubmit) -> Result<KBox<NativeDiscoveryPlan>> {
+        let mut plan = KBox::init(init!(NativeDiscoveryPlan {
+            operation: 0, count: 0, power_step: 0,
+            // SAFETY: repr(C) integers/bytes accept an all-zero value.
+            steps <- pin_init::init_array_from_fn(|_| unsafe { core::mem::zeroed::<NativeDiscoveryStep>() }),
+        }), GFP_KERNEL)?;
+        let input = NativeDiscoveryRequest {
+            operation: request.operation,
+            advertising: if request.operation == 1 { &request.advertising } else { core::ptr::null() },
+            scanning: if request.operation == 3 { &request.scanning } else { core::ptr::null() },
+            handle: request.handle, duration: request.duration, max_events: request.max_events,
+            data: if request.data_len > 0 { request.data.as_ptr() } else { core::ptr::null() },
+            data_size: request.data_len, scan_response_present: request.flags & 1,
+            scan_response: if request.flags & 1 != 0 { request.scan_response.as_ptr() } else { core::ptr::null() },
+            scan_response_size: request.scan_response_len,
+        };
+        // SAFETY: retained driver, immutable kernel request and disjoint heap
+        // output live for this call. Driver may not retain pointers or do I/O.
+        Self::result(unsafe { sparklink_native_transport_prepare(self.transport, &input, &mut *plan) })?;
+        if plan.operation != request.operation || !(1..=4).contains(&plan.count)
+            || plan.power_step > plan.count { return Err(EINVAL); }
+        for (step, part) in plan.steps[..plan.count as usize].iter().enumerate() {
+            if part.opcode == 0 || part.length as usize > part.params.len() { return Err(EINVAL); }
+            // Validate the whole prepared group before allocating Host state.
+            Self::result(unsafe { sparklink_native_transport_validate_step(self.transport,
+                plan.operation, step as u32, plan.count, part.opcode,
+                part.params.as_ptr(), part.length as usize) })?;
+        }
+        Ok(plan)
     }
 
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {

@@ -132,3 +132,20 @@ class NativeFaultVerdict(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+DISCOVERY = ("NATIVE_DISCOVERY: index=0 cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n"
+             "NATIVE_DISCOVERY: index=1 cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n"
+             "NATIVE_DISCOVERY_TIMEOUT: index=0 errno=110 radio_unknown=1\n")
+DISCOVERY_GOOD = GOOD.replace('NATIVE_REMOVE_FIRST', DISCOVERY + 'NATIVE_REMOVE_FIRST').replace(
+    'NATIVE_LIFETIME:', 'NATIVE_DISCOVERY_REPLUG: fault_reset=1 old_generation=1\nNATIVE_LIFETIME:')
+class DiscoveryVerdict(unittest.TestCase):
+    def test_full(self): self.assertEqual(assess_native(DISCOVERY_GOOD, 0, discovery=True), [])
+    def test_missing(self): self.assertTrue(assess_native(GOOD, 0, discovery=True))
+    def test_duplicate_owner(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('index=1 cycles', 'index=0 cycles'), 0, discovery=True))
+    def test_truncated_fields(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('failures=4', 'failures=3'), 0, discovery=True))
+    def test_unexpected(self): self.assertTrue(assess_native(DISCOVERY_GOOD, 0))
+    def test_extra_malformed(self): self.assertTrue(assess_native(DISCOVERY_GOOD+'NATIVE_DISCOVERY: invalid\n', 0, discovery=True))
+    def test_missing_fault(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('NATIVE_DISCOVERY_TIMEOUT', 'missing'), 0, discovery=True))
+    def test_wrong_radio(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('radio_unknown=1', 'radio_unknown=0'), 0, discovery=True))
+    def test_wrong_order(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace(DISCOVERY, '')+DISCOVERY, 0, discovery=True))
+    def test_wrong_replug(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('fault_reset=1', 'fault_reset=0'), 0, discovery=True))
