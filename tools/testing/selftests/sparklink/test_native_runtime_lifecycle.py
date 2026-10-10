@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Native virtual verdict tests; no USB, SDK, KVM or hardware evidence."""
 import unittest
-from run_runtime_lifecycle import assess_native, assess_tx_barrier
+from run_runtime_lifecycle import assess_native, assess_tx_barrier, assess_tx_terminal
 
 GOOD = '''NATIVE_RAW_STATUS: fe preserved
 NATIVE_ADD_SECOND
@@ -252,3 +252,100 @@ class TxBarrierVerdict(unittest.TestCase):
                 self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR + line, True))
         self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR.replace('serial=1', 'serial=2'), True))
         self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR.replace('OUT_COMPLETE', 'OUT_CANCEL'), True))
+
+
+class TxTerminalVerdict(unittest.TestCase):
+    """Verifier-only fixtures; actual USB race evidence comes from the guest."""
+    @staticmethod
+    def fixture(mode):
+        removed = 'NATIVE_REMOVE_FIRST\n'
+        driver, checks, outcome = {'out-error': ('pipe', 2, 'ERROR'),
+                                  'short-out': ('short', 2, 'SHORT'),
+                                  'unplug': ('removed', 0, 'CANCEL')}[mode]
+        console = ('NATIVE_ADD_SECOND\nNATIVE_TX_SUBMITTED\n'
+                   'NATIVE_TX_SNAPSHOT: elapsed_ms=0.01\n'
+                   'NATIVE_TX_PENDING: accepted=1 unresolved=1\n')
+        console += removed if mode == 'unplug' else 'NATIVE_TX_WAIT_FAULT\n'
+        console += ('NATIVE_HOST: index=1 queries=18 features=80 version=5 dialect_reject=1\n'
+                    f'NATIVE_TX_RETIRE: mode={mode} early_success=0 old_raw=ENODEV event_hup=1 survivor=1 '
+                    f'driver_error={driver} error_checks={checks} elapsed_ms=25.01\n')
+        if mode != 'unplug': console += removed
+        console += ('NATIVE_READD_FIRST\nNATIVE_TX_REPLUG: old=1 new=3 unaffected=2 '
+                    'features=10 old_raw=ENODEV late_guard_ms=2200.01\nNATIVE_TX_TERMINAL: PASS\n'
+                    'RUNTIME_GUEST_EXIT: 0\nRUNTIME_KERNEL_LOG_BEGIN\n'
+                    '[    0.000000] Linux version verdict fixture\nRUNTIME_KERNEL_LOG_END\n')
+        stderr = ('WS73_TEST_OUT_PENDING: serial=1 delay=2000\n'
+                  'WS73_TEST_EARLY_REPLY: serial=1\n'
+                  f'WS73_TEST_OUT_{outcome}: serial=1\n')
+        return console, stderr
+
+    def check(self, console, stderr, mode='out-error', exit=0, barrier=True, pending=False):
+        return assess_tx_terminal(console, stderr, exit, mode, barrier, pending)
+
+    def test_all_three_actual_outcomes_required(self):
+        for mode in ['out-error', 'short-out', 'unplug']:
+            with self.subTest(mode=mode):
+                c, s = self.fixture(mode)
+                self.assertEqual(self.check(c, s, mode, pending=mode == 'unplug'), [])
+                self.assertTrue(self.check(c, s.replace('EARLY_REPLY', 'missing'), mode, pending=mode == 'unplug'))
+
+    def test_failure_kernel_and_exit_cannot_be_masked(self):
+        c, s = self.fixture('out-error')
+        for exit in [1, 124, None]: self.assertTrue(self.check(c, s, exit=exit))
+        for text in ['NATIVE_FAILURE: surprise\n', '[ 1.2] BUG: scheduling while atomic\n']:
+            self.assertTrue(self.check(c + text, s))
+
+    def test_owner_survival_stale_and_error_checks_required(self):
+        c, s = self.fixture('out-error')
+        for good, bad in [('early_success=0', 'early_success=1'), ('old_raw=ENODEV', 'old_raw=success'),
+                          ('event_hup=1', 'event_hup=0'), ('survivor=1', 'survivor=0'),
+                          ('driver_error=pipe', 'driver_error=short'), ('error_checks=2', 'error_checks=1'),
+                          ('features=10', 'features=6'), ('queries=18', 'queries=0')]:
+            with self.subTest(good=good): self.assertTrue(self.check(c.replace(good, bad), s))
+
+    def test_deadline_latency_guard_and_numeric_schema(self):
+        c, s = self.fixture('out-error')
+        for good, bad in [('elapsed_ms=0.01', 'elapsed_ms=200'), ('elapsed_ms=25.01', 'elapsed_ms=4000'),
+                          ('late_guard_ms=2200.01', 'late_guard_ms=2199'),
+                          ('late_guard_ms=2200.01', 'late_guard_ms=..'),
+                          ('late_guard_ms=2200.01', 'late_guard_ms=' + '9' * 400)]:
+            with self.subTest(bad=bad): self.assertTrue(self.check(c.replace(good, bad), s))
+
+    def test_generation_alias_or_wrap_rejected(self):
+        c, s = self.fixture('out-error')
+        for good, bad in [('old=1', 'old=0'), ('new=3', 'new=1'),
+                          ('unaffected=2', 'unaffected=3'), ('new=3', 'new=' + str(1 << 64))]:
+            with self.subTest(bad=bad): self.assertTrue(self.check(c.replace(good, bad), s))
+
+    def test_unplug_requires_still_pending_packet(self):
+        c, s = self.fixture('unplug')
+        self.assertTrue(self.check(c, s, 'unplug'))
+        self.assertTrue(self.check(c, s, 'unplug', barrier=False, pending=True))
+        c, s = self.fixture('out-error')
+        self.assertTrue(self.check(c, s, pending=True))
+
+    def test_missing_duplicate_or_misplaced_phases(self):
+        c, s = self.fixture('out-error')
+        for line in c.splitlines(keepends=True):
+            if line.startswith(('NATIVE_', 'RUNTIME_')):
+                with self.subTest(line=line):
+                    self.assertTrue(self.check(c.replace(line, ''), s))
+                    self.assertTrue(self.check(c + line, s))
+        line = 'NATIVE_READD_FIRST\n'
+        self.assertTrue(self.check(line + c.replace(line, ''), s))
+
+    def test_synthetic_model_wrong_owner_late_complete_or_order(self):
+        c, s = self.fixture('out-error')
+        for line in s.splitlines(keepends=True):
+            self.assertTrue(self.check(c, s.replace(line, '')))
+            self.assertTrue(self.check(c, s + line))
+        self.assertTrue(self.check(c, s.replace('serial=1', 'serial=2')))
+        self.assertTrue(self.check(c, s.replace('OUT_ERROR', 'OUT_COMPLETE')))
+        lines = s.splitlines(keepends=True);lines[1], lines[2] = lines[2], lines[1]
+        self.assertTrue(self.check(c, ''.join(lines)))
+
+    def test_unexpected_native_row_and_marker_suffix_rejected(self):
+        c, s = self.fixture('out-error')
+        self.assertTrue(self.check(c + 'NATIVE_TX_BARRIER: unrelated pass\n', s))
+        self.assertTrue(self.check(c.replace('NATIVE_TX_SUBMITTED\n', 'NATIVE_TX_SUBMITTED_EXTRA\n'), s))
+        self.assertTrue(self.check(c, s, 'unknown'))

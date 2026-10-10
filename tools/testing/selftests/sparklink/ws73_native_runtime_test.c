@@ -880,9 +880,8 @@ static int discovery_timeout(int fd, unsigned long long gen,
 
 /* Host signals only after QEMU has both a held OUT and a Complete delivered
  * on IN. This is a synthetic transport race, never evidence of real RF. */
-static int tx_barrier(int a, const struct sci_dev_info *a_info,
-                      unsigned long long a_gen, int b,
-                      const struct sci_dev_info *b_info)
+static int tx_barrier_pending(int a, unsigned long long a_gen, int b,
+                             const struct sci_dev_info *b_info)
 {
     struct sle_dli_cmd cmd = { .opcode = 0x0403 };
     struct sle_controller_snapshot snap = { .version = 1, .generation = a_gen };
@@ -937,6 +936,16 @@ static int tx_barrier(int a, const struct sci_dev_info *a_info,
         usleep(1000);
     } while (now() - start < 0.1);
     if (accepted != 1) return fail("acceptance Status not processed during held OUT");
+    puts("NATIVE_TX_PENDING: accepted=1 unresolved=1");
+    return 0;
+}
+
+static int tx_barrier(int a, const struct sci_dev_info *a_info,
+                      unsigned long long a_gen, int b,
+                      const struct sci_dev_info *b_info)
+{
+    if (tx_barrier_pending(a, a_gen, b, b_info)) return -1;
+    struct sle_dli_event event = { 0 };
     double deadline = now() + 4;
     do {
         if (!ioctl(a, SL_IOCTL_DLI_POLL_EVENT, &event)) {

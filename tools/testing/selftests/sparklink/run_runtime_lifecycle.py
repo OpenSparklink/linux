@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -192,6 +193,69 @@ def assess_tx_barrier(console, stderr, early_in_while_out_pending):
     return errors
 
 
+def assess_tx_terminal(console, stderr, qemu_exit, mode, early_in_while_out_pending,
+                       cancel_pending_confirmed=False):
+    """A delivered device Complete must not survive failed/cancelled OUT."""
+    console = console.replace('\r', '')
+    errors = []
+    if mode not in ('out-error', 'short-out', 'unplug'):
+        return ['unknown TX terminal mode']
+    if qemu_exit != 0 or KERNEL_FAULT.search(console) or 'NATIVE_FAILURE:' in console:
+        errors.append('QEMU/guest/kernel failure')
+    if (console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1 or
+            console.count('RUNTIME_KERNEL_LOG_END') != 1):
+        errors.append('missing or duplicate complete kernel log')
+    else:
+        log = console.split('RUNTIME_KERNEL_LOG_BEGIN', 1)[1].split('RUNTIME_KERNEL_LOG_END', 1)[0]
+        if '[    0.000000]' not in log:
+            errors.append('missing early kernel log')
+    if re.findall(r'^RUNTIME_GUEST_EXIT: (\d+)$', console, re.MULTILINE) != ['0']:
+        errors.append('guest terminal status invalid')
+    retirement = re.findall(r'^NATIVE_TX_RETIRE: mode=(out-error|short-out|unplug) '
+                            r'early_success=0 old_raw=ENODEV event_hup=1 survivor=1 '
+                            r'driver_error=(pipe|short|removed) error_checks=(\d+) '
+                            r'elapsed_ms=(\d+(?:\.\d+)?)$', console, re.MULTILINE)
+    replug = re.findall(r'^NATIVE_TX_REPLUG: old=(\d+) new=(\d+) unaffected=(\d+) '
+                        r'features=10 old_raw=ENODEV late_guard_ms=(\d+(?:\.\d+)?)$', console, re.MULTILINE)
+    latency = re.findall(r'^NATIVE_TX_SNAPSHOT: elapsed_ms=(\d+(?:\.\d+)?)$', console, re.MULTILINE)
+    driver = {'out-error': ('pipe', '2'), 'short-out': ('short', '2'), 'unplug': ('removed', '0')}[mode]
+    if (len(retirement) != 1 or retirement[0][0] != mode or retirement[0][1:3] != driver or
+            not 0 <= float(retirement[0][3]) < 4000):
+        errors.append('missing or invalid bounded owner retirement')
+    if len(latency) != 1 or not 0 <= float(latency[0]) < 200:
+        errors.append('snapshot blocked by terminal OUT')
+    if len(replug) != 1:
+        errors.append('missing replacement/late callback guard')
+    else:
+        old, new, survivor = map(int, replug[0][:3])
+        guard = float(replug[0][3])
+        if (not all(0 < gen < 1 << 64 for gen in (old, new, survivor)) or new <= old or
+                survivor in (old, new) or not math.isfinite(guard) or guard < 2200):
+            errors.append('replacement or survivor generation invalid')
+    expected = ['NATIVE_ADD_SECOND', 'NATIVE_TX_SUBMITTED', 'NATIVE_TX_SNAPSHOT:',
+                'NATIVE_TX_PENDING: accepted=1 unresolved=1']
+    expected += ['NATIVE_REMOVE_FIRST' if mode == 'unplug' else 'NATIVE_TX_WAIT_FAULT',
+                 'NATIVE_HOST: index=1 queries=18 features=80 version=5 dialect_reject=1']
+    expected += ['NATIVE_TX_RETIRE:']
+    if mode != 'unplug': expected += ['NATIVE_REMOVE_FIRST']
+    expected += ['NATIVE_READD_FIRST', 'NATIVE_TX_REPLUG:', 'NATIVE_TX_TERMINAL: PASS',
+                 'RUNTIME_GUEST_EXIT: 0', 'RUNTIME_KERNEL_LOG_BEGIN', 'RUNTIME_KERNEL_LOG_END']
+    positions = [console.find(p) for p in expected]
+    if any(console.count(p) != 1 for p in expected) or positions != sorted(positions):
+        errors.append('missing, duplicate or out-of-order terminal phases')
+    if any(not any(line.startswith(p) if p.endswith(':') else line == p for p in expected)
+           for line in console.splitlines() if line.startswith('NATIVE_')):
+        errors.append('unexpected native terminal evidence')
+    outcome = {'out-error': 'ERROR', 'short-out': 'SHORT', 'unplug': 'CANCEL'}[mode]
+    actual = re.findall(r'^WS73_TEST_.*$', stderr, re.MULTILINE)
+    if actual != ['WS73_TEST_OUT_PENDING: serial=1 delay=2000',
+                  'WS73_TEST_EARLY_REPLY: serial=1', f'WS73_TEST_OUT_{outcome}: serial=1']:
+        errors.append('actual model completion/cancellation order invalid')
+    if not early_in_while_out_pending or (mode == 'unplug') != bool(cancel_pending_confirmed):
+        errors.append('missing or incorrect QMP in-flight barrier')
+    return errors
+
+
 def wait_marker(process, console, marker):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -239,7 +303,14 @@ def main():
     parser.add_argument('--native-ws73-management', action='store_true', help='exclusive native file ownership, close/revocation and fault support gate')
     parser.add_argument('--native-ws73-tx-barrier', action='store_true',
                         help='hold USB OUT after early Complete; verify unlocked state and pending result')
+    parser.add_argument('--native-ws73-tx-terminal', choices=['out-error', 'short-out', 'unplug'],
+                        help='early Complete then OUT error/short write or in-flight unplug; synthetic only')
     args = parser.parse_args()
+    tx_gate = args.native_ws73_tx_barrier or args.native_ws73_tx_terminal
+    if args.native_ws73_tx_terminal and (not args.native_ws73 or args.native_ws73_tx_barrier or
+            args.native_ws73_fault or args.native_ws73_events or args.native_ws73_discovery or
+            args.native_ws73_management):
+        parser.error('TX terminal requires independent native mode')
     if args.native_ws73_tx_barrier and (not args.native_ws73 or args.native_ws73_fault or
             args.native_ws73_events or args.native_ws73_discovery or args.native_ws73_management):
         parser.error('TX barrier requires independent native mode')
@@ -269,6 +340,7 @@ def main():
                     native_discovery=args.native_ws73_discovery,
                     native_management=args.native_ws73_management,
                     native_tx_barrier=args.native_ws73_tx_barrier,
+                    native_tx_terminal=args.native_ws73_tx_terminal,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
     process = monitor = barrier = None
     try:
@@ -293,6 +365,8 @@ def main():
         prefix = 'NATIVE' if args.native_ws73 else 'RUNTIME'
         model = 'usb-ws73-test' if args.native_ws73 else 'usb-sle-dli'
         source = HERE / ('ws73_native_runtime_test.c' if args.native_ws73 else 'sparklink_runtime_test.c')
+        if args.native_ws73_tx_terminal:
+            source = HERE / 'ws73_native_tx_fault_test.c'
         initroot = output / 'initramfs'
         (initroot / 'bin').mkdir(parents=True)
         for name in ['proc', 'sys', 'dev']:
@@ -345,6 +419,10 @@ poweroff -f
         if args.native_ws73_tx_barrier:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n', '/bin/sparklink_runtime_test --tx-barrier\n'))
+        if args.native_ws73_tx_terminal:
+            initfile = initroot / 'init'
+            initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
+                               '/bin/sparklink_runtime_test ' + args.native_ws73_tx_terminal + '\n'))
         if args.native_ws73_discovery:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
@@ -382,15 +460,17 @@ poweroff -f
                        (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
-            if args.native_ws73_tx_barrier:
+            if tx_gate:
                 command[-1] += ',runtime-out-delay-ms=2000'
+                if args.native_ws73_tx_terminal in ('out-error', 'short-out'):
+                    command[-1] += ',runtime-out-result=' + str(1 if args.native_ws73_tx_terminal == 'out-error' else 2)
                 command += ['-serial', f'unix:{barrier_sock},server=on,wait=off']
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
                 command.append('-enable-kvm')
             manifest['qemu_args'] = command
             with (output / 'qemu_stderr.log').open('wb') as stderr:
                 process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
-                if args.native_ws73_tx_barrier:
+                if tx_gate:
                     barrier = socket.socket(socket.AF_UNIX)
                     deadline = time.monotonic() + 5
                     while True:
@@ -410,7 +490,7 @@ poweroff -f
                     event_properties['recipe-status'] = True
                 monitor.execute('device_add', dict(driver=model, id='sle1',
                                                     bus='xhci.0', port='2', **event_properties))
-                if args.native_ws73_tx_barrier:
+                if tx_gate:
                     wait_marker(process, console, 'NATIVE_TX_SUBMITTED')
                     deadline = time.monotonic() + 1
                     while time.monotonic() < deadline:
@@ -426,6 +506,10 @@ poweroff -f
                     manifest['early_in_while_out_pending'] = True
                 wait_marker(process, console, f'{prefix}_FAULT_FIRST' if args.native_ws73_fault
                             else f'{prefix}_REMOVE_FIRST')
+                if args.native_ws73_tx_terminal == 'unplug':
+                    if not monitor.execute('qom-get', dict(path='/machine/peripheral/sle0', property='runtime-out-pending')):
+                        raise RuntimeError('OUT finished before in-flight removal')
+                    manifest['cancel_pending_confirmed'] = True
                 monitor.execute('device_del', dict(id='sle0'))
                 monitor.wait_deleted('sle0')
                 wait_marker(process, console, f'{prefix}_READD_FIRST')
@@ -434,7 +518,11 @@ poweroff -f
                 exit_code = process.wait(timeout=30)
             manifest['qemu_exit'] = exit_code
             verify = assess_native if args.native_ws73 else assess
-            errors = (verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
+            errors = (assess_tx_terminal(console.read_text(errors='replace'),
+                          (output / 'qemu_stderr.log').read_text(), exit_code, args.native_ws73_tx_terminal,
+                          manifest.get('early_in_while_out_pending', False),
+                          manifest.get('cancel_pending_confirmed', False)) if args.native_ws73_tx_terminal else
+                      verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
                              args.native_ws73_events, args.native_ws73_discovery, args.native_ws73_management)
                       if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code,
                                                      args.standard_host_recipes))

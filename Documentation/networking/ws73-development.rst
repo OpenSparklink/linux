@@ -702,3 +702,49 @@ the pre-boot gate rejected that image. The rejected build and initial test
 failures remain alongside the qualified fixed-toolchain run. Evidence is frozen
 locally in ``.dev/tx-unlock-final-evidence.json``; all real North Star checks and
 the remaining full issue requirements stay open.
+
+Early Complete followed by terminal OUT failure
+----------------------------------------------
+
+The same pending-reply barrier now supports three independent production-driver
+tests. Use the command above with ``--native-ws73-tx-terminal out-error``,
+``short-out`` or ``unplug`` instead of ``--native-ws73-tx-barrier``.
+The synthetic fixture first delivers a successful Complete on IN while holding
+the corresponding OUT. It subsequently returns STALL, completes OUT one byte
+short, or has its still-pending packet cancelled by model removal. These are
+USB transport tests, not real unplug or RF acceptance.
+
+The guest verifies acceptance without query resolution before the terminal
+event. It polls for retirement while rejecting a successful feature reply,
+requires only the affected owner to disappear within four seconds, and checks
+that its raw result/admission/snapshot fds return ENODEV and its retained event
+subscription signals HUP. STALL and short completion preserve EPIPE and
+EREMOTEIO respectively in the driver's failed state; two observations bracket
+the survivor's 18-query exercise. The unplug runner also confirms via QMP that
+OUT is still pending immediately before deletion, and requires the actual
+model's cancellation marker rather than an eventual success marker.
+
+Replacement uses a new generation and address. Both old fds remain retained
+while the guest observes at least 2200 ms of monotonic time, crossing the
+cancelled packet's original deadline. Old descriptors still cannot submit,
+read results or obtain a snapshot; new feature replies belong to the new
+registration and the survivor's identity stays unchanged. The verifier checks
+the measured duration, actual model outcome, phase order, complete kernel log,
+exit status, and exact generation/driver-error evidence together.
+
+All three final tests pass on the existing kernel #71. Measured retirement
+after the pending barrier was 1849.309 ms (STALL), 1847.687 ms (short OUT), and
+26.692 ms (unplug). The exact same compiled unplug test fails on #69 at a
+1967.032 ms blocked snapshot. Nine new verifier unit cases bring the kernel
+harness to 259; the success race and existing native discovery/event/ownership
+gates also pass. The new QEMU's original 96 cases pass with 1058 OK, no FAIL/SKIP
+and the three existing WARN. The ordinary-user synthetic 20+2 round control,
+TX-off, hotplug, capture and binding gates pass on the same new QEMU. Kernel
+runtime sources and the compiled Rust companion are unchanged in this batch.
+
+Current sources, actual fixture/object/QEMU/kernel/guest/capture hashes,
+old-kernel counterexample and first versus strengthened measurements are frozen
+locally in ``.dev/tx-terminal-final-evidence.json``. Physical entry still lacks
+WS73 hardware; real North Star acceptance stays 0/7 and board qualification
+NOT_ASSERTED. Native/legacy lock migration, real hardware, four parallel
+devices and the remaining full S0-S6 issue requirements remain open.

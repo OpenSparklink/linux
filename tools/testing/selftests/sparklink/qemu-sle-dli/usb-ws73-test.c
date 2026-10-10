@@ -23,6 +23,7 @@ struct USBWs73Test {
     QEMUTimer *out_timer;
     USBPacket *out_packet;
     uint32_t runtime_out_delay_ms;
+    uint8_t runtime_out_result;
     bool out_delayed, out_replied;
     bool in_flight;
     unsigned int head, count, sequence, commands, serial;
@@ -396,8 +397,16 @@ static void out_complete(void *opaque)
 
     g_assert(p);
     s->out_packet = NULL; /* completion can reenter the device */
-    p->status = USB_RET_SUCCESS;
-    fprintf(stderr, "WS73_TEST_OUT_COMPLETE: serial=%u\n", s->serial);
+    p->status = s->runtime_out_result == 1 ? USB_RET_STALL : USB_RET_SUCCESS;
+    if (s->runtime_out_result == 1) {
+        p->actual_length = 0;
+    } else if (s->runtime_out_result == 2) {
+        g_assert(p->actual_length > 0);
+        p->actual_length--;
+    }
+    fprintf(stderr, "WS73_TEST_OUT_%s: serial=%u\n",
+            s->runtime_out_result == 1 ? "ERROR" :
+            s->runtime_out_result == 2 ? "SHORT" : "COMPLETE", s->serial);
     usb_packet_complete(&s->parent_obj, p);
 }
 
@@ -438,6 +447,8 @@ static void realize(USBDevice *dev, Error **errp)
     g_assert(s->serial < 255);
     g_assert(s->runtime_reports <= 40);
     g_assert(s->runtime_out_delay_ms <= 2000);
+    g_assert(s->runtime_out_result <= 2);
+    g_assert(!s->runtime_out_result || s->runtime_out_delay_ms);
     g_assert(!s->runtime_policy || s->runtime_discovery);
     medium_devices[s->serial] = s;
     reset(dev);
@@ -506,6 +517,7 @@ static void transfer(USBDevice *dev, USBPacket *p)
 static Property properties[] = {
     DEFINE_PROP_BOOL("runtime-policy", USBWs73Test, runtime_policy, false),
     DEFINE_PROP_UINT32("runtime-out-delay-ms", USBWs73Test, runtime_out_delay_ms, 0),
+    DEFINE_PROP_UINT8("runtime-out-result", USBWs73Test, runtime_out_result, 0),
     DEFINE_PROP_BOOL("runtime-zlp", USBWs73Test, runtime_zlp, false),
     DEFINE_PROP_UINT8("runtime-medium", USBWs73Test, runtime_medium, 0),
     DEFINE_PROP_BOOL("runtime-discovery", USBWs73Test, runtime_discovery, false),

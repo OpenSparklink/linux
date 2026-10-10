@@ -199,3 +199,14 @@ host/guest UART barrier. The timer completes the held packet; packet cancellatio
 removes that timer and reference. The delay is off by default and limited to
 2000 ms, below the production driver's OUT timeout. This is a transport race
 fixture; it does not execute firmware or provide RF evidence.
+
+`--native-ws73-tx-terminal out-error|short-out|unplug` reuses that pending-reply
+barrier. `runtime-out-result=1` returns STALL after the early reply;
+`runtime-out-result=2` completes one byte short. Both require the opt-in delay,
+and the default remains normal completion. `unplug` verifies the packet is
+still pending immediately before deleting the synthetic device. Packet
+cancellation clears its timer/pointer; a late completion would fail the gate.
+The guest rejects early success, observes owner retirement, driver error and
+survivor isolation, then retains old raw/event fds through replacement and a
+measured 2200 ms guard. These modes are standalone synthetic tests and cannot
+certify physical WS73 unplug or receiver RF.
