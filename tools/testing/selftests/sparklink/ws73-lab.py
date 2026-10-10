@@ -156,6 +156,98 @@ def inventory():
     return result
 
 
+def usb_host_boundary(qemu):
+    """Introspect without creating or opening a host USB device."""
+    command = [str(qemu), '-device', 'usb-host,help']
+    result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    required = ['kernel-driver-detach', 'host-reset', 'host-retry', 'guest-reset',
+                'guest-resets-all', 'vendorid', 'productid', 'hostbus', 'hostport']
+    present = [name for name in required if re.search(
+        r'^\s*' + re.escape(name) + r'=<[^>]+>(?:\s|$)',
+        result.stdout + result.stderr, re.M)]
+    return dict(args=command, exit=result.returncode, stdout=result.stdout,
+                stderr=result.stderr, required=required, present=present,
+                supported=result.returncode == 0 and present == required)
+
+
+def opened_usb_node(pid, node, proc=Path('/proc')):
+    """Only the owned child's live fd proves ownership of the current node."""
+    try:
+        for link in (proc / str(pid) / 'fd').iterdir():
+            try:
+                if os.readlink(link) == node:
+                    return True
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    return False
+
+
+class ReattachmentWatcher:
+    """Wait for fixed-port auto-open; never delete an opening USB host object.
+
+    A retry pulse only clears that object's failed-open budget. It neither
+    establishes ownership nor confirms device/runtime readiness.
+    """
+    def __init__(self, addresses, records, owned=opened_usb_node,
+                 settle_seconds=6, timeout_seconds=20):
+        if not 0 < settle_seconds < timeout_seconds:
+            raise ValueError('reattach requires 0 < settle < timeout')
+        self.addresses, self.records, self.owned = addresses, records, owned
+        self.settle, self.timeout = settle_seconds, timeout_seconds
+        self.pending = {}
+
+    def poll(self, index, port, device, pid, monitor, now=None):
+        now = time.monotonic() if now is None else now
+        if device is None or device['address'] == self.addresses[port]:
+            self.pending.pop(port, None)
+            return False
+        if device['path'] != port or device['bus'] != int(port.split('-', 1)[0]):
+            raise ValueError('reattach USB topology changed')
+        record = self.pending.get(port)
+        if record is None or record['device'] != device['address']:
+            record = dict(port=port, device=device['address'], started_monotonic=now,
+                          action='waiting-auto-reattach', retry_requested=False)
+            self.pending[port] = record
+            self.records.append(record)
+        elapsed = now - record['started_monotonic']
+        if elapsed < 0:
+            raise ValueError('reattach monotonic clock moved backwards')
+        drivers = {i['driver'] for i in device['interfaces'] if i['driver']}
+        record.update(observed_monotonic=now, writable=device['writable'],
+                      drivers=sorted(drivers))
+        if drivers - {'usbfs'}:
+            record['action'] = 'foreign-driver-rejected'
+            raise ValueError('host acquired WS73 after re-enumeration; no detach')
+        if not device['writable']:
+            if elapsed >= self.timeout:
+                record['action'] = 'permission-deadline'
+                raise ValueError('WS73 reattach permissions did not settle')
+            return False
+        path = f'/machine/peripheral/ws73_{index}'
+        attached = monitor.execute('qom-get', dict(path=path, property='attached'))
+        if type(attached) is not bool:
+            raise ValueError('invalid QEMU attached state')
+        owned = self.owned(pid, device['node'])
+        record.update(attached=attached, owned_live_fd=owned)
+        if attached and owned:
+            self.addresses[port] = device['address']
+            record['action'] = 'observed-own-live-auto-reattach'
+            self.pending.pop(port)
+            return True
+        if elapsed >= self.timeout:
+            record['action'] = 'ownership-deadline'
+            raise ValueError('WS73 reattach ownership did not settle; no detach')
+        if elapsed >= self.settle and not drivers and not attached and not owned \
+                and not record['retry_requested']:
+            # The setter checks dh/attached under QEMU serialization, so an
+            # opener winning this observation race receives a harmless no-op.
+            monitor.execute('qom-set', dict(path=path, property='host-retry', value=True))
+            record.update(retry_requested=True, retry_monotonic=now)
+        return False
+
+
 def make_args(args):
     tools = WORKSPACE / '.dev/tools/bin'
     rustc = args.rustc or shutil.which('rustc')
@@ -481,6 +573,9 @@ def run(args):
         qemu = shutil.which('qemu-system-x86_64')
         if qemu:
             manifest['qemu_binary'] = file_record(Path(qemu))
+            manifest['usb_host_boundary'] = usb_host_boundary(qemu)
+        if not qemu or not manifest['usb_host_boundary']['supported']:
+            raise ValueError('QEMU requires guarded usb-host with host-retry; rebuild lab QEMU')
         for port in args.ports:
             if port not in devices or not devices[port]['writable']:
                 raise ValueError(f'{port}: not a writable WS73; check udev permissions')
@@ -554,29 +649,17 @@ def run_vm(args, run_dir, devices, manifest):
                 monitor = Qmp(monitor_path, run_dir / 'qmp.jsonl')
             addresses = {p: devices[p]['address'] for p in args.ports}
             reattached = []
+            watcher = ReattachmentWatcher(addresses, reattached)
             active = 1
             while process.poll() is None:
                 if time.monotonic() > deadline:
                     raise ValueError(f'VM timed out; inspect {log}')
                 current = {d['path']: d for d in inventory()}
                 for index, port in enumerate(args.ports[:active]):
-                    device = current.get(port)
-                    if device is None or device['address'] == addresses[port]:
-                        continue
-                    if not device['writable']:
-                        continue  # Wait for udev to apply the rule to the new node.
-                    identity = f'ws73_{index}'
-                    monitor.execute('device_del', dict(id=identity))
-                    monitor.wait_deleted(identity)
-                    bus, path = port.split('-', 1)
-                    monitor.execute('device_add', dict(driver='usb-host', id=identity,
-                        bus='ws73xhci.0', port=str(index + 1), hostbus=int(bus),
-                        hostport=path, vendorid=0xffff, productid=0x3733,
-                        **{'guest-reset': False, 'guest-resets-all': False,
-                           'kernel-driver-detach': False, 'host-reset': False}))
-                    addresses[port] = device['address']
-                    reattached.append(dict(port=port, address=device['address']))
-                    write_json(run_dir / 'reattach.json', reattached)
+                    try:
+                        watcher.poll(index, port, current.get(port), process.pid, monitor)
+                    finally:
+                        write_json(run_dir / 'reattach.json', reattached)
                 console = log.read_text(errors='replace')
                 if active < len(args.ports) and re.search(
                     rf'sparklink_ws73_usb \d+-{active}:1\.0: WS73 runtime interface', console):

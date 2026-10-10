@@ -99,6 +99,20 @@ guest reset 保持原独立开关。固件自身重新枚举和物理拔插仍�
 已由其他驱动占用的接口不会因此被释放，guest 初始化可能失败，应保留错误。
 默认 QEMU 没有这两个扩展属性；实机入口须拒绝并要求重建，不能静默省略。
 
+另应用 `usb-host-retry.patch`，提供每对象 `host-retry` bool 脉冲，读回始终
+false。true 仅在该对象无 libusb handle、未 attached 且使用 autoscan filter
+时清零失败重试计数；后续仍由既有 autoscan timer 打开。已打开/附着对象收到
+脉冲也不受影响，不触发 close/reset/detach，不修改其他对象或全局 timer。
+
+两个物理 launcher 共用 `ws73-lab.py` 的非阻塞 ReattachmentWatcher：新地址
+先等最多20秒，只有 attached 和该子进程当前USB节点的live fd均确认才更新
+地址。udev/usbfs交接窗口继续等待；没有占用/attached/live fd且等待满6秒时
+最多发一次 retry，仍不视为Ready。新的重新枚举重开计时；失踪设备不触发
+删除，其他端口继续轮询；外部驱动、权限/所有权超时留下错误和记录。
+禁止以 device_del/device_add 刷新物理对象，这会打断并发 auto-open/BSLE。
+两个入口在 VM 启动前检查 host-retry 与原有边界/匹配属性，旧 binary 须重建。
+这不修改内核 Ready 判据，也不证明真实拔插或 RF 成功。
+
 检查实际生产函数体（libusb 调用由计数 mock 代替）、三处生命周期路由、
 补丁的新应用/重复应用/漂移拒绝及可选实际二进制的 QMP 属性：
 
@@ -112,6 +126,9 @@ python3 check-usb-host-boundary.py \
 QMP 检查使用暂停的 TCG 客体，hostbus=255/hostport=255 与限定 VID/PID，
 验证对象未 attached、VM 未运行、属性值可读回。它不选择主机设备，生产函数
 mock 也不进行 libusb I/O；这两种检查均不证明真实透传/ROM/RF 或主机绑定竞争。
+检查还编译真实 retry setter，覆盖 false、handle已开、已attached、非autoscan
+拒绝、仅本对象恢复计数五种情况；暂停QMP验证脉冲读回false且仍未attached。
+`python3 ../test_ws73_reattach.py` 提供16种确定性交接/超时/端口隔离测试。
 
 构建输出保留完整 configure/compiler/install 诊断。固定的 QEMU 9.2.0
 包含仅用于构建的 libfdt const 声明修正，以兼容 glibc 2.43/GCC 16；

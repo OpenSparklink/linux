@@ -177,7 +177,7 @@ class ArtifactTests(unittest.TestCase):
              patch.object(lab.shutil, 'which', return_value=None), \
              patch.object(lab, 'run_vm') as vm, \
              contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(ValueError, 'not a writable WS73'):
+            with self.assertRaisesRegex(ValueError, 'QEMU requires guarded usb-host'):
                 lab.run(args)
             vm.assert_not_called()
         run_dir, = self.root.glob('ws73-run-*')

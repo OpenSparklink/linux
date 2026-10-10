@@ -65,6 +65,11 @@ def qmp_properties(args):
                     assert monitor.execute('qom-get',{'path':'/machine/peripheral/guarded','property':name}) is False
                 for name,value in [('hostbus',255),('hostport','255'),('vendorid',0xffff),('productid',0x3733)]:
                     assert monitor.execute('qom-get',{'path':'/machine/peripheral/guarded','property':name})==value
+                path='/machine/peripheral/guarded'
+                assert monitor.execute('qom-get',{'path':path,'property':'host-retry'}) is False
+                monitor.execute('qom-set',{'path':path,'property':'host-retry','value':True})
+                assert monitor.execute('qom-get',{'path':path,'property':'host-retry'}) is False
+                assert monitor.execute('qom-get',{'path':path,'property':'attached'}) is False
                 assert monitor.execute('query-status')['status']=='prelaunch'
                 monitor.execute('quit');assert process.wait(timeout=10)==0
             finally:
@@ -79,7 +84,8 @@ def check(args):
     source = host.read_text()
     maximum = re.search(r'^#define USB_MAX_INTERFACES (\d+)$',
                         (args.source/'include/hw/usb.h').read_text(), re.M)[1]
-    functions = ['usb_host_detach_kernel', 'usb_host_attach_kernel', 'usb_host_lifecycle_reset']
+    functions = ['usb_host_detach_kernel', 'usb_host_attach_kernel', 'usb_host_lifecycle_reset',
+                 'usb_host_set_retry']
     production = '\n\n'.join(body(source, name) for name in functions)
     (args.output/'production.h').write_text(production+'\n')
     for name in ['usb_host_open','usb_host_close','usb_host_exit_notifier']:
@@ -98,10 +104,19 @@ def check(args):
 struct libusb_config_descriptor { int unused; };
 typedef struct {
     bool allow_kernel_driver_detach, allow_host_reset;
+    bool attached, needs_autoscan;
+    int errcount;
     void *dh, *dev;
     int bus_num, addr;
     struct { bool detached; } ifs[USB_MAX_INTERFACES];
 } USBHostDevice;
+typedef USBHostDevice Object;
+typedef struct { int unused; } Error;
+#define USB_HOST_DEVICE(obj) (obj)
+#define USB_DEVICE(obj) (obj)
+static int errors;
+static void error_setg(Error **errp, const char *message)
+{ (void)errp; assert(strstr(message, "auto-scan filter")); errors++; }
 static int queries, active, detached, attached, resets, freed, config_error;
 static struct libusb_config_descriptor config;
 static int libusb_get_active_config_descriptor(void *dev, struct libusb_config_descriptor **out)
@@ -144,6 +159,24 @@ int main(void)
     usb_host_detach_kernel(&s);
     assert(queries==3 && active==USB_MAX_INTERFACES && detached==USB_MAX_INTERFACES && freed==2);
     puts("USB_HOST_GUARDS: PASS 7 cases (production bodies, counted mocks, no physical USB)");
+    USBHostDevice retry={.errcount=3}, other={.errcount=3};
+    usb_host_set_retry(&retry, false, NULL);
+    assert(retry.errcount==3 && errors==0);
+    retry.dh=&retry;
+    usb_host_set_retry(&retry, true, NULL);
+    assert(retry.errcount==3 && errors==0 && retry.dh==&retry);
+    retry.dh=NULL; retry.attached=true;
+    usb_host_set_retry(&retry, true, NULL);
+    assert(retry.errcount==3 && errors==0 && retry.attached);
+    retry.attached=false;
+    usb_host_set_retry(&retry, true, NULL);
+    assert(retry.errcount==3 && errors==1);
+    retry.needs_autoscan=true;
+    usb_host_set_retry(&retry, true, NULL);
+    assert(retry.errcount==0 && other.errcount==3 && errors==1);
+    assert(queries==3 && active==USB_MAX_INTERFACES && detached==USB_MAX_INTERFACES &&
+           attached==USB_MAX_INTERFACES && resets==1 && freed==2);
+    puts("USB_HOST_RETRY: PASS 5 cases (production setter, no libusb calls, no physical USB)");
 }
 '''
     (args.output/'guards.c').write_text('#define USB_MAX_INTERFACES '+maximum+'\n'+code)
@@ -154,13 +187,14 @@ int main(void)
     result=subprocess.check_output([str(args.output/'guards')],text=True)
     (args.output/'guards.log').write_text(result)
     print(result,end='')
-    patch = Path(__file__).with_name('usb-host-boundary.patch').resolve()
+    patches = [Path(__file__).with_name(name).resolve() for name in
+               ['usb-host-boundary.patch','usb-host-retry.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
-    commands=[['patch','--batch','--fuzz=0','--reverse','-p1','-i',str(patch)],
-              ['python3',str(apply),str(tree.resolve())],
-              ['python3',str(apply),str(tree.resolve())]]
+    commands=[['patch','--batch','--fuzz=0','--reverse','-p1','-i',str(patch)]
+              for patch in reversed(patches)]
+    commands += [['python3',str(apply),str(tree.resolve())]] * 2
     with (args.output/'patch.log').open('w') as log:
         for command in commands:
             subprocess.run(command,cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
@@ -169,8 +203,13 @@ int main(void)
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
+        copy.write_text(host.read_text().replace('object_property_add_bool(obj, "host-retry"',
+                                                'object_property_add_bool(obj, "unexpected-retry"',1))
+        drift=copy.read_bytes()
+        denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
+        assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
-             'physical_acceptance':False,'guard_cases':7,'host_lifecycle_sites':3,'patch_cases':3,
+             'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'host_lifecycle_sites':3,'patch_cases':4,
              'source_sha256':hashlib.sha256(host.read_bytes()).hexdigest(),
              'production_sha256':hashlib.sha256(production.encode()).hexdigest()}
     if args.qemu:
@@ -178,7 +217,7 @@ int main(void)
         summary['qmp']='PASS paused/unattached property probe; not physical passthrough'
         summary['qemu_sha256']=hashlib.sha256(args.qemu.read_bytes()).hexdigest()
     (args.output/'result.json').write_text(json.dumps(summary,indent=2)+'\n')
-    print('USB_HOST_PATCH: PASS fresh, idempotent, source-drift refusal')
+    print('USB_HOST_PATCH: PASS fresh, idempotent, boundary/retry source-drift refusal')
 
 
 if __name__=='__main__':
