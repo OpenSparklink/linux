@@ -115,4 +115,38 @@ mod containment_regression {
         assert_eq!((OpIndicator::READ | OpIndicator::NOTIFY).bits(), 0x09);
         assert!(!(OpIndicator::READ | OpIndicator::NOTIFY).contains(OpIndicator::WRITE_WITH_RSP));
     }
+    #[test]
+    fn reserved_bits_reject_before_database_mutation_and_full_permissions_match_table32() {
+        let flags = [
+            OpIndicator::READ,
+            OpIndicator::WRITE_NO_RSP,
+            OpIndicator::WRITE_WITH_RSP,
+            OpIndicator::NOTIFY,
+            OpIndicator::INDICATE,
+            OpIndicator::BROADCAST,
+            OpIndicator::DESC_WRITABLE,
+            OpIndicator::CLIENT_CFG_WR,
+            OpIndicator::SERVER_CFG_WR,
+        ];
+        assert_eq!(
+            flags.map(OpIndicator::bits),
+            [1, 2, 4, 8, 16, 32, 256, 512, 1024]
+        );
+        for bit in 0..32 {
+            if (1 << bit) & 0x73f == 0 {
+                assert_eq!(OpIndicator::try_from_raw((1 << bit) | 9), Err(EINVAL));
+            }
+        }
+        for bits in [0, 2, 4, 9, 16, 0x73f] {
+            assert_eq!(OpIndicator::try_from_raw(bits).unwrap().bits(), bits);
+        }
+        let (mut db, _) = database(OpIndicator::READ);
+        let next = db.next_handle;
+        assert_eq!(
+            db.add_property(SsapUuid::Uuid16(7), OpIndicator::READ, &[0; 513]),
+            Err(EINVAL)
+        );
+        assert_eq!(db.next_handle, next);
+        assert_eq!(db.property_count(), 1);
+    }
 }

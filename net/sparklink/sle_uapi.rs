@@ -1600,7 +1600,8 @@ unsafe impl FromBytes for SsapAddService {}
 pub(crate) struct SsapAddProperty {
     /// Property UUID (16-bit).
     pub uuid16: u16,
-    /// Operation indicator bitmask (bit0=Read, bit1=Write, bit2=Notify, etc.).
+    /// Local staging value rights: b0 READ, b1 WRITE_NO_RSP, b2 WRITE_WITH_RSP,
+    /// b3 NOTIFY, b4 INDICATE, b5 BROADCAST; b6/b7 reserved.
     pub ops: u8,
     /// Length of initial value data.
     pub value_len: u8,

@@ -2491,8 +2491,11 @@ fn ioctl_ssap_local(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<is
         }
         SL_IOCTL_SSAP_ADD_PROP => {
             let mut cmd_data: SsapAddProperty = read_user_struct(arg)?;
+            if cmd_data._reserved != [0; 2] {
+                return Err(EINVAL);
+            }
             let uuid = sle_ssap::SsapUuid::Uuid16(cmd_data.uuid16);
-            let ops = sle_ssap::OpIndicator::from_raw(u32::from(cmd_data.ops));
+            let ops = sle_ssap::OpIndicator::try_from_raw(u32::from(cmd_data.ops))?;
             let len = cmd_data.value_len as usize;
             if len > SSAP_VALUE_MAX {
                 return Err(EINVAL);

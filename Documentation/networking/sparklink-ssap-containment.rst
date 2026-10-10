@@ -25,3 +25,15 @@ are not implemented by this change. R04/R07/R08 and connection issues remain ope
 The Native WS73 typed discovery path does not use this legacy Engine. Every new
 kernel must still pass the real VM-only two-device discovery/recovery regression;
 fixture success alone cannot qualify firmware, physical recovery or SSAP support.
+
+Operation indicators
+--------------------
+
+The canonical UAPI names ``SL_SSAP_OP_*`` follow table 32: READ=1,
+WRITE_NO_RSP=2, WRITE_WITH_RSP=4, NOTIFY=8, INDICATE=16 and BROADCAST=32;
+descriptor write permissions occupy bits 8, 9 and 10. Bits 6, 7 and 11..31
+are reserved and rejected before local database mutation. The legacy staging
+byte cannot express descriptor permissions; callers must explicitly refuse that
+narrowing rather than discard those bits. This is not the standard wire Engine
+or an authorization decision: per-peer security and application policy remain
+separate. Raw staging inputs also require zero reserved bytes and bounded values.

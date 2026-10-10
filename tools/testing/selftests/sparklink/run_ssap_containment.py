@@ -34,7 +34,7 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     for p in paths:
         assert p.read_bytes() == inputs[p.name], 'production input changed during tests'
-    record = {'status': 'SSAP_LEGACY_CONTAINMENT_PASS', 'rust_tests': 8,
+    record = {'status': 'SSAP_LEGACY_CONTAINMENT_PASS', 'rust_tests': 9,
               'scope': 'actual full local database/session module with allocation dependency fixture; one historical codec test',
               'standard_ssap_acceptance': False, 'physical_acceptance': False,
               'sources': {name: hashlib.sha256(data).hexdigest() for name, data in inputs.items()},

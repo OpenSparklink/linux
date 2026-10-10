@@ -5,11 +5,12 @@ Run: python3 tools/testing/selftests/sparklink/run_ssap_containment.py
 
 The runner compiles the entire actual net/sparklink/sle_ssap.rs, appending
 private child tests, and the actual remote ioctl dispatcher body. KVec/allocation
-and the transport TCID constant are explicit dependency fixtures. Eight tests
+and the transport TCID constant are explicit dependency fixtures. Nine tests
 cover all opcodes and input lengths including 65535/65536, repeated full frames,
 no allocation/mutation/ACK on unsupported ingress, no method echo, no unowned
 notifications, atomic property replacement after OOM, and local value/permission
-boundaries. The whole kernel build separately checks production wiring.
+boundaries, all reserved operation bits and rejected property registration.
+The whole kernel build separately checks production wiring.
 
 legacy_codec.rs preserves the previous offset-format codec only as test material.
 Its section references are inherited history, not standard conformance claims.

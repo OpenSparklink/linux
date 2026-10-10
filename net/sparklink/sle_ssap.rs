@@ -143,9 +143,12 @@ impl OpIndicator {
         self.0
     }
 
-    /// Construct from a raw bitmask value.
-    pub const fn from_raw(v: u32) -> Self {
-        Self(v)
+    /// Validate all reserved bits before constructing permissions.
+    pub fn try_from_raw(v: u32) -> Result<Self> {
+        if v & !0x73f != 0 {
+            return Err(EINVAL);
+        }
+        Ok(Self(v))
     }
 }
 
@@ -441,6 +444,10 @@ impl SsapInner {
         ops: OpIndicator,
         initial_value: &[u8],
     ) -> Result<u16> {
+        // Validate before allocating a handle or mutating the local database.
+        if initial_value.len() > PROPERTY_VALUE_MAX {
+            return Err(EINVAL);
+        }
         let handle = self.alloc_handle()?;
         let svc = self.services.last_mut().ok_or(ENODEV)?;
 
