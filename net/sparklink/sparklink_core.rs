@@ -532,6 +532,10 @@ pub(crate) struct ControllerRuntime {
     pub(crate) snoop_poll: PollCondVar,
     #[pin]
     pub(crate) state: Mutex<Option<KBox<ControllerState>>>,
+    /// Serializes native open against teardown, never protocol observation.
+    #[pin]
+    pub(crate) native_lifecycle: Mutex<()>,
+    pub(crate) transport_open: core::sync::atomic::AtomicBool,
     #[pin]
     pub(crate) ingress: Lock<KBox<sle_dli::ControllerEventRing>, IrqLockBackend>,
     #[pin]
@@ -563,6 +567,7 @@ impl ControllerRuntime {
             sle_dli::ControllerBackend::Ws73(controller) => controller.profile(),
             _ => 0,
         };
+        let initially_open = protocol_profile == 0;
         Arc::pin_init(pin_init!(Self {
             identity: dev.identity(),
             protocol_profile,
@@ -572,6 +577,8 @@ impl ControllerRuntime {
             snoop <- new_irq_lock!(snoop, "sparklink_snoop"),
             snoop_poll <- new_poll_condvar!("sparklink_snoop_poll"),
             state <- new_mutex!(Some(state), "sparklink_runtime"),
+            native_lifecycle <- new_mutex!((), "sparklink_native_lifecycle"),
+            transport_open: core::sync::atomic::AtomicBool::new(initially_open),
             ingress <- new_irq_lock!(ingress, "sparklink_runtime_rx"),
             host <- new_irq_lock!(host, "sparklink_runtime_host"),
             rx_work <- new_delayed_work!("sparklink_runtime_rx_work"),
@@ -586,7 +593,12 @@ impl ControllerRuntime {
     /// Called in process context without the registry lock. In-flight protocol
     /// operations finish before invalidation; subsequent accesses get ENODEV.
     pub(crate) fn invalidate(self: &Arc<Self>) {
+        // Close admission before waiting for a driver's blocking open. Its
+        // eventual success may acquire resources, but cannot admit commands.
+        *self.schedule_gate.lock() = true;
+        self.transport_open.store(false, core::sync::atomic::Ordering::Release);
         self.management.lock().settled(ENODEV.to_errno());
+        let _lifecycle = self.native_lifecycle.lock();
         sle_usb::unpublish_runtime(self);
         self.stop_workers();
         let state = self.state.lock().take();
@@ -3292,6 +3304,7 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
     if request.generation == 0 || request.generation != owner.identity.generation { return Err(ENODEV); }
     if cmd == SL_IOCTL_MANAGEMENT_ACQUIRE {
         if request.lease != 0 || me.owned_target.lock().is_some() { return Err(EINVAL); }
+        if !owner.transport_open.load(core::sync::atomic::Ordering::Acquire) { return Err(EAGAIN); }
         if let Some(error) = owner.host.lock().controller_status().2 { return Err(error); }
         let token = gate.prepare(request.mode).map_err(management_error)?;
         if !owner.host.lock().quiet() { return Err(EBUSY); }

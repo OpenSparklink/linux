@@ -105,9 +105,9 @@ impl Drop for NativeController {
     }
 }
 
-/// An independent retained reference for the TX worker's blocking transfer.
-/// The worker releases Runtime state before sending; invalidation joins that
-/// worker before closing the Backend. This handle cannot refer to a reused id.
+/// Independent retained transport for blocking open or the TX worker. Lifecycle
+/// serialization joins open, and invalidation joins TX before closing Backend.
+/// Neither operation retains Runtime state or can follow a reused identity.
 pub(crate) struct NativeCommandTransport {
     transport: *mut c_void,
 }
@@ -187,6 +187,46 @@ impl NativeController {
     }
 }
 
+impl super::ControllerRuntime {
+    fn open_native(self: &kernel::sync::Arc<Self>) -> Result {
+        let _lifecycle = self.native_lifecycle.lock();
+        let transport = {
+            let state = self.state.lock();
+            if *self.schedule_gate.lock() { return Err(ENODEV); }
+            let Some(super::sle_dli::ControllerBackend::Ws73(controller)) =
+                state.as_ref().map(|state| &state.controller) else { return Err(ENODEV) };
+            controller.command_transport()
+        };
+        // Publish ingress before open submits RX. Invalidation closes its
+        // gate immediately, then joins this lifecycle before unpublishing.
+        super::sle_usb::publish_runtime(self);
+        // SAFETY: independent reference retains the driver; lifecycle excludes
+        // close. No registry, management, Runtime state or IRQ lock spans I/O.
+        NativeController::result(unsafe {
+            sparklink_native_transport_open(transport.transport, self.identity.id, self.identity.generation)
+        })?;
+        {
+            let state = self.state.lock();
+            let Some(super::sle_dli::ControllerBackend::Ws73(controller)) =
+                state.as_ref().map(|state| &state.controller) else {
+                drop(state);
+                // SAFETY: successful open must be closed even if adoption fails.
+                unsafe { sparklink_native_transport_close(transport.transport) };
+                return Err(ENODEV);
+            };
+            // Transfer successful-open cleanup to Backend even when retirement
+            // won. Teardown cannot take state until this lifecycle is released.
+            controller.opened.store(true, Ordering::Release);
+            let stopping = self.schedule_gate.lock();
+            if *stopping { return Err(ENODEV); }
+            self.transport_open.store(true, Ordering::Release);
+        }
+        // Ingress is already published. Do not republish a retired registration.
+        self.schedule_rx(kernel::time::msecs_to_jiffies(500));
+        Ok(())
+    }
+}
+
 impl NativeCommandTransport {
     pub(crate) fn send(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>) -> Result {
         if let Some(tag) = recipe {
@@ -254,6 +294,7 @@ impl SleController for NativeController {
     }
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
+        if !self.opened.load(Ordering::Acquire) { return Err(EAGAIN); }
         self.validate_command(opcode as u16, params)?;
         let owner = super::sle_usb::ingress_owner(self.identity).ok_or(ENODEV)?;
         let gate = owner.schedule_gate.lock();
@@ -302,19 +343,30 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
             )?;
             state.command_credits = metadata.command_credits;
             let mut registry = super::SUBSYSTEM.lock();
-            registry.as_mut().ok_or(ENODEV)?.install_runtime(id, state, false)
+            let ss = registry.as_mut().ok_or(ENODEV)?;
+            if !ss.dev_registry.get(id).is_some_and(|dev| dev.identity() == identity
+                && !dev.test_flag(super::sle_dev::SLE_DEV_UNREGISTERING)) { return Err(ENODEV); }
+            ss.install_runtime(id, state, false)
         })();
         let owner = match installed {
             Ok(owner) => owner,
-            Err(error) => { super::sle_detach_device(id); return Err(error); }
+            Err(error) => {
+                let mut registry = super::SUBSYSTEM.lock();
+                if let Some(ss) = registry.as_mut() {
+                    if ss.runtime(id).is_none() && ss.dev_registry.get(id).is_some_and(|dev| dev.identity() == identity
+                        && !dev.test_flag(super::sle_dev::SLE_DEV_UNREGISTERING)) {
+                        let _ = ss.dev_registry.unregister(id);
+                    }
+                }
+                return Err(error);
+            }
         };
-        super::sle_usb::publish_runtime(&owner);
-        let opened = {
-            let state = owner.state.lock();
-            state.as_ref().ok_or(ENODEV).and_then(|state| state.controller.open())
-        };
-        if let Err(error) = opened { super::sle_detach_device(id); return Err(error); }
-        owner.start_workers();
+        if let Err(error) = owner.open_native() {
+            // A concurrent unregister may finish and reuse this index before
+            // open returns. Cleanup must target only the original generation.
+            sparklink_native_unregister_rust(id, identity.generation);
+            return Err(error);
+        }
         // SAFETY: output is live for this C call. Written only on success.
         unsafe { *out = NativeIdentity { id, generation: identity.generation } };
         pr_info!("sparklink: native WS73 sle{} generation={} registered SETUP, not Ready\n",

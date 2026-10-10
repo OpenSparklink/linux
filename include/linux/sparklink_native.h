@@ -30,6 +30,11 @@ struct sparklink_native_identity {
 };
 
 /* open/close/send execute in process context. close must join all callbacks.
+ * open does not hold the Runtime state mutex; snapshots remain observable and
+ * management acquisition returns -EAGAIN until open succeeds. Open is joined
+ * before close, including retirement during open. A failing open must release
+ * its own partial resources. Queue unregister on another process-context work
+ * item; do not call it synchronously from open/close/send or IRQ callbacks.
  * get/put retain the context across every Backend and in-flight callback.
  * Core owns scheduling/credit/transactions; send only performs one transfer.
  * validate_command is side-effect free and must not perform I/O or acquire

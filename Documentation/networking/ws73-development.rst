@@ -748,3 +748,63 @@ locally in ``.dev/tx-terminal-final-evidence.json``. Physical entry still lacks
 WS73 hardware; real North Star acceptance stays 0/7 and board qualification
 NOT_ASSERTED. Native/legacy lock migration, real hardware, four parallel
 devices and the remaining full S0-S6 issue requirements remain open.
+
+Native open without the protocol state mutex
+-------------------------------------------
+
+Native registration now retains its transport, releases Runtime state, and
+opens under a separate per-owner lifecycle mutex. Read-only snapshots remain
+available in SETUP. Management acquisition returns EAGAIN until open succeeds;
+neither a rejected lease nor an unowned raw command advances admission. This
+transport-open condition does not itself mark a controller Ready.
+
+Retirement closes admission before joining open. A successful late open is
+adopted only for teardown and closed exactly once; it cannot start new work.
+An unsuccessful open must clean up its own partial resources. Failed
+registration cleanup checks the original generation and cannot unregister a
+replacement. Ingress is published before RX starts and is unpublished after
+the lifecycle join; native worker startup does not republish the owner.
+Native callbacks must queue unregister on another process-context worker,
+not invoke it synchronously from open, close, send or an IRQ callback.
+
+The guest-only ``native-open`` external module blocks a native API callback
+until the C test releases it. It has no USB, firmware or RF implementation.
+The four cases are success, EIO, retirement during successful open and
+retirement during failed open. Each checks a responsive full SETUP snapshot,
+ten EAGAIN lease attempts, no unowned send, exact get/put/close counts, and an
+actual synthetic WS73 survivor query before and after release. Retiring open
+must keep its index reserved; retained old descriptors and stale unregister
+identities are checked again while later registrations reuse that index.
+The test also requires a clean fixture module unload and full kernel log.
+
+Run with an already compiled matching kernel build tree (for Module.symvers
+and generated headers), a frozen image/config manifest, test QEMU and BusyBox::
+
+  python3 tools/testing/selftests/sparklink/run_native_open_test.py \
+    --kernel-build /absolute/frozen-image \
+    --module-build /absolute/kernel-build \
+    --qemu /absolute/qemu-system-x86_64 \
+    --busybox /absolute/busybox --output /absolute/new-test-output
+
+The fixture is loaded only inside that guest. Historical comparison needs a
+module compiled for the old kernel's release; do not force-load a mismatched
+module. The final guest executable and fixture C object are byte-identical in
+the #71 comparison; module release metadata differs. The old snapshot waits
+10065.533 ms and fails; final #74 snapshots take 0.002/0.001/0.001/0.002 ms.
+Eight new fail-closed verifier cases bring the kernel harness to 267. The
+fixture and twelve transport/lifecycle regression gates pass, including three
+OUT terminal failures, successful OUT, discovery, events, management, three
+protocol faults and the standard USB lifecycle/recipes. Original 96 cases
+pass with 1058 OK, no FAIL/SKIP and the three existing WARN. The #74 ordinary
+user slctl support run passes 20 alternating plus two recovery rounds under
+the same daemon, TX-off, survivor, capture and C/Python binding gates.
+
+Final source/input/kernel/module/guest hashes and the counterexample are
+recorded locally in ``.dev/native-open-final-evidence.json``. Earlier #73 runs,
+the verifier/guest build corrections and the mismatched-module comparison
+are retained separately. Companion Rust sources and executable hashes are
+unchanged; no new Rust tests/clippy, remote CI or 32-bit runtime is claimed.
+Native open is covered here; broader legacy blocking-I/O migration and the
+complete lifecycle/recovery issue are still open. Physical WS73/RF acceptance
+remains 0/7, board qualification NOT_ASSERTED, and four devices/two parallel
+pairs remain subsequent work within the retained full S0-S6 scope.
