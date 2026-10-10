@@ -33,7 +33,7 @@ def copy_elf(source, target, root):
             shutil.copy2(path, dest)
 
 
-def assess(console, code, radio=False):
+def assess(console, code, radio=False, production_policy=False):
     errors = []
     if code:
         errors.append(f'QEMU exit {code}')
@@ -54,9 +54,28 @@ def assess(console, code, radio=False):
         errors.append('survivor changed or replacement generation reused')
     if re.findall(r'^DAEMON_GUEST_EXIT: (\d+)$', console, re.M) != ['0']:
         errors.append('guest exit missing or nonzero')
-    bus = re.findall(r'^DAEMON_BUS_IDENTITY: pid=([1-9][0-9]*) uid=1000 owner=(:[0-9]+\.[0-9]+) same_owner=1$',console,re.M)
+    daemon_uid = 0 if production_policy else 1000
+    bus = re.findall(rf'^DAEMON_BUS_IDENTITY: pid=([1-9][0-9]*) uid={daemon_uid} owner=(:[0-9]+\.[0-9]+) same_owner=1$',console,re.M)
     if len(bus) != 1 or console.count('DAEMON_BUS_IDENTITY:') != 1:
         errors.append('missing or changed bus-authenticated daemon identity')
+    if production_policy:
+        expected = ['observer-uid=1001 control-uid=1000 control-primary-gid=1002 control-supplementary-gid=1000 daemon-uid=0 read=allowed '
+                    'control=denied observer-denials=16 control-own=denied']
+        if re.findall(r'^DAEMON_AUTHORIZATION: (.*)$', console, re.M) != expected:
+            errors.append('missing/duplicate/invalid production authorization proof')
+        denials = re.findall(r'^AUTH_DENIED: (.*)$', console, re.M)
+        if denials != ['own-service', 'StartDiscovery', 'StopDiscovery', 'SubmitScanning',
+                       'SubmitStopScanning', 'SubmitStopAdvertising', 'SubmitAdvertising',
+                       'unique-owner-write', 'interface-less-write', 'interface-less-read',
+                       'Properties.Set', 'future-method', 'foreign-interface',
+                       'RemoteService.Read', 'DequeueNotification', 'GetPasskey', 'own-service']:
+            errors.append('authorization denial matrix incomplete or reordered')
+        if re.findall(r'^AUTH_OBSERVE: (.*)$', console, re.M) != ['observer', 'control']:
+            errors.append('observer/control read access missing')
+        if re.findall(r'^AUTH_CREDENTIALS: (.*)$', console, re.M) != ['uid=1001 gid=1001 caps=0', 'uid=1000 gid=1002 caps=0']:
+            errors.append('ordinary observer/control credentials missing')
+    elif any(marker in console for marker in ['DAEMON_AUTHORIZATION:', 'AUTH_DENIED:', 'AUTH_CREDENTIALS:']):
+        errors.append('unexpected production authorization evidence')
     if console.count('DAEMON_KERNEL_LOG_BEGIN') != 1 or console.count('DAEMON_KERNEL_LOG_END') != 1:
         errors.append('complete kernel log missing')
     elif '[    0.000000]' not in console.split('DAEMON_KERNEL_LOG_BEGIN', 1)[1].split('DAEMON_KERNEL_LOG_END', 1)[0]:
@@ -146,16 +165,21 @@ def main():
     for name in ['kernel-build', 'qemu', 'busybox', 'userspace', 'dbus-daemon', 'output']:
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--radio-policy', action='store_true', help='basic policy and explicit synthetic cross-controller medium; never real RF')
+    p.add_argument('--production-policy', action='store_true', help='installed D-Bus policy, root daemon, uid-1000 control group and uid-1001 observer')
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    manifest = {'scope': 'real uid-1000 slkd/slctl on synthetic WS73: no firmware/RF acceptance',
+    manifest = {'scope': 'actual slkd and uid-1000 slctl on synthetic WS73: no firmware/RF acceptance',
                 'radio_policy': a.radio_policy,
+                'production_policy': a.production_policy,
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
         kernel = a.kernel_build.resolve() / 'arch/x86/boot/bzImage'
         userspace = a.userspace.resolve()
+        if a.production_policy:
+            policy = userspace / 'data/dbus/sparklink.conf'
+            manifest['production_policy_input'] = file_record(policy)
         manifest['inputs'] = [file_record(path) for path in [kernel, a.kernel_build / '.config', a.qemu, a.busybox,
             a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c']]
         tracked = subprocess.check_output(['git', 'ls-files', 'crates', 'Cargo.toml', 'Cargo.lock'],
@@ -169,7 +193,10 @@ def main():
             if (SOURCE / x).is_file()]
         manifest['userspace_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=userspace, text=True).strip()
         with (output / 'build.log').open('w') as log:
-            subprocess.run(['cargo', 'build', '-p', 'slkd', '-p', 'slctl'], cwd=userspace,
+            build = ['cargo', 'build', '-p', 'slkd', '-p', 'slctl']
+            if a.production_policy:
+                build += ['--bins', '--examples']
+            subprocess.run(build, cwd=userspace,
                            stdout=log, stderr=subprocess.STDOUT, check=True)
         root = output / 'initramfs'
         (root / 'bin').mkdir(parents=True)
@@ -179,8 +206,18 @@ def main():
             (root / 'bin' / name).symlink_to('busybox')
         for name in ['slkd', 'slctl']:
             copy_elf(userspace / 'target/debug' / name, root / 'bin' / name, root)
+        if a.production_policy:
+            copy_elf(userspace / 'target/debug/examples/bus_policy_probe', root / 'bin/bus-policy-probe', root)
+            # Additional debug Rust ELF can exhaust a 512M guest's initramfs.
+            # Strip only disposable copies; preserve original/program hashes.
+            manifest['unstripped_programs'] = [file_record(userspace / name) for name in
+                ['target/debug/slkd', 'target/debug/slctl', 'target/debug/examples/bus_policy_probe']]
+            for name in ['slkd', 'slctl', 'bus-policy-probe']:
+                subprocess.run(['strip', '--strip-debug', str(root / 'bin' / name)], check=True)
+            manifest['guest_strip_debug'] = True
         copy_elf(a.dbus_daemon, root / 'bin/dbus-daemon', root)
-        manifest['guest_programs'] = [file_record(root / 'bin' / name) for name in ['slkd', 'slctl', 'dbus-daemon']]
+        programs = ['slkd', 'slctl', 'dbus-daemon'] + (['bus-policy-probe'] if a.production_policy else [])
+        manifest['guest_programs'] = [file_record(root / 'bin' / name) for name in programs]
         for name in ['proc', 'sys', 'dev', 'etc', 'tmp']:
             (root / name).mkdir()
         (root / 'tmp').chmod(0o1777)
@@ -191,6 +228,14 @@ def main():
 <busconfig><type>session</type><listen>unix:path=/tmp/slkbus</listen>
 <auth>EXTERNAL</auth><policy context="default"><allow own="*"/>
 <allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>''')
+        if a.production_policy:
+            (root / 'etc/passwd').write_text((root / 'etc/passwd').read_text().replace('ws73:x:1000:1000:', 'ws73:x:1000:1002:') + 'observer:x:1001:1001:test:/tmp:/bin/sh\n')
+            (root / 'etc/group').write_text('root:x:0:\nsparklink:x:1000:ws73\nobserver:x:1001:observer\nws73:x:1002:ws73\n')
+            (root / 'etc/shadow').write_text((root / 'etc/shadow').read_text() + 'observer::0:0:99999:7:::\n')
+            shutil.copy2(policy, root / 'etc/sparklink.conf')
+            config = root / 'etc/dbus.conf'
+            config.write_text(config.read_text().replace('<allow own="*"/>', '<allow user="*"/><allow own="*"/>')
+                              .replace('</busconfig>', '<include>/etc/sparklink.conf</include></busconfig>'))
         firmware = root / 'lib/firmware/sparklink/ws73'
         firmware.mkdir(parents=True)
         (firmware / 'bsle_custom.bin').write_bytes(bytes(range(140)))
@@ -220,6 +265,11 @@ poweroff -f
 ''')
         if a.radio_policy:
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_RADIO=1'))
+        if a.production_policy:
+            f = root / 'init'
+            f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_PRODUCTION_POLICY=1')
+                         .replace("su ws73 -s /bin/sh -c 'exec /bin/dbus-daemon --config-file=/etc/dbus.conf --nofork'",
+                                  '/bin/dbus-daemon --config-file=/etc/dbus.conf --nofork'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -259,7 +309,7 @@ poweroff -f
                 monitor.execute('device_add', dict(id='sle0', port='1', **props))
                 code = process.wait(timeout=30)
             manifest['qemu_exit'] = code
-            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy)
+            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy)
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'
@@ -274,6 +324,8 @@ poweroff -f
             process.wait(timeout=10)
         manifest['finished_at'] = datetime.now(timezone.utc).isoformat()
         records = manifest.get('inputs', []) + manifest.get('userspace_sources', []) + manifest.get('kernel_sources', [])
+        if 'production_policy_input' in manifest:
+            records.append(manifest['production_policy_input'])
         manifest['inputs_and_sources_unchanged'] = all(file_record(Path(x['path'])) == x for x in records)
         (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(manifest['status'], manifest.get('error', ''))

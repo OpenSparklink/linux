@@ -22,13 +22,28 @@ wait_ready() {
 }
 [ "$(user 'id -u')" = 1000 ] || fail 'ordinary application uid'
 echo 'DAEMON_UID: 1000'
-user 'exec /bin/slkd --session --storage /tmp/bonds -n' > /tmp/slkd.log 2>&1 &
+daemon_uid=1000
+if [ "$SPARKLINK_TEST_PRODUCTION_POLICY" = 1 ]; then
+    daemon_uid=0
+    /bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd.log 2>&1 &
+else
+    user 'exec /bin/slkd --session --storage /tmp/bonds -n' > /tmp/slkd.log 2>&1 &
+fi
 wait_ready 1
 pid=$(pidof slkd)
 [ -n "$pid" ] || fail 'daemon pid'
 ctl daemon > /tmp/daemon-before || fail 'bus-authenticated daemon identity'
-grep -Eq "^DaemonIdentity: owner=:[0-9]+\.[0-9]+ pid=$pid uid=1000$" /tmp/daemon-before || fail 'daemon bus PID/UID mismatch'
+grep -Eq "^DaemonIdentity: owner=:[0-9]+\.[0-9]+ pid=$pid uid=$daemon_uid$" /tmp/daemon-before || fail 'daemon bus PID/UID mismatch'
 first=$(list | awk '{print $1}')
+if [ "$SPARKLINK_TEST_PRODUCTION_POLICY" = 1 ]; then
+    [ "$(su observer -s /bin/sh -c 'id -u')" = 1001 ] || fail 'observer uid'
+    [ "$(user 'id -g')" = 1002 ] || fail 'distinct primary group'
+    user 'id -G' | grep -Eq '(^| )1000( |$)' || fail 'supplementary control group'
+    if su observer -s /bin/sh -c '[ -r /dev/sparklink ] || [ -w /dev/sparklink ]'; then fail 'observer has direct chardev access'; fi
+    su observer -s /bin/sh -c "/bin/bus-policy-probe $first observer" || fail 'observer policy matrix'
+    user "/bin/bus-policy-probe $first control" || fail 'control group policy matrix'
+    echo 'DAEMON_AUTHORIZATION: observer-uid=1001 control-uid=1000 control-primary-gid=1002 control-supplementary-gid=1000 daemon-uid=0 read=allowed control=denied observer-denials=16 control-own=denied'
+fi
 ctl --adapter "$first" show || fail 'first show'
 echo 'DAEMON_ADD_SECOND'
 wait_ready 2
@@ -60,7 +75,7 @@ fi
 ctl daemon > /tmp/daemon-after || fail 'daemon bus identity after replug'
 /bin/busybox cmp /tmp/daemon-before /tmp/daemon-after || fail 'daemon bus owner changed'
 owner=$(awk '{sub(/^owner=/,"",$2);print $2}' /tmp/daemon-after)
-echo "DAEMON_BUS_IDENTITY: pid=$pid uid=1000 owner=$owner same_owner=1"
+echo "DAEMON_BUS_IDENTITY: pid=$pid uid=$daemon_uid owner=$owner same_owner=1"
 echo 'DAEMON_HOTPLUG: independent=2 same_process=1 new_generation=1'
 kill -INT "$pid"
 for n in $(seq 1 100); do [ -z "$(pidof slkd)" ] && break; sleep 0.1; done

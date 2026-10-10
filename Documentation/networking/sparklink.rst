@@ -1892,6 +1892,20 @@ The script:
 4. Waits for ``/dev/sparklink`` and runs the full test suite
 5. Parses console output for OK/FAIL/WARN counts and overall result
 
+The separate ``run_daemon_lifecycle.py`` runner exercises actual ``slkd`` and
+uid-1000 ``slctl`` binaries against synthetic WS73 USB controllers.  Its
+``--radio-policy`` option adds twenty alternating discovery rounds, hotplug
+with the same daemon process/owner and two further rounds, plus transmitter-off
+observations.  ``--production-policy`` loads the companion userspace repository's
+``data/dbus/sparklink.conf``: root owns the service, uid 1000 uses a supplementary
+control group, and uid 1001 can observe but cannot submit control, set properties,
+claim the service name or bypass authorization through unique-name/interface-less
+calls.  Both application identities must have zero inherited, permitted,
+effective and ambient capabilities.  Source, policy, guest program and image
+hashes accompany the denial matrix and complete kernel log.  This disposable
+private-bus fixture does not alter host authorization, establish kernel writer
+leases or prove physical WS73 firmware/RF acceptance.
+
 sparklink_ctl
 -------------
 

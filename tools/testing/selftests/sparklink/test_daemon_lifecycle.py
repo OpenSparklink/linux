@@ -80,4 +80,32 @@ class RadioVerdict(unittest.TestCase):
     def test_runtime_panic(self): self.assertTrue(assess(GOOD + "thread 'executor' panicked at radio.rs:1\n",0))
 
 
+class AuthorizationVerdict(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.denied = ['own-service', 'StartDiscovery', 'StopDiscovery', 'SubmitScanning',
+                      'SubmitStopScanning', 'SubmitStopAdvertising', 'SubmitAdvertising',
+                      'unique-owner-write', 'interface-less-write', 'interface-less-read',
+                      'Properties.Set', 'future-method', 'foreign-interface',
+                      'RemoteService.Read', 'DequeueNotification', 'GetPasskey']
+        cls.proof = ('AUTH_CREDENTIALS: uid=1001 gid=1001 caps=0\nAUTH_OBSERVE: observer\n' +
+                     ''.join(f'AUTH_DENIED: {x}\n' for x in cls.denied) +
+                     'AUTH_CREDENTIALS: uid=1000 gid=1002 caps=0\nAUTH_OBSERVE: control\nAUTH_DENIED: own-service\n'
+                     'DAEMON_AUTHORIZATION: observer-uid=1001 control-uid=1000 control-primary-gid=1002 control-supplementary-gid=1000 daemon-uid=0 '
+                     'read=allowed control=denied observer-denials=16 control-own=denied\n')
+        cls.good = GOOD.replace('pid=100 uid=1000', 'pid=100 uid=0') + cls.proof
+
+    def test_complete(self): self.assertEqual(assess(self.good, 0, production_policy=True), [])
+    def test_no_opt_in(self): self.assertTrue(assess(self.good, 0))
+    def test_non_root_service(self): self.assertTrue(assess(self.good.replace('pid=100 uid=0', 'pid=100 uid=1000'), 0, production_policy=True))
+    def test_missing_authorization(self): self.assertTrue(assess(GOOD.replace('pid=100 uid=1000', 'pid=100 uid=0'), 0, production_policy=True))
+    def test_missing_denial(self):
+        for label in self.denied:
+            with self.subTest(label=label):
+                self.assertTrue(assess(self.good.replace(f'AUTH_DENIED: {label}\n', '', 1), 0, production_policy=True))
+    def test_missing_read(self): self.assertTrue(assess(self.good.replace('AUTH_OBSERVE: observer', 'missing'), 0, production_policy=True))
+    def test_duplicate_summary(self): self.assertTrue(assess(self.good + self.proof, 0, production_policy=True))
+    def test_application_caps(self): self.assertTrue(assess(self.good.replace('caps=0', 'caps=1', 1), 0, production_policy=True))
+
+
 if __name__ == '__main__': unittest.main()
