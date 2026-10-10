@@ -87,6 +87,27 @@ static struct sle_mgmt_stats stats(int fd)
 	require(!ioctl(fd, SL_IOCTL_MGMT_STATS, &value), "actual admission counters");
 	return value;
 }
+static struct sle_diagnostic_result completed(int fd, const struct sle_diagnostic_submit *cmd,
+					     size_t len, uint64_t deadline)
+{
+	struct sle_diagnostic_result r;
+	for (;;) {
+		r = request(cmd->generation, cmd->seq);
+		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &r), "result query");
+		if (r.state != 1) break;
+		require(now(CLOCK_MONOTONIC) < deadline, "metadata deadline"); usleep(10000);
+	}
+	require(r.version == 1 && !r.flags && r.generation == cmd->generation && r.seq == cmd->seq &&
+		r.opcode == cmd->opcode && r.state == 2 && !r.error && !r.status && r.data_len == len,
+		"exact final reply");
+	return r;
+}
+static void counters(struct sle_mgmt_stats before, struct sle_mgmt_stats after)
+{
+	printf(",\"submitted_before\":%u,\"submitted_after\":%u,\"resolved_before\":%u,\"resolved_after\":%u,\"pending_before\":%u,\"pending_after\":%u,\"timeouts_before\":%u,\"timeouts_after\":%u",
+		before.total_submitted, after.total_submitted, before.total_resolved, after.total_resolved,
+		before.pending, after.pending, before.total_timeouts, after.total_timeouts);
+}
 static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t opcode, size_t len)
 {
 	static uint64_t request_id;
@@ -116,15 +137,7 @@ static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t 
 		else require(!memcmp(&fault_output, &initial, sizeof(initial)), "readonly submit unchanged");
 	}
 	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) && cmd.seq, "idempotent metadata admission");
-	struct sle_diagnostic_result r;
-	for (;;) {
-		r = request(generation, cmd.seq);
-		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &r), "result query");
-		if (r.state != 1) break;
-		require(now(CLOCK_MONOTONIC) < deadline, "metadata deadline"); usleep(10000);
-	}
-	require(r.version == 1 && !r.flags && r.generation == generation && r.seq == cmd.seq &&
-		r.opcode == opcode && r.state == 2 && !r.error && !r.status && r.data_len == len, "exact final reply");
+	struct sle_diagnostic_result r = completed(fd, &cmd, len, deadline);
 	if (fault) {
 		for (size_t i = 0; i < 3; i++) {
 			retries[i] = initial;
@@ -158,6 +171,80 @@ static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t 
 		require(!munmap(mapping, 2 * page), "submit munmap");
 	}
 	return r;
+}
+static void eviction(int fd, uint64_t generation, const unsigned char *address)
+{
+	/* The separate author fd starts at ID1. Complete each real query before
+	 * advancing: 33 completed admissions exceed the actual 32-slot retention. */
+	struct sle_diagnostic_submit first = { 0 }, retained = { 0 };
+	struct sle_diagnostic_result retained_result = { 0 };
+	for (uint64_t id = 1; id <= 33; id++) {
+		struct sle_diagnostic_submit input = { .version = 1, .generation = generation,
+			.request_id = id, .timeout_ms = 5000, .opcode = 0x0406, .action = 1 };
+		struct sle_diagnostic_submit output = input;
+		struct sle_mgmt_stats before = stats(fd);
+		require(!before.pending && before.total_submitted != UINT32_MAX &&
+			before.total_resolved != UINT32_MAX, "quiet eviction fill accounting");
+		uint64_t start = now(CLOCK_REALTIME), deadline = now(CLOCK_MONOTONIC) + 6000000000ULL;
+		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &output) && output.seq, "eviction fill submit");
+		struct sle_diagnostic_result result = completed(fd, &output, 6, deadline);
+		require(!memcmp(result.data, address, 6), "eviction actual MAC");
+		struct sle_mgmt_stats after = stats(fd);
+		require(!after.pending && after.total_submitted == before.total_submitted + 1 &&
+			after.total_resolved == before.total_resolved + 1 &&
+			after.total_timeouts == before.total_timeouts, "eviction one submit one completion");
+		uint64_t end = now(CLOCK_REALTIME);
+		if (id == 1) first = output;
+		if (id == 2) { retained = output; retained_result = result; }
+		printf("{\"eviction\":\"fill\",\"generation\":%llu,\"request_id\":%llu,\"seq\":%u,\"opcode\":%u,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"data\":",
+			(unsigned long long)generation, (unsigned long long)id, output.seq, output.opcode,
+			(unsigned long long)start, (unsigned long long)end);
+		hex(result.data, result.data_len); printf(",\"input\":"); hex(&input, sizeof(input));
+		printf(",\"output\":"); hex(&output, sizeof(output));
+		printf(",\"result_bytes\":"); hex(&result, sizeof(result)); counters(before, after);
+		puts("}"); fflush(stdout);
+	}
+	struct sle_diagnostic_submit old_input = first, retries[3]; old_input.seq = 0;
+	int retry_results[3], retry_errnos[3];
+	struct sle_mgmt_stats before = stats(fd);
+	uint64_t start = now(CLOCK_REALTIME);
+	for (size_t i = 0; i < 3; i++) {
+		retries[i] = old_input; errno = 0;
+		retry_results[i] = ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &retries[i]); retry_errnos[i] = errno;
+		require(retry_results[i] == -1 && retry_errnos[i] == ESTALE &&
+			!memcmp(&retries[i], &old_input, sizeof(old_input)),
+			"evicted ID never resubmits");
+	}
+	struct sle_diagnostic_result old_query = request(generation, first.seq), old_output = old_query;
+	errno = 0; int ret = ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &old_output), error = errno;
+	require(ret == -1 && error == ENOENT && !memcmp(&old_output, &old_query, sizeof(old_query)),
+		"evicted sequence no longer retained");
+	struct sle_diagnostic_submit retained_input = retained, retained_output;
+	retained_input.seq = 0; retained_output = retained_input;
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &retained_output) &&
+		!memcmp(&retained_output, &retained, sizeof(retained)), "retention boundary ID2 retry");
+	struct sle_diagnostic_result repeated = request(generation, retained.seq);
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &repeated) &&
+		!memcmp(&repeated, &retained_result, sizeof(repeated)), "retained result bytes");
+	/* Observe the quiet Host for100ms as well: an accidentally queued replay
+	 * must not escape a short syscall-only capture interval. */
+	uint64_t quiet = now(CLOCK_MONOTONIC) + 100000000ULL;
+	while (now(CLOCK_MONOTONIC) < quiet) usleep(1000);
+	struct sle_mgmt_stats after = stats(fd);
+	require(!memcmp(&before, &after, sizeof(before)), "evicted/repeated requests do not change counters");
+	uint64_t end = now(CLOCK_REALTIME);
+	printf("{\"eviction\":\"old_id_and_result_rejected\",\"generation\":%llu,\"request_id\":1,\"seq\":%u,\"opcode\":%u,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"quiet_observation_ms\":100,\"retry_results\":[%d,%d,%d],\"retry_errnos\":[%d,%d,%d],\"old_input\":",
+		(unsigned long long)generation, first.seq, first.opcode, (unsigned long long)start,
+		(unsigned long long)end, retry_results[0], retry_results[1], retry_results[2],
+		retry_errnos[0], retry_errnos[1], retry_errnos[2]);
+	hex(&old_input, sizeof(old_input)); printf(",\"retry_outputs\":[");
+	for (size_t i = 0; i < 3; i++) { if (i) putchar(','); hex(&retries[i], sizeof(retries[i])); }
+	printf("],\"result_query_return\":%d,\"result_query_errno\":%d,\"result_query_input\":", ret, error);
+	hex(&old_query, sizeof(old_query)); printf(",\"result_query_output\":"); hex(&old_output, sizeof(old_output));
+	printf(",\"retained_input\":"); hex(&retained_input, sizeof(retained_input));
+	printf(",\"retained_output\":"); hex(&retained_output, sizeof(retained_output));
+	printf(",\"retained_result\":"); hex(&repeated, sizeof(repeated)); counters(before, after);
+	puts("}"); fflush(stdout);
 }
 static void caps_zero(int fd, uint64_t generation, uint32_t seq)
 {
@@ -238,6 +325,7 @@ int main(int argc, char **argv)
 	release(fd, &lease);
 	int other = bound(index); lease = acquire(other, generation);
 	rejected(other, "foreign_author_with_lease", request(generation, mac.seq), EPERM);
+	eviction(other, generation, snapshot.address);
 	release(other, &lease); close(other);
 	puts("{\"phase\":\"BEFORE_DAEMON_PASS\"}"); fflush(stdout);
 	char ack[32]; require(fgets(ack, sizeof(ack), stdin) && !strcmp(ack, "retired\n"), "retirement acknowledgment");
