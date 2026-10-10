@@ -41,6 +41,7 @@ mod tests {
     #[test]
     fn local_parameter_validation_and_roundtrip_are_not_hardware_state() {
         let mut model = PhyConfig::default_config();
+        assert_eq!(model.hopping.next_channel(), 7);
         for invalid in [13, 255] {
             assert_eq!(model.set_mcs(invalid), Err(EINVAL));
             assert_eq!(model.mcs_index, 4);

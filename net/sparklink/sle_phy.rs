@@ -17,21 +17,21 @@
 // =========================================================================
 
 /// Total number of frequency channels in the SLE band (2402-2480 MHz).
-pub const NUM_CHANNELS: u8 = 79;
+pub(crate) const NUM_CHANNELS: u8 = 79;
 
 /// Channel map: bitmask of usable channels (79 bits).
 /// Bit N set = channel N is usable.
 #[derive(Copy, Clone, Debug)]
-pub struct ChannelMap {
+pub(crate) struct ChannelMap {
     /// 10-byte bitmask (80 bits, only bits 0-78 used).
-    pub map: [u8; 10],
+    pub(crate) map: [u8; 10],
     /// Number of used channels (cached).
     used_count: u8,
 }
 
 impl ChannelMap {
     /// Create a channel map where all 79 channels are usable.
-    pub fn all_used() -> Self {
+    pub(crate) fn all_used() -> Self {
         let mut map = [0xFFu8; 10];
         // Clear bit 79 (not a valid channel)
         map[9] &= 0x7F;
@@ -42,7 +42,7 @@ impl ChannelMap {
     }
 
     /// Create a channel map from a raw 10-byte bitmask.
-    pub fn from_raw(raw: [u8; 10]) -> Self {
+    pub(crate) fn from_raw(raw: [u8; 10]) -> Self {
         let mut s = Self {
             map: raw,
             used_count: 0,
@@ -64,7 +64,7 @@ impl ChannelMap {
     }
 
     /// Check if a channel is marked as usable.
-    pub fn is_used(&self, channel: u8) -> bool {
+    pub(crate) fn is_used(&self, channel: u8) -> bool {
         if channel >= NUM_CHANNELS {
             return false;
         }
@@ -74,7 +74,7 @@ impl ChannelMap {
     }
 
     /// Mark a channel as used or unused.
-    pub fn set_used(&mut self, channel: u8, used: bool) {
+    pub(crate) fn set_used(&mut self, channel: u8, used: bool) {
         if channel >= NUM_CHANNELS {
             return;
         }
@@ -89,13 +89,13 @@ impl ChannelMap {
     }
 
     /// Number of usable channels.
-    pub fn used_count(&self) -> u8 {
+    pub(crate) fn used_count(&self) -> u8 {
         self.used_count
     }
 
     /// Get the Nth used channel (0-indexed among used channels).
     /// Returns `None` if n >= used_count.
-    pub fn nth_used(&self, n: u8) -> Option<u8> {
+    pub(crate) fn nth_used(&self, n: u8) -> Option<u8> {
         let mut count = 0u8;
         for ch in 0..NUM_CHANNELS {
             if self.is_used(ch) {
@@ -111,20 +111,20 @@ impl ChannelMap {
 
 /// Frequency hopping state for a connection.
 #[derive(Clone, Debug)]
-pub struct HoppingState {
+pub(crate) struct HoppingState {
     /// Hop increment (1-78), derived from connection parameters.
-    pub hop_increment: u8,
+    pub(crate) hop_increment: u8,
     /// Current channel map.
-    pub channel_map: ChannelMap,
+    pub(crate) channel_map: ChannelMap,
     /// Connection event counter (wraps at u16::MAX).
-    pub event_counter: u16,
+    pub(crate) event_counter: u16,
     /// Last selected channel.
-    pub last_channel: u8,
+    pub(crate) last_channel: u8,
 }
 
 impl HoppingState {
     /// Create a new hopping state with given increment and channel map.
-    pub fn new(hop_increment: u8, channel_map: ChannelMap) -> Self {
+    pub(crate) fn new(hop_increment: u8, channel_map: ChannelMap) -> Self {
         let hop = if hop_increment == 0 || hop_increment >= NUM_CHANNELS {
             7 // default to 7 if invalid
         } else {
@@ -144,7 +144,7 @@ impl HoppingState {
     /// 1. unmapped_channel = (last_channel + hop_increment) mod 79
     /// 2. If unmapped_channel is in the channel map, use it directly
     /// 3. Otherwise, remap: used_channel[unmapped_channel mod used_count]
-    pub fn next_channel(&mut self) -> u8 {
+    pub(crate) fn next_channel(&mut self) -> u8 {
         let unmapped = (u16::from(self.last_channel) + u16::from(self.hop_increment))
             % u16::from(NUM_CHANNELS);
         let unmapped = unmapped as u8;
@@ -168,12 +168,12 @@ impl HoppingState {
 
     /// Get the RF frequency in MHz for a channel index.
     /// Channel 0 = 2402 MHz, Channel 78 = 2480 MHz.
-    pub fn channel_to_freq(channel: u8) -> u16 {
+    pub(crate) fn channel_to_freq(channel: u8) -> u16 {
         2402 + u16::from(channel)
     }
 
     /// Update the channel map (e.g., after AFH classification).
-    pub fn update_map(&mut self, new_map: ChannelMap) {
+    pub(crate) fn update_map(&mut self, new_map: ChannelMap) {
         self.channel_map = new_map;
     }
 }

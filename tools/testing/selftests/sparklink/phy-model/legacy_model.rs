@@ -349,7 +349,7 @@ pub struct PhyConfig {
     /// TX power in dBm.
     pub tx_power_dbm: i8,
     /// Frequency hopping state.
-    pub hopping: HoppingState,
+    pub(crate) hopping: HoppingState,
     /// Antenna configuration.
     pub antenna: AntennaConfig,
     /// SINR thresholds (dB x10) per MCS index (0-12).
