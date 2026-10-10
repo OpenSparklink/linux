@@ -208,6 +208,44 @@ static int events_subscribe(int fd, unsigned long long generation)
     return 0;
 }
 
+/* A ReadFeatures Complete precedes the fixture's 40 report packets. It is
+ * not a barrier for USB ingress. Observe the actual final sequence through
+ * a separate fd so neither tested reader's poll cursor is advanced. */
+static int events_wait_burst(const struct sci_dev_info *info,
+                            unsigned long long generation)
+{
+    struct sci_dev_info guard_info;
+    unsigned long long guard_generation;
+    int guard = bind_owner(info->index, &guard_info, &guard_generation);
+    double deadline = now() + 1;
+    if (guard < 0)
+        return -1;
+    if (guard_generation != generation) {
+        close(guard);
+        return fail("event barrier selected wrong generation");
+    }
+    while (now() < deadline) {
+        struct sle_controller_event_query q = {
+            .version = 1, .generation = generation, .after_seq = 39,
+        };
+        if (!ioctl(guard, SL_IOCTL_CONTROLLER_EVENT_GET, &q)) {
+            close(guard);
+            if (q.event.seq != 40 || q.event.generation != generation ||
+                q.event.dev_index != info->index || q.event.event_code != 0x180b)
+                return fail("event barrier final record identity");
+            printf("NATIVE_EVENT_BARRIER: index=%u generation=%llu last=40\n", info->index, generation);
+            return 0;
+        }
+        if (errno != EINVAL && errno != EAGAIN) {
+            close(guard);
+            return fail("event barrier query");
+        }
+        usleep(1000);
+    }
+    close(guard);
+    return fail("event burst not received before deadline");
+}
+
 static int events_read(int fd, const struct sci_dev_info *info, unsigned long long generation,
                        struct sle_controller_event *first)
 {
@@ -227,8 +265,12 @@ static int events_read(int fd, const struct sci_dev_info *info, unsigned long lo
             !e->timestamp_ns || e->timestamp_ns < timestamp || b[0] != 3 || b[1] != 6 ||
             memcmp(b + 2, "\xaa\xbb\xcc\xdd\xee", 5) || b[7] != info->addr[5] ||
             b[8] != 4 || memcmp(b + 9, "\x09\x08\x07\x06\x05\x04", 6) ||
-            memcmp(b + 15, "\x01\x02\x03\x44\x55\xa7\xd6\xff", 8))
+            memcmp(b + 15, "\x01\x02\x03\x44\x55\xa7\xd6\xff", 8)) {
+            fprintf(stderr, "NATIVE_EVENT_MISMATCH: expected=%u seq=%llu lost=%llu generation=%llu length=%u\n",
+                    ordinal, (unsigned long long)e->seq, (unsigned long long)e->lost,
+                    (unsigned long long)e->generation, e->payload_len);
             return fail("native identity/header/loss/timestamp preserved");
+        }
         for (unsigned int i = 0; i < 255; i++)
             if (b[23 + i] != (unsigned char)(i ^ ordinal))
                 return fail("maximum report data is not truncated");
@@ -251,6 +293,8 @@ static int events_read(int fd, const struct sci_dev_info *info, unsigned long lo
 static int events_gate(int fd, int reader, const struct sci_dev_info *info,
                        unsigned long long generation)
 {
+    if (events_wait_burst(info, generation))
+        return -1;
     struct sle_controller_event_query request = { .version = 2, .generation = generation };
     struct sle_controller_event first, second;
     const unsigned int fields[][2] = { {2, 0}, {1, 1} };
@@ -732,6 +776,7 @@ int main(int argc, char **argv)
 	if (event_mode) {
 		struct sle_controller_event first;
 		if (query(replacement, &replacement_info, 0x0404, 0) ||
+            events_wait_burst(&replacement_info, replacement_gen) ||
 		    events_read(replacement, &replacement_info, replacement_gen,
 				&first) ||
 		    events_retired(a, a_gen))

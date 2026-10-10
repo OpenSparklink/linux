@@ -113,6 +113,7 @@ impl configfs::AttributeOperations<1> for SparkLinkConfig {
     }
 
     fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
         let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
         let val: u8 = s.trim().parse().map_err(|_| EINVAL)?;
         if val == 0 || val > 8 {
@@ -134,6 +135,7 @@ impl configfs::AttributeOperations<2> for SparkLinkConfig {
     }
 
     fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
         let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
         let val: u16 = s.trim().parse().map_err(|_| EINVAL)?;
         if !(20..=10240).contains(&val) {
@@ -155,6 +157,7 @@ impl configfs::AttributeOperations<3> for SparkLinkConfig {
     }
 
     fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
         let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
         let val: u16 = s.trim().parse().map_err(|_| EINVAL)?;
         if !(10..=10240).contains(&val) {
@@ -183,6 +186,7 @@ impl configfs::AttributeOperations<4> for SparkLinkConfig {
     }
 
     fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
         let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
         let val = match s.trim() {
             "active" | "0" => 0u8,
@@ -214,6 +218,7 @@ impl configfs::AttributeOperations<5> for SparkLinkConfig {
     }
 
     fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
         let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
         let val = match s.trim() {
             "none" | "0" => 0u8,

@@ -1906,6 +1906,36 @@ hashes accompany the denial matrix and complete kernel log.  This disposable
 private-bus fixture does not alter host authorization, establish kernel writer
 leases or prove physical WS73 firmware/RF acceptance.
 
+The control chardev checks current ``CAP_NET_ADMIN`` in the initial user
+namespace before protected calls read parameters, synchronize power policy or
+admit commands.  Its explicit access table covers all 135 unique declared
+ioctls: 34 observations, two per-file affinity operations and 99 protected
+operations.  Secret retrieval, remote reads and destructive queue consumption
+are protected even when encoded as read ioctls.  Unknown commands remain
+``ENOTTY``.  Observation does not apply configfs power mode.  The five configfs
+stores and five exported genl mutation bridges also check the capability;
+implemented genl mutations retain ``GENL_ADMIN_PERM``.  Device-node group
+membership, a previously privileged open, or uid 0 without the capability does
+not authorize mutation.  ``slkd`` needs this daemon privilege; ``slctl`` does not.
+
+The runner's ``--kernel-authorization`` option inherits real opened chardev and
+configfs fds into uid 1001, supplementary-group uid 1000 and uid 0 with all
+application capabilities cleared.  Each identity must see ``EPERM`` for all
+99 protected ioctls before invalid user memory is accessed, five configfs
+stores and five genl mutations.  Public observation/affinity remains available;
+registration, metadata and admission counts remain unchanged, and reading does
+not apply a pending idle policy.  This is a capability boundary, not an exclusive
+managed/diagnostic file lease or a complete proxy ownership implementation.
+The ordinary application uses a privileged daemon even in the development
+session fixture.  The runner rejects configurations missing Rust/SparkLink or
+required authorization entrypoints rather than testing an unqualified image.
+
+The native event-overflow fixture waits for the actual fortieth report through
+an independent observer before checking retained records 9--40.  A command
+Complete precedes the model's report burst and cannot establish that ingress
+has finished.  The separate observer preserves both tested poll cursors;
+the bound, generation, payload, loss and hot-unplug assertions still apply.
+
 sparklink_ctl
 -------------
 

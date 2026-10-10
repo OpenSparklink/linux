@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Run real slkd/slctl binaries as uid 1000 on synthetic WS73 controllers.
+"""Run a root slkd and ordinary uid-1000 slctl on synthetic WS73 controllers.
 
 Host prepares a disposable guest, no host sudo/USB access required. This proves
 userspace/kernel lifecycle integration only, never WS73 firmware or RF behavior.
@@ -21,6 +21,16 @@ HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
 
 
+def require_config(path, authorization=False):
+    config = path.read_text().splitlines()
+    names = ['RUST', 'SPARKLINK', 'SPARKLINK_SLE', 'SPARKLINK_WS73_USB']
+    if authorization:
+        names += ['SPARKLINK_GENL', 'CONFIGFS_FS']
+    for name in names:
+        if f'CONFIG_{name}=y' not in config:
+            raise RuntimeError(f'required CONFIG_{name}=y missing; reject unqualified image')
+
+
 def copy_elf(source, target, root):
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
@@ -33,7 +43,7 @@ def copy_elf(source, target, root):
             shutil.copy2(path, dest)
 
 
-def assess(console, code, radio=False, production_policy=False):
+def assess(console, code, radio=False, production_policy=False, kernel_authorization=False):
     errors = []
     if code:
         errors.append(f'QEMU exit {code}')
@@ -54,7 +64,7 @@ def assess(console, code, radio=False, production_policy=False):
         errors.append('survivor changed or replacement generation reused')
     if re.findall(r'^DAEMON_GUEST_EXIT: (\d+)$', console, re.M) != ['0']:
         errors.append('guest exit missing or nonzero')
-    daemon_uid = 0 if production_policy else 1000
+    daemon_uid = 0
     bus = re.findall(rf'^DAEMON_BUS_IDENTITY: pid=([1-9][0-9]*) uid={daemon_uid} owner=(:[0-9]+\.[0-9]+) same_owner=1$',console,re.M)
     if len(bus) != 1 or console.count('DAEMON_BUS_IDENTITY:') != 1:
         errors.append('missing or changed bus-authenticated daemon identity')
@@ -76,6 +86,16 @@ def assess(console, code, radio=False, production_policy=False):
             errors.append('ordinary observer/control credentials missing')
     elif any(marker in console for marker in ['DAEMON_AUTHORIZATION:', 'AUTH_DENIED:', 'AUTH_CREDENTIALS:']):
         errors.append('unexpected production authorization evidence')
+    if kernel_authorization:
+        matrix = re.findall(r'^KERNEL_AUTHORIZATION: (.*)$', console, re.M)
+        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected=99 denied=99 observe=34 configfs_denied=5 genl_denied=5 unknown=ENOTTY'
+                    for uid, gid in [(1001,1001), (1000,1002), (0,0)]]
+        if matrix != expected or re.findall(r'^KERNEL_AUTHORIZATION_STATE: (.*)$', console, re.M) != ['unchanged=1 native_admission=0 observe_no_power_sync=1']:
+            errors.append('kernel authorization matrix missing, duplicated or incomplete')
+        if 'KERNEL_AUTH_FAILURE:' in console:
+            errors.append('kernel authorization assertion failed')
+    elif 'KERNEL_AUTHORIZATION' in console:
+        errors.append('unexpected kernel authorization evidence')
     if console.count('DAEMON_KERNEL_LOG_BEGIN') != 1 or console.count('DAEMON_KERNEL_LOG_END') != 1:
         errors.append('complete kernel log missing')
     elif '[    0.000000]' not in console.split('DAEMON_KERNEL_LOG_BEGIN', 1)[1].split('DAEMON_KERNEL_LOG_END', 1)[0]:
@@ -166,22 +186,27 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--radio-policy', action='store_true', help='basic policy and explicit synthetic cross-controller medium; never real RF')
     p.add_argument('--production-policy', action='store_true', help='installed D-Bus policy, root daemon, uid-1000 control group and uid-1001 observer')
+    p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd ioctl/configfs credential-drop matrix')
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     manifest = {'scope': 'actual slkd and uid-1000 slctl on synthetic WS73: no firmware/RF acceptance',
                 'radio_policy': a.radio_policy,
                 'production_policy': a.production_policy,
+                'kernel_authorization': a.kernel_authorization,
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
         kernel = a.kernel_build.resolve() / 'arch/x86/boot/bzImage'
+        require_config(a.kernel_build.resolve() / '.config', a.kernel_authorization)
         userspace = a.userspace.resolve()
         if a.production_policy:
             policy = userspace / 'data/dbus/sparklink.conf'
             manifest['production_policy_input'] = file_record(policy)
         manifest['inputs'] = [file_record(path) for path in [kernel, a.kernel_build / '.config', a.qemu, a.busybox,
             a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c']]
+        if a.kernel_authorization:
+            manifest['inputs'].append(file_record(HERE / 'kernel_authorization_test.c'))
         tracked = subprocess.check_output(['git', 'ls-files', 'crates', 'Cargo.toml', 'Cargo.lock'],
                                          cwd=userspace, text=True).splitlines()
         # Include untracked new implementation files before committing them.
@@ -201,6 +226,11 @@ def main():
         root = output / 'initramfs'
         (root / 'bin').mkdir(parents=True)
         shutil.copy2(a.busybox, root / 'bin/busybox')
+        if a.kernel_authorization:
+            with (output / 'kernel-authorization-build.log').open('w') as log:
+                subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+                    '-o', str(root / 'bin/kernel-authorization'), str(HERE / 'kernel_authorization_test.c')],
+                    stdout=log, stderr=subprocess.STDOUT, check=True)
         for name in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'su', 'id', 'grep',
                      'awk', 'seq', 'cat', 'pidof', 'chmod', 'mkdir']:
             (root / 'bin' / name).symlink_to('busybox')
@@ -216,7 +246,7 @@ def main():
                 subprocess.run(['strip', '--strip-debug', str(root / 'bin' / name)], check=True)
             manifest['guest_strip_debug'] = True
         copy_elf(a.dbus_daemon, root / 'bin/dbus-daemon', root)
-        programs = ['slkd', 'slctl', 'dbus-daemon'] + (['bus-policy-probe'] if a.production_policy else [])
+        programs = ['slkd', 'slctl', 'dbus-daemon'] + (['bus-policy-probe'] if a.production_policy else []) + (['kernel-authorization'] if a.kernel_authorization else [])
         manifest['guest_programs'] = [file_record(root / 'bin' / name) for name in programs]
         for name in ['proc', 'sys', 'dev', 'etc', 'tmp']:
             (root / name).mkdir()
@@ -226,7 +256,7 @@ def main():
         (root / 'etc/shadow').write_text('root::0:0:99999:7:::\nws73::0:0:99999:7:::\n')
         (root / 'etc/dbus.conf').write_text('''<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig><type>session</type><listen>unix:path=/tmp/slkbus</listen>
-<auth>EXTERNAL</auth><policy context="default"><allow own="*"/>
+<auth>EXTERNAL</auth><policy context="default"><allow user="*"/><allow own="*"/>
 <allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>''')
         if a.production_policy:
             (root / 'etc/passwd').write_text((root / 'etc/passwd').read_text().replace('ws73:x:1000:1000:', 'ws73:x:1000:1002:') + 'observer:x:1001:1001:test:/tmp:/bin/sh\n')
@@ -234,8 +264,7 @@ def main():
             (root / 'etc/shadow').write_text((root / 'etc/shadow').read_text() + 'observer::0:0:99999:7:::\n')
             shutil.copy2(policy, root / 'etc/sparklink.conf')
             config = root / 'etc/dbus.conf'
-            config.write_text(config.read_text().replace('<allow own="*"/>', '<allow user="*"/><allow own="*"/>')
-                              .replace('</busconfig>', '<include>/etc/sparklink.conf</include></busconfig>'))
+            config.write_text(config.read_text().replace('</busconfig>', '<include>/etc/sparklink.conf</include></busconfig>'))
         firmware = root / 'lib/firmware/sparklink/ws73'
         firmware.mkdir(parents=True)
         (firmware / 'bsle_custom.bin').write_bytes(bytes(range(140)))
@@ -252,7 +281,7 @@ mount -t devtmpfs none /dev || mdev -s
 for n in $(seq 1 100); do [ -c /dev/sparklink ] && break; sleep 0.1; done
 /bin/busybox chown 0:1000 /dev/sparklink
 chmod 0660 /dev/sparklink
-su ws73 -s /bin/sh -c 'exec /bin/dbus-daemon --config-file=/etc/dbus.conf --nofork' > /tmp/dbus.log 2>&1 &
+/bin/dbus-daemon --config-file=/etc/dbus.conf --nofork > /tmp/dbus.log 2>&1 &
 for n in $(seq 1 100); do [ -S /tmp/slkbus ] && break; sleep 0.1; done
 /bin/test-daemon
 status=$?
@@ -267,9 +296,9 @@ poweroff -f
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_RADIO=1'))
         if a.production_policy:
             f = root / 'init'
-            f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_PRODUCTION_POLICY=1')
-                         .replace("su ws73 -s /bin/sh -c 'exec /bin/dbus-daemon --config-file=/etc/dbus.conf --nofork'",
-                                  '/bin/dbus-daemon --config-file=/etc/dbus.conf --nofork'))
+            f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_PRODUCTION_POLICY=1'))
+        if a.kernel_authorization:
+            f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_KERNEL_AUTHORIZATION=1'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -309,7 +338,7 @@ poweroff -f
                 monitor.execute('device_add', dict(id='sle0', port='1', **props))
                 code = process.wait(timeout=30)
             manifest['qemu_exit'] = code
-            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy)
+            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy, a.kernel_authorization)
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'

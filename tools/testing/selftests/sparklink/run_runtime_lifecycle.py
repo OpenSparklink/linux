@@ -113,6 +113,15 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
     replug = 'NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1'
     if console.count(replug) != (1 if events else 0):
         errors.append('missing, duplicate or unexpected native event replug evidence')
+    barriers = re.findall(r'^NATIVE_EVENT_BARRIER: index=(\d+) generation=(\d+) last=40$', console, re.MULTILINE)
+    expected_barriers = [('0', generations[0][0]), ('1', generations[0][2]), ('0', generations[0][1])] if events and len(generations) == 1 else []
+    if barriers != expected_barriers or console.count('NATIVE_EVENT_BARRIER:') != len(expected_barriers):
+        errors.append('missing, duplicate or wrong-generation complete event burst barrier')
+    elif events:
+        positions = [m.start() for m in re.finditer(r'^NATIVE_EVENT_BARRIER:', console, re.MULTILINE)]
+        if not (console.find('NATIVE_ADD_SECOND') < positions[0] < positions[1] < console.find('NATIVE_REMOVE_FIRST')
+                < console.find('NATIVE_READD_FIRST') < positions[2] < console.find('NATIVE_LIFETIME:')):
+            errors.append('event burst barrier outside live phase')
     discovery_proofs = re.findall(r'^NATIVE_DISCOVERY: index=(\d+) cycles=5 failures=4 '
                                  r'stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1$',
                                  console, re.MULTILINE)

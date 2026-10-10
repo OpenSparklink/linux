@@ -22,19 +22,17 @@ wait_ready() {
 }
 [ "$(user 'id -u')" = 1000 ] || fail 'ordinary application uid'
 echo 'DAEMON_UID: 1000'
-daemon_uid=1000
-if [ "$SPARKLINK_TEST_PRODUCTION_POLICY" = 1 ]; then
-    daemon_uid=0
-    /bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd.log 2>&1 &
-else
-    user 'exec /bin/slkd --session --storage /tmp/bonds -n' > /tmp/slkd.log 2>&1 &
-fi
+daemon_uid=0
+/bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd.log 2>&1 &
 wait_ready 1
 pid=$(pidof slkd)
 [ -n "$pid" ] || fail 'daemon pid'
 ctl daemon > /tmp/daemon-before || fail 'bus-authenticated daemon identity'
 grep -Eq "^DaemonIdentity: owner=:[0-9]+\.[0-9]+ pid=$pid uid=$daemon_uid$" /tmp/daemon-before || fail 'daemon bus PID/UID mismatch'
 first=$(list | awk '{print $1}')
+if [ "$SPARKLINK_TEST_KERNEL_AUTHORIZATION" = 1 ]; then
+    /bin/kernel-authorization "$first" || fail 'kernel permission matrix'
+fi
 if [ "$SPARKLINK_TEST_PRODUCTION_POLICY" = 1 ]; then
     [ "$(su observer -s /bin/sh -c 'id -u')" = 1001 ] || fail 'observer uid'
     [ "$(user 'id -g')" = 1002 ] || fail 'distinct primary group'

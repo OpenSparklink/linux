@@ -11,7 +11,7 @@ def view(index, generation):
 GOOD = ('DAEMON_UID: 1000\n' + view(0, 1) + 'DAEMON_ADD_SECOND\n' + view(1, 2) +
         'DAEMON_REMOVE_FIRST\n' + view(1, 2) + 'DAEMON_STALE_SELECTION: rejected\n' +
         'DAEMON_READD_FIRST\n' + view(0, 3) + view(1, 2) +
-        'DAEMON_BUS_IDENTITY: pid=100 uid=1000 owner=:1.4 same_owner=1\n'
+        'DAEMON_BUS_IDENTITY: pid=100 uid=0 owner=:1.4 same_owner=1\n'
         'DAEMON_HOTPLUG: independent=2 same_process=1 new_generation=1\n'
         'DAEMON_LIFECYCLE: PASS\nDAEMON_GUEST_EXIT: 0\n'
         'DAEMON_KERNEL_LOG_BEGIN\n[    0.000000] early kernel\nDAEMON_KERNEL_LOG_END\n')
@@ -28,6 +28,7 @@ class DaemonVerdict(unittest.TestCase):
     def test_changed_survivor(self): self.assertTrue(assess(GOOD.replace(view(1, 2), view(1, 4), 1), 0))
     def test_missing_bus_identity(self): self.assertTrue(assess(GOOD.replace('DAEMON_BUS_IDENTITY:', 'missing'),0))
     def test_changed_bus_identity(self): self.assertTrue(assess(GOOD.replace('same_owner=1','same_owner=0'),0))
+    def test_unprivileged_daemon(self): self.assertTrue(assess(GOOD.replace('pid=100 uid=0','pid=100 uid=1000'),0))
     def test_failure(self): self.assertTrue(assess(GOOD + 'DAEMON_FAILURE: assertion\n', 0))
     def test_missing_log(self): self.assertTrue(assess(GOOD.replace('DAEMON_KERNEL_LOG_END', 'missing'), 0))
     def test_truncated_log(self): self.assertTrue(assess(GOOD.replace('[    0.000000]', '[    1.000000]'), 0))
@@ -106,6 +107,30 @@ class AuthorizationVerdict(unittest.TestCase):
     def test_missing_read(self): self.assertTrue(assess(self.good.replace('AUTH_OBSERVE: observer', 'missing'), 0, production_policy=True))
     def test_duplicate_summary(self): self.assertTrue(assess(self.good + self.proof, 0, production_policy=True))
     def test_application_caps(self): self.assertTrue(assess(self.good.replace('caps=0', 'caps=1', 1), 0, production_policy=True))
+
+
+class KernelAuthorizationVerdict(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected=99 denied=99 observe=34 configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
+                             for uid,gid in [(1001,1001),(1000,1002),(0,0)])
+        cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 observe_no_power_sync=1\n'
+        cls.good = GOOD + cls.matrix + cls.state
+
+    def test_complete(self): self.assertEqual(assess(self.good, 0, kernel_authorization=True), [])
+    def test_no_opt_in(self): self.assertTrue(assess(self.good, 0))
+    def test_missing(self): self.assertTrue(assess(GOOD, 0, kernel_authorization=True))
+    def test_missing_root_without_cap(self): self.assertTrue(assess(self.good.replace('uid=0 gid=0', 'uid=1 gid=1'), 0, kernel_authorization=True))
+    def test_missing_control_uid(self): self.assertTrue(assess(self.good.replace('uid=1000 gid=1002','uid=0 gid=0'),0,kernel_authorization=True))
+    def test_capabilities(self): self.assertTrue(assess(self.good.replace('caps=0','caps=1',1),0,kernel_authorization=True))
+    def test_wrong_deny_count(self): self.assertTrue(assess(self.good.replace('denied=99','denied=98',1),0,kernel_authorization=True))
+    def test_missing_fd_inheritance(self): self.assertTrue(assess(self.good.replace('inherited_fd=1','inherited_fd=0',1),0,kernel_authorization=True))
+    def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('configfs_denied=5','configfs_denied=4',1),0,kernel_authorization=True))
+    def test_genl_bypass(self): self.assertTrue(assess(self.good.replace('genl_denied=5','genl_denied=4',1),0,kernel_authorization=True))
+    def test_changed_state(self): self.assertTrue(assess(self.good.replace('unchanged=1','unchanged=0'),0,kernel_authorization=True))
+    def test_observer_changed_power(self): self.assertTrue(assess(self.good.replace('observe_no_power_sync=1','observe_no_power_sync=0'),0,kernel_authorization=True))
+    def test_duplicate_matrix(self): self.assertTrue(assess(self.good+self.matrix,0,kernel_authorization=True))
+    def test_guest_failure(self): self.assertTrue(assess(self.good+'KERNEL_AUTH_FAILURE: permission\n',0,kernel_authorization=True))
 
 
 if __name__ == '__main__': unittest.main()

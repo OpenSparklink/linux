@@ -548,8 +548,6 @@ struct sle_mgmt_stats {
 	__u32 total_timeouts;
 };
 
-#define SL_IOCTL_DISCOVERY_SUBMIT _IOW(SL_MAGIC, 0x88, struct sle_discovery_submit)
-#define SL_IOCTL_DISCOVERY_RESULT _IOWR(SL_MAGIC, 0x89, struct sle_discovery_result)
 
 /* Explicitly selected registration. Native Ready means actual metadata and
  * both initialization stop operations completed, with no Host fault. It is

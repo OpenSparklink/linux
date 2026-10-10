@@ -19,11 +19,19 @@ RUNTIME_GUEST_EXIT: 0
 '''
 
 
-EVENTS = ('NATIVE_EVENTS: index=0 retained=32 first=9 last=40 lost=8 payload=278 '
+EVENTS = ('NATIVE_EVENT_BARRIER: index=0 generation=1 last=40\n'
+          'NATIVE_EVENTS: index=0 retained=32 first=9 last=40 lost=8 payload=278 '
           'fanout=2 fault_retry=1 poll=1\n'
+          'NATIVE_EVENT_BARRIER: index=1 generation=2 last=40\n'
           'NATIVE_EVENTS: index=1 retained=32 first=9 last=40 lost=8 payload=278 '
           'fanout=2 fault_retry=1 poll=1\n'
+          'NATIVE_EVENT_BARRIER: index=0 generation=3 last=40\n'
           'NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1\n')
+
+
+def event_log(evidence=EVENTS):
+    initial, boundary, replug = evidence.partition('NATIVE_EVENT_BARRIER: index=0 generation=3 last=40')
+    return GOOD.replace('NATIVE_REMOVE_FIRST', initial + 'NATIVE_REMOVE_FIRST').replace('NATIVE_LIFETIME', boundary + replug + 'NATIVE_LIFETIME')
 
 
 class NativeVerdict(unittest.TestCase):
@@ -36,28 +44,40 @@ class NativeVerdict(unittest.TestCase):
     def test_duplicate_kernel_log(self):
         self.assertTrue(assess_native(GOOD + 'RUNTIME_KERNEL_LOG_END\n', 0))
     def test_event_stream(self):
-        self.assertEqual(assess_native(GOOD + EVENTS, 0, events=True), [])
+        self.assertEqual(assess_native(event_log(), 0, events=True), [])
+
+    def test_missing_burst_barrier(self):
+        self.assertTrue(assess_native(event_log().replace('NATIVE_EVENT_BARRIER:', 'missing', 1), 0, events=True))
+
+    def test_wrong_burst_generation(self):
+        self.assertTrue(assess_native(event_log().replace('generation=3 last=40', 'generation=1 last=40'), 0, events=True))
+
+    def test_early_replug_burst(self):
+        self.assertTrue(assess_native(event_log().replace('NATIVE_READD_FIRST', 'missing')+'NATIVE_READD_FIRST\n', 0, events=True))
+
+    def test_incomplete_burst(self):
+        self.assertTrue(assess_native(event_log().replace('last=40', 'last=39', 1), 0, events=True))
 
     def test_missing_event_stream(self):
         self.assertTrue(assess_native(GOOD, 0, events=True))
 
     def test_event_fanout_missing(self):
-        self.assertTrue(assess_native(GOOD + EVENTS.replace('fanout=2', 'fanout=1'), 0, events=True))
+        self.assertTrue(assess_native(event_log(EVENTS.replace('fanout=2', 'fanout=1')), 0, events=True))
 
     def test_event_payload_truncated(self):
-        self.assertTrue(assess_native(GOOD + EVENTS.replace('payload=278', 'payload=240'), 0, events=True))
+        self.assertTrue(assess_native(event_log(EVENTS.replace('payload=278', 'payload=240')), 0, events=True))
 
     def test_event_loss_hidden(self):
-        self.assertTrue(assess_native(GOOD + EVENTS.replace('lost=8', 'lost=0'), 0, events=True))
+        self.assertTrue(assess_native(event_log(EVENTS.replace('lost=8', 'lost=0')), 0, events=True))
 
     def test_event_owner_duplicate(self):
-        self.assertTrue(assess_native(GOOD + EVENTS.replace('index=1', 'index=0'), 0, events=True))
+        self.assertTrue(assess_native(event_log(EVENTS.replace('index=1', 'index=0')), 0, events=True))
 
     def test_event_replug_missing(self):
-        self.assertTrue(assess_native(GOOD + EVENTS.split('NATIVE_EVENTS_REPLUG')[0], 0, events=True))
+        self.assertTrue(assess_native(event_log(EVENTS.split('NATIVE_EVENTS_REPLUG')[0]), 0, events=True))
 
     def test_event_unexpected(self):
-        self.assertTrue(assess_native(GOOD + EVENTS, 0))
+        self.assertTrue(assess_native(event_log(), 0))
 
     def test_complete(self):
         self.assertEqual(assess_native(GOOD, 0), [])

@@ -15,6 +15,7 @@
 //!   - Security: SM2/SM3/SM4 pairing and encryption (future)
 
 mod sle_adv;
+mod sle_authorization;
 mod sle_configfs;
 mod sle_conn;
 mod sle_command_plan;
@@ -159,6 +160,7 @@ pub extern "C" fn sparklink_genl_get_role() -> u8 {
 /// Returns 0 on success, negative errno on failure.
 #[no_mangle]
 pub extern "C" fn sparklink_genl_set_role(role: u8) -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
     let mut guard = context.lock().ok();
     let ss = guard.as_deref_mut();
@@ -876,6 +878,7 @@ fn do_stop_scan(context: &RuntimeContext) -> Result<i32> {
 /// Start advertising (C FFI). Returns 0 on success, negative errno on failure.
 #[no_mangle]
 pub extern "C" fn sparklink_do_start_adv(interval_ms: u32, discovery_level: u8) -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
     let context = &context;
     match do_start_adv(context, interval_ms, discovery_level) {
@@ -887,6 +890,7 @@ pub extern "C" fn sparklink_do_start_adv(interval_ms: u32, discovery_level: u8) 
 /// Stop advertising (C FFI). Returns 0 on success, negative errno on failure.
 #[no_mangle]
 pub extern "C" fn sparklink_do_stop_adv() -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
     let context = &context;
     match do_stop_adv(context) {
@@ -902,6 +906,7 @@ pub extern "C" fn sparklink_do_start_scan(
     interval_ms: u32,
     filter_level: u8,
 ) -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
     let context = &context;
     match do_start_scan(context, window_ms, interval_ms, filter_level) {
@@ -913,6 +918,7 @@ pub extern "C" fn sparklink_do_start_scan(
 /// Stop scanning (C FFI). Returns 0 on success, negative errno on failure.
 #[no_mangle]
 pub extern "C" fn sparklink_do_stop_scan() -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
     let context = &context;
     match do_stop_scan(context) {
@@ -3865,6 +3871,10 @@ impl MiscDevice for SparkLinkCtl {
     }
 
     fn ioctl(me: Pin<&SparkLinkCtl>, _file: &FsFile, cmd: u32, arg: usize) -> Result<isize> {
+        let access = sle_authorization::classify(cmd)?;
+        if access == sle_authorization::Access::Protected {
+            sle_authorization::require_admin()?;
+        }
         // Per-fd device routing: DEV_SELECT and DEV_GET_ACTIVE are handled
         // before capturing a RuntimeContext so they can query/set affinity.
         match cmd {
@@ -3889,7 +3899,8 @@ impl MiscDevice for SparkLinkCtl {
             }
         };
         let context = &context;
-        if !registration_only && !matches!(cmd, SL_IOCTL_CONTROLLER_EVENT_GET | SL_IOCTL_DISCOVERY_RESULT | SL_IOCTL_CONTROLLER_SNAPSHOT) {
+        // Observation never applies global policy or modifies Runtime state.
+        if !registration_only && access == sle_authorization::Access::Protected {
             Self::sync_power_mode(context)?;
         }
 
