@@ -36,6 +36,8 @@ pub(crate) struct CmdPendingEntry {
     pub(crate) opcode: u16,
     /// Author of an explicitly submitted diagnostic; zero for internal work.
     pub(crate) file_id: u64,
+    pub(crate) request_id: u64,
+    pub(crate) timeout_ms: u32,
     /// Monotonically increasing sequence number (for dedup).
     pub(crate) seq: u32,
     /// Resolution status.
@@ -65,6 +67,8 @@ impl CmdPendingEntry {
         Self {
             opcode,
             file_id: 0,
+            request_id: 0,
+            timeout_ms,
             seq,
             status: AtomicU32::new(CMD_STATUS_PENDING),
             data: [0u8; CMD_DATA_MAX],
@@ -299,6 +303,39 @@ impl CmdPendingQueue {
     pub(crate) fn assign_owner(&mut self, seq: u32, file_id: u64) {
         if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.seq == seq) {
             entry.file_id = file_id;
+        }
+    }
+
+    /// Retained admission identity belongs to one original open file.
+    pub(crate) fn find_request(&self, file_id: u64, request_id: u64) -> Option<&CmdPendingEntry> {
+        self.entries.iter().flatten().find(|e| e.file_id == file_id && e.request_id == request_id)
+    }
+
+    pub(crate) fn assign_request(&mut self, seq: u32, file_id: u64, request_id: u64) {
+        if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.seq == seq) {
+            entry.file_id = file_id;
+            entry.request_id = request_id;
+        }
+    }
+
+    /// Local cancellation does not invent a controller Status or free Host's
+    /// on-wire reservation. A late reply cannot overwrite the final snapshot.
+    pub(crate) fn cancel_seq(&mut self, seq: u32) {
+        self.fail_seq(seq, -(kernel::bindings::ECANCELED as i32));
+    }
+
+    /// Transport/admission failures are local errno, never fabricated firmware
+    /// status. Already-final (including cancelled) entries cannot be rewritten.
+    pub(crate) fn fail_seq(&mut self, seq: u32, error: i32) {
+        if error >= 0 { return; }
+        if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.seq == seq && e.is_pending()) {
+            entry.error = error;
+            entry.data.fill(0);
+            entry.data_len = 0;
+            entry.status.store(CMD_RESOLVED_BIT | 0x200, Ordering::Release);
+            self.pending_count = self.pending_count.saturating_sub(1);
+            self.total_resolved += 1;
+            if error == -(kernel::bindings::ETIMEDOUT as i32) { self.total_timeouts += 1; }
         }
     }
 

@@ -1259,4 +1259,23 @@ struct sle_diagnostic_result {
 };
 #define SL_IOCTL_DIAGNOSTIC_RESULT _IOWR(SL_MAGIC, 0xd0, struct sle_diagnostic_result)
 
+/* Native profile1 metadata only. version1/flags0, exact selected generation,
+ * nonzero request_id increasing for NEW admissions on this open fd; seq=0 on
+ * input. Retry same retained ID/opcode/timeout returns the original seq and
+ * deadline even after submission copyout EFAULT. Evicted old IDs ESTALE, changed
+ * opcode/timeout EINVAL; never resend. A new fd is a new author/ID namespace.
+ * action1 submits; action2 cancels only an existing request (same fields).
+ * Cancellation snapshot is ECANCELED; on-wire slot/credits remain reserved for
+ * real reply or timeout. Already-final requests keep their original result.
+ * timeout_ms 1..5000 is the whole admission deadline, not wire-only time.
+ */
+struct sle_diagnostic_submit {
+    __u32 version, flags;
+    __aligned_u64 generation, request_id;
+    __u32 timeout_ms;
+    __u16 opcode, reserved;
+    __u32 seq, action;
+};
+#define SL_IOCTL_DIAGNOSTIC_SUBMIT _IOWR(SL_MAGIC, 0xd1, struct sle_diagnostic_submit)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

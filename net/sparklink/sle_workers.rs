@@ -61,6 +61,10 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
     let Some(reply) = reply else {
         return false;
     };
+    // Admission deadlines include queue, transport and final Host processing.
+    // A late Complete releases its real reservation but cannot revive a timed
+    // out author result; queued expirations do not invent hardware failure.
+    state.cmd_pending.expire_stale();
     match &reply.event {
         sle_dli::SleEvent::CommandComplete { status, data, .. } => {
             state
@@ -126,10 +130,10 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
 fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error: Error) {
     let mut host = owner.host.lock();
     if let Some(seq) = host.fail(error) {
-        state.cmd_pending.resolve_seq(seq, 0x03, &[]);
+        state.cmd_pending.fail_seq(seq, error.to_errno());
     }
     while let Some(request) = host.cancel_next() {
-        state.cmd_pending.resolve_seq(request.seq, 0x03, &[]);
+        state.cmd_pending.fail_seq(request.seq, error.to_errno());
     }
     state.adv_scan.abort_advertising();
     state.adv_scan.abort_scanning();

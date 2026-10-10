@@ -481,3 +481,26 @@ fn internal_revocation_retains_only_exact_cookie_single_step_confirmed_off() {
     assert_eq!(q.first_recipe().unwrap().cookie,11);
     q.pop();assert!(q.first_recipe().is_none());
 }
+
+#[test]
+fn remove_diagnostic_preserves_fifo_for_every_ring_position() {
+    for shift in 0..64 {
+        let mut q = CmdRequestQueue::new();
+        for _ in 0..shift { raw(&mut q, 999); check_raw(&mut q, 999); }
+        for seq in 1..=64 { raw(&mut q, seq); }
+        q.remove_seq(0); assert_eq!(q.len(), 64);
+        for seq in [1, 32, 64, 1000] { q.remove_seq(seq); }
+        assert_eq!(q.len(), 61);
+        for seq in 2..64 { if seq != 32 { check_raw(&mut q, seq); } }
+        assert!(q.is_empty());
+    }
+}
+#[test]
+fn queued_raw_deadline_does_not_hide_recipe_deadline_or_fake_wire_fault() {
+    let mut q = CmdRequestQueue::new();
+    q.push_tagged(0x0406, &[], 1, 1, None, 1).unwrap();
+    assert_eq!(q.first_recipe_deadline(), None);
+    q.push_recipe(&parts(), 2, Intent::Scanning(true), 123).unwrap();
+    assert_eq!(q.first_recipe_deadline(), Some(123));
+    q.remove_seq(1); assert_eq!(q.first_recipe_deadline(), Some(123));
+}

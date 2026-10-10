@@ -149,6 +149,26 @@ impl CmdRequestQueue {
             .map(|request| request.deadline)
     }
 
+    /// Remove a queued diagnostic only; preserve other requests/order and the
+    /// independent Host on-wire reservation. Sequence zero is internal work.
+    pub(crate) fn remove_seq(&mut self, seq: u32) {
+        if seq == 0 { return; }
+        let count = self.count;
+        for _ in 0..count {
+            let Some(request) = self.pop() else { break };
+            if request.seq == seq { continue; }
+            self.entries[self.tail] = Some(request);
+            self.tail = (self.tail + 1) % CMD_REQ_QUEUE_DEPTH;
+            self.count += 1;
+        }
+    }
+
+    /// A queued raw request may expire locally without an uncertain USB
+    /// outcome; only typed recipe deadlines can fault Host before transmission.
+    pub(crate) fn first_recipe_deadline(&self) -> Option<u64> {
+        self.entries.iter().flatten().filter(|r| r.recipe.is_some()).map(|r| r.deadline).min()
+    }
+
     /// Preserve unrelated/raw requests and their order, even across wraparound.
     /// The already-on-wire reservation lives in Host, not this queue.
     pub(crate) fn remove_recipes(&mut self, intent: DiscoveryIntent) {

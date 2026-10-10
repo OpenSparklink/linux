@@ -27,6 +27,7 @@ pub mod bindings {
     pub const EOPNOTSUPP: u32 = 95;
     pub const EMSGSIZE: u32 = 90;
     pub const ETIMEDOUT: u32 = 110;
+    pub const ECANCELED: u32 = 125;
     pub static mut JIFFIES_64: u64 = 0;
     pub use JIFFIES_64 as jiffies_64;
 }

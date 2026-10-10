@@ -16,7 +16,7 @@ def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
     inputs = {name: (net / name).read_bytes() for name in
-              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs']}
+              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs']}
     uapi = inputs['sle_uapi.rs'].decode()
     declaration = uapi[uapi.index('/// Owner-private bounded diagnostic result;'):
                        uapi.index('unsafe impl FromBytes for SleDiagnosticResult')]
@@ -33,14 +33,33 @@ def run(output):
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
+    with tempfile.TemporaryDirectory(prefix='sparklink-diagnostic-admission-') as tmp:
+        tmp = Path(tmp)
+        for name in ['sle_mgmt.rs', 'sle_command_queue.rs', 'sle_command_plan.rs']:
+            (tmp / name).write_bytes(inputs[name])
+        declaration = uapi[uapi.index('/// Idempotent metadata diagnostic admission/cancel;'):
+                           uapi.index('unsafe impl FromBytes for SleDiagnosticSubmit')]
+        declaration = declaration[:declaration.rfind('// SAFETY:')]
+        fixture = (here / 'diagnostic/admission_fixture.rs').read_text()
+        for marker, body in {
+            '// @@SUBMIT_STRUCT@@': declaration,
+            '// @@SUBMIT_HANDLER@@': function(inputs['sparklink_core.rs'].decode(), 'ioctl_diagnostic_submit'),
+            '// @@ENQUEUE@@': function(inputs['sle_host.rs'].decode(), 'enqueue_diagnostic'),
+            '// @@CANCEL@@': function(inputs['sle_host.rs'].decode(), 'cancel_diagnostic'),
+        }.items():
+            fixture = fixture.replace(marker, body)
+        (tmp / 'fixture.rs').write_text(fixture)
+        subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
+                        '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
+        subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 11,
-              'scope': 'actual pending module and result handler; clock/lease/lock/usercopy/allocation dependencies are fixtures',
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 23, 'result_tests': 12, 'admission_tests': 11,
+              'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},
               'remaining': ['Actual ioctl owner/CAP/usercopy/removal gates in qualified VM',
                             'Legacy DLI event callers and shared projection removal',
-                            'Full request admission copyout/cancel/idempotency contract']}
+                            'Live idempotent admission/cancel/deadline syscall and on-wire late reply gates']}
     if output:
         output.write_text(json.dumps(record, indent=2) + '\n')
     print(json.dumps(record, indent=2))

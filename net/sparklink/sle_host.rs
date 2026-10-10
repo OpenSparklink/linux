@@ -101,6 +101,23 @@ impl CommandHost {
         Ok(())
     }
 
+    /// Metadata-only diagnostic admission supplies the original absolute
+    /// deadline; queue wait does not grant a fresh full timeout on transmission.
+    pub(crate) fn enqueue_diagnostic(&mut self, opcode: u16, seq: u32, deadline: u64) -> Result {
+        if let Some(error) = self.fault { return Err(error); }
+        let cookie = self.next_cookie;
+        let next_cookie = cookie.checked_add(1).ok_or(EOVERFLOW)?;
+        self.requests.push_tagged(opcode, &[], seq, cookie, None, deadline).map_err(Error::from)?;
+        self.next_cookie = next_cookie;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_diagnostic(&mut self, seq: u32) {
+        self.requests.remove_seq(seq);
+        // active/reply/credits/deadline remain untouched. Cancelling an on-wire
+        // author waits for its real reply or a normal uncertain-outcome fault.
+    }
+
     fn supersede_recipe(&mut self, intent: DiscoveryIntent) {
         self.requests.remove_recipes(intent);
         self.cancel_recipe_progress(intent);
@@ -296,7 +313,7 @@ impl CommandHost {
             // SAFETY: reading the kernel clock does not dereference user memory.
             deadline: unsafe { kernel::bindings::jiffies_64 }
                 .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64)
-                .min(if request.recipe.is_some() { request.deadline } else { u64::MAX }),
+                .min(request.deadline),
             recipe: request.recipe,
             transport_done: false,
         });
@@ -464,7 +481,7 @@ impl CommandHost {
                 .is_some_and(|active| (!active.transport_done || self.reply.is_none()) && now >= active.deadline)
             || self
                 .requests
-                .first_deadline()
+                .first_recipe_deadline()
                 .is_some_and(|deadline| now >= deadline)
     }
 

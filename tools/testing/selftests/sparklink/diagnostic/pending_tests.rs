@@ -44,4 +44,14 @@ mod diagnostic_pending_tests {
         assert_eq!(q.submit(0x0403), Err(EOVERFLOW));
         assert_eq!((q.pending_count, q.total_submitted, q.tail), (0, 0, 0));
     }
+    #[test]
+    fn local_host_failure_keeps_errno_and_never_fabricates_controller_status() {
+        let mut q = CmdPendingQueue::new();
+        let seq = q.submit(0x0406).unwrap();
+        q.fail_seq(seq, -110); q.fail_seq(seq, -5);
+        assert!(!q.resolve_seq(seq, 0, &[9]));
+        let e = q.find_by_seq(seq).unwrap();
+        assert_eq!((e.error, e.result_status(), e.data_len), (-110, None, 0));
+        assert_eq!((q.pending_count, q.total_resolved, q.total_timeouts), (0, 1, 1));
+    }
 }

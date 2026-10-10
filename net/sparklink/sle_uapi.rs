@@ -3191,3 +3191,23 @@ unsafe impl FromBytes for SleDiagnosticResult {}
 impl_check_reserved!(SleDiagnosticResult, [_pad, _reserved]);
 const _: () = assert!(core::mem::size_of::<SleDiagnosticResult>() == 104);
 pub(crate) const SL_IOCTL_DIAGNOSTIC_RESULT: u32 = _IOWR::<SleDiagnosticResult>(SL_MAGIC, 0xd0);
+
+/// Idempotent metadata diagnostic admission/cancel; request ID is local only.
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiagnosticSubmit {
+    pub version: u32,
+    pub flags: u32,
+    pub generation: u64,
+    pub request_id: u64,
+    pub timeout_ms: u32,
+    pub opcode: u16,
+    pub reserved: u16,
+    pub seq: u32,
+    pub action: u32,
+}
+// SAFETY: fixed integer fields, no implicit padding.
+unsafe impl FromBytes for SleDiagnosticSubmit {}
+impl_check_reserved!(SleDiagnosticSubmit, [reserved]);
+const _: () = assert!(core::mem::size_of::<SleDiagnosticSubmit>() == 40);
+pub(crate) const SL_IOCTL_DIAGNOSTIC_SUBMIT: u32 = _IOWR::<SleDiagnosticSubmit>(SL_MAGIC, 0xd1);

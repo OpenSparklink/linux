@@ -1363,6 +1363,9 @@ fn init_subsystem() -> Result<SubsystemGuard> {
 #[pin_data(PinnedDrop)]
 struct SparkLinkCtl {
     file_id: u64,
+    /// Per-open monotonic watermark survives bounded result eviction/selection.
+    #[pin]
+    diagnostic_request_id: Mutex<u64>,
     #[pin]
     operation: Mutex<()>,
     #[pin]
@@ -2881,6 +2884,11 @@ fn ioctl_sync_data_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
 /// DLI command ioctl — isolated for stack safety (SleDliCmd = 248 bytes).
 #[inline(never)]
 fn ioctl_dli_send_cmd(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    // Native diagnostics use caller-known IDs; old output-only admission
+    // cannot recover copyout failures and is not a second production entry.
+    if context.owner.as_ref().is_some_and(|o| o.protocol_profile != 0) {
+        return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+    }
     let mut cmd_data: SleDliCmd = read_user_struct(arg)?;
     let param_len = cmd_data.param_len as usize;
     if param_len > DLI_PARAM_MAX {
@@ -2963,7 +2971,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
         // Preserve the active reply reservation and its deadline. Only queued
         // work is cancelled; cleanup stops follow the outstanding wire slot.
         while let Some(request) = host.cancel_next() {
-            state.cmd_pending.resolve_seq(request.seq, 0x03, &[]);
+            state.cmd_pending.cancel_seq(request.seq);
         }
         host.begin_revoke(&adv_parts[..adv.count as usize], &scan_parts[..scan.count as usize])
     })();
@@ -3282,6 +3290,62 @@ fn ioctl_snoop_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize)
     Ok(0)
 }
 
+/// Explicit Native metadata-only request admission. Per-fd operation mutex
+/// serializes IDs; management mutex spans owner authorization/admission, never
+/// usercopy. No default controller, transport I/O, power policy or test hook.
+#[inline(never)]
+fn ioctl_diagnostic_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let mut input: SleDiagnosticSubmit = read_user_struct(arg)?;
+    if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if input.flags != 0 || input.generation == 0 || input.request_id == 0 || input.seq != 0
+        || !(1..=sle_mgmt::CMD_TIMEOUT_MS).contains(&input.timeout_ms) || !matches!(input.action, 1 | 2) {
+        return Err(EINVAL);
+    }
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    if me.target.lock().as_ref().map(|t| t.identity) != Some(owner.identity) { return Err(EINVAL); }
+    if input.generation != owner.identity.generation { return Err(ENODEV); }
+    if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if *owner.schedule_gate.lock() { return Err(ENODEV); }
+    let management = owner.management.lock();
+    management.authorize(me.file_id, sle_management::DIAGNOSTIC).map_err(management_error)?;
+    let mut watermark = me.diagnostic_request_id.lock();
+    {
+        let mut state = context.lock()?;
+        let state = state.as_mut().ok_or(ENODEV)?;
+        if !matches!(input.opcode, 0x0402 | 0x0403 | 0x0404 | 0x0406) {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
+        state.controller.validate_command(input.opcode, &[])?;
+        state.cmd_pending.expire_stale();
+        if let Some(entry) = state.cmd_pending.find_request(me.file_id, input.request_id) {
+            if entry.opcode != input.opcode || entry.timeout_ms != input.timeout_ms { return Err(EINVAL); }
+            input.seq = entry.seq;
+            if input.action == 2 {
+                state.cmd_pending.cancel_seq(input.seq);
+                owner.host.lock().cancel_diagnostic(input.seq);
+            }
+        } else {
+            if input.request_id <= *watermark { return Err(Error::from_errno(-(bindings::ESTALE as i32))); }
+            if input.action == 2 { return Err(ENOENT); }
+            input.seq = state.cmd_pending.submit_with_timeout(input.opcode, input.timeout_ms)?;
+            state.cmd_pending.assign_request(input.seq, me.file_id, input.request_id);
+            let deadline = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?.deadline;
+            if let Err(error) = owner.host.lock().enqueue_diagnostic(input.opcode, input.seq, deadline) {
+                state.cmd_pending.rollback(input.seq);
+                return Err(error);
+            }
+            *watermark = input.request_id;
+        }
+    }
+    drop(watermark);
+    drop(management);
+    owner.kick_commands();
+    // Committed ID/admission remain findable on EFAULT. Retrying cannot enqueue
+    // a second command, extend its deadline or revive an evicted/cancelled ID.
+    write_user_struct(arg, &input)?;
+    Ok(0)
+}
+
 /// Non-destructive result for the diagnostic author. A local sequence is
 /// assigned by admission and resolved only by the Host's captured wire slot.
 #[inline(never)]
@@ -3295,8 +3359,10 @@ fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if *owner.schedule_gate.lock() { return Err(ENODEV); }
     owner.management.lock().authorize(me.file_id, sle_management::DIAGNOSTIC).map_err(management_error)?;
-    let state = context.lock()?;
-    let entry = state.as_ref().ok_or(ENODEV)?.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;
+    let mut guard = context.lock()?;
+    let state = guard.as_mut().ok_or(ENODEV)?;
+    state.cmd_pending.expire_stale();
+    let entry = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;
     if entry.file_id != me.file_id { return Err(EPERM); }
     // SAFETY: only integer fields and byte arrays; all-zero is a valid baseline.
     let mut output: SleDiagnosticResult = unsafe { core::mem::zeroed() };
@@ -3313,8 +3379,8 @@ fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         output.state = 3;
         output.error = entry.error;
     }
-    drop(state);
-    // No queue mutation or acknowledgement: an EFAULT is safely retryable.
+    drop(guard);
+    // No result consumption or acknowledgement: an EFAULT is safely retryable.
     write_user_struct(arg, &output)?;
     Ok(0)
 }
@@ -3688,6 +3754,7 @@ impl MiscDevice for SparkLinkCtl {
             try_pin_init! {
                 SparkLinkCtl {
                     file_id,
+                    diagnostic_request_id <- new_mutex!(0),
                     operation <- new_mutex!(()),
                     owned_target <- new_mutex!(None),
                     events <- new_mutex!(EventQueue::new()),
@@ -3782,6 +3849,12 @@ impl MiscDevice for SparkLinkCtl {
         let context = &context;
         if matches!(cmd, SL_IOCTL_MANAGEMENT_ACQUIRE | SL_IOCTL_MANAGEMENT_RELEASE | SL_IOCTL_MANAGEMENT_QUERY) {
             return ioctl_management(context, me, cmd, arg);
+        }
+        if cmd == SL_IOCTL_DLI_SEND_CMD && context.owner.as_ref().is_some_and(|o| o.protocol_profile != 0) {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
+        if cmd == SL_IOCTL_DIAGNOSTIC_SUBMIT {
+            return ioctl_diagnostic_submit(context, me, arg);
         }
         // Admission serialization lasts through dispatch. Workers do not take
         // this mutex under the protocol mutex; revocation completion is in Host.

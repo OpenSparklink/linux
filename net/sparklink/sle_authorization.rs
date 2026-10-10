@@ -48,7 +48,8 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_SUBSYS_STATS
         | SL_IOCTL_SYNC_INFO
         | SL_IOCTL_USB_DEV_COUNT => Ok(Access::Observe),
-        SL_IOCTL_MANAGEMENT_ACQUIRE
+        SL_IOCTL_DIAGNOSTIC_SUBMIT
+        | SL_IOCTL_MANAGEMENT_ACQUIRE
         | SL_IOCTL_MANAGEMENT_RELEASE
         | SL_IOCTL_AFH_CLASSIFY
         | SL_IOCTL_AFH_HOP_NEXT

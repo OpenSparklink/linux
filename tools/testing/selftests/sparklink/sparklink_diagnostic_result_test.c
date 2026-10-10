@@ -82,9 +82,11 @@ static void release(int fd, struct sle_management_request *r)
 }
 static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t opcode, size_t len)
 {
-	struct sle_dli_cmd cmd = { .opcode = opcode };
+	static uint64_t request_id;
+	struct sle_diagnostic_submit cmd = { .version = 1, .generation = generation,
+		.request_id = ++request_id, .timeout_ms = 5000, .opcode = opcode, .action = 1 };
 	uint64_t start = now(CLOCK_REALTIME), deadline = now(CLOCK_MONOTONIC) + 6000000000ULL;
-	require(!ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &cmd) && cmd.seq, "raw metadata admission");
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) && cmd.seq, "idempotent metadata admission");
 	struct sle_diagnostic_result r;
 	for (;;) {
 		r = request(generation, cmd.seq);
