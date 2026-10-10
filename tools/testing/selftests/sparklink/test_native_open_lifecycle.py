@@ -11,6 +11,8 @@ def golden():
                   f'NATIVE_OPEN_PENDING: slot={i} id=1 generation={i + 2} snapshot_ms=0.001 '
                   'lease_eagain=1 refs=1 sends=0']
         if i >= 2:
+            lines += [f'NATIVE_OPEN_WATCH_ARMED: slot={i} generation={i + 2} epoll_empty=1 event=1 snoop=1',
+                      f'NATIVE_OPEN_WAKE: slot={i} elapsed_ms=0.001 event_hup=1 snoop_hup=1 blocked=1 close=0 put=0']
             lines += [f'NATIVE_OPEN_RETIRING: slot={i} blocked=1 admission_closed=1 close=0 put=0']
         lines += [f'NATIVE_OPEN_CASE: slot={i} mode={i % 2} retiring={int(i >= 2)} result={result} '
                   f'close={int(i % 2 == 0)} get=1 put=1 sends=0 survivor=1 stale=1']
@@ -69,6 +71,29 @@ class NativeOpenVerdict(unittest.TestCase):
                        'RUNTIME_GUEST_EXIT: 1', 'NATIVE_OPEN_MODULE_EXIT: 1']:
             with self.subTest(marker=marker):
                 self.assertTrue(assess(golden() + marker + '\n', 0))
+
+    def test_observer_proof(self):
+        for before, after in [('epoll_empty=1', 'epoll_empty=0'), ('event_hup=1', 'event_hup=0'),
+                              ('snoop_hup=1', 'snoop_hup=0'), ('blocked=1', 'blocked=0')]:
+            with self.subTest(before=before):
+                self.assertTrue(assess(golden().replace(before, after), 0))
+        self.assertTrue(assess(golden() + 'NATIVE_OPEN_WAKE_TIMEOUT: slot=2\n', 0))
+
+    def test_observer_latency(self):
+        for value in ['200', '-1', 'nan', 'inf', 'bad']:
+            with self.subTest(value=value):
+                self.assertTrue(assess(golden().replace('elapsed_ms=0.001 event_hup',
+                                                      'elapsed_ms=' + value + ' event_hup'), 0))
+
+    def test_observer_identity(self):
+        for bad in ['slot=1 generation=4', 'slot=2 generation=0', 'slot=2 generation=5']:
+            self.assertTrue(assess(golden().replace('slot=2 generation=4', bad), 0))
+
+    def test_observer_order(self):
+        lines = golden().splitlines()
+        arm = next(i for i, line in enumerate(lines) if line.startswith('NATIVE_OPEN_WATCH_ARMED:'))
+        lines[arm], lines[arm + 1] = lines[arm + 1], lines[arm]
+        self.assertTrue(assess('\n'.join(lines), 0))
 
 
 if __name__ == '__main__':

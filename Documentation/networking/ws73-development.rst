@@ -808,3 +808,40 @@ Native open is covered here; broader legacy blocking-I/O migration and the
 complete lifecycle/recovery issue are still open. Physical WS73/RF acceptance
 remains 0/7, board qualification NOT_ASSERTED, and four devices/two parallel
 pairs remain subsequent work within the retained full S0-S6 scope.
+
+Notify observers before joining native initialization
+----------------------------------------------------
+
+Retirement now wakes controller-event and snoop observers immediately after
+closing admission, before waiting for a driver's pending open. The final
+post-join notifications remain. An already registered epoll interest must not
+wait for open to finish before learning that its owner is retired.
+
+The native-open C test creates two separate descriptors for the blocked
+owner, subscribes one to controller events and one to snoop, and registers
+both with edge-triggered epoll. A zero-time wait confirms the ready list is
+empty before requesting retirement. After admission closes it waits on that
+same epoll instance, without adding or rearming the interests. Both attributed
+entries must report exactly ERR|HUP within 200 ms while open remains blocked,
+close/put counters stay zero and the index remains reserved. The existing
+late-open, reference, generation, survivor and module-unload checks follow.
+
+Both successful and failing blocked-open cases pass on #75: observer wake
+latencies are 3.009 and 3.083 ms. The byte-identical guest executable and
+fixture C object on #74 time out after 201.909 ms while open is still blocked;
+the negative test then releases and joins the fixture so module unload still
+succeeds. Old/new module release metadata differs and is never force-loaded.
+Four additional fail-closed verifier cases check registration identity,
+observer masks, latency and phase order; all 271 kernel harness tests pass.
+
+The four native-open cases and twelve existing runtime regression gates pass.
+The current original 96-case suite has 1059 OK, no FAIL/SKIP and three existing
+WARN. Ordinary-user slctl synthetic 20+2 rounds, the same daemon/bus/owner,
+TX-off, survivor, hotplug, independently corroborated capture and C/Python
+binding gates pass. Companion Rust sources/executable hashes and the actual
+QEMU inputs are unchanged; no new Rust tests/clippy, remote CI or 32-bit
+runtime is claimed. Source, #75 compiled input, guest/module/capture and exact
+#74 counterexample records are local in ``.dev/open-wake-final-evidence.json``.
+These are development support results. Real WS73/RF acceptance remains 0/7,
+board qualification NOT_ASSERTED, and all incomplete original issues remain
+open within the retained full plan.

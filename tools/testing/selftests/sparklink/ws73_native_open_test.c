@@ -4,6 +4,7 @@
 #include "ws73_native_runtime_test.c"
 #undef main
 #include "native-open/native_open_fixture.h"
+#include <sys/epoll.h>
 
 static int control;
 static int retained[4] = { -1, -1, -1, -1 };
@@ -85,6 +86,31 @@ static int opening_observe(int fd, struct native_open_probe *p)
 
 static int retire_wait(int fd, struct native_open_probe *p, int during_open)
 {
+	int watchers[2] = { -1, -1 }, epoll = -1;
+	if (during_open) {
+		epoll = epoll_create1(EPOLL_CLOEXEC);
+		if (epoll < 0) return fail("open observer epoll");
+		for (unsigned int i = 0; i < 2; i++) {
+			watchers[i] = fixture_bind(p);
+			if (watchers[i] < 0) return -1;
+			if (!i) {
+				if (events_subscribe(watchers[i], p->generation)) return -1;
+			} else {
+				struct sle_snoop_query snoop = { .version = 1, .generation = p->generation };
+				if (ioctl(watchers[i], SL_IOCTL_SNOOP_GET, &snoop) != -1 || errno != EAGAIN)
+					return fail("empty opening snoop subscription");
+			}
+			struct epoll_event event = { .events = EPOLLIN | EPOLLET, .data.u32 = i };
+			if (epoll_ctl(epoll, EPOLL_CTL_ADD, watchers[i], &event))
+				return fail("arm native observers");
+		}
+		struct epoll_event events[2];
+		if (epoll_wait(epoll, events, 2, 0) != 0)
+			return fail("opening observers not empty before retirement");
+		printf("NATIVE_OPEN_WATCH_ARMED: slot=%u generation=%llu epoll_empty=1 event=1 snoop=1\n",
+			p->slot, (unsigned long long)p->generation);
+	}
+	double began = now();
 	if (fixture(NATIVE_OPEN_RETIRE, p))
 		return -1;
 	double deadline = now() + 2;
@@ -97,8 +123,36 @@ static int retire_wait(int fd, struct native_open_probe *p, int during_open)
 	if (now() >= deadline)
 		return fail("retirement did not close admission before joining open");
 	if (during_open) {
+		unsigned int observed = 0;
+		while (observed != 3 && now() - began < 0.2) {
+			struct epoll_event events[2];
+			int ready = epoll_wait(epoll, events, 2, 200);
+			if (ready < 0) return fail("opening observer epoll wait");
+			for (int i = 0; i < ready; i++) {
+				unsigned int type = events[i].data.u32;
+				if (type > 1 || observed & (1U << type) ||
+					events[i].events != (EPOLLERR | EPOLLHUP))
+					return fail("incorrect opening observer identity/mask");
+				observed |= 1U << type;
+			}
+		}
+		double elapsed = now() - began;
+		for (unsigned int i = 0; i < 2; i++) close(watchers[i]);
+		close(epoll);
+		if (observed != 3 || elapsed >= 0.2) {
+			if (fixture(NATIVE_OPEN_QUERY, p) || p->flags != 9 || p->puts || p->closes)
+				return fail("timeout did not occur while open remained blocked");
+			printf("NATIVE_OPEN_WAKE_TIMEOUT: slot=%u elapsed_ms=%.3f blocked=1 close=0 put=0\n",
+				p->slot, elapsed * 1000);
+			// Keep a negative comparison clean: release and join its fixture
+			// before returning failure so the module can still unload.
+			if (fixture(NATIVE_OPEN_RELEASE, p) || fixture_wait(p, 4 | 16)) return -1;
+			return fail("retirement did not wake armed observers before joining open");
+		}
 		if (fixture(NATIVE_OPEN_QUERY, p) || p->flags != 9 || p->puts || p->closes || p->sends)
 			return fail("teardown failed to join open");
+		printf("NATIVE_OPEN_WAKE: slot=%u elapsed_ms=%.3f event_hup=1 snoop_hup=1 blocked=1 close=0 put=0\n",
+			p->slot, elapsed * 1000);
 		printf("NATIVE_OPEN_RETIRING: slot=%u blocked=1 admission_closed=1 close=0 put=0\n", p->slot);
 	} else if (fixture_wait(p, 16)) {
 		return -1;

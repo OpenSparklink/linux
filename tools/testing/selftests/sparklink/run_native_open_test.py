@@ -57,17 +57,34 @@ def assess(console, qemu_exit):
                           r'close=0 put=0$', console, re.M)
     if retiring != ['2', '3'] or console.count('NATIVE_OPEN_RETIRING:') != 2:
         errors.append('missing, duplicate or malformed pre-join retirement evidence')
+    armed = re.findall(r'^NATIVE_OPEN_WATCH_ARMED: slot=(\d+) generation=(\d+) '
+                       r'epoll_empty=1 event=1 snoop=1$', console, re.M)
+    wake = re.findall(r'^NATIVE_OPEN_WAKE: slot=(\d+) elapsed_ms=([^ ]+) '
+                      r'event_hup=1 snoop_hup=1 blocked=1 close=0 put=0$', console, re.M)
+    if (len(pending) != 4 or armed != [(p[0], p[2]) for p in pending[2:]] or
+            console.count('NATIVE_OPEN_WATCH_ARMED:') != 2):
+        errors.append('missing or incorrect pre-retirement observer registration')
+    if len(wake) != 2 or [p[0] for p in wake] != ['2', '3'] or console.count('NATIVE_OPEN_WAKE:') != 2:
+        errors.append('missing or incorrect observer retirement wake evidence')
+    else:
+        try:
+            if any(not math.isfinite(float(p[1])) or not 0 <= float(p[1]) < 200 for p in wake):
+                errors.append('observer retirement wake blocked by open')
+        except ValueError:
+            errors.append('invalid observer wake measurement')
+    if 'NATIVE_OPEN_WAKE_TIMEOUT:' in console:
+        errors.append('observer retirement wake timed out')
     cases = re.findall(r'^NATIVE_OPEN_CASE: slot=(\d+) mode=(\d+) retiring=(\d+) result=(-?\d+) '
                        r'close=(\d+) get=1 put=1 sends=0 survivor=1 stale=1$', console, re.M)
     expected = [('0', '0', '0', '0', '1'), ('1', '1', '0', '-5', '0'),
                 ('2', '0', '1', '-19', '1'), ('3', '1', '1', '-5', '0')]
     if cases != expected or console.count('NATIVE_OPEN_CASE:') != 4:
         errors.append('missing, duplicate or incorrect terminal lifetime evidence')
-    sequence = re.findall(r'^NATIVE_OPEN_(SNAPSHOT|PENDING|RETIRING|CASE): slot=(\d+)', console, re.M)
+    sequence = re.findall(r'^NATIVE_OPEN_(SNAPSHOT|PENDING|WATCH_ARMED|WAKE|RETIRING|CASE): slot=(\d+)', console, re.M)
     if sequence != [('SNAPSHOT', '0'), ('PENDING', '0'), ('CASE', '0'),
                     ('SNAPSHOT', '1'), ('PENDING', '1'), ('CASE', '1'),
-                    ('SNAPSHOT', '2'), ('PENDING', '2'), ('RETIRING', '2'), ('CASE', '2'),
-                    ('SNAPSHOT', '3'), ('PENDING', '3'), ('RETIRING', '3'), ('CASE', '3')]:
+                    ('SNAPSHOT', '2'), ('PENDING', '2'), ('WATCH_ARMED', '2'), ('WAKE', '2'), ('RETIRING', '2'), ('CASE', '2'),
+                    ('SNAPSHOT', '3'), ('PENDING', '3'), ('WATCH_ARMED', '3'), ('WAKE', '3'), ('RETIRING', '3'), ('CASE', '3')]:
         errors.append('out-of-order open lifecycle phases')
     exact = ['NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1',
              'NATIVE_OPEN_LIFECYCLE: PASS synthetic_only=1 cases=4',

@@ -598,6 +598,10 @@ impl ControllerRuntime {
         *self.schedule_gate.lock() = true;
         self.transport_open.store(false, core::sync::atomic::Ordering::Release);
         self.management.lock().settled(ENODEV.to_errno());
+        // Observers must learn retirement while open/transport joins are still
+        // pending. Poll registers first and rechecks the closed admission gate.
+        self.controller_event_poll.notify_all();
+        self.snoop_poll.notify_all();
         let _lifecycle = self.native_lifecycle.lock();
         sle_usb::unpublish_runtime(self);
         self.stop_workers();
