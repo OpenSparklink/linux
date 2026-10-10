@@ -22,6 +22,7 @@
 
 _Static_assert(sizeof(struct sle_diagnostic_result) == 104, "diagnostic ABI");
 _Static_assert(sizeof(struct sle_diagnostic_submit) == 40, "admission ABI");
+_Static_assert(sizeof(struct sle_dli_event) == 256, "legacy event ABI");
 static void require(int ok, const char *message)
 {
 	if (!ok) { fprintf(stderr, "DIAGNOSTIC_RESULT_FAILURE: %s errno=%d\n", message, errno); exit(1); }
@@ -171,6 +172,75 @@ static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t 
 		require(!munmap(mapping, 2 * page), "submit munmap");
 	}
 	return r;
+}
+static void legacy_poll_faults(int fd, uint64_t generation, const unsigned char *address)
+{
+	/* Before Managed/slkd starts, drain this controlled test's stale projection.
+	 * Seed each fault with a new actual metadata reply; never synthesize events. */
+	struct sle_dli_event discard;
+	unsigned int drained = 0;
+	for (;;) {
+		errno = 0; int ret = ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &discard);
+		if (ret == -1) { require(errno == EAGAIN, "legacy drain empty"); break; }
+		require(ret == 0 && ++drained <= 31, "bounded legacy drain");
+	}
+	const char *names[] = { "bad_address", "read_only_output", "partial_output" };
+	for (size_t i = 0; i < 3; i++) {
+		struct sle_diagnostic_submit input = { .version = 1, .generation = generation,
+			.request_id = 5 + i, .timeout_ms = 5000, .opcode = 0x0406, .action = 1 };
+		struct sle_diagnostic_submit output = input;
+		struct sle_mgmt_stats before = stats(fd);
+		require(!before.pending && before.total_submitted != UINT32_MAX &&
+			before.total_resolved != UINT32_MAX, "legacy seed quiet accounting");
+		uint64_t start = now(CLOCK_REALTIME), deadline = now(CLOCK_MONOTONIC) + 6000000000ULL;
+		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &output) && output.seq, "real legacy seed submit");
+		struct sle_diagnostic_result result = completed(fd, &output, 6, deadline);
+		require(!memcmp(result.data, address, 6), "legacy seed actual MAC");
+		struct sle_dli_event reference = { .event_type = 1, .opcode = 0x0406, .data_len = 6 };
+		memcpy(reference.data, result.data, 6);
+		size_t prefix = i == 2 ? 128 : 0;
+		unsigned char fault_output[256], *mapping = NULL, *destination = (void *)(uintptr_t)1;
+		long page = 0;
+		if (i) {
+			page = sysconf(_SC_PAGESIZE); require(page > 256, "legacy page");
+			mapping = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			require(mapping != MAP_FAILED, "legacy mmap");
+			destination = mapping + page - prefix;
+			memset(destination, 0xa5, sizeof(fault_output));
+			require(!mprotect(mapping + page, page, PROT_READ), "legacy readonly suffix");
+		}
+		errno = 0; int ret = ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, destination), error = errno;
+		require(ret == -1 && error == EFAULT, "legacy actual copy EFAULT");
+		if (i) {
+			memcpy(fault_output, destination, sizeof(fault_output));
+			require(!memcmp(fault_output, &reference, prefix), "legacy actual copied prefix");
+			for (size_t j = prefix; j < sizeof(fault_output); j++)
+				require(fault_output[j] == 0xa5, "legacy inaccessible suffix unchanged");
+		}
+		struct sle_dli_event retry;
+		memset(&retry, 0x5a, sizeof(retry));
+		require(!ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &retry) &&
+			!memcmp(&retry, &reference, sizeof(retry)), "legacy retry exact same event");
+		errno = 0; int empty = ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &discard), empty_error = errno;
+		require(empty == -1 && empty_error == EAGAIN, "legacy consumes only once");
+		struct sle_mgmt_stats after = stats(fd);
+		require(!after.pending && after.total_submitted == before.total_submitted + 1 &&
+			after.total_resolved == before.total_resolved + 1 &&
+			after.total_timeouts == before.total_timeouts, "legacy one seed no extra submission");
+		uint64_t end = now(CLOCK_REALTIME);
+		printf("{\"legacy_poll\":\"%s\",\"generation\":%llu,\"request_id\":%llu,\"seq\":%u,\"opcode\":%u,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"result\":%d,\"errno\":%d,\"partial_prefix\":%zu,\"drained_before\":%u,\"final_poll_result\":%d,\"final_poll_errno\":%d,\"data\":",
+			names[i], (unsigned long long)generation, (unsigned long long)input.request_id,
+			output.seq, output.opcode, (unsigned long long)start, (unsigned long long)end,
+			ret, error, prefix, i ? 0 : drained, empty, empty_error);
+		hex(result.data, result.data_len); printf(",\"input\":"); hex(&input, sizeof(input));
+		printf(",\"output\":"); hex(&output, sizeof(output));
+		printf(",\"result_bytes\":"); hex(&result, sizeof(result));
+		printf(",\"reference\":"); hex(&reference, sizeof(reference));
+		printf(",\"retry\":"); hex(&retry, sizeof(retry));
+		printf(",\"fault_output\":"); if (i) hex(fault_output, sizeof(fault_output)); else printf("null");
+		counters(before, after); puts("}"); fflush(stdout);
+		if (i) require(!munmap(mapping, 2 * page), "legacy munmap");
+	}
 }
 static void eviction(int fd, uint64_t generation, const unsigned char *address)
 {
@@ -322,6 +392,7 @@ int main(int argc, char **argv)
 	bad = request(generation, mac.seq); bad.generation = 0; rejected(fd, "zero_generation", bad, EINVAL);
 	rejected(fd, "wrong_generation", request(generation + 1, mac.seq), ENODEV);
 	rejected(fd, "missing_sequence", request(generation, UINT32_MAX), ENOENT);
+	legacy_poll_faults(fd, generation, snapshot.address);
 	release(fd, &lease);
 	int other = bound(index); lease = acquire(other, generation);
 	rejected(other, "foreign_author_with_lease", request(generation, mac.seq), EPERM);
