@@ -3,8 +3,10 @@ SparkLink implementation roadmap
 
 This is an experimental implementation. Source coverage, a simulated test
 result and physical controller acceptance are separate facts. The current
-WS73 driver implements firmware boot only, as described in
-:doc:`ws73-development`; it does not register a ready SLE controller.
+WS73 driver implements boot, native metadata queries, typed discovery and
+per-controller Host readiness, as described in :doc:`ws73-development`. Basic
+slkd/slctl discovery passes a synthetic USB integration gate; the physical
+dual-controller milestone remains unverified.
 
 The cross-repository roadmap is maintained in the userspace repository at
 ``docs/IMPLEMENTATION_PLAN.md``. Existing acceptance criteria remain in

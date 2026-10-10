@@ -25,6 +25,10 @@ struct USBWs73Test {
     uint8_t runtime_status;
     uint8_t runtime_fault;
     uint8_t runtime_reports;
+    bool runtime_policy;
+    uint8_t runtime_medium;
+    uint8_t adv_data[251];
+    unsigned int adv_data_len;
     bool runtime_discovery, advertising, scanning, fail_stop;
     unsigned int adv_phase, scan_phase, adv_handle, fail_step;
     bool timeout_enable;
@@ -33,6 +37,7 @@ struct USBWs73Test {
 };
 
 static unsigned int instances;
+static USBWs73Test *medium_devices[256];
 
 static const USBDescStrings strings = {
     [1] = "OpenSparklink synthetic test",
@@ -149,6 +154,50 @@ static void report_events(USBWs73Test *s)
     }
 }
 
+/* Explicit synthetic medium, never an air capture. Only a different live
+ * policy-enabled controller in the same group can supply a scan report. */
+static void medium_report(USBWs73Test *rx, USBWs73Test *tx)
+{
+    uint8_t data[5 + 23 + 251] = { 0xa2 };
+    uint8_t *body = data + 5;
+    g_assert(rx != tx && rx->runtime_policy && tx->runtime_policy);
+    put16(data + 1, 0x180b); put16(data + 3, 23 + tx->adv_data_len);
+    body[1] = 0;
+    memcpy(body + 2, "\x02\x73\x00\x00\x00", 5); body[7] = tx->serial;
+    body[16] = 1; body[21] = 0xd6; body[22] = tx->adv_data_len;
+    memcpy(body + 23, tx->adv_data, tx->adv_data_len);
+    queue_frame(rx, 10, 8, data, 28 + tx->adv_data_len);
+    usb_wakeup(usb_ep_get(&rx->parent_obj, USB_TOKEN_IN, 1), 0);
+}
+static void medium_discover(USBWs73Test *changed)
+{
+    if (!changed->runtime_policy || !changed->runtime_medium) { return; }
+    for (unsigned int i = 1; i < ARRAY_SIZE(medium_devices); i++) {
+        USBWs73Test *peer = medium_devices[i];
+        if (!peer || peer == changed || !peer->runtime_policy ||
+            peer->runtime_medium != changed->runtime_medium) { continue; }
+        if (changed->scanning && peer->advertising) { medium_report(changed, peer); }
+        if (changed->advertising && peer->scanning) { medium_report(peer, changed); }
+    }
+}
+static bool basic_parameters(USBWs73Test *s, const uint8_t *p)
+{
+    uint8_t expected[49] = { 0 };
+    expected[2] = 2; put16(expected + 3, 1200); put16(expected + 6, 1200);
+    expected[9] = 7; expected[25] = 127; expected[43] = 200;
+    memcpy(expected + 12, "\x02\x73\x00\x00\x00", 5); expected[17] = s->serial;
+    return !memcmp(p, expected, sizeof(expected));
+}
+static bool basic_data(const uint8_t *p, size_t size)
+{
+    const uint8_t prefix[] = { 255, 41, 1, 1, 1, 11, 36, 's', 'l', 'k', '-' };
+    if (size != 43 || memcmp(p, prefix, sizeof(prefix))) { return false; }
+    for (size_t i = sizeof(prefix); i < size; i++) {
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) { return false; }
+    }
+    return true;
+}
+
 static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
 {
     uint8_t value[10] = { 0 };
@@ -180,7 +229,9 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         break;
     case 0x0c02:
         if (!s->runtime_discovery || n != 49 || s->advertising || s->scanning || p[5] > 0xef) { return false; }
-        if (p[5] != 7 || le16(p + 8) != 800 || p[10] || le16(p + 11) != 800 || p[13]
+        if (s->runtime_policy) {
+            if (!basic_parameters(s, p + 5)) { return false; }
+        } else if (p[5] != 7 || le16(p + 8) != 800 || p[10] || le16(p + 11) != 800 || p[13]
             || memcmp(p + 17, "\x02\x73\x00\x00\x00", 5) || p[22] != s->serial
             || p[30] != 0 || p[31] != 1) { return false; }
         typed = true; s->adv_handle = p[5]; s->adv_phase = 1;
@@ -192,7 +243,10 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
     case 0x0c03:
     case 0x0c04:
         if (!s->runtime_discovery || n < 3 || p[5] != s->adv_handle || p[6] != 3 || n != 3 + p[7]) { return false; }
-        if (p[7] != 6 || memcmp(p + 8, op == 0x0c03 ? "\x05\x09WS73" : "\x05\x09RSP!", 6)) { return false; }
+        if (s->runtime_policy) {
+            if (op != 0x0c03 || !basic_data(p + 8, p[7])) { return false; }
+            memcpy(s->adv_data, p + 8, p[7]); s->adv_data_len = p[7];
+        } else if (p[7] != 6 || memcmp(p + 8, op == 0x0c03 ? "\x05\x09WS73" : "\x05\x09RSP!", 6)) { return false; }
         g_assert(s->adv_phase == (op == 0x0c03 ? 1 : 2));
         typed = true; s->adv_phase++;
         typed_status = s->fail_step == (op == 0x0c03 ? 1 : 2) ? 0xfd : 0;
@@ -214,7 +268,9 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
     case 0x1001:
         if (!s->runtime_discovery || n != 8 || p[7] != 1 || p[8] > 1
             || !le16(p + 9) || !le16(p + 11) || le16(p + 11) > le16(p + 9)
-            || le16(p + 9) != 800 || le16(p + 11) != 400 || s->advertising || s->scanning) { return false; }
+            || le16(p + 9) != (s->runtime_policy ? 1600 : 800)
+            || le16(p + 11) != (s->runtime_policy ? 800 : 400) || s->advertising || s->scanning) { return false; }
+        if (s->runtime_policy && (p[5] || p[6] || p[8])) { return false; }
         typed = true; s->scan_phase = 1;
         break;
     case 0x1002:
@@ -234,6 +290,7 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         if (timeout) { return true; } /* accepted, missing terminal result */
         command_event(s, 2, op, 0, typed_status, value, size);
         command_event(s, 2, 0, 1, 0, NULL, 0);
+        if (!typed_status && (op == 0x0c05 || op == 0x1002)) { medium_discover(s); }
         return true;
     }
     if (s->commands > 4 && s->runtime_fault && !s->failed_once) {
@@ -304,6 +361,7 @@ static void reset(USBDevice *dev)
     s->adv_phase = s->scan_phase = 0; s->fail_step = 255;
     s->bsp = true; s->pm = s->custom = s->opened = s->failed_once = s->in_flight = false;
     s->reports_emitted = false;
+    s->adv_data_len = 0;
     if (s->wake) { timer_del(s->wake); }
 }
 
@@ -321,6 +379,8 @@ static void realize(USBDevice *dev, Error **errp)
     s->serial = ++instances;
     g_assert(s->serial < 255);
     g_assert(s->runtime_reports <= 40);
+    g_assert(!s->runtime_policy || s->runtime_discovery);
+    medium_devices[s->serial] = s;
     reset(dev);
 }
 
@@ -365,6 +425,8 @@ static void transfer(USBDevice *dev, USBPacket *p)
 }
 
 static Property properties[] = {
+    DEFINE_PROP_BOOL("runtime-policy", USBWs73Test, runtime_policy, false),
+    DEFINE_PROP_UINT8("runtime-medium", USBWs73Test, runtime_medium, 0),
     DEFINE_PROP_BOOL("runtime-discovery", USBWs73Test, runtime_discovery, false),
     DEFINE_PROP_UINT8("runtime-status", USBWs73Test, runtime_status, 0),
     DEFINE_PROP_UINT8("runtime-fault", USBWs73Test, runtime_fault, 0),
@@ -375,6 +437,7 @@ static Property properties[] = {
 static void unrealize(USBDevice *dev)
 {
     USBWs73Test *s = USB_WS73_TEST(dev);
+    medium_devices[s->serial] = NULL;
     timer_free(s->wake); s->wake = NULL;
 }
 

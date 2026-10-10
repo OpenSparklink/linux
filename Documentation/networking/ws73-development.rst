@@ -587,9 +587,8 @@ remove/recreate adapters without restarting. Native initialization submits the
 two typed stops and waits for their matching result records without holding
 business-state or directory locks. Native event subscriptions preserve complete
 WS73 report headers/data and explicit loss independently of the legacy ring.
-Native SSAP profiles and the legacy scan command are unsupported until their
-native policies/backends exist; metadata Ready does not imply that those
-features are implemented.
+Native SSAP profiles remain unsupported. Basic native scan/advertisement policy
+is now supplied by userspace; Host Ready alone cannot certify its RF behavior.
 
 The reproducible software integration gate is::
 
@@ -604,3 +603,25 @@ selection, new generation and the same daemon process after hotplug, and saves
 source/image/program hashes, QMP traffic and complete kernel logs. It is not
 real WS73 firmware execution or RF/no-sudo acceptance on the user's machine.
 The original North Star criteria and full S0--S6 issues remain open.
+
+Basic policy and synthetic CLI discovery
+----------------------------------------
+
+Add ``--radio-policy`` to the daemon lifecycle command above to exercise actual
+uid-1000 slkd/slctl advertisement, scanning and stops through the typed native
+API. Policy-enabled test controllers in an explicit nonzero ``runtime-medium``
+group can report another live controller's advertisement, never their own data.
+Both properties are opt-in and disabled in the existing native transaction gate.
+The 20 alternating rounds and two rounds after hotplug retain fresh random
+markers, exact data/address/RSSI, kernel receipt times and matched results; each
+phase also observes no new reports for two seconds with transmitters stopped.
+The verifier rejects wrong addresses/generations, stale sequences, timeouts,
+loss, failed/missing/duplicate completions and misplaced lifecycle evidence.
+
+This model is an explicit synthetic medium, not an RF recording. Production
+policy does not reside in the model: libsparklink supplies full typed requests,
+the driver independently validates/encodes them, and actual firmware status
+remains authoritative. The real North Star and four-controller parallel pairs
+still require physical devices, qualified configuration and receiver USB/HCC/DLI
+captures. Native event fds activate their subscription before epoll registration
+so the selected controller's queue can wake the daemon.

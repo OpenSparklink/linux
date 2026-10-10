@@ -33,12 +33,14 @@ def copy_elf(source, target, root):
             shutil.copy2(path, dest)
 
 
-def assess(console, code):
+def assess(console, code, radio=False):
     errors = []
     if code:
         errors.append(f'QEMU exit {code}')
     if KERNEL_FAULT.search(console):
         errors.append('kernel fault')
+    if re.search(r"thread .+ panicked at|there is no reactor running", console):
+        errors.append('userspace runtime panic')
     if 'DAEMON_FAILURE:' in console:
         errors.append('guest assertion failed')
     markers = re.findall(r'^DAEMON_(UID: 1000|ADD_SECOND|REMOVE_FIRST|STALE_SELECTION: rejected|READD_FIRST|HOTPLUG: independent=2 same_process=1 new_generation=1|LIFECYCLE: PASS)$', console, re.M)
@@ -56,6 +58,83 @@ def assess(console, code):
         errors.append('complete kernel log missing')
     elif '[    0.000000]' not in console.split('DAEMON_KERNEL_LOG_BEGIN', 1)[1].split('DAEMON_KERNEL_LOG_END', 1)[0]:
         errors.append('early kernel log missing')
+    if radio:
+        errors += assess_radio(console)
+    elif 'DAEMON_RADIO_' in console:
+        errors.append('unexpected radio evidence')
+    return errors
+
+
+def assess_radio(console):
+    errors = []
+    rounds = re.findall(r'^DAEMON_RADIO_ROUND: phase=(initial|replug) round=(\d+) tx=(/org/sparklink/slk\d+_g\d+) rx=(/org/sparklink/slk\d+_g\d+) marker=([0-9a-f]{32})$', console, re.M)
+    expected = [('initial',i) for i in range(1,21)] + [('replug',i) for i in range(1,3)]
+    if [(r[0],int(r[1])) for r in rounds] != expected or console.count('DAEMON_RADIO_ROUND:') != 22:
+        errors.append('missing/duplicate/out-of-order typed radio rounds')
+    if len({r[4] for r in rounds}) != 22:
+        errors.append('radio markers not all fresh')
+    for prev,cur in zip(rounds,rounds[1:]):
+        if cur[0]==prev[0] and (cur[2]!=prev[3] or cur[3]!=prev[2]):
+            errors.append('radio roles did not alternate')
+    matches = re.findall(r'^NativeDiscoveryMatch: generation=(\d+) seq=(\d+) address=([0-9A-F:]+) RSSI=(-?\d+) marker=([0-9a-f]{32}) data=([0-9a-f]+) kernel_boottime_ns=(\d+) elapsed_ms=(\d+) lost=(\d+)$',console,re.M)
+    if len(matches)!=22 or console.count('NativeDiscoveryMatch:') != 22:
+        errors.append('missing/duplicate report identity/time/data proof')
+    for match,round_record in zip(matches,rounds):
+        gen,seq,addr,rssi,marker,data,boot,ms,lost=match
+        expected_data=bytes([255,41,1,1,1,11,36])+('slk-'+marker).encode()
+        if (marker!=round_record[4] or int(gen)!=int(round_record[3].split('_g')[1])
+            or int(seq)==0 or int(rssi)!=-42 or bytes.fromhex(data)!=expected_data
+            or int(boot)==0 or int(ms)>=10000 or int(lost)!=0):
+            errors.append('invalid fresh report proof')
+    identities = {f'/org/sparklink/slk{i}_g{g}': addr for i,g,addr in re.findall(
+        r'^Adapter /org/sparklink/slk(\d+)_g(\d+):\n  State:       Ready\n  Generation:  \d+\n  Address:     ([0-9A-F:]+)', console, re.M)}
+    seen = {}
+    for match, round_record in zip(matches, rounds):
+        gen, seq, addr, _, _, _, boot, _, _ = match
+        tx, rx = round_record[2:4]
+        if tx == rx or tx not in identities or rx not in identities or addr != identities.get(tx):
+            errors.append('report address does not identify a distinct live transmitter')
+        previous = seen.get(rx, (0, 0))
+        if int(seq) <= previous[0] or int(boot) <= previous[1]:
+            errors.append('receiver sequence/time did not advance')
+        seen[rx] = (int(seq), int(boot))
+    operations = re.findall(
+        r'^NativeOperationResult: generation=(\d+) request=(\d+) operation=(\d+) state=(\d+) errno=(-?\d+) status=0x([0-9a-f]{2}) opcode=0x([0-9a-f]{4}) step=(\d+)/(\d+) power=(-?\d+) power_valid=(\d+) adv=(\d+) scan=(\d+) profile=(\d+)$', console, re.M)
+    if len(operations) != 88 or console.count('NativeOperationResult:') != 88:
+        errors.append('missing/duplicate/malformed typed operation results')
+    if len({(r[0], r[1]) for r in operations}) != len(operations):
+        errors.append('operation identity reused')
+    terminal = {1: ('0c05','2','3','-42','1','2','1'),
+                3: ('1002','1','2','0','0','1','2'),
+                2: ('0c05','0','1','0','0','1','1'),
+                4: ('1002','0','1','0','0','1','1')}
+    for i, r in enumerate(operations):
+        if i // 4 >= len(rounds):
+            break
+        phase, _, tx, rx, marker = rounds[i // 4]
+        op = [1,3,2,4][i % 4]
+        owner = tx if op in (1,2) else rx
+        if (int(r[0]) != int(owner.split('_g')[1]) or int(r[1]) == 0
+                or int(r[2]) != op or r[3:6] != ('3','0','00')
+                or r[6:13] != terminal[op] or r[13] != '1'):
+            errors.append('invalid selected typed transaction completion')
+    admissions = re.findall(r'^NativeAdvertisementAccepted: request=(\d+) marker=([0-9a-f]{32}) data=([0-9a-f]+)$', console, re.M)
+    if len(admissions) != 22 or console.count('NativeAdvertisementAccepted:') != 22:
+        errors.append('missing/duplicate advertisement admission')
+    for i, (request, marker, data) in enumerate(admissions):
+        if i >= len(rounds) or i * 4 >= len(operations):
+            break
+        expected_data = bytes([255,41,1,1,1,11,36]) + ('slk-'+marker).encode()
+        if request != operations[i * 4][1] or marker != rounds[i][4] or bytes.fromhex(data) != expected_data:
+            errors.append('admission/result/received data correlation mismatch')
+    for m in re.finditer(r'^DAEMON_RADIO_ROUND: phase=(initial|replug)', console, re.M):
+        lower = console.find('DAEMON_ADD_SECOND' if m[1] == 'initial' else 'DAEMON_READD_FIRST')
+        upper = console.find('DAEMON_REMOVE_FIRST' if m[1] == 'initial' else 'DAEMON_HOTPLUG:')
+        if lower < 0 or upper < 0 or not lower < m.start() < upper:
+            errors.append('radio proof outside live lifecycle phase')
+    negatives = re.findall(r'^DAEMON_RADIO_NEGATIVE: phase=(initial|replug) no_new_report=1 duration_ms=2000$',console,re.M)
+    if negatives!=['initial','replug']:
+        errors.append('missing/duplicate transmitter-off negative control')
     return errors
 
 
@@ -63,17 +142,19 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ['kernel-build', 'qemu', 'busybox', 'userspace', 'dbus-daemon', 'output']:
         p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument('--radio-policy', action='store_true', help='basic policy and explicit synthetic cross-controller medium; never real RF')
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     manifest = {'scope': 'real uid-1000 slkd/slctl on synthetic WS73: no firmware/RF acceptance',
+                'radio_policy': a.radio_policy,
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
         kernel = a.kernel_build.resolve() / 'arch/x86/boot/bzImage'
         userspace = a.userspace.resolve()
         manifest['inputs'] = [file_record(path) for path in [kernel, a.kernel_build / '.config', a.qemu, a.busybox,
-            a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh']]
+            a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c']]
         tracked = subprocess.check_output(['git', 'ls-files', 'crates', 'Cargo.toml', 'Cargo.lock'],
                                          cwd=userspace, text=True).splitlines()
         # Include untracked new implementation files before committing them.
@@ -111,6 +192,7 @@ def main():
         firmware.mkdir(parents=True)
         (firmware / 'bsle_custom.bin').write_bytes(bytes(range(140)))
         (firmware / 'pm_config.bin').write_bytes(bytes.fromhex('01000000'))
+        shutil.copy2(HERE / 'daemon_radio_guest.sh', root / 'bin/test-radio')
         shutil.copy2(HERE / 'daemon_lifecycle_guest.sh', root / 'bin/test-daemon')
         (root / 'bin/test-daemon').chmod(0o755)
         (root / 'init').write_text('''#!/bin/sh
@@ -133,6 +215,8 @@ dmesg
 echo "DAEMON_KERNEL_LOG_END"
 poweroff -f
 ''')
+        if a.radio_policy:
+            f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_RADIO=1'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -153,7 +237,7 @@ poweroff -f
                 '-append', 'console=ttyS0 loglevel=5 log_buf_len=4M panic=1 oops=panic',
                 '-serial', f'file:{console}', '-display', 'none', '-no-reboot', '-m', '512M', '-smp', '2',
                 '-qmp', f'unix:{socket},server=on,wait=off', '-device', 'qemu-xhci,id=xhci',
-                '-device', 'usb-ws73-test,id=sle0,bus=xhci.0,port=1,runtime-discovery=on']
+                '-device', 'usb-ws73-test,id=sle0,bus=xhci.0,port=1,runtime-discovery=on' + (',runtime-policy=on,runtime-medium=1' if a.radio_policy else '')]
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
                 command.append('-enable-kvm')
             manifest['qemu_args'] = command
@@ -162,6 +246,8 @@ poweroff -f
                 wait_marker(process, console, 'DAEMON_ADD_SECOND')
                 monitor = load_qmp()(socket, output / 'qmp.jsonl')
                 props = dict(driver='usb-ws73-test', bus='xhci.0', **{'runtime-discovery': True})
+                if a.radio_policy:
+                    props.update({'runtime-policy': True, 'runtime-medium': 1})
                 monitor.execute('device_add', dict(id='sle1', port='2', **props))
                 wait_marker(process, console, 'DAEMON_REMOVE_FIRST')
                 monitor.execute('device_del', dict(id='sle0'))
@@ -170,7 +256,7 @@ poweroff -f
                 monitor.execute('device_add', dict(id='sle0', port='1', **props))
                 code = process.wait(timeout=30)
             manifest['qemu_exit'] = code
-            errors = assess(console.read_text(errors='replace').replace('\r', ''), code)
+            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy)
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'

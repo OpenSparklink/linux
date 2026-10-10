@@ -34,6 +34,10 @@ second=$(list | grep -v "$first" | awk '{print $1}')
 [ -n "$second" ] || fail 'distinct second registration'
 ctl --adapter "$second" show || fail 'second show'
 [ "$(pidof slkd)" = "$pid" ] || fail 'daemon restarted before removal'
+if [ "$SPARKLINK_TEST_RADIO" = 1 ]; then
+    . /bin/test-radio
+    radio_rounds 20 "$first" "$second" initial
+fi
 echo 'DAEMON_REMOVE_FIRST'
 wait_ready 1
 [ "$(list | awk '{print $1}')" = "$second" ] || fail 'unaffected registration changed'
@@ -48,6 +52,9 @@ replacement=$(list | grep -v "$second" | awk '{print $1}')
 ctl --adapter "$replacement" show || fail 'replacement not Ready'
 ctl --adapter "$second" show || fail 'survivor changed after replug'
 [ "$(pidof slkd)" = "$pid" ] || fail 'daemon restarted during hotplug'
+if [ "$SPARKLINK_TEST_RADIO" = 1 ]; then
+    radio_rounds 2 "$replacement" "$second" replug
+fi
 echo 'DAEMON_HOTPLUG: independent=2 same_process=1 new_generation=1'
 kill -INT "$pid"
 for n in $(seq 1 100); do [ -z "$(pidof slkd)" ] && break; sleep 0.1; done
