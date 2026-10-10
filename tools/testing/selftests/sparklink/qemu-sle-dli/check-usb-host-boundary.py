@@ -79,6 +79,27 @@ def qmp_properties(args):
                 else:
                     raise AssertionError('unattached fault pulse accepted')
                 assert monitor.execute('qom-get',{'path':path,'property':'test-runtime-in-error-once'}) is False
+                for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release']:
+                    assert monitor.execute('qom-get',{'path':path,'property':name}) is False
+                for name in ['test-runtime-in-holds','test-runtime-in-releases',
+                             'test-runtime-in-bounded-releases','test-runtime-in-hold-drops']:
+                    assert monitor.execute('qom-get',{'path':path,'property':name}) == 0
+                    try:
+                        monitor.execute('qom-set',{'path':path,'property':name,'value':1})
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError('read-only hold counter accepted a write')
+                for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release']:
+                    try:
+                        monitor.execute('qom-set',{'path':path,'property':name,'value':True})
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError('unattached hold/release or read-only state accepted')
+                    assert monitor.execute('qom-get',{'path':path,'property':name}) is False
+                monitor.execute('qom-set',{'path':path,'property':'test-runtime-in-hold-once','value':False})
+                monitor.execute('qom-set',{'path':path,'property':'test-runtime-in-release','value':False})
                 assert monitor.execute('query-status')['status']=='prelaunch'
                 monitor.execute('quit');assert process.wait(timeout=10)==0
             finally:
@@ -217,7 +238,7 @@ int main(void)
     print(result,end='')
     patches = [Path(__file__).with_name(name).resolve() for name in
                ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
-                'usb-host-autoscan.patch','usb-host-runtime-error.patch']]
+                'usb-host-autoscan.patch','usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -228,6 +249,15 @@ int main(void)
         for command in commands:
             subprocess.run(command,cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
         assert copy.read_bytes()==host.read_bytes()
+        # Every earlier complete prefix is supported, not just the immediately
+        # preceding version. Never touch the original source while checking.
+        for prefix in range(len(patches)+1):
+            copy.write_bytes(host.read_bytes())
+            for patch in reversed(patches[prefix:]):
+                subprocess.run(['patch','--batch','--fuzz=0','--reverse','-p1','-i',str(patch)],
+                               cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
+            subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
+            assert copy.read_bytes()==host.read_bytes()
         subprocess.run(['patch','--batch','--fuzz=0','--reverse','-p1','-i',str(patches[-1])],
                        cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
         subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
@@ -236,6 +266,17 @@ int main(void)
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
+        for before, after in [
+            ('"test-runtime-in-held"','"unexpected-held"'),
+            ('timer_mod(s->test_runtime_hold_timer,',
+             'timer_mod(s->test_runtime_hold_timer_drift,'),
+            ('s->test_runtime_hold_once = value;', 's->test_runtime_hold_once = !value;'),
+        ]:
+            assert source.count(before)==1
+            copy.write_text(source.replace(before, after, 1))
+            drift=copy.read_bytes()
+            denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
+            assert denied.returncode!=0 and copy.read_bytes()==drift
         copy.write_text(host.read_text().replace('allow_host_reset, true','unexpected_drift, true',1))
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
@@ -257,7 +298,9 @@ int main(void)
         assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
              'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'reenumeration_cases':6,
-             'host_lifecycle_sites':3,'patch_cases':8,
+             'host_lifecycle_sites':3,'patch_cases':18,
+             'supported_patch_prefixes':list(range(len(patches)+1)),
+             'hold_source_drift_cases':3,
              'source_sha256':hashlib.sha256(host.read_bytes()).hexdigest(),
              'production_sha256':hashlib.sha256(production.encode()).hexdigest()}
     if args.qemu:

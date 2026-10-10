@@ -157,8 +157,48 @@ python3 check-usb-host-runtime-error.py \
 
 该检查编译实际callback/setter，使用计数mock验证默认行为、单次注入、
 禁止arm条件及取消。autoscan检查还验证关闭一只设备只清除该设备的脉冲。
-补丁应用工具先在临时树验证完整链，可升级已应用的四补丁树；所有上下文
+补丁应用工具先在临时树验证完整链，可升级零至六补丁的完整前缀；所有上下文
 漂移检查完成前不修改调用者源码。暂停QMP检查拒绝对未attached对象arm。
+
+`usb-host-runtime-hold.patch`提供单对象、默认关闭的成功接收暂留：显式设置
+`test-runtime-in-hold-once=true`后，仅暂留下一份成功且非空的bulk IN81。
+原libusb transfer、buffer和USBPacket保留，不改状态或数据、不生成回复。
+日志保留长度和原始数据SHA256；`test-runtime-in-held`为只读状态。
+`test-runtime-in-release=true`将原数据交给正常callback；`test-runtime-in-holds`、
+`test-runtime-in-releases`、`test-runtime-in-bounded-releases`、
+`test-runtime-in-hold-drops`均为只读计数。设置两秒REALTIME timer截止后自动释放；
+实际执行仍取决于QEMU事件循环调度，不能宣称硬实时上限。
+取消或close先清理timer/身份，再释放已完成transfer一次，不再向libusb取消它。
+error/hold脉冲互斥；arm要求attached WS73和全部reset/detach关闭。
+disarm仅取消尚未消费的脉冲，不能静默丢弃已暂留数据；release无实际暂留时拒绝。
+
+```sh
+python3 check-usb-host-runtime-hold.py \
+  --source .build/qemu-9.2.0/hw/usb/host-libusb.c \
+  --cc clang --sanitize \
+  --output /absolute/private/fresh-runtime-hold-check
+```
+
+该检查编译实际hold/callback/abort/cancel/getter/setter，依赖由计数fixture提供；
+覆盖默认行为、过滤、原数据交付、显式/有界释放、取消/abort/combined首包清理、
+其他对象拒绝释放及arm互斥。timer、digest和combining是替身；实际QEMU调度、
+完整close drain、多设备并发、线上取消/迟到回复/期限仍须独立VM真实设备门禁。
+暂停QMP只验证默认/只读/拒绝arm与release，无USB匹配或guest运行。
+这种暂留属于故障测试，不是自然故障根因或自主恢复验收。
+
+完整开发门禁可由固定上游归档复现：
+
+```sh
+python3 run-usb-host-boundaries.py \
+  --archive /absolute/qemu-9.2.0.tar.xz \
+  --cc clang --output /absolute/private/fresh-qemu-host-boundaries
+```
+
+归档SHA256固定为
+`f859f0bc65e1f533d040bbe8c92bcfecee5af2c921a6687c652fb44d089bd894`，
+只读取两个指定源码成员，应用整条补丁链并执行实际函数依赖fixture；error/hold
+启用ASan/UBSan。可另传`--qemu`进行上述暂停QMP检查。CI不编译完整QEMU、
+不执行timer scheduler或真实USB；本地完整QEMU构建及实机门禁分开记录。
 
 构建输出保留完整 configure/compiler/install 诊断。固定的 QEMU 9.2.0
 包含仅用于构建的 libfdt const 声明修正，以兼容 glibc 2.43/GCC 16；

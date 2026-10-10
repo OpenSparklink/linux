@@ -37,7 +37,10 @@ typedef struct { int status, actual_length; void *ep; } USBPacket;
 typedef struct USBHostDevice {
     bool attached, allow_host_reset, allow_kernel_driver_detach;
     bool allow_one_guest_reset, allow_all_guest_resets;
-    bool test_runtime_in_error_once;
+    bool test_runtime_in_error_once, test_runtime_hold_once;
+    struct USBHostRequest *test_runtime_held;
+    void *test_runtime_hold_timer;
+    uint64_t test_runtime_holds;
     uint64_t test_runtime_in_errors;
     void *dh;
     struct { unsigned idVendor, idProduct; } ddesc;
@@ -47,10 +50,18 @@ typedef USBHostDevice Object;
 typedef struct { int calls; } Error;
 #define USB_HOST_DEVICE(s) (s)
 #define USB_DEVICE(s) (s)
-typedef struct { USBHostDevice *host; USBPacket *p; bool in; unsigned char *buffer; } USBHostRequest;
+typedef struct USBHostRequest { USBHostDevice *host; USBPacket *p; bool in; unsigned char *buffer; } USBHostRequest;
 struct libusb_transfer { void *user_data; int status, type, endpoint, actual_length; };
 static const int status_map[] = {0,-1,-2,-3,-4,-1};
 static unsigned copied, completed, freed, nodev, injected;
+#define g_autofree
+#define G_CHECKSUM_SHA256 0
+#define QEMU_CLOCK_REALTIME 0
+static char *g_compute_checksum_for_data(int algo, const unsigned char *data, int len) { assert(!"hold must remain inactive in error fixture");return NULL; }
+static void *timer_new_ms(int clock, void (*cb)(void *), void *opaque) { assert(!"hold must remain inactive in error fixture");return NULL; }
+static void timer_mod(void *timer, int64_t deadline) { assert(!"hold must remain inactive in error fixture"); }
+static int64_t qemu_clock_get_ms(int clock) { assert(!"hold must remain inactive in error fixture");return 0; }
+static void usb_host_test_hold_timeout(void *opaque) { assert(!"hold must remain inactive in error fixture"); }
 static void error_setg(Error **errp, const char *format, ...) { (*errp)->calls++; }
 static void error_report(const char *format, ...) { injected++; }
 static void usb_packet_copy(USBPacket *p, void *data, int size) { copied+=size; p->actual_length+=size; }
@@ -110,8 +121,10 @@ int main(void) {
 }
 '''
     (args.output / 'check.c').write_text(mocks)
-    command = ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+    command = [args.cc, '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
                str(args.output / 'check.c'), '-o', str(args.output / 'check')]
+    if args.sanitize:
+        command[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     subprocess.run(command, check=True)
     subprocess.run([str((args.output / 'check').resolve())], check=True)
     record = {'status': 'PASS_MOCKED_ACTUAL_RUNTIME_ERROR_BOUNDARY',
@@ -127,4 +140,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--cc', default='cc')
+    parser.add_argument('--sanitize', action='store_true')
     check(parser.parse_args())
