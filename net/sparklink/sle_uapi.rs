@@ -3121,3 +3121,32 @@ impl CheckReserved for SleManagementQuery {
 }
 const _: () = assert!(core::mem::size_of::<SleManagementRequest>() == 32);
 const _: () = assert!(core::mem::size_of::<SleManagementQuery>() == 48);
+
+pub(crate) const SNOOP_VERSION: u32 = 1;
+pub(crate) const SNOOP_PAYLOAD_MAX: usize = 320;
+pub(crate) const SNOOP_TRUNCATED: u16 = 1;
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct SleSnoopRecord {
+    pub seq: u64, pub generation: u64, pub timestamp_ns: u64, pub lost: u64,
+    pub profile: u32, pub original_length: u32, pub status: i32,
+    pub dev_index: u16, pub direction: u8, pub format: u8,
+    pub captured_length: u16, pub flags: u16, pub reserved: u32,
+    pub payload: [u8; SNOOP_PAYLOAD_MAX],
+}
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct SleSnoopQuery {
+    pub generation: u64, pub after_seq: u64, pub version: u32, pub flags: u32,
+    pub reserved: u64, pub record: SleSnoopRecord,
+}
+// SAFETY: these types contain only integers and byte arrays.
+unsafe impl FromBytes for SleSnoopRecord {}
+// SAFETY: these types contain only integers and byte arrays.
+unsafe impl FromBytes for SleSnoopQuery {}
+impl CheckReserved for SleSnoopQuery {
+    fn check_reserved(&self) -> Result { if self.flags != 0 || self.reserved != 0 { Err(EINVAL) } else { Ok(()) } }
+}
+pub(crate) const SL_IOCTL_SNOOP_GET: u32 = _IOWR::<SleSnoopQuery>(SL_MAGIC, 0x8e);
+const _: () = assert!(core::mem::size_of::<SleSnoopRecord>() == 376);
+const _: () = assert!(core::mem::size_of::<SleSnoopQuery>() == 408);

@@ -37,6 +37,7 @@ mod sle_pdu;
 mod sle_phy;
 mod sle_power;
 mod sle_security;
+mod sle_snoop;
 mod sle_serdev;
 mod sle_spi;
 mod sle_ssap;
@@ -526,6 +527,10 @@ pub(crate) struct ControllerRuntime {
     #[pin]
     pub(crate) controller_event_poll: PollCondVar,
     #[pin]
+    pub(crate) snoop: Lock<KBox<sle_snoop::SnoopLog>, IrqLockBackend>,
+    #[pin]
+    pub(crate) snoop_poll: PollCondVar,
+    #[pin]
     pub(crate) state: Mutex<Option<KBox<ControllerState>>>,
     #[pin]
     pub(crate) ingress: Lock<KBox<sle_dli::ControllerEventRing>, IrqLockBackend>,
@@ -553,6 +558,7 @@ impl ControllerRuntime {
         let ingress = sle_dli::ControllerEventRing::new_boxed()?;
         let host = sle_host::CommandHost::new_boxed(state.command_credits)?;
         let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
+        let snoop = sle_snoop::SnoopLog::new_boxed()?;
         let protocol_profile = match &state.controller {
             sle_dli::ControllerBackend::Ws73(controller) => controller.profile(),
             _ => 0,
@@ -563,6 +569,8 @@ impl ControllerRuntime {
             management <- new_mutex!(sle_management::Management::new(), "sparklink_management"),
             controller_events <- new_irq_lock!(controller_events, "sparklink_controller_events"),
             controller_event_poll <- new_poll_condvar!("sparklink_controller_event"),
+            snoop <- new_irq_lock!(snoop, "sparklink_snoop"),
+            snoop_poll <- new_poll_condvar!("sparklink_snoop_poll"),
             state <- new_mutex!(Some(state), "sparklink_runtime"),
             ingress <- new_irq_lock!(ingress, "sparklink_runtime_rx"),
             host <- new_irq_lock!(host, "sparklink_runtime_host"),
@@ -586,6 +594,7 @@ impl ControllerRuntime {
             state.controller.close();
         }
         self.controller_event_poll.notify_all();
+        self.snoop_poll.notify_all();
     }
 }
 
@@ -1358,6 +1367,8 @@ struct SparkLinkCtl {
     target: Mutex<Option<Arc<ControllerRuntime>>>,
     #[pin]
     controller_subscription: Mutex<Option<sle_controller_event::Subscription>>,
+    #[pin]
+    snoop_subscription: Mutex<Option<sle_controller_event::Subscription>>,
 }
 
 /// Advertising, scanning, device management ioctl sub-dispatcher.
@@ -1427,6 +1438,7 @@ fn ioctl_dev_select(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     };
     *me.target.lock() = identity;
     *me.controller_subscription.lock() = None;
+    *me.snoop_subscription.lock() = None;
     // Events queued for a previous selection must not masquerade as the new one.
     *me.events.lock() = EventQueue::new();
     me.last_seq.store(sle_event::BroadcastRing::current_seq(), core::sync::atomic::Ordering::Relaxed);
@@ -3455,6 +3467,7 @@ fn ioctl_discovery_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
 /// Read one complete native record without mutating the controller protocol.
 #[inline(never)]
 fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    if me.snoop_subscription.lock().is_some() { return Err(EBUSY); }
     let mut query: SleControllerEventQuery = read_user_struct(arg)?;
     if query.version != CONTROLLER_EVENT_VERSION { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if query.flags != 0 || (query.after_seq != 0 && query.generation == 0) { return Err(EINVAL); }
@@ -3483,10 +3496,39 @@ fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, 
     Ok(0)
 }
 
+#[inline(never)]
+fn ioctl_snoop_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let mut query: SleSnoopQuery = read_user_struct(arg)?;
+    if query.version != SNOOP_VERSION { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    if me.target.lock().as_ref().map(|target| target.identity) != Some(owner.identity) || query.generation == 0 { return Err(EINVAL); }
+    if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if me.controller_subscription.lock().is_some() { return Err(EBUSY); }
+    let gate=owner.schedule_gate.lock();
+    if *gate { return Err(ENODEV); }
+    if query.generation != owner.identity.generation { return Err(ENODEV); }
+    let record = {
+        let log=owner.snoop.lock();
+        if query.after_seq>log.current_seq() { return Err(EINVAL); }
+        log.next_after(query.after_seq)
+    };
+    drop(gate);
+    // The fd mutex may sleep; never acquire it under the IRQ retirement gate.
+    // A concurrent retirement remains visible to poll and the next query.
+    *me.snoop_subscription.lock()=Some(sle_controller_event::Subscription { identity:owner.identity,after_seq:query.after_seq });
+    query.record=record.ok_or(EAGAIN)?;
+    write_user_struct(arg,&query)?;
+    if let Some(current)=Option::as_mut(&mut *me.snoop_subscription.lock()) {
+        if current.identity==owner.identity { current.after_seq=current.after_seq.max(query.record.seq); }
+    }
+    Ok(0)
+}
+
 /// Infrastructure ioctl sub-dispatcher: PM, sync, DLI, events, PHY, role, RAL/RPA.
 #[inline(never)]
 fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
+        SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
         SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
@@ -3947,6 +3989,7 @@ impl MiscDevice for SparkLinkCtl {
                     ),
                     target <- new_mutex!(None),
                     controller_subscription <- new_mutex!(None),
+                    snoop_subscription <- new_mutex!(None),
                 }
             },
             GFP_KERNEL,
@@ -3977,6 +4020,16 @@ impl MiscDevice for SparkLinkCtl {
     }
 
     fn poll(me: Pin<&SparkLinkCtl>, file: &FsFile, table: &PollTable<'_>) -> u32 {
+        let snoop_subscription = *me.snoop_subscription.lock();
+        if let Some(subscription) = snoop_subscription {
+            if sle_authorization::require_admin().is_err() { return bindings::POLLERR; }
+            let target=me.target.lock().clone();
+            let Some(owner)=target.as_ref() else { return bindings::POLLERR|bindings::POLLHUP; };
+            if owner.identity!=subscription.identity { return bindings::POLLERR|bindings::POLLHUP; }
+            table.register_wait(file,&owner.snoop_poll);
+            if *owner.schedule_gate.lock() { return bindings::POLLERR|bindings::POLLHUP; }
+            return if owner.snoop.lock().current_seq()>subscription.after_seq {bindings::POLLIN|bindings::POLLRDNORM} else {0};
+        }
         let subscription = *me.controller_subscription.lock();
         if let Some(subscription) = subscription {
             let target = me.target.lock().clone();
@@ -4006,7 +4059,7 @@ impl MiscDevice for SparkLinkCtl {
     fn ioctl(me: Pin<&SparkLinkCtl>, _file: &FsFile, cmd: u32, arg: usize) -> Result<isize> {
         let _operation = me.operation.lock();
         let access = sle_authorization::classify(cmd)?;
-        if access == sle_authorization::Access::Protected {
+        if matches!(access, sle_authorization::Access::Protected | sle_authorization::Access::PrivilegedObserve) {
             sle_authorization::require_admin()?;
         }
         // Per-fd device routing: DEV_SELECT and DEV_GET_ACTIVE are handled
@@ -4157,6 +4210,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_EVENT_STATS
             | SL_IOCTL_DLI_INFO
             | SL_IOCTL_CONTROLLER_EVENT_GET
+            | SL_IOCTL_SNOOP_GET
             | SL_IOCTL_CONTROLLER_SNAPSHOT
             | SL_IOCTL_DISCOVERY_SUBMIT
             | SL_IOCTL_DISCOVERY_RESULT

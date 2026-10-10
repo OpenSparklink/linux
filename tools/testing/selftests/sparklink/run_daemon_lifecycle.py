@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 from run_runtime_lifecycle import file_record, load_qmp, wait_marker
 from qemu_verdict import KERNEL_FAULT
+from snoop_verdict import assess_snoop, capture_files
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
@@ -43,7 +44,7 @@ def copy_elf(source, target, root):
             shutil.copy2(path, dest)
 
 
-def assess(console, code, radio=False, production_policy=False, kernel_authorization=False, management_handoff=False, diagnostic_tools=False):
+def assess(console, code, radio=False, production_policy=False, kernel_authorization=False, management_handoff=False, diagnostic_tools=False, snoop_tools=False):
     errors = []
     if code:
         errors.append(f'QEMU exit {code}')
@@ -53,7 +54,7 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors.append('userspace runtime panic')
     if 'DAEMON_FAILURE:' in console:
         errors.append('guest assertion failed')
-    if re.search(r'/bin/(?:test-daemon|test-radio|test-diagnostic):[^\n]*not found', console):
+    if re.search(r'/bin/(?:test-daemon|test-radio|test-diagnostic|test-snoop):[^\n]*not found', console):
         errors.append('guest shell dependency missing')
     markers = re.findall(r'^DAEMON_(UID: 1000|ADD_SECOND|REMOVE_FIRST|STALE_SELECTION: rejected|READD_FIRST|HOTPLUG: independent=2 same_process=1 new_generation=1|LIFECYCLE: PASS)$', console, re.M)
     if markers != ['UID: 1000', 'ADD_SECOND', 'REMOVE_FIRST', 'STALE_SELECTION: rejected',
@@ -90,7 +91,7 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors.append('unexpected production authorization evidence')
     if kernel_authorization:
         matrix = re.findall(r'^KERNEL_AUTHORIZATION: (.*)$', console, re.M)
-        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected=101 denied=101 observe=35 configfs_denied=5 genl_denied=5 unknown=ENOTTY'
+        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected=102 denied=102 observe=35 configfs_denied=5 genl_denied=5 unknown=ENOTTY'
                     for uid, gid in [(1001,1001), (1000,1002), (0,0)]]
         if matrix != expected or re.findall(r'^KERNEL_AUTHORIZATION_STATE: (.*)$', console, re.M) != ['unchanged=1 native_admission=0 observe_no_power_sync=1']:
             errors.append('kernel authorization matrix missing, duplicated or incomplete')
@@ -114,6 +115,10 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors += assess_diagnostic(console)
     elif 'TOOL_DIAGNOSTIC_' in console or 'NativeDiagnosticQuery:' in console:
         errors.append('unexpected diagnostic tool evidence')
+    if snoop_tools:
+        errors += assess_snoop(console)
+    elif 'SNOOP_' in console:
+        errors.append('unexpected snoop evidence')
     return errors
 
 
@@ -279,11 +284,14 @@ def main():
     p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd ioctl/configfs credential-drop matrix')
     p.add_argument('--management-handoff', action='store_true', help='active radio cleanup on SIGTERM, same-generation successor, SIGINT cleanup; NO RF')
     p.add_argument('--diagnostic-tools', action='store_true', help='actual selected slkconfig observation/denial/exclusive native query and stale-drain gate')
+    p.add_argument('--snoop-tools', action='store_true', help='actual independent slkmon/slkdump captures, permission/loss/copyout/retirement; NO RF')
     a = p.parse_args()
     if a.management_handoff and not a.radio_policy:
         p.error('--management-handoff requires --radio-policy')
     if a.diagnostic_tools and not a.management_handoff:
         p.error('--diagnostic-tools requires --management-handoff')
+    if a.snoop_tools and not a.radio_policy:
+        p.error('--snoop-tools requires --radio-policy')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     manifest = {'scope': 'actual slkd and uid-1000 slctl on synthetic WS73: no firmware/RF acceptance',
@@ -292,6 +300,7 @@ def main():
                 'kernel_authorization': a.kernel_authorization,
                 'management_handoff': a.management_handoff,
                 'diagnostic_tools': a.diagnostic_tools,
+                'snoop_tools': a.snoop_tools,
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
@@ -309,6 +318,9 @@ def main():
             manifest['inputs'].append(file_record(HERE / 'daemon_management_test.c'))
         if a.diagnostic_tools:
             manifest['inputs'].append(file_record(HERE / 'daemon_diagnostic_guest.sh'))
+        if a.snoop_tools:
+            manifest['inputs'] += [file_record(HERE / name) for name in
+                ['daemon_snoop_guest.sh', 'daemon_snoop_test.c', 'snoop_verdict.py']]
         tracked = subprocess.check_output(['git', 'ls-files', 'crates', 'Cargo.toml', 'Cargo.lock'],
                                          cwd=userspace, text=True).splitlines()
         # Include untracked new implementation files before committing them.
@@ -323,6 +335,8 @@ def main():
             build = ['cargo', 'build', '-p', 'slkd', '-p', 'slctl']
             if a.diagnostic_tools:
                 build += ['-p','slkconfig']
+            if a.snoop_tools:
+                build += ['-p','slkmon','-p','slkdump']
             if a.production_policy:
                 build += ['--bins', '--examples']
             subprocess.run(build, cwd=userspace,
@@ -340,6 +354,11 @@ def main():
                 subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
                     '-o', str(root / 'bin/daemon-management'), str(HERE / 'daemon_management_test.c')],
                     stdout=log, stderr=subprocess.STDOUT, check=True)
+        if a.snoop_tools:
+            with (output / 'snoop-build.log').open('w') as log:
+                subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+                    '-o', str(root / 'bin/daemon-snoop'), str(HERE / 'daemon_snoop_test.c')],
+                    stdout=log, stderr=subprocess.STDOUT, check=True)
         for name in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'su', 'id', 'grep',
                      'awk', 'seq', 'cat', 'pidof', 'chmod', 'mkdir']:
             (root / 'bin' / name).symlink_to('busybox')
@@ -347,6 +366,12 @@ def main():
             copy_elf(userspace / 'target/debug' / name, root / 'bin' / name, root)
         if a.diagnostic_tools:
             copy_elf(userspace / 'target/debug/slkconfig', root / 'bin/slkconfig', root)
+        if a.snoop_tools:
+            for name in ['slkmon','slkdump']:
+                copy_elf(userspace / 'target/debug' / name, root / 'bin' / name, root)
+            manifest['unstripped_snoop_programs'] = [file_record(userspace/'target/debug'/name) for name in ['slkmon','slkdump']]
+            for name in ['slkd','slctl','slkmon','slkdump']:
+                subprocess.run(['strip','--strip-debug',str(root/'bin'/name)],check=True)
         if a.production_policy:
             copy_elf(userspace / 'target/debug/examples/bus_policy_probe', root / 'bin/bus-policy-probe', root)
             # Additional debug Rust ELF can exhaust a 512M guest's initramfs.
@@ -367,6 +392,8 @@ def main():
             programs.append('daemon-management')
         if a.diagnostic_tools:
             programs.append('slkconfig')
+        if a.snoop_tools:
+            programs += ['slkmon','slkdump','daemon-snoop']
         manifest['guest_programs'] = [file_record(root / 'bin' / name) for name in programs]
         for name in ['proc', 'sys', 'dev', 'etc', 'tmp']:
             (root / name).mkdir()
@@ -393,6 +420,8 @@ def main():
         shutil.copy2(HERE / 'daemon_lifecycle_guest.sh', root / 'bin/test-daemon')
         if a.diagnostic_tools:
             shutil.copy2(HERE / 'daemon_diagnostic_guest.sh',root/'bin/test-diagnostic')
+        if a.snoop_tools:
+            shutil.copy2(HERE / 'daemon_snoop_guest.sh',root/'bin/test-snoop')
         (root / 'bin/test-daemon').chmod(0o755)
         (root / 'init').write_text('''#!/bin/sh
 export PATH=/bin
@@ -425,6 +454,8 @@ poweroff -f
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_MANAGEMENT_HANDOFF=1'))
         if a.diagnostic_tools:
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin','export PATH=/bin\nexport SPARKLINK_TEST_DIAGNOSTIC_TOOLS=1'))
+        if a.snoop_tools:
+            f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin','export PATH=/bin\nexport SPARKLINK_TEST_SNOOP_TOOLS=1'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -464,7 +495,14 @@ poweroff -f
                 monitor.execute('device_add', dict(id='sle0', port='1', **props))
                 code = process.wait(timeout=30)
             manifest['qemu_exit'] = code
-            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy, a.kernel_authorization, a.management_handoff, a.diagnostic_tools)
+            transcript = console.read_text(errors='replace').replace('\r', '')
+            errors = assess(transcript, code, a.radio_policy, a.production_policy, a.kernel_authorization, a.management_handoff, a.diagnostic_tools, a.snoop_tools)
+            if a.snoop_tools:
+                captures = capture_files(transcript)
+                manifest['snoop_captures'] = []
+                for name, data in captures.items():
+                    capture = output / (name + '.snoop'); capture.write_bytes(data)
+                    manifest['snoop_captures'].append(file_record(capture))
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'

@@ -160,3 +160,16 @@ int sparklink_native_event(u16 id, u64 generation, u32 profile, u16 event_code,
 	return sparklink_native_event_rust(id, generation, profile, event_code, params, length);
 }
 EXPORT_SYMBOL_GPL(sparklink_native_event);
+
+void sparklink_native_snoop_rx(u16 id, u64 generation, const u8 *data, size_t length)
+{
+	sparklink_native_snoop_rx_rust(id, generation, data, length);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_snoop_rx);
+
+void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
+			      const u8 *params, size_t length, int status)
+{
+	sparklink_native_snoop_tx_rust(id, generation, opcode, params, length, status);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_snoop_tx);

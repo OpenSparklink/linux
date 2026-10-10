@@ -5,10 +5,11 @@ use kernel::{bindings, prelude::*};
 use super::sle_uapi::*;
 
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Access { Observe, Affinity, Protected }
+pub(crate) enum Access { Observe, Affinity, Protected, PrivilegedObserve }
 
 pub(crate) fn classify(cmd: u32) -> Result<Access> {
     match cmd {
+        SL_IOCTL_SNOOP_GET => Ok(Access::PrivilegedObserve),
         SL_IOCTL_DEV_GET_ACTIVE
         | SL_IOCTL_DEV_SELECT => Ok(Access::Affinity),
         SL_IOCTL_MANAGEMENT_QUERY

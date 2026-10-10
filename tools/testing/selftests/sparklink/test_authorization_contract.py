@@ -23,7 +23,11 @@ class AuthorizationContract(unittest.TestCase):
             guest = re.search(rf'{kind}\[\] = \{{(.*?)\}};', source, re.S)[1]
             policy = (ROOT / 'net/sparklink/sle_authorization.rs').read_text()
             branch = re.search(rf'((?:\s*(?:\| )?SL_IOCTL_\w+)+) => Ok\(Access::{access}\)', policy)[1]
-            self.assertCountEqual(re.findall(r'SL_IOCTL_\w+',guest),re.findall(r'SL_IOCTL_\w+',branch))
+            expected = re.findall(r'SL_IOCTL_\w+',branch)
+            if kind == 'protected':
+                privileged = re.search(r'((?:\s*(?:\| )?SL_IOCTL_\w+)+) => Ok\(Access::PrivilegedObserve\)', policy)[1]
+                expected += re.findall(r'SL_IOCTL_\w+',privileged)
+            self.assertCountEqual(re.findall(r'SL_IOCTL_\w+',guest),expected)
 
     def test_missing_feature_config_rejected(self):
         names = ['RUST','SPARKLINK','SPARKLINK_SLE','SPARKLINK_WS73_USB']

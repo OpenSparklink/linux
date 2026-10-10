@@ -23,6 +23,8 @@
 #include "../../../../include/uapi/linux/sparklink.h"
 
 static const unsigned long protected[] = {
+    /* Capability-requiring passive trace, without Managed writer ownership. */
+    SL_IOCTL_SNOOP_GET,
     SL_IOCTL_MANAGEMENT_ACQUIRE, SL_IOCTL_MANAGEMENT_RELEASE,
 	SL_IOCTL_AFH_CLASSIFY,
 	SL_IOCTL_AFH_HOP_NEXT,

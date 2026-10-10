@@ -1157,4 +1157,34 @@ struct sle_management_query {
 #define SL_IOCTL_MANAGEMENT_RELEASE _IOW(SL_MAGIC, 0x8c, struct sle_management_request)
 #define SL_IOCTL_MANAGEMENT_QUERY _IOWR(SL_MAGIC, 0x8d, struct sle_management_query)
 
+/* Independent privileged DLI seam trace, not a command/reply consumer. RX
+ * denotes a validated HCC slot before DLI decoding; TX denotes transfer result,
+ * timestamped after transport completion, so RX may precede TX in the log.
+ * WS73 packet bytes include the A1/A2 header. Oversize packets have an explicit
+ * truncated prefix and original_length, never silently masquerade as complete.
+ */
+#define SLE_SNOOP_VERSION 1U
+#define SLE_SNOOP_PAYLOAD_MAX 320U
+#define SLE_SNOOP_RX 1U
+#define SLE_SNOOP_TX 2U
+#define SLE_SNOOP_WS73_DLI 1U
+#define SLE_SNOOP_TRUNCATED 1U
+struct sle_snoop_record {
+    __aligned_u64 seq, generation, timestamp_ns, lost;
+    __u32 profile, original_length;
+    __s32 status;
+    __u16 dev_index;
+    __u8 direction, format;
+    __u16 captured_length, flags;
+    __u32 reserved;
+    __u8 payload[SLE_SNOOP_PAYLOAD_MAX];
+};
+struct sle_snoop_query {
+    __aligned_u64 generation, after_seq;
+    __u32 version, flags;
+    __aligned_u64 reserved;
+    struct sle_snoop_record record;
+};
+#define SL_IOCTL_SNOOP_GET _IOWR(SL_MAGIC, 0x8e, struct sle_snoop_query)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

@@ -49,9 +49,17 @@ second=$(list | grep -v "$first" | awk '{print $1}')
 [ -n "$second" ] || fail 'distinct second registration'
 ctl --adapter "$second" show || fail 'second show'
 [ "$(pidof slkd)" = "$pid" ] || fail 'daemon restarted before removal'
+if [ "$SPARKLINK_TEST_SNOOP_TOOLS" = 1 ]; then
+    . /bin/test-snoop
+    snoop_begin "$second"
+fi
 if [ "$SPARKLINK_TEST_RADIO" = 1 ]; then
     . /bin/test-radio
     radio_rounds 20 "$first" "$second" initial
+fi
+if [ "$SPARKLINK_TEST_SNOOP_TOOLS" = 1 ]; then
+    snoop_finish "$second"
+    snoop_before_remove "$first"
 fi
 echo 'DAEMON_REMOVE_FIRST'
 wait_ready 1
@@ -60,6 +68,7 @@ ctl --adapter "$second" show || fail 'survivor not usable'
 if ctl --adapter "$first" show > /tmp/stale.out 2>&1; then fail 'stale selection reached survivor'; fi
 grep -q 'not a live registration' /tmp/stale.out || fail 'stale selection error missing'
 echo 'DAEMON_STALE_SELECTION: rejected'
+if [ "$SPARKLINK_TEST_SNOOP_TOOLS" = 1 ]; then snoop_removed; fi
 echo 'DAEMON_READD_FIRST'
 wait_ready 2
 replacement=$(list | grep -v "$second" | awk '{print $1}')
@@ -67,6 +76,7 @@ replacement=$(list | grep -v "$second" | awk '{print $1}')
 ctl --adapter "$replacement" show || fail 'replacement not Ready'
 ctl --adapter "$second" show || fail 'survivor changed after replug'
 [ "$(pidof slkd)" = "$pid" ] || fail 'daemon restarted during hotplug'
+if [ "$SPARKLINK_TEST_SNOOP_TOOLS" = 1 ]; then snoop_replug "$replacement" "$first"; fi
 if [ "$SPARKLINK_TEST_RADIO" = 1 ]; then
     radio_rounds 2 "$replacement" "$second" replug
 fi

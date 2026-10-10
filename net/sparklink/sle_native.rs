@@ -326,6 +326,33 @@ pub(crate) extern "C" fn sparklink_native_unregister_rust(id: u16, generation: u
 
 /// Callback receives a validated HCC slot, not a complete USB aggregate.
 #[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_snoop_rx_rust(id:u16, generation:u64, data:*const u8, length:usize) {
+    if data.is_null() || length==0 || length>20*1024 { return; }
+    let Some(owner)=super::sle_usb::ingress_owner(DeviceIdentity {id,generation}) else { return; };
+    if owner.protocol_profile!=1 { return; }
+    // SAFETY: driver retains its validated HCC slot until the callback returns.
+    let data=unsafe {core::slice::from_raw_parts(data,length)};
+    let gate=owner.schedule_gate.lock();
+    if *gate {return;}
+    owner.snoop.lock().rx(owner.identity,owner.protocol_profile,data);
+    drop(gate); owner.snoop_poll.notify_all();
+}
+
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_snoop_tx_rust(id:u16, generation:u64, opcode:u16, params:*const u8, length:usize, status:i32) {
+    if params.is_null() || length>u16::MAX as usize {return;}
+    let Some(owner)=super::sle_usb::ingress_owner(DeviceIdentity {id,generation}) else {return;};
+    if owner.protocol_profile!=1 {return;}
+    // SAFETY: driver retains the command parameter buffer for this callback.
+    let params=unsafe {core::slice::from_raw_parts(params,length)};
+    let gate=owner.schedule_gate.lock();
+    if *gate {return;}
+    owner.snoop.lock().tx(owner.identity,owner.protocol_profile,opcode,params,status);
+    drop(gate); owner.snoop_poll.notify_all();
+}
+
+/// Callback receives a validated HCC slot, not a complete USB aggregate.
+#[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_event_rust(
     id: u16, generation: u64, profile: u32, event_code: u16, params: *const u8, length: usize,
 ) -> i32 {

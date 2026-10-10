@@ -429,6 +429,7 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 
 	if (service != WS73_WIRE_SLE_SERVICE || queue != WS73_WIRE_SLE_QUEUE)
 		return 0;
+	sparklink_native_snoop_rx(ws->native_id, ws->native_generation, data, size);
 	if (size >= 3 && data[0] == 0xa2 &&
 	    (get_unaligned_le16(data + 1) == 1 || get_unaligned_le16(data + 1) == 2)) {
 		ret = ws73_dli_validate_reply(data, size);
@@ -558,6 +559,7 @@ static int ws73_native_validate_step(void *context, unsigned int operation,
 static int ws73_native_command(void *context, u16 opcode, const u8 *params, size_t length)
 {
 	struct ws73_usb *ws = context;
+	bool traced = false;
 	int ret;
 
 	mutex_lock(&ws->tx_lock);
@@ -570,9 +572,13 @@ static int ws73_native_command(void *context, u16 opcode, const u8 *params, size
 		goto out;
 	ws->tx_sequence++;
 	ret = ws73_write(ws, ws->tx, ret);
+	sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
+	traced = true;
 	if (ret && !READ_ONCE(ws->stopping))
 		ws73_async_failure(ws, ret);
 out:
+	if (!traced)
+		sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
 	mutex_unlock(&ws->tx_lock);
 	return ret;
 }

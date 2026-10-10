@@ -182,3 +182,44 @@ has nine failed assertions. This is not real WS73/RF, slkd dynamic-adapter,
 unprivileged application, 20-cycle or complete lifecycle acceptance. USB
 context generations, Host transactions/credits, connection handle mapping,
 PM and the full fault matrix remain required.
+
+Independent native WS73 snoop
+----------------------------
+
+SL_IOCTL_SNOOP_GET (0xc198538e) is a privileged passive observation channel,
+separate from management leases and the consuming legacy raw reply queue.
+Each Runtime has a 64-record preallocated IRQ-safe ring and waitqueue.
+Readers explicitly select index and exact nonzero generation. They pass
+version=1, after_seq and zero flags/reserved in a pointer-free 408-byte query;
+the returned 376-byte record carries identity, sequence, CLOCK_BOOTTIME,
+direction, transport status, original/captured length and up to 320 bytes.
+The integer layout is eight-byte aligned; no compat user pointers exist.
+
+CAP_NET_ADMIN is checked before usercopy and when polling a snoop fd.
+PrivilegedObserve does not acquire a management lease, authorize a writer,
+sync power or submit protocol work. Independent readers copy the same
+retained records without consuming replies or other readers' records.
+The kernel reports lost=seq-after_seq-1 after ring overwrite, and explicitly
+marks oversized prefixes TRUNCATED. Payload tails and reserved fields are
+zeroed. EFAULT does not acknowledge the unread record. An fd already in
+controller-event mode rejects snoop with EBUSY and conversely; DEV_SELECT
+resets observation mode. Ioctls on each open file are serialized.
+
+Only WS73 profile 1 is implemented. RX records contain the service-10,
+queue-8 HCC-validated SLE slot before DLI parsing. TX records contain the
+A1 command bytes and submission/transfer result, timestamped after the
+attempt returns; an RX response can precede TX_RESULT. Transport success
+does not imply DLI Complete or radio delivery. This is a DLI seam trace,
+not USB aggregate, HCC header, bootstrap, PCAP or physical RF capture.
+Removal wakes stale observers with POLLERR|POLLHUP and ENODEV; reused
+indices never retarget old fds. Producers do not allocate or perform I/O,
+and release the IRQ retirement gate before sleeping fd mutexes or wakeup.
+
+The daemon lifecycle runner's --snoop-tools option requires --radio-policy.
+It runs actual slkmon/slkdump alongside managed slkd and ordinary slctl,
+compares exported portable capture bytes, matches raw scan report data,
+address and RSSI to the independent slctl result, exercises permission,
+copyout retry, slow-reader loss, unplug wakeup and new-generation capture.
+QMP, full console, capture files and source/input/binary hashes are retained.
+These synthetic USB gates do not satisfy physical WS73/RF acceptance or
+complete legacy-profile/Proxy/PDU/security/PM/release issue requirements.

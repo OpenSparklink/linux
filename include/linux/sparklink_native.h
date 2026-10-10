@@ -78,4 +78,13 @@ int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t leng
 int sparklink_native_event(u16 id, u64 generation, u32 profile, u16 event_code,
 			   const u8 *params, size_t length);
 
+/* Optional observational hooks. No allocation, I/O or protocol admission;
+ * errors/drops must never alter transport behavior. Buffers are copied now.
+ * RX is one HCC-validated WS73 DLI slot, before DLI schema/domain decoding.
+ * TX is the WS73 A1 command and actual blocking transfer result, not Complete.
+ */
+void sparklink_native_snoop_rx(u16 id, u64 generation, const u8 *data, size_t length);
+void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
+			      const u8 *params, size_t length, int status);
+
 #endif
