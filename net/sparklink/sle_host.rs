@@ -39,7 +39,7 @@ pub(crate) struct CommandHost {
     requests: CmdRequestQueue,
     credits: u8,
     active: Option<InFlight>,
-    reply: Option<SleEvent>,
+    reply: Option<(SleEvent, u64)>,
     fault: Option<Error>,
     next_cookie: u64,
     broadcast_cookie: u64,
@@ -155,7 +155,7 @@ impl CommandHost {
         self.operations.entries[slot] = Some(Operation {
             request_id, cookie, intent, state: State::Queued, error: 0,
             status: 0, opcode: 0, step: 0, count: parts.len() as u8,
-            power_step, selected_power: None,
+            power_step, selected_power: None, completed_boottime_ns: 0,
         });
         Ok(())
     }
@@ -325,7 +325,9 @@ impl CommandHost {
                 .as_ref()
                 .is_some_and(|active| active.opcode == opcode)
         {
-            self.reply = Some(event);
+            // SAFETY: CLOCK_BOOTTIME may be read under this IRQ-safe Host lock.
+            let received = unsafe { kernel::bindings::ktime_get_boottime() } as u64;
+            self.reply = Some((event, received));
             None
         } else {
             Some(event)
@@ -335,7 +337,7 @@ impl CommandHost {
     /// The protocol consumer releases the on-wire slot. Keeping it occupied
     /// until consumption bounds management delivery even if RX is busy.
     pub(crate) fn take_reply(&mut self) -> Option<HostReply> {
-        let event = self.reply.take()?;
+        let (event, received) = self.reply.take()?;
         let active = self.active.take()?;
         let current_intent = if let Some(tag) = active.recipe {
             self.current_recipe(tag)
@@ -353,7 +355,7 @@ impl CommandHost {
                 SleEvent::NativeCommandReply { status, complete, data, .. } => (*complete, *status, data.as_slice()),
                 _ => (false, 0, &[][..]),
             };
-            self.operations.reply(tag.cookie, tag.step, complete, status, data, current_intent);
+            self.operations.reply(tag.cookie, tag.step, complete, status, data, current_intent, received);
         }
         let recipe = active.recipe.map(|tag| {
             let (complete, status) = match &event {

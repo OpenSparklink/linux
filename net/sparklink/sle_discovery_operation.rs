@@ -36,6 +36,8 @@ pub(crate) struct Operation {
     pub(crate) count: u8,
     pub(crate) power_step: u8,
     pub(crate) selected_power: Option<i8>,
+    /// Final successful matching Complete receipt; zero before/without success.
+    pub(crate) completed_boottime_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +144,7 @@ impl Operations {
         status: u8,
         data: &[u8],
         current: bool,
+        received_boottime_ns: u64,
     ) {
         let Some(op) = self
             .entries
@@ -190,6 +193,7 @@ impl Operations {
         }
         if step + 1 == op.count {
             op.state = State::Succeeded;
+            op.completed_boottime_ns = received_boottime_ns;
             let radio = if op.intent.enabled() { 2 } else { 1 };
             match op.intent {
                 DiscoveryIntent::Advertising(_) => self.advertising = radio,

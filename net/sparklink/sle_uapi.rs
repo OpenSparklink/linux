@@ -3150,3 +3150,27 @@ impl CheckReserved for SleSnoopQuery {
 pub(crate) const SL_IOCTL_SNOOP_GET: u32 = _IOWR::<SleSnoopQuery>(SL_MAGIC, 0x8e);
 const _: () = assert!(core::mem::size_of::<SleSnoopRecord>() == 376);
 const _: () = assert!(core::mem::size_of::<SleSnoopQuery>() == 408);
+
+/// Read-only final Complete timing; existing 64-byte result ABI is unchanged.
+pub(crate) const SL_IOCTL_DISCOVERY_TIMING: u32 = _IOWR::<SleDiscoveryTiming>(SL_MAGIC, 0x8f);
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiscoveryTiming {
+    pub generation: u64,
+    pub request_id: u64,
+    pub completed_boottime_ns: u64,
+    pub version: u32,
+    pub flags: u32,
+    pub operation: u32,
+    pub state: u32,
+    pub dev_index: u16,
+    pub opcode: u16,
+    pub status: u8,
+    pub reserved: [u8; 3],
+}
+// SAFETY: repr(C), integer/byte fields; every bit pattern valid.
+unsafe impl FromBytes for SleDiscoveryTiming {}
+impl CheckReserved for SleDiscoveryTiming {
+ fn check_reserved(&self)->Result { if self.reserved==[0;3] {Ok(())} else {Err(EINVAL)} }
+}
+const _: () = assert!(core::mem::size_of::<SleDiscoveryTiming>()==48);

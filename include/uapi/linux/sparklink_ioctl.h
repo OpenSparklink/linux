@@ -582,6 +582,24 @@ struct sle_controller_snapshot {
 #define SL_IOCTL_CONTROLLER_SNAPSHOT _IOWR(SL_MAGIC, 0x8a, struct sle_controller_snapshot)
 
 
+/* Matched final Complete receipt in CLOCK_BOOTTIME ns. Zero until success.
+ * Observational, explicit generation/request; does not consume event history.
+ * The existing sle_discovery_result and ioctl remain unchanged. */
+struct sle_discovery_timing {
+ __aligned_u64 generation;
+ __aligned_u64 request_id;
+ __aligned_u64 completed_boottime_ns;
+ __u32 version;
+ __u32 flags;
+ __u32 operation;
+ __u32 state;
+ __u16 dev_index;
+ __u16 opcode;
+ __u8 status;
+ __u8 reserved[3];
+};
+#define SL_IOCTL_DISCOVERY_TIMING _IOWR(SL_MAGIC, 0x8f, struct sle_discovery_timing)
+
 /* --- PHY layer ---------------------------------------------------------- */
 
 struct sle_phy_info {

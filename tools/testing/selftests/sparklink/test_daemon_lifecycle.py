@@ -176,7 +176,7 @@ class AuthorizationVerdict(unittest.TestCase):
 class KernelAuthorizationVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected=102 denied=102 observe=35 configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
+        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected=102 denied=102 observe=36 configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
                              for uid,gid in [(1001,1001),(1000,1002),(0,0)])
         cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 observe_no_power_sync=1\n'
         cls.good = GOOD + cls.matrix + cls.state

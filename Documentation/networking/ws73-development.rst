@@ -625,3 +625,26 @@ remains authoritative. The real North Star and four-controller parallel pairs
 still require physical devices, qualified configuration and receiver USB/HCC/DLI
 captures. Native event fds activate their subscription before epoll registration
 so the selected controller's queue can wake the daemon.
+
+Matched Complete timing
+-----------------------
+
+``SL_IOCTL_DISCOVERY_TIMING`` (0x8f, 48-byte ``sle_discovery_timing``)
+observes an explicit selected generation/request without taking management
+ownership or consuming events. Version 1, flags/reserved zero and nonzero
+identity are required. Missing requests return ENOENT; stale generations
+return ENODEV. The existing 64-byte discovery result and its ioctl are unchanged.
+
+The Host stamps CLOCK_BOOTTIME when an opcode-matched response enters its
+reserved slot, before worker consumption. Only the final successful Complete
+of the current public recipe publishes that timestamp. Pending, failed,
+cancelled and faulted recipes without success retain zero; later replies/faults
+never rewrite a previously completed result. This clock denotes validated DLI
+Complete receipt, not a PHY start timestamp. Readers cannot generate success.
+
+Ordinary applications obtain ``GetDiscoveryTiming`` via slkd. slctl bounds
+matching RX and observation to ten seconds after this receipt and keeps an
+independent invocation lower bound against older queued RX. Query delays count
+against the window. No fallback to daemon poll time or a narrower admission
+window is permitted. The explicit model tests remain software support only;
+physical firmware/RF and all real North Star checks require hardware evidence.

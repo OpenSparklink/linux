@@ -3464,6 +3464,30 @@ fn ioctl_discovery_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
     Ok(0)
 }
 
+/// Retain the exact receipt clock of the reserved final successful Complete.
+#[inline(never)]
+fn ioctl_discovery_timing(context:&RuntimeContext, me:Pin<&SparkLinkCtl>, arg:usize)->Result<isize> {
+ let input:SleDiscoveryTiming=read_user_struct(arg)?;
+ if input.version!=1 {return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));}
+ if input.flags!=0 || input.generation==0 || input.request_id==0 {return Err(EINVAL);}
+ let owner=discovery_owner(context,me)?;
+ if input.generation!=owner.identity.generation {return Err(ENODEV);}
+ let state=context.lock()?;
+ let record=owner.host.lock().discovery_result(input.request_id).ok_or(ENOENT)?;
+ // SAFETY: all fields are integers/bytes, initialize every output byte.
+ let mut output:SleDiscoveryTiming=unsafe {core::mem::zeroed()};
+ output.version=1;output.generation=owner.identity.generation;output.request_id=record.request_id;
+ output.completed_boottime_ns=record.completed_boottime_ns;output.dev_index=owner.identity.id;
+ output.state=record.state as u32;output.opcode=record.opcode;output.status=record.status;
+ output.operation=match record.intent {
+  sle_command_plan::DiscoveryIntent::Advertising(true)=>1,
+  sle_command_plan::DiscoveryIntent::Advertising(false)=>2,
+  sle_command_plan::DiscoveryIntent::Scanning(true)=>3,
+  sle_command_plan::DiscoveryIntent::Scanning(false)=>4,
+ };
+ drop(state);write_user_struct(arg,&output)?;Ok(0)
+}
+
 /// Read one complete native record without mutating the controller protocol.
 #[inline(never)]
 fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
@@ -3532,6 +3556,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
         SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
+        SL_IOCTL_DISCOVERY_TIMING => ioctl_discovery_timing(context, me, arg),
         SL_IOCTL_CONTROLLER_EVENT_GET => ioctl_controller_event_get(context, me, arg),
         SL_IOCTL_PM_INFO => {
             let info = {
@@ -4214,6 +4239,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_CONTROLLER_SNAPSHOT
             | SL_IOCTL_DISCOVERY_SUBMIT
             | SL_IOCTL_DISCOVERY_RESULT
+            | SL_IOCTL_DISCOVERY_TIMING
             | SL_IOCTL_DLI_POLL_EVENT
             | SL_IOCTL_DLI_RESET
             | SL_IOCTL_DLI_SEND_CMD

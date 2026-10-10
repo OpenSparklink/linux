@@ -24,6 +24,7 @@ fn add(ops: &mut Operations, id: u64, intent: I, count: u8) {
             count
         },
         selected_power: None,
+        completed_boottime_ns: 0,
     });
 }
 #[test]
@@ -55,7 +56,7 @@ fn status_complete_power_and_failure_each_step() {
             add(&mut o, 1, I::Advertising(true), 4);
             for step in 0..=fail {
                 o.sent(1, step, 0xc02 + step as u16);
-                o.reply(1, step, false, 0, &[], true);
+                o.reply(1, step, false, 0, &[], true, 123);
                 assert_eq!(o.find(1).unwrap().state, State::Pending);
                 o.reply(
                     1,
@@ -63,8 +64,7 @@ fn status_complete_power_and_failure_each_step() {
                     true,
                     if step == fail { status } else { 0 },
                     &[0xd6],
-                    true,
-                );
+                    true, 123);
             }
             let r = o.find(1).unwrap();
             assert_eq!(r.state, State::Failed);
@@ -82,13 +82,13 @@ fn stop_stays_on_until_complete_and_failed_stop_keeps_on() {
     o.advertising = 2;
     add(&mut o, 1, I::Advertising(false), 1);
     o.sent(1, 0, 0xc05);
-    o.reply(1, 0, false, 0, &[], true);
+    o.reply(1, 0, false, 0, &[], true, 123);
     assert_eq!(o.advertising, 2);
-    o.reply(1, 0, true, 0xfd, &[], true);
+    o.reply(1, 0, true, 0xfd, &[], true, 123);
     assert_eq!(o.advertising, 2);
     add(&mut o, 2, I::Advertising(false), 1);
     o.sent(2, 0, 0xc05);
-    o.reply(2, 0, true, 0, &[], true);
+    o.reply(2, 0, true, 0, &[], true, 123);
     assert_eq!(o.advertising, 1);
 }
 #[test]
@@ -100,11 +100,11 @@ fn cancelled_enable_is_uncertain_until_stop_barrier() {
     o.sent(1, 2, 0xc05);
     o.cancel_domain(I::Advertising(false), -125);
     add(&mut o, 2, I::Advertising(false), 1);
-    o.reply(1, 2, true, 0, &[], false);
+    o.reply(1, 2, true, 0, &[], false, 123);
     assert_eq!(o.advertising, 0);
     assert_eq!(o.find(1).unwrap().state, State::Cancelled);
     o.sent(2, 0, 0xc05);
-    o.reply(2, 0, true, 0, &[], true);
+    o.reply(2, 0, true, 0, &[], true, 123);
     assert_eq!(o.advertising, 1);
     assert!(o.can_start(I::Scanning(true)));
 }
@@ -119,7 +119,7 @@ fn radio_unknown_and_other_domain_pending_block_start() {
     add(&mut o, 1, I::Scanning(false), 1);
     assert!(!o.can_start(I::Advertising(true)));
     o.sent(1, 0, 0x1002);
-    o.reply(1, 0, true, 0, &[], true);
+    o.reply(1, 0, true, 0, &[], true, 123);
     assert!(o.can_start(I::Advertising(true)));
 }
 #[test]
@@ -131,7 +131,7 @@ fn faults_are_per_owner_and_do_not_rewrite_terminal_results() {
         add(o, 2, I::Scanning(false), 1);
     }
     a.sent(1, 0, 0xc05);
-    a.reply(1, 0, true, 0, &[], true);
+    a.reply(1, 0, true, 0, &[], true, 123);
     a.fault(-110);
     assert_eq!(a.find(1).unwrap().state, State::Succeeded);
     assert_eq!(a.find(2).unwrap().state, State::Faulted);
@@ -145,7 +145,7 @@ fn result_reads_are_independent_and_original_power_byte_survives() {
         let mut o = Operations::new();
         add(&mut o, 1, I::Advertising(true), 1);
         o.sent(1, 0, 0xc05);
-        o.reply(1, 0, true, 0, &[byte], true);
+        o.reply(1, 0, true, 0, &[byte], true, 123);
         for _ in 0..10 {
             let r = o.find(1).unwrap();
             assert_eq!(r.selected_power, Some(byte as i8));
@@ -161,20 +161,39 @@ fn readiness_requires_both_confirmed_stops_and_is_cleared_on_fault() {
     assert!(!o.initialized);
     add(&mut o, 1, I::Advertising(false), 1);
     o.sent(1, 0, 0xc05);
-    o.reply(1, 0, true, 0, &[], true);
+    o.reply(1, 0, true, 0, &[], true, 123);
     assert!(!o.initialized);
     add(&mut o, 2, I::Scanning(false), 1);
     o.sent(2, 0, 0x1002);
-    o.reply(2, 0, true, 0xfd, &[], true);
+    o.reply(2, 0, true, 0xfd, &[], true, 123);
     assert!(!o.initialized);
     add(&mut o, 3, I::Scanning(false), 1);
     o.sent(3, 0, 0x1002);
-    o.reply(3, 0, true, 0, &[], true);
+    o.reply(3, 0, true, 0, &[], true, 123);
     assert!(o.initialized);
     add(&mut o, 4, I::Advertising(true), 1);
     o.sent(4, 0, 0xc05);
-    o.reply(4, 0, true, 0, &[], true);
+    o.reply(4, 0, true, 0, &[], true, 123);
     assert!(o.initialized); // Ready is Host usability, not RF off.
     o.fault(-110);
     assert!(!o.initialized);
+}
+
+#[test]
+fn completion_clock_is_retained_only_for_correlated_success() {
+ let mut o=Operations::new();add(&mut o,1,I::Scanning(true),2);
+ o.sent(1,0,0x1001);o.reply(1,0,true,0,&[],true,10);
+ assert_eq!(o.find(1).unwrap().completed_boottime_ns,0);
+ o.sent(1,1,0x1002);o.reply(1,1,false,0,&[],true,20);
+ assert_eq!(o.find(1).unwrap().completed_boottime_ns,0);
+ o.reply(1,1,true,0,&[],false,30);
+ assert_eq!(o.find(1).unwrap().completed_boottime_ns,0);
+ o.reply(1,1,true,0,&[],true,40);
+ assert_eq!(o.find(1).unwrap().completed_boottime_ns,40);
+ o.reply(1,1,true,0,&[],true,50);o.fault(-5);
+ assert_eq!(o.find(1).unwrap().completed_boottime_ns,40);
+ add(&mut o,2,I::Scanning(false),1);o.sent(2,0,0x1002);o.reply(2,0,true,1,&[],true,60);
+ assert_eq!(o.find(2).unwrap().completed_boottime_ns,0);
+ add(&mut o,3,I::Scanning(false),1);o.cancel_domain(I::Scanning(false),-125);
+ o.reply(3,0,true,0,&[],true,70);assert_eq!(o.find(3).unwrap().completed_boottime_ns,0);
 }
