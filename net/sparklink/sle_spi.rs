@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! SparkLink SPI transport for SLE DLI controllers.
+//! Experimental SPI framing; hardware controller operations are unsupported.
 //!
 //! Implements DLI packet framing over SPI following T/XS 10003-2025
 //! SPI transport binding. The SPI transport uses a register-based
@@ -47,8 +47,7 @@ use kernel::alloc::KVec;
 use kernel::prelude::*;
 
 use super::sle_dli::{
-    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleFeature, SleOpcode,
-    SleStatus, SLE_MEAS_RSSI, SLE_SEC_AES_CCM, SLE_TRANSPORT_UNRELIABLE,
+    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode,
 };
 
 // =========================================================================
@@ -385,32 +384,19 @@ impl SleController for SpiController {
         info.name[..name.len()].copy_from_slice(name);
         info.bus = SleBus::Spi;
         info.addr = self.addr;
-        info.fw_version = 0x0001_0000;
-        info.features = (SleFeature::Encryption as u64)
-            | (SleFeature::Mcs4 as u64)
-            | (SleFeature::Pilot8to1 as u64)
-            | (SleFeature::Crc32 as u64);
-        info.max_pdu_payload = 255;
-        info.max_connections = 2;
-        info.max_mtu = 247;
-        info.max_mps = 247;
-        info.transport_modes = SLE_TRANSPORT_UNRELIABLE;
-        info.measurement_cap = SLE_MEAS_RSSI;
-        info.security_cap = SLE_SEC_AES_CCM;
+        // No firmware/capability has been queried. Do not advertise the
+        // codec's hypothetical limits as supported hardware operations.
+        info.max_pdu_payload = 0;
+        info.max_connections = 0;
+        info.max_mtu = 0;
+        info.max_mps = 0;
+        info.transport_modes = 0;
         info
     }
 
     fn open(&self) -> Result {
-        if self.opened.get() {
-            return Err(EBUSY);
-        }
-        self.opened.set(true);
-        pr_info!(
-            "sparklink-spi: open freq={}Hz mode={}\n",
-            self.config.freq_hz,
-            self.config.mode
-        );
-        Ok(())
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
     fn close(&self) {
@@ -418,43 +404,14 @@ impl SleController for SpiController {
         pr_info!("sparklink-spi: close\n");
     }
 
-    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
-        let mut hdr_buf = [0u8; 8];
-        let mut data_buf = [0u8; 260];
-        let (hdr_len, data_len) =
-            self.prepare_command(opcode as u16, params, &mut hdr_buf, &mut data_buf);
-        if hdr_len == 0 {
-            return Err(EINVAL);
-        }
-        pr_debug!(
-            "sparklink-spi: cmd 0x{:04x} hdr={} data={}\n",
-            opcode as u16,
-            hdr_len,
-            data_len
-        );
-        self.enqueue_event(SleEvent::CommandComplete {
-            opcode,
-            command_credits: 1,
-            status: SleStatus::Success,
-            data: KVec::new(),
-        });
-        Ok(())
+    fn send_command(&self, _opcode: SleOpcode, _params: &[u8]) -> Result {
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
-    fn send_data(&self, handle: u16, data: &[u8]) -> Result {
-        let mut hdr_buf = [0u8; 8];
-        let mut data_buf = [0u8; 260];
-        let (hdr_len, data_len) = self.prepare_data(handle, data, &mut hdr_buf, &mut data_buf);
-        if hdr_len == 0 {
-            return Err(EINVAL);
-        }
-        pr_debug!(
-            "sparklink-spi: data handle={} hdr={} payload={}\n",
-            handle,
-            hdr_len,
-            data_len
-        );
-        Ok(())
+    fn send_data(&self, _handle: u16, _data: &[u8]) -> Result {
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
     fn poll_event(&self) -> Option<SleEvent> {
@@ -469,7 +426,7 @@ impl SleController for SpiController {
     }
 
     fn reset(&self) -> Result {
-        pr_info!("sparklink-spi: reset\n");
-        Ok(())
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 }

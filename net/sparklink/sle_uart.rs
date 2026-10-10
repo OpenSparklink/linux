@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! SparkLink UART transport for SLE DLI controllers.
+//! Experimental UART framing; hardware controller operations are unsupported.
 //!
 //! Implements DLI packet framing over UART following T/XS 10003-2025
 //! UART transport binding. The framing is similar to the Bluetooth HCI
@@ -45,9 +45,7 @@ use kernel::alloc::KVec;
 use kernel::prelude::*;
 
 use super::sle_dli::{
-    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleFeature, SleOpcode,
-    SleStatus, SLE_MEAS_RSSI, SLE_SEC_AES_CCM, SLE_SEC_ECDH_P256, SLE_TRANSPORT_RELIABLE,
-    SLE_TRANSPORT_UNRELIABLE,
+    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode,
 };
 
 // =========================================================================
@@ -194,8 +192,7 @@ impl UartParser {
                 }
                 // Header complete, determine payload length.
                 // All DLI frame types use LE16 length at header[2..3].
-                let payload_len =
-                    u16::from_le_bytes([self.header[2], self.header[3]]) as usize;
+                let payload_len = u16::from_le_bytes([self.header[2], self.header[3]]) as usize;
                 if payload_len == 0 {
                     let frame = self.build_frame(pkt_type);
                     self.reset();
@@ -453,33 +450,19 @@ impl SleController for UartController {
         info.name[..name.len()].copy_from_slice(name);
         info.bus = SleBus::Uart;
         info.addr = self.addr;
-        info.fw_version = 0x0001_0000;
-        info.features = (SleFeature::Encryption as u64)
-            | (SleFeature::Mcs4 as u64)
-            | (SleFeature::Pilot8to1 as u64)
-            | (SleFeature::Crc32 as u64)
-            | (SleFeature::DataLenUpdate as u64);
-        info.max_pdu_payload = MAX_PAYLOAD_LEN as u16;
-        info.max_connections = 4;
-        info.max_mtu = 512;
-        info.max_mps = MAX_PAYLOAD_LEN as u16;
-        info.transport_modes = SLE_TRANSPORT_UNRELIABLE | SLE_TRANSPORT_RELIABLE;
-        info.measurement_cap = SLE_MEAS_RSSI;
-        info.security_cap = SLE_SEC_AES_CCM | SLE_SEC_ECDH_P256;
+        // No firmware/capability has been queried. Do not advertise the
+        // codec's hypothetical limits as supported hardware operations.
+        info.max_pdu_payload = 0;
+        info.max_connections = 0;
+        info.max_mtu = 0;
+        info.max_mps = 0;
+        info.transport_modes = 0;
         info
     }
 
     fn open(&self) -> Result {
-        if self.opened.get() {
-            return Err(EBUSY);
-        }
-        self.opened.set(true);
-        pr_info!(
-            "sparklink-uart: open baud={} flow_ctrl={}\n",
-            self.config.baud_rate,
-            self.config.hw_flow_ctrl
-        );
-        Ok(())
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
     fn close(&self) {
@@ -487,30 +470,14 @@ impl SleController for UartController {
         pr_info!("sparklink-uart: close\n");
     }
 
-    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
-        let mut buf = [0u8; CMD_HEADER_SIZE + MAX_PAYLOAD_LEN];
-        let len = encode_command(opcode as u16, params, &mut buf);
-        if len == 0 {
-            return Err(EINVAL);
-        }
-        pr_debug!("sparklink-uart: cmd 0x{:04x} len={}\n", opcode as u16, len);
-        self.enqueue_event(SleEvent::CommandComplete {
-            opcode,
-            command_credits: 1,
-            status: SleStatus::Success,
-            data: KVec::new(),
-        });
-        Ok(())
+    fn send_command(&self, _opcode: SleOpcode, _params: &[u8]) -> Result {
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
-    fn send_data(&self, handle: u16, data: &[u8]) -> Result {
-        let mut buf = [0u8; DATA_HEADER_SIZE + MAX_PAYLOAD_LEN];
-        let len = encode_data(DliPacketType::AsyncUnicast, handle, 0, data, &mut buf);
-        if len == 0 {
-            return Err(EINVAL);
-        }
-        pr_debug!("sparklink-uart: data handle={} len={}\n", handle, len);
-        Ok(())
+    fn send_data(&self, _handle: u16, _data: &[u8]) -> Result {
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
     fn poll_event(&self) -> Option<SleEvent> {
@@ -525,7 +492,7 @@ impl SleController for UartController {
     }
 
     fn reset(&self) -> Result {
-        pr_info!("sparklink-uart: reset\n");
-        Ok(())
+        // Encoding is not hardware execution. No synthetic success here.
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 }
