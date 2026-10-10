@@ -26,6 +26,7 @@ struct USBWs73Test {
     uint8_t runtime_fault;
     uint8_t runtime_reports;
     bool runtime_policy;
+    bool runtime_zlp;
     uint8_t runtime_medium;
     uint8_t adv_data[251];
     unsigned int adv_data_len;
@@ -118,6 +119,17 @@ static void bsle_ack(USBWs73Test *s, unsigned int message)
     uint8_t data[8] = { 2, 0, 4, 0 };
     put32(data + 4, message);
     queue_frame(s, 5, 10, data, sizeof(data));
+}
+
+static void queue_zlp(USBWs73Test *s)
+{
+    unsigned int tail;
+
+    g_assert(s->count < 64);
+    tail = (s->head + s->count++) % 64;
+    memset(s->packets[tail], 0, sizeof(s->packets[tail]));
+    s->packet_size[tail] = 0;
+    s->ready_at[tail] = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
 }
 
 static void command_event(USBWs73Test *s, unsigned int event, unsigned int opcode,
@@ -283,6 +295,11 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
     default: return false; /* especially do not accept 0x0401 as ReadCmdLen */
     }
     s->commands++;
+    /* Only after bootstrap queries: exercise the production asynchronous
+     * bulk URB, including initialization stops and in-flight commands.
+     * This has no HCC payload and must not clear command ownership.
+     */
+    if (s->commands > 4 && s->runtime_zlp) { queue_zlp(s); }
     if (typed) {
         if (typed_status) { s->adv_phase = 0; size = 0; }
         s->in_flight = true;
@@ -413,7 +430,7 @@ static void transfer(USBDevice *dev, USBPacket *p)
         if (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) < s->ready_at[s->head]) {
             timer_mod(s->wake, s->ready_at[s->head]); p->status = USB_RET_NAK; return;
         }
-        if (s->packets[s->head][96] == 0xa2 && le16(s->packets[s->head] + 97) == 2
+        if (s->packet_size[s->head] >= 105 && s->packets[s->head][96] == 0xa2 && le16(s->packets[s->head] + 97) == 2
             && le16(s->packets[s->head] + 101)) { s->in_flight = false; }
         usb_packet_copy(p, s->packets[s->head], s->packet_size[s->head]);
         s->head = (s->head + 1) % 64; s->count--;
@@ -426,6 +443,7 @@ static void transfer(USBDevice *dev, USBPacket *p)
 
 static Property properties[] = {
     DEFINE_PROP_BOOL("runtime-policy", USBWs73Test, runtime_policy, false),
+    DEFINE_PROP_BOOL("runtime-zlp", USBWs73Test, runtime_zlp, false),
     DEFINE_PROP_UINT8("runtime-medium", USBWs73Test, runtime_medium, 0),
     DEFINE_PROP_BOOL("runtime-discovery", USBWs73Test, runtime_discovery, false),
     DEFINE_PROP_UINT8("runtime-status", USBWs73Test, runtime_status, 0),

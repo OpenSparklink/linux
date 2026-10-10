@@ -223,3 +223,24 @@ copyout retry, slow-reader loss, unplug wakeup and new-generation capture.
 QMP, full console, capture files and source/input/binary hashes are retained.
 These synthetic USB gates do not satisfy physical WS73/RF acceptance or
 complete legacy-profile/Proxy/PDU/security/PM/release issue requirements.
+
+WS73 successful empty bulk reception
+-----------------------------------
+
+A successful bulk IN URB may terminate with zero bytes. The WS73 runtime
+driver resubmits that same URB without passing an empty buffer to the HCC
+parser. It publishes no DLI payload, command credit, completion or snoop
+record for the empty transfer. URB status errors are still handled first;
+interrupt notifications still require their exact eight-byte format, and
+nonempty malformed HCC/DLI still faults only the affected transport. See
+the USB host API's short-read semantics:
+https://docs.kernel.org/driver-api/usb/usb.html.
+
+The synthetic usb-ws73-test model's runtime-zlp property queues a successful
+zero-length bulk completion before each post-bootstrap command reply. It
+does not clear the model's in-flight command or fabricate a DLI response.
+The userspace target support --empty-bulk gate checks actual guest usbmon
+empty completions for both selected identities, ordinary-user discovery
+and independent raw snoop. A kernel that faults the first empty completion
+cannot reach Ready or pass this gate. These are transport regression
+fixtures; real firmware, physical passthrough, RF and PM remain unverified.

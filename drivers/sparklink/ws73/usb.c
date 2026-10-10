@@ -480,6 +480,12 @@ static void ws73_native_rx_complete(struct urb *urb)
 			ret = -EIO;
 		else
 			ret = 0;
+	} else if (!urb->actual_length) {
+		/* A successful bulk short packet may carry no HCC aggregate.
+		 * Keep the same URB/Runtime alive; it supplies no DLI data, credit
+		 * or completion. Status errors were handled above.
+		 */
+		ret = 0;
 	} else {
 		ret = ws73_wire_receive(ws->rx, urb->actual_length, ws73_native_packet, ws);
 	}
