@@ -519,7 +519,7 @@ static void discovery_request(struct sle_discovery_submit *r,
 		memcpy(r->data, "\x05\x09WS73", 6);
 		memcpy(r->scan_response, "\x05\x09RSP!", 6);
 	}
-	if (op == 3) {
+	if (op == 3 || op == SLE_DISCOVERY_SCAN_INITIALIZE_OFF) {
 		r->scanning.frame_types = 1;
 		r->scanning.interval = 800;
 		r->scanning.window = 400;
@@ -732,7 +732,7 @@ static int management_gate(int *fd, unsigned long long gen, const struct sci_dev
     struct sci_dev_info unused;
     unsigned long long observer_gen;
     if (management_mode(*fd, gen, SLE_MANAGEMENT_MANAGED) ||
-        discovery_do(*fd, gen, 2, info, &result) || discovery_do(*fd, gen, 4, info, &result)) return -1;
+        discovery_do(*fd, gen, 2, info, &result) || discovery_do(*fd, gen, SLE_DISCOVERY_SCAN_INITIALIZE_OFF, info, &result)) return -1;
     int observer = bind_owner(info->index, &unused, &observer_gen);
     if (observer < 0 || observer_gen != gen) return fail("owner independent observer");
     struct sle_management_query own = { .version = 1, .generation = gen };
@@ -827,7 +827,7 @@ static int management_gate(int *fd, unsigned long long gen, const struct sci_dev
         result.radio_adv != 1 || result.radio_scan != 1 || result.flags ||
         controller_snapshot(observer, gen, info, SLE_CONTROLLER_READY, 0))
         return fail("last close confirms actual stops before successor");
-    puts("NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=2 radio_off=1 ready=1");
+    puts("NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=1 retained_scan_off=1 radio_off=1 ready=1");
     if (management_mode(observer, gen, 1)) return -1;
     struct sle_discovery_submit r;
     discovery_request(&r, gen, 1, info); r.advertising.mode = 0xee;
@@ -852,7 +852,7 @@ static int management_replug_gate(int *fd, unsigned long long gen, const struct 
     struct sle_discovery_result result;
     struct sle_discovery_submit r;
     if (management_mode(*fd, gen, 1) || discovery_do(*fd, gen, 2, info, &result) ||
-        discovery_do(*fd, gen, 4, info, &result)) return -1;
+        discovery_do(*fd, gen, SLE_DISCOVERY_SCAN_INITIALIZE_OFF, info, &result)) return -1;
     discovery_request(&r, gen, 1, info); r.advertising.mode = 0xed;
     if (ioctl(*fd, SL_IOCTL_DISCOVERY_SUBMIT, &r)) return fail("pending close start");
     double deadline = now() + 2;

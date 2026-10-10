@@ -976,3 +976,29 @@ full North Star acceptance. Earlier physical removal changed the survivor's
 registration, and that session timed out before capture statistics. Preserve
 both failures; isolation, replug, native-host comparisons, disappearance root
 cause, bounded automatic recovery and four-device parallelism remain open.
+
+
+Confirmed OFF during internal management revocation (kernel92)
+--------------------------------------------------------------
+
+An internal single-step STOP may retain this owner's confirmed OFF only when
+its cookie matches the current revocation. This decision follows consumption
+of the previous wire request. Public requests, unknown/ON radio state,
+multistep recipes, cancelled enables and faults still take the normal path.
+No USB OUT, Complete, credit, clock or public result is fabricated; another
+domain requiring I/O still waits for genuine credits and successful completion.
+
+The C binding writer explicitly establishes scan ON before testing public OFF,
+then releases while scan is ON and advertising is confirmed OFF. Capture checks
+require one successful scan OFF, no advertising OFF in that release window and
+Ready in the same generation. The management gate uses passive initialization
+and the strict idle-scan-stop=0b model, retaining failure and timeout negatives.
+
+Frozen kernel92 full synthetic support passes 20+2 rounds, hotplug, warm restore,
+empty bulk and C/Python binding checks: 2557 USB packets, zero capture drops,
+192 empty completions and 22 independent control proofs. All twelve Runtime
+gates, 16 Host-plan, 11 operation, 96 user tool and 282 kernel script tests pass.
+The old kernel90 failed suite is retained. These are synthetic receipts, not
+physical acceptance. Real North Star stays 4/8; physical survivor-generation
+change, automatic recovery, native-host comparison and four-device parallelism
+remain open. Current host inventory still lacks physical port 1-2.1.4.

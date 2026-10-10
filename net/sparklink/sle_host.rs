@@ -216,9 +216,19 @@ impl CommandHost {
 
     pub(crate) fn can_send(&self) -> bool {
         self.fault.is_none()
-            && self.credits > 0
+            && (self.credits > 0 || self.retained_revocation_ready())
             && self.active.is_none()
             && !self.requests.is_empty()
+    }
+
+    fn retained_revocation(&self, tag: RecipeTag) -> Option<usize> {
+        if !self.revoking { return None; }
+        super::sle_command_plan::retained_revocation_off(tag, self.revoke_cookies,
+            [self.operations.advertising, self.operations.scanning])
+    }
+
+    fn retained_revocation_ready(&self) -> bool {
+        self.requests.first_recipe().and_then(|tag| self.retained_revocation(tag)).is_some()
     }
 
     pub(crate) fn next(&mut self, valid_raw: impl Fn(u32) -> bool) -> Result<Option<CmdRequest>> {
@@ -226,12 +236,24 @@ impl CommandHost {
             return Ok(None);
         }
         let request = loop {
+            // Retaining an actual OFF needs no credit. A later domain that
+            // needs I/O must still await the controller's genuine grant.
+            if self.credits == 0 && !self.retained_revocation_ready() { return Ok(None); }
             let Some(request) = self.requests.pop() else { return Ok(None) };
             if let Some(tag) = request.recipe {
                 if tag.intent.has_enable() && !self.current_recipe(tag) { continue; }
                 // SAFETY: only reads the kernel clock.
                 if unsafe { kernel::bindings::jiffies_64 } >= request.deadline {
                     return Err(ETIMEDOUT);
+                }
+                if let Some(domain) = self.retained_revocation(tag) {
+                    // No OUT, new Complete, clock, credit or public operation
+                    // is fabricated. A preceding late OFF was consumed first;
+                    // uncertain/cancelled enables remain unknown and cannot
+                    // take this path. Both domains must settle before reuse.
+                    self.revoke_done |= 1 << domain;
+                    if self.revoke_done == 3 { self.operations.initialized = true; }
+                    continue;
                 }
                 if tag.step == 0 {
                     let progress = RecipeProgress::new(tag.count).ok_or(EINVAL)?;

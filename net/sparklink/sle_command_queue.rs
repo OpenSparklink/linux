@@ -116,6 +116,11 @@ impl CmdRequestQueue {
         Ok(())
     }
 
+    pub(crate) fn first_recipe(&self) -> Option<RecipeTag> {
+        if self.count == 0 { return None; }
+        self.entries[self.head].as_ref().and_then(|request| request.recipe)
+    }
+
     pub(crate) fn pop(&mut self) -> Option<CmdRequest> {
         if self.count == 0 {
             return None;

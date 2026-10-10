@@ -457,3 +457,27 @@ fn passive_probe_has_an_intermediate_enable_and_a_final_stop_barrier() {
     q.remove_recipes(Intent::Scanning(false));
     assert!(q.pop().is_none());
 }
+
+#[test]
+fn internal_revocation_retains_only_exact_cookie_single_step_confirmed_off() {
+    use sle_command_plan::retained_revocation_off as retained;
+    for (intent, domain) in [(Intent::Advertising(false), 0), (Intent::Scanning(false), 1)] {
+        let tag=RecipeTag {cookie:11+domain as u64, step:0, count:1, intent};
+        assert_eq!(retained(tag,[11,12],[1,1]),Some(domain));
+        for state in [0,2,3,u32::MAX] {
+            let mut radio=[1,1];radio[domain]=state;
+            assert_eq!(retained(tag,[11,12],radio),None);
+        }
+        assert_eq!(retained(RecipeTag {cookie:99,..tag},[11,12],[1,1]),None);
+        assert_eq!(retained(RecipeTag {cookie:0,..tag},[0,0],[1,1]),None);
+        assert_eq!(retained(RecipeTag {count:2,..tag},[11,12],[1,1]),None);
+        assert_eq!(retained(RecipeTag {step:1,..tag},[11,12],[1,1]),None);
+    }
+    for intent in [Intent::Advertising(true),Intent::Scanning(true),Intent::AdvertisingStandby,Intent::ScanningStandby] {
+        assert_eq!(retained(RecipeTag {cookie:11,step:0,count:1,intent},[11,12],[1,1]),None);
+    }
+    let mut q=CmdRequestQueue::new();assert!(q.first_recipe().is_none());
+    q.push_recipe(&parts()[..1],11,Intent::Advertising(false),10).unwrap();
+    assert_eq!(q.first_recipe().unwrap().cookie,11);
+    q.pop();assert!(q.first_recipe().is_none());
+}

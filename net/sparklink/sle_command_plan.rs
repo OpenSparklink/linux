@@ -59,6 +59,21 @@ pub(crate) struct RecipeTag {
     pub(crate) intent: DiscoveryIntent,
 }
 
+/// Internal lease cleanup may retain this owner's already-confirmed OFF.
+/// Public requests, multi-step recipes and unknown/ON state always reach the
+/// normal scheduler. Call only after the preceding wire slot was consumed.
+pub(crate) fn retained_revocation_off(
+    tag: RecipeTag, cookies: [u64; 2], radio: [u32; 2],
+) -> Option<usize> {
+    let domain = match tag.intent {
+        DiscoveryIntent::Advertising(false) => 0,
+        DiscoveryIntent::Scanning(false) => 1,
+        _ => return None,
+    };
+    (tag.count == 1 && tag.step == 0 && tag.cookie != 0
+        && tag.cookie == cookies[domain] && radio[domain] == 1).then_some(domain)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Ready(u8),

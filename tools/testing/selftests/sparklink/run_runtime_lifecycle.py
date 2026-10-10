@@ -156,7 +156,7 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
     management_markers = [
         'NATIVE_MANAGEMENT_CONTRACT: index=0 exclusive=1 mode=1 stale=1 selection=1 copyout=1 no_admission=1 schema=6',
         'NATIVE_MANAGEMENT_CREDENTIALS: inherited_owner=1 uid=1001 caps=0 denied=3',
-        'NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=2 radio_off=1 ready=1',
+        'NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=1 retained_scan_off=1 radio_off=1 ready=1',
         'NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077',
         'NATIVE_MANAGEMENT_PENDING_CLOSE: cancelled=1 wire_reserved=1 errno=110 radio_unknown=1',
         'NATIVE_MANAGEMENT_REPLUG: fresh_lease=1 old_generation=1',
@@ -468,7 +468,8 @@ poweroff -f
                         ',runtime-status=254' if args.native_ws73 else '') +
                        (',runtime-reports=40' if args.native_ws73_events else '') +
                        (',runtime-link-events=on' if args.native_ws73_link_events else '') +
-                       (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '')]
+                       (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '') +
+                       (',runtime-idle-scan-stop=on' if args.native_ws73_management else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
             if tx_gate:
@@ -499,6 +500,8 @@ poweroff -f
                     event_properties['runtime-link-events'] = True
                 if args.native_ws73_discovery or args.native_ws73_management:
                     event_properties['runtime-discovery'] = True
+                if args.native_ws73_management:
+                    event_properties['runtime-idle-scan-stop'] = True
                 if args.standard_host_recipes:
                     event_properties['recipe-status'] = True
                 monitor.execute('device_add', dict(driver=model, id='sle1',
