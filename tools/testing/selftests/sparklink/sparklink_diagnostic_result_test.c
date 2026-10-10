@@ -21,6 +21,7 @@
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
 
 _Static_assert(sizeof(struct sle_diagnostic_result) == 104, "diagnostic ABI");
+_Static_assert(sizeof(struct sle_diagnostic_submit) == 40, "admission ABI");
 static void require(int ok, const char *message)
 {
 	if (!ok) { fprintf(stderr, "DIAGNOSTIC_RESULT_FAILURE: %s errno=%d\n", message, errno); exit(1); }
@@ -80,12 +81,40 @@ static void release(int fd, struct sle_management_request *r)
 		usleep(10000);
 	}
 }
+static struct sle_mgmt_stats stats(int fd)
+{
+	struct sle_mgmt_stats value = { 0 };
+	require(!ioctl(fd, SL_IOCTL_MGMT_STATS, &value), "actual admission counters");
+	return value;
+}
 static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t opcode, size_t len)
 {
 	static uint64_t request_id;
-	struct sle_diagnostic_submit cmd = { .version = 1, .generation = generation,
+	struct sle_diagnostic_submit initial = { .version = 1, .generation = generation,
 		.request_id = ++request_id, .timeout_ms = 5000, .opcode = opcode, .action = 1 };
+	struct sle_diagnostic_submit cmd = initial, fault_output = { 0 }, retries[3];
+	int fault = opcode == 0x0406 || opcode == 0x0403, error = 0;
+	size_t prefix = opcode == 0x0403 ? 36 : 0;
+	struct sle_mgmt_stats before = stats(fd);
+	require(!before.pending && before.total_submitted != UINT32_MAX &&
+		before.total_resolved != UINT32_MAX, "quiet admission accounting");
 	uint64_t start = now(CLOCK_REALTIME), deadline = now(CLOCK_MONOTONIC) + 6000000000ULL;
+	unsigned char *mapping = NULL, *destination = NULL; long page = 0;
+	if (fault) {
+		page = sysconf(_SC_PAGESIZE); require(page > 104, "submit page");
+		mapping = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		require(mapping != MAP_FAILED, "submit mmap");
+		destination = mapping + page - prefix;
+		/* A raw ioctl user buffer may be unaligned. Use memcpy, never C struct
+		 * dereferences: 36 writable bytes include seq at32, then action faults. */
+		memcpy(destination, &initial, sizeof(initial));
+		require(!mprotect(mapping + page, page, PROT_READ), "submit readonly suffix");
+		errno = 0; int ret = ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, destination); error = errno;
+		require(ret == -1 && error == EFAULT, "admission copyout EFAULT");
+		memcpy(&fault_output, destination, sizeof(fault_output));
+		if (prefix) require(fault_output.seq != 0, "actual partial admission copy includes seq");
+		else require(!memcmp(&fault_output, &initial, sizeof(initial)), "readonly submit unchanged");
+	}
 	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) && cmd.seq, "idempotent metadata admission");
 	struct sle_diagnostic_result r;
 	for (;;) {
@@ -96,9 +125,38 @@ static struct sle_diagnostic_result query(int fd, uint64_t generation, uint16_t 
 	}
 	require(r.version == 1 && !r.flags && r.generation == generation && r.seq == cmd.seq &&
 		r.opcode == opcode && r.state == 2 && !r.error && !r.status && r.data_len == len, "exact final reply");
+	if (fault) {
+		for (size_t i = 0; i < 3; i++) {
+			retries[i] = initial;
+			require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &retries[i]) &&
+				!memcmp(&retries[i], &cmd, sizeof(cmd)), "same ID same admission bytes");
+		}
+		struct sle_diagnostic_result repeated = request(generation, cmd.seq);
+		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &repeated) &&
+			!memcmp(&repeated, &r, sizeof(r)), "replay result bytes unchanged");
+		if (prefix) require(!memcmp(&fault_output, &cmd, prefix), "observed admission copy prefix");
+	}
+	struct sle_mgmt_stats after = stats(fd);
+	require(!after.pending && after.total_submitted == before.total_submitted + 1 &&
+		after.total_resolved == before.total_resolved + 1 && after.total_timeouts == before.total_timeouts,
+		"one admission one final resolution");
+	uint64_t end = now(CLOCK_REALTIME);
 	printf("{\"case\":\"metadata\",\"generation\":%llu,\"seq\":%u,\"opcode\":%u,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"data\":",
 		(unsigned long long)generation, cmd.seq, opcode, (unsigned long long)start,
-		(unsigned long long)now(CLOCK_REALTIME)); hex(r.data, r.data_len); puts("}"); fflush(stdout);
+		(unsigned long long)end); hex(r.data, r.data_len); puts("}"); fflush(stdout);
+	if (fault) {
+		printf("{\"admission\":\"%s\",\"result\":-1,\"errno\":%d,\"generation\":%llu,\"request_id\":%llu,\"seq\":%u,\"opcode\":%u,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"partial_prefix\":%zu,\"user_address_mod8\":%zu,\"input\":",
+			prefix ? "submit_partial_output" : "submit_read_only_output", error,
+			(unsigned long long)generation, (unsigned long long)initial.request_id, cmd.seq, opcode,
+			(unsigned long long)start, (unsigned long long)end, prefix, (size_t)((uintptr_t)destination % 8));
+		hex(&initial, sizeof(initial)); printf(",\"fault_output\":"); hex(&fault_output, sizeof(fault_output));
+		printf(",\"retry_outputs\":[");
+		for (size_t i = 0; i < 3; i++) { if (i) putchar(','); hex(&retries[i], sizeof(retries[i])); }
+		printf("],\"submitted_before\":%u,\"submitted_after\":%u,\"resolved_before\":%u,\"resolved_after\":%u,\"pending_before\":%u,\"pending_after\":%u,\"timeouts_before\":%u,\"timeouts_after\":%u}\n",
+			before.total_submitted, after.total_submitted, before.total_resolved, after.total_resolved,
+			before.pending, after.pending, before.total_timeouts, after.total_timeouts); fflush(stdout);
+		require(!munmap(mapping, 2 * page), "submit munmap");
+	}
 	return r;
 }
 static void caps_zero(int fd, uint64_t generation, uint32_t seq)
