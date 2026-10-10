@@ -158,10 +158,12 @@ int ws73_wire_receive(const unsigned char *data, size_t size,
 		if (slot < 4 || slot > size - offset ||
 		    wire_u16(data + offset + 2) > slot - 4)
 			return -EPROTO;
-		if (((data[offset] >> 4 == WS73_WIRE_BSLE_SERVICE &&
-		      data[offset + 1] == WS73_WIRE_BSLE_QUEUE) ||
-		     (data[offset] >> 4 == WS73_WIRE_SLE_SERVICE &&
-		      data[offset + 1] == WS73_WIRE_SLE_QUEUE)) &&
+		/* SDK SLE RX routes by service/queue and ignores sub_type.
+		 * Real 1.10.111 buffer Complete has tag a1, not a0. Keep
+		 * the distinct BSLE message profile's reserved subtype check.
+		 */
+		if ((data[offset] >> 4 == WS73_WIRE_BSLE_SERVICE &&
+		     data[offset + 1] == WS73_WIRE_BSLE_QUEUE) &&
 		    (data[offset] & 0x0f))
 			return -EPROTO;
 		offset += slot;

@@ -39,7 +39,7 @@ struct fake {
 	struct ws73_bsle_io io;
 	unsigned char tx[864], rx[220];
 	unsigned int sequence, controls, commands, pending_opcode, reads, grant_reads;
-	unsigned int reply_stage, credits, owner;
+	unsigned int reply_stage, credits, owner, rx_subtype;
 	unsigned long long now;
 	enum fault fault;
 };
@@ -85,7 +85,7 @@ static void packet(struct fake *f, unsigned int event, unsigned int opcode,
 	put32(p, 2);
 	put32(p + 4, 156);
 	put16(p + 12, 64);
-	p[92] = 0xa0;
+	p[92] = 0xa0 | f->rx_subtype;
 	p[93] = 8;
 	put16(p + 94, opcode ? 9 + length : 8);
 	p[96] = 0xa2;
@@ -397,6 +397,18 @@ static void link_event_tests(void)
 
 int main(void)
 {
+	/* SDK ignores SLE RX sub_type; all 16 still pass the full query
+	 * validator and bounded HCC parser. No RX rule changes TX tags.
+	 */
+	for (unsigned int subtype = 0; subtype < 16; subtype++) {
+		struct fake f;
+		struct ws73_dli_info info;
+		struct ws73_dli_result result;
+		init_fake(&f, NORMAL, 0x11);
+		f.rx_subtype = subtype;
+		CHECK(ws73_dli_query(&f.io, &f.credits, &info, &result) == 0);
+		CHECK(info.address[5] == 0x11 && info.acb_length == 254);
+	}
 	link_event_tests();
 	reply_tests();
 	command_tests();

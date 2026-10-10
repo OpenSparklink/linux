@@ -31,7 +31,7 @@ struct USBWs73Test {
     uint8_t runtime_fault;
     uint8_t runtime_reports;
     bool runtime_link_events;
-    bool runtime_policy;
+    bool runtime_policy, runtime_fresh_advertiser, advertiser_created, runtime_sle_subtypes;
     bool runtime_zlp;
     uint8_t runtime_medium;
     uint8_t adv_data[251];
@@ -117,6 +117,7 @@ static void queue_frame(USBWs73Test *s, uint8_t service, uint8_t queue,
     s->packet_size[tail] = 92 + slot;
     put32(p, 2); put32(p + 4, 92 + slot); put16(p + 12, slot);
     p[92] = service << 4; p[93] = queue; put16(p + 94, length);
+    if (service == 10 && s->runtime_sle_subtypes) { p[92] |= (s->commands - 1) & 15; }
     memcpy(p + 96, data, length);
 }
 
@@ -274,6 +275,7 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         s->fail_step = p[6] >= 0xf0 && p[6] <= 0xf3 ? p[6] - 0xf0 : 255;
         s->fail_stop = p[6] == 0xee; s->timeout_enable = p[6] == 0xed;
         typed_status = s->fail_step == 0 ? 0xfd : 0;
+        if (!typed_status) { s->advertiser_created = true; }
         value[0] = 0xd6; size = 1; /* selected -42, independent of requested power */
         break;
     case 0x0c03:
@@ -296,6 +298,9 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
             typed_status = s->fail_step == 3 ? 0xfd : 0;
             timeout = s->timeout_enable;
             if (!typed_status && !timeout) { s->advertising = true; }
+        } else if (s->runtime_fresh_advertiser &&
+                   (!s->advertiser_created || p[6] != s->adv_handle)) {
+            typed_status = 0x1e; /* real fresh-controller unknown advertiser */
         } else if (s->fail_stop) {
             s->fail_stop = false; typed_status = 0xfd;
         } else { s->advertising = false; }
@@ -399,6 +404,7 @@ static void reset(USBDevice *dev)
     USBWs73Test *s = USB_WS73_TEST(dev);
     s->head = s->count = s->sequence = s->commands = 0;
     s->advertising = s->scanning = s->fail_stop = s->timeout_enable = false;
+    s->advertiser_created = false;
     s->adv_phase = s->scan_phase = 0; s->fail_step = 255;
     s->bsp = true; s->pm = s->custom = s->opened = s->failed_once = s->in_flight = false;
     s->reports_emitted = false;
@@ -535,6 +541,8 @@ static void transfer(USBDevice *dev, USBPacket *p)
 
 static Property properties[] = {
     DEFINE_PROP_BOOL("runtime-policy", USBWs73Test, runtime_policy, false),
+    DEFINE_PROP_BOOL("runtime-sle-subtypes", USBWs73Test, runtime_sle_subtypes, false),
+    DEFINE_PROP_BOOL("runtime-fresh-advertiser", USBWs73Test, runtime_fresh_advertiser, false),
     DEFINE_PROP_UINT32("runtime-out-delay-ms", USBWs73Test, runtime_out_delay_ms, 0),
     DEFINE_PROP_UINT8("runtime-out-result", USBWs73Test, runtime_out_result, 0),
     DEFINE_PROP_BOOL("runtime-zlp", USBWs73Test, runtime_zlp, false),

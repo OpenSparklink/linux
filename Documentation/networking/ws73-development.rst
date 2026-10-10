@@ -134,7 +134,11 @@ Rust ControllerRuntime after its two RX URBs open, but does not publish Ready.
 Typed discovery transactions are separate from these bootstrap queries. A
 physical controller now reaches Setup with all four queries; its initial
 ADV_STOP returns raw status 0x1e (unknown advertising identifier), so slkd
-correctly withholds Ready pending advertiser-instance initialization. Real
+correctly withheld Ready pending advertiser-instance initialization. The new
+explicit ADV_CONFIGURE_OFF operation supplies parameters, waits for the
+matching parameter Complete, then sends OFF and requires its successful
+Complete. slkd uses this before scan OFF; neither configuration nor Status
+alone confirms OFF or Ready. Real
 dual-controller RF acceptance has not passed.
 
 The direct-production-code synthetic test covers independent instances,
@@ -923,3 +927,26 @@ create a link, authorize data/security operations or promote Setup to Ready.
 Use ``run_runtime_lifecycle.py --native-ws73 --native-ws73-link-events`` for
 synthetic fanout, overflow, EFAULT retry, retirement and survivor coverage.
 These events have not been verified over a real WS73 link.
+
+Firmware 1.10.111 comparison
+---------------------------
+
+The original local SDK files concatenate byte-for-byte to libws73-usb's
+combined-1.10.110.bin. Keep those physical receipts labelled 110. The
+user-selected 111 combined blob is verified and exported unchanged by the
+companion ``tools/ws73_firmware.py`` into a new private directory; pass it as
+``--firmware-dir``. Do not concatenate payloads after removing their 64-byte
+hash headers. Firmware identity does not certify board calibration.
+
+A physical 111 cold boot completed firmware upload and BSLE, then the old
+receiver rejected tag a1/queue8 on buffer Complete. The SDK SLE RX callback
+ignores sub_type and libws73-usb routes by service/queue. SLE receive now
+accepts the four-bit subtype without changing bounded slot, payload or DLI
+validation; TX remains subtype0, and BSLE keeps its separate reserved check.
+The five actual captured frames pass the revised production codec offline;
+this is not a new physical query/Ready result. Synthetic tests cover all16
+subtypes, malformed bounds and fresh-advertiser initialization.
+
+The physical devices are now warm. Testing re-customize/open recovery without
+requiring another manual hub replug is the next dependency; automatic recovery
+and the full native-host/real-QEMU single/multiple-device matrix remain open.

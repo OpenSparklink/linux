@@ -237,6 +237,13 @@ int ws73_discovery_validate_step(unsigned int operation, unsigned int step,
 		if (step == count - 1)
 			enable = 1;
 		break;
+	case SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF:
+		if (count != 2)
+			return -EINVAL;
+		expected = step == 0 ? 0x0c02 : 0x0c05;
+		if (step == 1)
+			enable = 0;
+		break;
 	case SPARKLINK_DISCOVERY_ADV_STOP:
 		if (count != 1)
 			return -EINVAL;
@@ -308,6 +315,13 @@ static int ws73_discovery_build(const struct sparklink_discovery_request *r,
 		     ws73_discovery_adv_enable(p, sizeof(scratch), 1, r->handle,
 					       r->duration, r->max_events));
 		break;
+	case SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF:
+		count = 2;
+		PART(0x0c02, ws73_discovery_adv_params(p, sizeof(scratch),
+						       r->advertising));
+		PART(0x0c05, ws73_discovery_adv_enable(p, sizeof(scratch), 0,
+						       r->handle, 0, 0));
+		break;
 	case SPARKLINK_DISCOVERY_ADV_STOP:
 		count = 1;
 		PART(0x0c05, ws73_discovery_adv_enable(p, sizeof(scratch), 0,
@@ -336,7 +350,8 @@ static int ws73_discovery_build(const struct sparklink_discovery_request *r,
 	if (out) {
 		out->operation = r->operation;
 		out->count = count;
-		out->power_step = r->operation == SPARKLINK_DISCOVERY_ADV_START ? 0 : count;
+		out->power_step = (r->operation == SPARKLINK_DISCOVERY_ADV_START ||
+				   r->operation == SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF) ? 0 : count;
 	}
 	return 0;
 }
@@ -352,6 +367,7 @@ int ws73_discovery_prepare(const struct sparklink_discovery_request *r,
 		return -EINVAL;
 	switch (r->operation) {
 	case SPARKLINK_DISCOVERY_ADV_START:
+	case SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF:
 		if (!r->advertising || r->scanning ||
 		    r->advertising->handle != r->handle)
 			return -EINVAL;
@@ -372,7 +388,8 @@ int ws73_discovery_prepare(const struct sparklink_discovery_request *r,
 		if (r->data || r->data_size || r->scan_response_present ||
 		    r->duration || r->max_events)
 			return -EINVAL;
-		if (r->operation != SPARKLINK_DISCOVERY_ADV_STOP && r->handle)
+		if (r->operation != SPARKLINK_DISCOVERY_ADV_STOP &&
+		    r->operation != SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF && r->handle)
 			return -EINVAL;
 	}
 	ret = ws73_discovery_build(r, NULL);

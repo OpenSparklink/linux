@@ -956,6 +956,8 @@ struct ssap_uuid_op {
 #define SLE_DISCOVERY_ADV_STOP 2U
 #define SLE_DISCOVERY_SCAN_START 3U
 #define SLE_DISCOVERY_SCAN_STOP 4U
+/* Explicit params -> successful OFF Complete; never enables advertising. */
+#define SLE_DISCOVERY_ADV_CONFIGURE_OFF 5U
 #define SLE_DISCOVERY_SCAN_RESPONSE 1U
 #define SLE_DISCOVERY_FAULT 1U /* result flags, not Ready */
 #define SLE_DISCOVERY_QUEUED 1U

@@ -93,7 +93,7 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
         if let Some((intent, outcome)) = reply.recipe {
             use super::sle_command_plan::{DiscoveryIntent, RecipeReply};
             match (intent, outcome) {
-                (DiscoveryIntent::Advertising(_), RecipeReply::Failed) => state.adv_scan.abort_advertising(),
+                (DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby, RecipeReply::Failed) => state.adv_scan.abort_advertising(),
                 (DiscoveryIntent::Scanning(_), RecipeReply::Failed) => state.adv_scan.abort_scanning(),
                 (DiscoveryIntent::Advertising(true), RecipeReply::Finished) => state.adv_scan.confirm_advertising(),
                 (DiscoveryIntent::Scanning(true), RecipeReply::Finished) => state.adv_scan.confirm_scanning(),

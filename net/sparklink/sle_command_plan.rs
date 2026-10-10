@@ -10,12 +10,15 @@ pub(crate) const RECIPE_PARAMS_MAX: usize = 255;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DiscoveryIntent {
     Advertising(bool),
+    /// Explicit parameter configuration followed by OFF; no enable step.
+    AdvertisingStandby,
     Scanning(bool),
 }
 
 impl DiscoveryIntent {
     pub(crate) fn enabled(self) -> bool {
         match self {
+            Self::AdvertisingStandby => false,
             Self::Advertising(enable) | Self::Scanning(enable) => enable,
         }
     }
@@ -23,7 +26,7 @@ impl DiscoveryIntent {
     pub(crate) fn same_domain(self, other: Self) -> bool {
         matches!(
             (self, other),
-            (Self::Advertising(_), Self::Advertising(_)) | (Self::Scanning(_), Self::Scanning(_))
+            (Self::Advertising(_) | Self::AdvertisingStandby, Self::Advertising(_) | Self::AdvertisingStandby) | (Self::Scanning(_), Self::Scanning(_))
         )
     }
 }

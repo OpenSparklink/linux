@@ -131,7 +131,7 @@ impl CommandHost {
         self.cancel_recipe_progress(intent);
         self.next_cookie = next_cookie;
         match intent {
-            DiscoveryIntent::Advertising(_) => self.broadcast_cookie = cookie,
+            DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.broadcast_cookie = cookie,
             DiscoveryIntent::Scanning(_) => self.scan_cookie = cookie,
         }
         Ok(())
@@ -208,7 +208,7 @@ impl CommandHost {
 
     fn current_recipe(&self, tag: RecipeTag) -> bool {
         tag.cookie == match tag.intent {
-            DiscoveryIntent::Advertising(_) => self.broadcast_cookie,
+            DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.broadcast_cookie,
             DiscoveryIntent::Scanning(_) => self.scan_cookie,
         }
     }

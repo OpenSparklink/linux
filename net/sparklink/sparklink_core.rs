@@ -3424,11 +3424,12 @@ fn validate_discovery_submit(request: &SleDiscoverySubmit) -> Result<sle_command
         2 => { if !adv_zero || !scan_zero { return Err(EINVAL); } DiscoveryIntent::Advertising(false) }
         3 => { if !adv_zero { return Err(EINVAL); } DiscoveryIntent::Scanning(true) }
         4 => { if !adv_zero || !scan_zero { return Err(EINVAL); } DiscoveryIntent::Scanning(false) }
+        5 => { if !scan_zero { return Err(EINVAL); } DiscoveryIntent::AdvertisingStandby }
         _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
     };
     if request.operation != 1 && (request.flags != 0 || request.data_len != 0
         || request.scan_response_len != 0 || request.duration != 0 || request.max_events != 0) { return Err(EINVAL); }
-    if request.operation >= 3 && request.handle != 0 { return Err(EINVAL); }
+    if matches!(request.operation, 3 | 4) && request.handle != 0 { return Err(EINVAL); }
     Ok(intent)
 }
 
@@ -3485,6 +3486,7 @@ fn ioctl_discovery_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
             sle_command_plan::DiscoveryIntent::Advertising(false) => 2,
             sle_command_plan::DiscoveryIntent::Scanning(true) => 3,
             sle_command_plan::DiscoveryIntent::Scanning(false) => 4,
+            sle_command_plan::DiscoveryIntent::AdvertisingStandby => 5,
         };
         output.state = record.state as u32; output.error = record.error;
         output.status = record.status; output.opcode = record.opcode;
@@ -3516,6 +3518,7 @@ fn ioctl_discovery_timing(context:&RuntimeContext, me:Pin<&SparkLinkCtl>, arg:us
   sle_command_plan::DiscoveryIntent::Advertising(false)=>2,
   sle_command_plan::DiscoveryIntent::Scanning(true)=>3,
   sle_command_plan::DiscoveryIntent::Scanning(false)=>4,
+  sle_command_plan::DiscoveryIntent::AdvertisingStandby=>5,
  };
  drop(state);write_user_struct(arg,&output)?;Ok(0)
 }

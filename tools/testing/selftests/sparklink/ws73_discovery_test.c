@@ -475,10 +475,10 @@ static void recipe_tests(void)
 	/* Exhaust sequence positions/counts and wrong action/enable combinations.
   * Only the complete plan's own positions are authorized by this validator.
   */
-	for (unsigned int op = 1; op <= 4; op++) {
+	for (unsigned int op = 1; op <= 5; op++) {
 		request =
 			(struct sparklink_discovery_request){ .operation = op };
-		if (op == 1) {
+		if (op == 1 || op == 5) {
 			request.advertising = &adv;
 			request.handle = 7;
 		}
@@ -527,8 +527,31 @@ static void recipe_tests(void)
 				       op, plan.count - 1, plan.count,
 				       last->opcode, last->params,
 				       last->length) == 0) ==
-			      (enable == (op & 1)));
+			      (enable == (op == 1 || op == 3)));
 		}
+	}
+	request = (struct sparklink_discovery_request){
+		.operation = SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF,
+		.advertising = &adv, .handle = 7,
+	};
+	CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+	CHECK(plan.count == 2 && plan.power_step == 0 &&
+	      plan.steps[0].opcode == 0x0c02 && plan.steps[1].opcode == 0x0c05 &&
+	      plan.steps[1].params[0] == 0);
+	before = plan;
+	for (unsigned int field = 0; field < 7; field++) {
+		candidate = request;
+		switch (field) {
+		case 0: candidate.data = data; break;
+		case 1: candidate.data_size = 1; break;
+		case 2: candidate.duration = 1; break;
+		case 3: candidate.max_events = 1; break;
+		case 4: candidate.scan_response_present = 1; break;
+		case 5: candidate.scanning = &scan; break;
+		case 6: candidate.handle = 8; break;
+		}
+		CHECK(ws73_discovery_prepare(&candidate, &plan) < 0);
+		CHECK(!memcmp(&plan, &before, sizeof(plan)));
 	}
 	/* Reject irrelevant input without changing a prior complete output. */
 	for (unsigned int op = 2; op <= 4; op++) {

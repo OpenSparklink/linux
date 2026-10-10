@@ -148,7 +148,7 @@ impl NativeController {
         }), GFP_KERNEL)?;
         let input = NativeDiscoveryRequest {
             operation: request.operation,
-            advertising: if request.operation == 1 { &request.advertising } else { core::ptr::null() },
+            advertising: if matches!(request.operation, 1 | 5) { &request.advertising } else { core::ptr::null() },
             scanning: if request.operation == 3 { &request.scanning } else { core::ptr::null() },
             handle: request.handle, duration: request.duration, max_events: request.max_events,
             data: if request.data_len > 0 { request.data.as_ptr() } else { core::ptr::null() },
@@ -238,6 +238,7 @@ impl NativeCommandTransport {
                 DiscoveryIntent::Advertising(false) => 2,
                 DiscoveryIntent::Scanning(true) => 3,
                 DiscoveryIntent::Scanning(false) => 4,
+                DiscoveryIntent::AdvertisingStandby => 5,
             };
             // SAFETY: retained driver/context and borrowed parameter buffer
             // are live throughout this side-effect-free validation call.

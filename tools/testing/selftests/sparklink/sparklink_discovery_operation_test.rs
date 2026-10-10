@@ -197,3 +197,39 @@ fn completion_clock_is_retained_only_for_correlated_success() {
  add(&mut o,3,I::Scanning(false),1);o.cancel_domain(I::Scanning(false),-125);
  o.reply(3,0,true,0,&[],true,70);assert_eq!(o.find(3).unwrap().completed_boottime_ns,0);
 }
+
+#[test]
+fn standby_never_confirms_off_on_configuration_status_or_cancelled_prefix() {
+    for cancelled in [false, true] {
+        let mut o = Operations::new();
+        add(&mut o, 1, I::AdvertisingStandby, 2);
+        o.entries[0].as_mut().unwrap().power_step = 0;
+        assert!(!I::AdvertisingStandby.enabled());
+        assert!(I::AdvertisingStandby.same_domain(I::Advertising(true)));
+        assert!(!I::AdvertisingStandby.same_domain(I::Scanning(false)));
+        o.sent(1, 0, 0xc02);
+        if cancelled { o.cancel_domain(I::Advertising(false), -125); }
+        o.reply(1, 0, false, 0, &[], !cancelled, 100);
+        o.reply(1, 0, true, 0, &[0xd6], !cancelled, 101);
+        assert_eq!(o.advertising, 0);
+        assert!(!o.initialized);
+        if !cancelled {
+            assert_eq!(o.find(1).unwrap().selected_power, Some(-42));
+            o.sent(1, 1, 0xc05);
+        }
+        o.reply(1, 1, false, 0, &[], !cancelled, 102);
+        assert_eq!(o.advertising, 0);
+        o.reply(1, 1, true, 0, &[], !cancelled, 103);
+        assert_eq!(o.advertising, 1);
+        assert!(!o.initialized);
+        assert_eq!(o.find(1).unwrap().state, if cancelled { State::Cancelled } else { State::Succeeded });
+    }
+    for step in 0..2 {
+        let mut o = Operations::new();add(&mut o, 1, I::AdvertisingStandby, 2);
+        o.sent(1, step, if step == 0 { 0xc02 } else { 0xc05 });
+        o.reply(1, step, true, 0x1e, &[], true, 104);
+        assert_eq!(o.advertising, 0);
+        assert_eq!(o.find(1).unwrap().status, 0x1e);
+        assert_eq!(o.find(1).unwrap().state, State::Failed);
+    }
+}

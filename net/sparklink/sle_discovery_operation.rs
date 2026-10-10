@@ -100,7 +100,7 @@ impl Operations {
     }
     pub(crate) fn can_start(&self, intent: DiscoveryIntent) -> bool {
         let (own, other, other_intent) = match intent {
-            DiscoveryIntent::Advertising(_) => (
+            DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => (
                 self.advertising,
                 self.scanning,
                 DiscoveryIntent::Scanning(true),
@@ -164,13 +164,14 @@ impl Operations {
                 // A cancelled on-wire enable may have reached the radio. Do
                 // not confirm the replacement intent or pretend it stayed off.
                 match op.intent {
-                    DiscoveryIntent::Advertising(_) => self.advertising = 0,
+                    DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.advertising = 0,
                     DiscoveryIntent::Scanning(_) => self.scanning = 0,
                 }
             }
-            if op.state == State::Cancelled && !op.intent.enabled() && complete && status == 0 {
+            if op.state == State::Cancelled && !op.intent.enabled() && complete && status == 0
+                && step + 1 == op.count {
                 match op.intent {
-                    DiscoveryIntent::Advertising(_) => self.advertising = 1,
+                    DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.advertising = 1,
                     DiscoveryIntent::Scanning(_) => self.scanning = 1,
                 }
             }
@@ -196,7 +197,7 @@ impl Operations {
             op.completed_boottime_ns = received_boottime_ns;
             let radio = if op.intent.enabled() { 2 } else { 1 };
             match op.intent {
-                DiscoveryIntent::Advertising(_) => self.advertising = radio,
+                DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.advertising = radio,
                 DiscoveryIntent::Scanning(_) => self.scanning = radio,
             }
             if self.advertising == 1 && self.scanning == 1 {
