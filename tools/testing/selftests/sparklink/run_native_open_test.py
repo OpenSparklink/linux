@@ -108,6 +108,60 @@ def assess(console, qemu_exit):
     return errors
 
 
+def assess_userfault(console, qemu_exit):
+    """Require actual kernel usercopy faults, independent progress and no late lease."""
+    console = console.replace('\r', '')
+    errors = []
+    if qemu_exit or KERNEL_FAULT.search(console) or 'NATIVE_FAILURE:' in console:
+        errors.append('QEMU/guest/kernel failure')
+    armed = re.findall(r'^RPC_FAULT_ARMED: mode=(query|acquire) id=(\d+) generation=(\d+) '
+                       r'kernel_wp=1 thread=1 epoll_empty=1$', console, re.M)
+    if len(armed) != 2 or [p[:2] for p in armed] != [('query', '1'), ('acquire', '1')] or \
+            console.count('RPC_FAULT_ARMED:') != 2:
+        errors.append('missing or incorrect actual usercopy barrier')
+    elif not 0 < int(armed[0][2]) < int(armed[1][2]) <= 2**64 - 1:
+        errors.append('invalid usercopy owner generation')
+    queries = re.findall(r'^RPC_FAULT_QUERY: elapsed_ms=([^ ]+) free=1 copy_blocked=1$', console, re.M)
+    wakes = re.findall(r'^RPC_FAULT_WAKE: mode=(query|acquire) elapsed_ms=([^ ]+) '
+                       r'event_hup=1 snoop_hup=1 copy_blocked=1$', console, re.M)
+    if len(queries) != 1 or console.count('RPC_FAULT_QUERY:') != 1:
+        errors.append('missing independent management query')
+    if [p[0] for p in wakes] != ['query', 'acquire'] or console.count('RPC_FAULT_WAKE:') != 2:
+        errors.append('missing independent retirement notifications')
+    try:
+        if any(not math.isfinite(float(v)) or not 0 <= float(v) < 200 for v in [*queries, *[p[1] for p in wakes]]):
+            errors.append('usercopy blocked unrelated observation')
+    except ValueError:
+        errors.append('invalid usercopy progress timing')
+    cases = re.findall(r'^RPC_FAULT_CASE: mode=(query|acquire) copy_release=1 result=(snapshot|ENODEV) '
+                       r'get=1 put=1 close=1 sends=0 old_fd=ENODEV new_lease=1 survivor=1$', console, re.M)
+    if cases != [('query', 'snapshot'), ('acquire', 'ENODEV')] or console.count('RPC_FAULT_CASE:') != 2:
+        errors.append('missing exact usercopy result/retirement proof')
+    phases = re.findall(r'^RPC_FAULT_(ARMED|QUERY|WAKE|CASE):(?: mode=(query|acquire))?', console, re.M)
+    if phases != [('ARMED', 'query'), ('QUERY', ''), ('WAKE', 'query'), ('CASE', 'query'),
+                  ('ARMED', 'acquire'), ('WAKE', 'acquire'), ('CASE', 'acquire')]:
+        errors.append('usercopy phases out of order')
+    if any(p in console for p in ['RPC_FAULT_QUERY_BLOCKED:', 'RPC_FAULT_WAKE_TIMEOUT:', 'RPC_FAULT_LATE_LEASE:']):
+        errors.append('blocked progress or late lease')
+    exact = ['NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1',
+             'RPC_FAULT_LIFECYCLE: PASS synthetic_only=1 cases=2',
+             'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0']
+    if any(console.splitlines().count(p) != 1 for p in exact):
+        errors.append('missing or duplicate terminal usercopy evidence')
+    positions = [console.find('RPC_FAULT_CASE: mode=acquire'), *[console.find(p) for p in exact],
+                 console.find('RUNTIME_KERNEL_LOG_BEGIN'), console.find('RUNTIME_KERNEL_LOG_END')]
+    if any(p < 0 for p in positions) or positions != sorted(positions):
+        errors.append('out-of-order usercopy terminal evidence')
+    for prefix in ['RUNTIME_GUEST_EXIT', 'NATIVE_OPEN_MODULE_EXIT']:
+        if re.findall('^' + prefix + r': (.*)$', console, re.M) != ['0']:
+            errors.append('unsuccessful usercopy process/module exit')
+    if console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1 or console.count('RUNTIME_KERNEL_LOG_END') != 1:
+        errors.append('missing full usercopy kernel log')
+    elif '[    0.000000]' not in console.split('RUNTIME_KERNEL_LOG_BEGIN', 1)[1].split('RUNTIME_KERNEL_LOG_END', 1)[0]:
+        errors.append('usercopy kernel log missing early record')
+    return errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kernel-build', type=Path, required=True)
@@ -116,6 +170,7 @@ def main():
     parser.add_argument('--qemu', type=Path, required=True)
     parser.add_argument('--busybox', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--userfault', action='store_true', help='management usercopy WP gate; needs CONFIG_USERFAULTFD=y')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -124,10 +179,17 @@ def main():
     try:
         kernel = args.kernel_build.resolve() / 'arch/x86/boot/bzImage'
         manifest['kernel_inputs'] = checked_kernel_inputs(args.kernel_build.resolve())
+        if args.userfault and 'CONFIG_USERFAULTFD=y\n' not in (args.kernel_build / '.config').read_text():
+            raise RuntimeError('userfault gate needs CONFIG_USERFAULTFD=y')
+        manifest['userfault'] = args.userfault
+        if args.userfault:
+            manifest['scope'] = 'actual kernel ioctl usercopy WP, observation/admission retirement; synthetic only'
         sources = [HERE / 'ws73_native_open_test.c', HERE / 'ws73_native_runtime_test.c',
                    HERE / 'native-open/native_open_fixture.c', HERE / 'native-open/native_open_fixture.h',
                    HERE / 'native-open/Makefile', Path(__file__).resolve(), HERE / 'qemu_verdict.py',
                    HERE / 'run_runtime_lifecycle.py']
+        if args.userfault:
+            sources += [HERE / 'ws73_native_rpc_fault_test.c']
         manifest['sources'] = [file_record(p) for p in sources]
         manifest['inputs'] = [file_record(p) for p in [kernel, args.kernel_build / '.config',
                                                       args.qemu, args.busybox]]
@@ -156,8 +218,9 @@ def main():
         for applet in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'insmod', 'rmmod']:
             (initroot / 'bin' / applet).symlink_to('busybox')
         shutil.copy2(module, initroot / 'native_open_fixture.ko')
+        source = HERE / ('ws73_native_rpc_fault_test.c' if args.userfault else 'ws73_native_open_test.c')
         command = ['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
-                   str(HERE / 'ws73_native_open_test.c'), '-o', str(initroot / 'bin/open_test')]
+                   *(['-pthread'] if args.userfault else []), str(source), '-o', str(initroot / 'bin/open_test')]
         manifest['guest_compile_args'] = command
         with (output / 'guest-build.log').open('wb') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -213,7 +276,7 @@ poweroff -f
                 process.wait()
                 raise RuntimeError('guest timed out')
         manifest['qemu_exit'] = code
-        manifest['errors'] = assess(console.read_text(errors='replace'), code)
+        manifest['errors'] = (assess_userfault if args.userfault else assess)(console.read_text(errors='replace'), code)
         for record in manifest['sources'] + manifest['inputs']:
             if file_record(Path(record['path'])) != record:
                 manifest['errors'].append('input changed during test: ' + record['path'])

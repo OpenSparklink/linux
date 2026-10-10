@@ -845,3 +845,48 @@ runtime is claimed. Source, #75 compiled input, guest/module/capture and exact
 These are development support results. Real WS73/RF acceptance remains 0/7,
 board qualification NOT_ASSERTED, and all incomplete original issues remain
 open within the retained full plan.
+
+Management usercopy faults during retirement
+-------------------------------------------
+
+Management QUERY copies its input before locking management and copies an
+owned integer snapshot out after dropping that lock. A query which took its
+snapshot before retirement may return that old generation's snapshot; it
+acquires no authority. Retirement closes admission and notifies event/snoop
+before waiting for management or native lifecycle.
+
+ACQUIRE retains transactional copyout: EFAULT does not consume a token.
+After a successful copy it checks admission and commits under the admission
+lock. If retirement closed admission during copyout, the ioctl returns
+ENODEV and the copied candidate grants no lease. Discard results of failed
+ioctls. Old descriptors stay attached to their old generation after reuse.
+
+The guest-only gate uses userfaultfd write protection on a populated page to
+stop an actual kernel ioctl copyout. It verifies page address, WRITE/WP and
+the worker's thread ID. While the fault remains unresolved it checks an
+independent QUERY and pre-registered empty event/snoop edge-triggered epoll
+interests. Both notifications must arrive within 200 ms without rearming.
+After resolution it checks QUERY's snapshot, ACQUIRE's ENODEV, exactly-once
+get/put/close, no sends, old fd/index reuse, a fresh first lease, survivor DLI
+and clean module unload.
+
+Use the native-open invocation above with ``--userfault`` and an isolated
+kernel configured with ``CONFIG_USERFAULTFD=y``. The fixture runs as guest
+root to intercept kernel-origin faults; this adds no application privilege
+or host configuration requirement. Ordinary slctl is validated separately.
+
+Same-config old #76 reproduces a 200.668 ms blocked second query, retirement
+timeouts of 200.335/200.357 ms and a successful late ACQUIRE. New #77 passes:
+query 1.088 ms, notifications 0.096/0.101 ms, late ACQUIRE ENODEV. Guest
+executable and fixture C object are byte-identical in the comparison; modules
+have matching release metadata and are not force-loaded. The negative
+releases its faults and unloads successfully.
+
+All 277 verifier tests, Werror extended C builds, four native-open cases,
+twelve runtime gates and original 96 cases pass (1059 OK, no FAIL/SKIP,
+three existing WARN). Ordinary-user synthetic slctl 20+2 rounds pass with
+the same daemon/bus, hotplug, survivor and independently corroborated USB
+capture. Evidence is local in ``.dev/rpc-fault-final-evidence.json``. Rust
+companion sources/programs and QEMU inputs are unchanged. These results do
+not qualify real WS73/RF, four devices, full lifecycle or the retained S0-S6
+plan; original incomplete issues remain open.

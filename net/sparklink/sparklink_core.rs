@@ -597,11 +597,13 @@ impl ControllerRuntime {
         // eventual success may acquire resources, but cannot admit commands.
         *self.schedule_gate.lock() = true;
         self.transport_open.store(false, core::sync::atomic::Ordering::Release);
-        self.management.lock().settled(ENODEV.to_errno());
         // Observers must learn retirement while open/transport joins are still
         // pending. Poll registers first and rechecks the closed admission gate.
         self.controller_event_poll.notify_all();
         self.snoop_poll.notify_all();
+        // A transaction may be faulting while copying its candidate lease.
+        // Observers must not wait for that management mutex either.
+        self.management.lock().settled(ENODEV.to_errno());
         let _lifecycle = self.native_lifecycle.lock();
         sle_usb::unpublish_runtime(self);
         self.stop_workers();
@@ -3282,6 +3284,12 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
     let owner = context.owner.as_ref().ok_or(ENODEV)?;
     if me.target.lock().as_ref().map(|target| target.identity) != Some(owner.identity) { return Err(EINVAL); }
     if owner.protocol_profile == 0 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if *owner.schedule_gate.lock() { return Err(ENODEV); }
+    // Observation copies user input/output without the management mutex. Only
+    // constructing its owned integer snapshot needs admission serialization.
+    let query: Option<SleManagementQuery> = if cmd == SL_IOCTL_MANAGEMENT_QUERY {
+        Some(read_user_struct(arg)?)
+    } else { None };
     let mut gate = owner.management.lock();
     if *owner.schedule_gate.lock() { return Err(ENODEV); }
     if gate.state == sle_management::REVOKING {
@@ -3289,8 +3297,7 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
             gate.settled(result.err().map_or(0, |error| error.to_errno()));
         }
     }
-    if cmd == SL_IOCTL_MANAGEMENT_QUERY {
-        let input: SleManagementQuery = read_user_struct(arg)?;
+    if let Some(input) = query {
         if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
         if input.generation != 0 && input.generation != owner.identity.generation { return Err(ENODEV); }
         let detail = if gate.state == sle_management::FAULTED { owner.host.lock().revocation_detail() } else { (0, 0, false) };
@@ -3300,6 +3307,7 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
             flags: u32::from(gate.owns(me.file_id)) | (u32::from(detail.2) << 1),
             error: gate.error, status: detail.0 as u32, opcode: detail.1 as u32, reserved: 0,
         };
+        drop(gate);
         write_user_struct(arg, &output)?;
         return Ok(0);
     }
@@ -3316,7 +3324,14 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
         // No command has been admitted. EFAULT leaves ownership and counter
         // unchanged; commit cannot fail while the management mutex is held.
         write_user_struct(arg, &request)?;
-        gate.commit(me.file_id, request.mode, token);
+        {
+            // Copyout may sleep after retirement has closed admission. The
+            // copied candidate is not a lease until this atomic liveness check
+            // and commit succeed; an ioctl error never grants it authority.
+            let stopping = owner.schedule_gate.lock();
+            if *stopping { return Err(ENODEV); }
+            gate.commit(me.file_id, request.mode, token);
+        }
         *me.owned_target.lock() = Some(owner.clone());
     } else {
         if request.mode != gate.mode { return Err(EPERM); }

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Native API fixture plus a synthetic WS73 survivor; never physical evidence. */
+#pragma push_macro("main")
+#undef main
 #define main ws73_native_lifecycle_main
 #include "ws73_native_runtime_test.c"
 #undef main
+#pragma pop_macro("main")
 #include "native-open/native_open_fixture.h"
 #include <sys/epoll.h>
 
