@@ -2880,7 +2880,7 @@ fn ioctl_sync_data_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
 
 /// DLI command ioctl — isolated for stack safety (SleDliCmd = 248 bytes).
 #[inline(never)]
-fn ioctl_dli_send_cmd(context: &RuntimeContext, arg: usize) -> Result<isize> {
+fn ioctl_dli_send_cmd(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     let mut cmd_data: SleDliCmd = read_user_struct(arg)?;
     let param_len = cmd_data.param_len as usize;
     if param_len > DLI_PARAM_MAX {
@@ -2894,6 +2894,7 @@ fn ioctl_dli_send_cmd(context: &RuntimeContext, arg: usize) -> Result<isize> {
         let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
         s.controller.validate_command(cmd_data.opcode, &cmd_data.params[..param_len])?;
         cmd_data.seq = s.cmd_pending.submit(cmd_data.opcode)?;
+        s.cmd_pending.assign_owner(cmd_data.seq, me.file_id);
         let enqueue = if s.controller.uses_command_host() {
             context.owner.as_ref().ok_or(ENODEV)?.host.lock().enqueue(
                 cmd_data.opcode, &cmd_data.params[..param_len], cmd_data.seq,
@@ -3281,11 +3282,48 @@ fn ioctl_snoop_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize)
     Ok(0)
 }
 
+/// Non-destructive result for the diagnostic author. A local sequence is
+/// assigned by admission and resolved only by the Host's captured wire slot.
+#[inline(never)]
+fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let input: SleDiagnosticResult = read_user_struct(arg)?;
+    if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if input.flags != 0 || input.generation == 0 || input.seq == 0 { return Err(EINVAL); }
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    if me.target.lock().as_ref().map(|t| t.identity) != Some(owner.identity) { return Err(EINVAL); }
+    if input.generation != owner.identity.generation { return Err(ENODEV); }
+    if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    owner.management.lock().authorize(me.file_id, sle_management::DIAGNOSTIC).map_err(management_error)?;
+    let state = context.lock()?;
+    let entry = state.as_ref().ok_or(ENODEV)?.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;
+    if entry.file_id != me.file_id { return Err(EPERM); }
+    // SAFETY: only integer fields and byte arrays; all-zero is a valid baseline.
+    let mut output: SleDiagnosticResult = unsafe { core::mem::zeroed() };
+    output.version = 1; output.generation = owner.identity.generation;
+    output.seq = entry.seq; output.opcode = entry.opcode;
+    if entry.is_pending() {
+        output.state = 1;
+    } else if let Some(status) = entry.result_status() {
+        output.state = if status == 0 { 2 } else { 3 };
+        output.status = status;
+        output.data_len = entry.data_len;
+        output.data.copy_from_slice(&entry.data);
+    } else {
+        output.state = 3;
+        output.error = entry.error;
+    }
+    drop(state);
+    // No queue mutation or acknowledgement: an EFAULT is safely retryable.
+    write_user_struct(arg, &output)?;
+    Ok(0)
+}
+
 /// Infrastructure ioctl sub-dispatcher: PM, sync, DLI, events, PHY, role, RAL/RPA.
 #[inline(never)]
 fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
         SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
+        SL_IOCTL_DIAGNOSTIC_RESULT => ioctl_diagnostic_result(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
         SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
@@ -3448,7 +3486,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             s.controller.reset()?;
             Ok(0)
         }
-        SL_IOCTL_DLI_SEND_CMD => ioctl_dli_send_cmd(context, arg),
+        SL_IOCTL_DLI_SEND_CMD => ioctl_dli_send_cmd(context, me, arg),
         SL_IOCTL_MGMT_STATS => {
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
@@ -3865,6 +3903,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_EVENT_STATS
             | SL_IOCTL_DLI_INFO
             | SL_IOCTL_CONTROLLER_EVENT_GET
+            | SL_IOCTL_DIAGNOSTIC_RESULT
             | SL_IOCTL_SNOOP_GET
             | SL_IOCTL_CONTROLLER_SNAPSHOT
             | SL_IOCTL_DISCOVERY_SUBMIT

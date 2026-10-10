@@ -3168,3 +3168,26 @@ impl CheckReserved for SleDiscoveryTiming {
  fn check_reserved(&self)->Result { if self.reserved==[0;3] {Ok(())} else {Err(EINVAL)} }
 }
 const _: () = assert!(core::mem::size_of::<SleDiscoveryTiming>()==48);
+
+/// Owner-private bounded diagnostic result; input version/flags/generation/seq.
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleDiagnosticResult {
+    pub version: u32,
+    pub flags: u32,
+    pub generation: u64,
+    pub seq: u32,
+    pub state: u32,
+    pub error: i32,
+    pub opcode: u16,
+    pub status: u8,
+    pub(crate) _pad: u8,
+    pub data_len: u16,
+    pub(crate) _reserved: [u8; 6],
+    pub data: [u8; 64],
+}
+// SAFETY: repr(C), integer and byte-array fields; every bit pattern is valid.
+unsafe impl FromBytes for SleDiagnosticResult {}
+impl_check_reserved!(SleDiagnosticResult, [_pad, _reserved]);
+const _: () = assert!(core::mem::size_of::<SleDiagnosticResult>() == 104);
+pub(crate) const SL_IOCTL_DIAGNOSTIC_RESULT: u32 = _IOWR::<SleDiagnosticResult>(SL_MAGIC, 0xd0);

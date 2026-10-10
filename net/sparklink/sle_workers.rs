@@ -608,7 +608,6 @@ impl WorkItem<0> for ControllerRuntime {
                             expired
                         );
                     }
-                    runtime.cmd_pending.gc();
                     let mut timeout_buf = [0u16; sle_conn::MAX_CONNECTIONS];
                     let n = runtime.conn.check_supervision_timeouts(&mut timeout_buf);
                     for &h in &timeout_buf[..n] {

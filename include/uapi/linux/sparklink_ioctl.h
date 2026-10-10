@@ -1241,4 +1241,22 @@ struct sle_snoop_query {
 };
 #define SL_IOCTL_SNOOP_GET _IOWR(SL_MAGIC, 0x8e, struct sle_snoop_query)
 
+/* Owner-private result of a raw WS73 diagnostic admitted by the same fd.
+ * Input: version=1, flags=0, exact generation and nonzero admission seq.
+ * State: 1 pending, 2 complete-success, 3 failed (error or controller status).
+ * Missing/evicted is ENOENT; queries never acknowledge or remove a result.
+ */
+struct sle_diagnostic_result {
+    __u32 version, flags;
+    __aligned_u64 generation;
+    __u32 seq, state;
+    __s32 error;
+    __u16 opcode;
+    __u8 status, _pad;
+    __u16 data_len;
+    __u8 _reserved[6];
+    __u8 data[64];
+};
+#define SL_IOCTL_DIAGNOSTIC_RESULT _IOWR(SL_MAGIC, 0xd0, struct sle_diagnostic_result)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

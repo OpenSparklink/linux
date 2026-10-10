@@ -12,6 +12,7 @@ TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containme
 TEST_PROGS += run_connection_tx.py run_ssap_containment.py
 TEST_PROGS += run_event_copy.py
 TEST_PROGS += run_phy_model.py
+TEST_PROGS += run_diagnostic_result.py
 
 include ../lib.mk
 

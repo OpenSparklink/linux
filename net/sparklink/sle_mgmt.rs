@@ -34,6 +34,8 @@ pub(crate) const CMD_TIMEOUT_MS: u32 = 5000;
 pub(crate) struct CmdPendingEntry {
     /// DLI opcode (OGF|OCF) that was sent.
     pub(crate) opcode: u16,
+    /// Author of an explicitly submitted diagnostic; zero for internal work.
+    pub(crate) file_id: u64,
     /// Monotonically increasing sequence number (for dedup).
     pub(crate) seq: u32,
     /// Resolution status.
@@ -46,6 +48,7 @@ pub(crate) struct CmdPendingEntry {
     pub(crate) data: [u8; CMD_DATA_MAX],
     /// Length of valid data.
     pub(crate) data_len: u16,
+    pub(crate) error: i32,
     /// Deadline (jiffies) after which this entry is considered timed out.
     pub(crate) deadline: u64,
 }
@@ -61,10 +64,12 @@ impl CmdPendingEntry {
         let deadline = Self::jiffies_now().wrapping_add(msecs_to_jiffies(timeout_ms) as u64);
         Self {
             opcode,
+            file_id: 0,
             seq,
             status: AtomicU32::new(CMD_STATUS_PENDING),
             data: [0u8; CMD_DATA_MAX],
             data_len: 0,
+            error: 0,
             deadline,
         }
     }
@@ -84,9 +89,16 @@ impl CmdPendingEntry {
 
     /// Resolve this entry with a CommandComplete result.
     ///
-    /// Stores the status and up to `CMD_DATA_MAX` bytes of response data.
+    /// Stores an exact bounded response; oversized data fails with EMSGSIZE.
     pub(crate) fn resolve(&mut self, dli_status: u8, response: &[u8]) {
-        let copy_len = response.len().min(CMD_DATA_MAX);
+        if response.len() > CMD_DATA_MAX {
+            self.error = -(kernel::bindings::EMSGSIZE as i32);
+            self.data_len = 0;
+            self.data.fill(0);
+            self.status.store(CMD_RESOLVED_BIT | 0x200, Ordering::Release);
+            return;
+        }
+        let copy_len = response.len();
         self.data[..copy_len].copy_from_slice(&response[..copy_len]);
         self.data_len = copy_len as u16;
         self.status.store(
@@ -97,6 +109,7 @@ impl CmdPendingEntry {
 
     /// Mark this entry as timed out.
     pub(crate) fn timeout(&mut self) {
+        self.error = -(kernel::bindings::ETIMEDOUT as i32);
         self.status.store(CMD_TIMEOUT_STATUS, Ordering::Release);
     }
 
@@ -105,8 +118,8 @@ impl CmdPendingEntry {
     pub(crate) fn result_status(&self) -> Option<u8> {
         let v = self.status.load(Ordering::Acquire);
         if v != CMD_STATUS_PENDING && v & CMD_RESOLVED_BIT != 0 {
-            if v == CMD_TIMEOUT_STATUS {
-                None // timeout — no DLI status
+            if self.error != 0 {
+                None // local failure — no DLI status
             } else {
                 Some((v & 0xFF) as u8)
             }
@@ -136,7 +149,8 @@ const CMD_QUEUE_DEPTH: usize = 32;
 
 /// Fixed-size ring buffer of pending commands.
 ///
-/// Access is serialized by the caller (the SUBSYSTEM mutex).
+/// Access is serialized by the per-Runtime protocol mutex. Resolved entries
+/// remain observable until a later admission reuses their bounded slot.
 pub(crate) struct CmdPendingQueue {
     /// Circular buffer of entries.
     entries: [Option<CmdPendingEntry>; CMD_QUEUE_DEPTH],
@@ -205,7 +219,7 @@ impl CmdPendingQueue {
             })
             .ok_or(EBUSY)?;
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        self.next_seq = self.next_seq.checked_add(1).ok_or(EOVERFLOW)?;
 
         let entry = CmdPendingEntry::new(opcode, seq, timeout_ms);
         self.entries[slot] = Some(entry);
@@ -280,16 +294,11 @@ impl CmdPendingQueue {
         expired
     }
 
-    /// Remove resolved entries from the ring (garbage collection).
-    ///
-    /// Call periodically to free slots for new commands.
-    pub(crate) fn gc(&mut self) {
-        for slot in self.entries.iter_mut() {
-            if let Some(ref entry) = slot {
-                if entry.is_resolved() {
-                    *slot = None;
-                }
-            }
+    /// Associate an admitted sequence with the originating open file. Caller
+    /// holds the same per-Runtime protocol mutex through submit/enqueue/tag.
+    pub(crate) fn assign_owner(&mut self, seq: u32, file_id: u64) {
+        if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.seq == seq) {
+            entry.file_id = file_id;
         }
     }
 
