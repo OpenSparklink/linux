@@ -1751,15 +1751,25 @@ fn ioctl_inject_raw_adv(context: &RuntimeContext, arg: usize) -> Result<isize> {
 #[inline(never)]
 fn ioctl_conn_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
     let cd: SleConnData = read_user_struct(arg)?;
-    let len = (cd.length as usize).min(CONN_DATA_MAX);
+    let len = cd.length as usize;
+    if len > CONN_DATA_MAX {
+        return Err(EINVAL);
+    }
     let mut ss = context.lock()?;
     let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    let handle = s.conn.resolve_handle(cd.handle)?;
-    let sent = s.conn.send(handle, &cd.data[..len])?;
-    let mut tx_buf = [0u8; 1 + CONN_DATA_MAX];
-    tx_buf[0] = sle_conn::tcid::DEFAULT_DATA as u8;
-    tx_buf[1..1 + len].copy_from_slice(&cd.data[..len]);
-    s.controller.send_data(cd.handle, &tx_buf[..1 + len])?;
+    let s: &mut ControllerState = s;
+    let controller = &s.controller;
+    let sent = s.conn.send(cd.handle, &cd.data[..len], |host_handle, wire_handle, payload| {
+        let handle = if controller.uses_command_host() {
+            wire_handle.ok_or(EPIPE)?
+        } else {
+            host_handle
+        };
+        let mut tx_buf = [0u8; 1 + CONN_DATA_MAX];
+        tx_buf[0] = sle_conn::tcid::DEFAULT_DATA as u8;
+        tx_buf[1..1 + payload.len()].copy_from_slice(payload);
+        controller.send_data(handle, &tx_buf[..1 + payload.len()])
+    })?;
     Ok(sent as isize)
 }
 
@@ -1883,7 +1893,9 @@ fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u3
             info.supervision_timeout = entry.params.supervision_timeout;
             info.tx_seq = entry.seq.tx_seq;
             info.rx_seq = entry.seq.rx_seq;
-            info.tx_pending = entry.tx_queue.len() as u16;
+            // Legacy direct submission has no queued payloads. Acceptance is
+            // not a remote delivery acknowledgement or an async queue depth.
+            info.tx_pending = 0;
             info.rx_pending = entry.rx_queue.len() as u16;
             info.tx_bytes = entry.tx_bytes;
             info.rx_bytes = entry.rx_bytes;

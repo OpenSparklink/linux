@@ -1031,13 +1031,11 @@ pub struct ConnEntry {
     pub ssap_session: Option<SsapSession>,
     /// Sequence number tracker.
     pub seq: SeqTracker,
-    /// Transmit data queue (userspace -> peer).
-    pub tx_queue: DataRingBuffer,
     /// Receive data queue (peer -> userspace).
     pub rx_queue: DataRingBuffer,
     /// Maximum queue depth.
     pub queue_max: usize,
-    /// Total bytes sent.
+    /// Payload bytes accepted by the backend; not proof of peer delivery.
     pub tx_bytes: u64,
     /// Total bytes received.
     pub rx_bytes: u64,
@@ -1070,7 +1068,6 @@ impl ConnEntry {
             channels: ChannelSet::default(),
             ssap_session: None,
             seq: SeqTracker::new_async(),
-            tx_queue: DataRingBuffer::try_new()?,
             rx_queue: DataRingBuffer::try_new()?,
             queue_max: QUEUE_DEPTH,
             tx_bytes: 0,
@@ -1466,10 +1463,21 @@ impl ConnManager {
         }
     }
 
-    /// Send data on a connection identified by handle.
-    pub fn send(&mut self, handle: u16, data: &[u8]) -> Result<usize> {
+    /// Submit once, committing accounting only after backend acceptance.
+    ///
+    /// The caller holds the per-Runtime protocol lock throughout validation,
+    /// transport submission and commit. The callback receives both the resolved
+    /// Host handle and the optional controller handle; it must not re-enter this
+    /// manager. This legacy direct path has no asynchronous payload queue.
+    pub fn send(
+        &mut self,
+        handle: u16,
+        data: &[u8],
+        transmit: impl FnOnce(u16, Option<u16>, &[u8]) -> Result,
+    ) -> Result<usize> {
+        let handle = self.resolve_handle(handle)?;
         let entry = self.find_mut(handle)?;
-        if entry.state != ConnState::Connected {
+        if entry.state != ConnState::Connected || entry.channels.data.state != ChannelState::Open {
             return Err(EPIPE);
         }
         if data.is_empty() || data.len() > CONN_DATA_MAX {
@@ -1479,9 +1487,18 @@ impl ConnManager {
         if data.len() > mtu {
             return Err(EFBIG);
         }
-        entry.tx_queue.enqueue(data)?;
+        // Reliable framing, acknowledgements and segmentation are not wired
+        // into this old ioctl. Never accept them as if a bare TCID PDU sufficed.
+        if entry.channels.data.mode != TransportMode::Unreliable {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        if data.len() > entry.channels.data.mps as usize {
+            return Err(Error::from_errno(-(kernel::bindings::EMSGSIZE as i32)));
+        }
+        let bytes = entry.tx_bytes.checked_add(data.len() as u64).ok_or(EOVERFLOW)?;
+        transmit(entry.handle, entry.controller_handle, data)?;
         entry.seq.advance_tx();
-        entry.tx_bytes += data.len() as u64;
+        entry.tx_bytes = bytes;
         entry.last_activity = jiffies_now();
         Ok(data.len())
     }

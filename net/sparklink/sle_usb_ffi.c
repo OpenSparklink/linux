@@ -618,11 +618,10 @@ int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len)
 	if (!d->active || !d->udev)
 		return -ENODEV;
 
-	if (len > 511)
-		len = 511;
-
-	if (len > 0 && !data)
+	if (len <= 0 || !data || handle > 0x0fff)
 		return -EINVAL;
+	if (len > 511)
+		return -EMSGSIZE;
 
 	total = 5 + len;
 	pkt = kmalloc(total, GFP_KERNEL);
@@ -645,6 +644,8 @@ int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len)
 	ret = usb_bulk_msg(d->udev, pipe, pkt, total,
 			   &actual_len, SLE_CMD_TIMEOUT_MS);
 	kfree(pkt);
+	if (!ret && actual_len != total)
+		return -EIO;
 	return ret;
 }
 

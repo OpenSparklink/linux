@@ -1,0 +1,12 @@
+The test runner compiles actual production bodies from sle_conn.rs,
+sparklink_core.rs and sle_usb_ffi.c. Only dependency/container/USB types are
+fixtures. Production source hashes are recorded and checked again after tests.
+
+No test sender or success injection is compiled into the kernel. Fixture
+acceptance proves a submission/accounting boundary, not negotiated transport,
+socket ABI, peer delivery, hardware or RF. The native WS73 discovery path must
+also be regressed with a freshly built kernel and two real devices in a VM.
+
+The Rust source is compiled with -D warnings. C boundaries require
+ASan/UBSan/LeakSanitizer; a restricted ptrace environment may prevent LSan
+execution and must be corrected, not recorded as a passing/skipped gate.
