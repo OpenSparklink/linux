@@ -18,7 +18,7 @@ import time
 
 
 def body(source, name):
-    match = re.search(r'static (?:void|int) '+name+r'\([^;]*?\)\n\{', source)
+    match = re.search(r'static (?:void|int|bool) (?:LIBUSB_CALL )?'+re.escape(name)+r'\([^;]*?\)\n\{', source)
     if not match:
         raise ValueError('missing production function: '+name)
     depth = 1
@@ -70,6 +70,15 @@ def qmp_properties(args):
                 monitor.execute('qom-set',{'path':path,'property':'host-retry','value':True})
                 assert monitor.execute('qom-get',{'path':path,'property':'host-retry'}) is False
                 assert monitor.execute('qom-get',{'path':path,'property':'attached'}) is False
+                assert monitor.execute('qom-get',{'path':path,'property':'test-runtime-in-error-once'}) is False
+                assert monitor.execute('qom-get',{'path':path,'property':'test-runtime-in-errors'}) == 0
+                try:
+                    monitor.execute('qom-set',{'path':path,'property':'test-runtime-in-error-once','value':True})
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('unattached fault pulse accepted')
+                assert monitor.execute('qom-get',{'path':path,'property':'test-runtime-in-error-once'}) is False
                 assert monitor.execute('query-status')['status']=='prelaunch'
                 monitor.execute('quit');assert process.wait(timeout=10)==0
             finally:
@@ -208,7 +217,7 @@ int main(void)
     print(result,end='')
     patches = [Path(__file__).with_name(name).resolve() for name in
                ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
-                'usb-host-autoscan.patch']]
+                'usb-host-autoscan.patch','usb-host-runtime-error.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -219,7 +228,15 @@ int main(void)
         for command in commands:
             subprocess.run(command,cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
         assert copy.read_bytes()==host.read_bytes()
-        copy.write_text(copy.read_text().replace('allow_host_reset, true','unexpected_drift, true',1))
+        subprocess.run(['patch','--batch','--fuzz=0','--reverse','-p1','-i',str(patches[-1])],
+                       cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
+        subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
+        assert copy.read_bytes()==host.read_bytes()
+        copy.write_text(host.read_text().replace('test-runtime-in-error-once','unexpected-error-once'))
+        drift=copy.read_bytes()
+        denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
+        assert denied.returncode!=0 and copy.read_bytes()==drift
+        copy.write_text(host.read_text().replace('allow_host_reset, true','unexpected_drift, true',1))
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
@@ -240,7 +257,7 @@ int main(void)
         assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
              'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'reenumeration_cases':6,
-             'host_lifecycle_sites':3,'patch_cases':6,
+             'host_lifecycle_sites':3,'patch_cases':8,
              'source_sha256':hashlib.sha256(host.read_bytes()).hexdigest(),
              'production_sha256':hashlib.sha256(production.encode()).hexdigest()}
     if args.qemu:

@@ -140,6 +140,26 @@ mock 也不进行 libusb I/O；这两种检查均不证明真实透传/ROM/RF �
 拒绝、仅本对象恢复计数五种情况；暂停QMP验证脉冲读回false且仍未attached。
 `python3 ../test_ws73_reattach.py` 提供16种确定性交接/超时/端口隔离测试。
 
+`usb-host-runtime-error.patch`增加默认关闭的测试专用 QMP 脉冲
+`test-runtime-in-error-once`及只读计数`test-runtime-in-errors`。只能在实际
+ffff:3733 WS73 已 attached、handle有效且所有 reset/detach 开关关闭时显式
+arm；下一次成功、非空的 bulk IN81 在 host/libusb 层已经完成，但其数据不交给
+guest，改报 USB_RET_IOERROR。其他对象、端点、零长度和取消完成不消耗脉冲；
+close清除未消费脉冲，不能跨到新 transport。禁止把这项人工注入计作自然故障
+或物理拔插验收。内核 xHCI 可以先自行恢复端点，再由丢失回复导致命令超时；
+需要同时保留 guest xHCI、QEMU生命周期、原始USB及协议诊断证据。
+
+```sh
+python3 check-usb-host-runtime-error.py \
+  --source .build/qemu-9.2.0/hw/usb/host-libusb.c \
+  --output /absolute/private/fresh-runtime-error-check
+```
+
+该检查编译实际callback/setter，使用计数mock验证默认行为、单次注入、
+禁止arm条件及取消。autoscan检查还验证关闭一只设备只清除该设备的脉冲。
+补丁应用工具先在临时树验证完整链，可升级已应用的四补丁树；所有上下文
+漂移检查完成前不修改调用者源码。暂停QMP检查拒绝对未attached对象arm。
+
 构建输出保留完整 configure/compiler/install 诊断。固定的 QEMU 9.2.0
 包含仅用于构建的 libfdt const 声明修正，以兼容 glibc 2.43/GCC 16；
 不改变虚拟控制器的协议行为。无 sudo 环境可使用工作区解包的官方

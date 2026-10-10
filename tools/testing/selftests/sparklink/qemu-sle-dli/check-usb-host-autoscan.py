@@ -36,7 +36,7 @@ struct USBAutoFilter { int bus_num, addr, vendor_id, product_id; const char *por
 struct USBHostDevice {
     struct USBHostDevice *next;
     struct USBAutoFilter match;
-    bool attached;
+    bool attached, test_runtime_in_error_once;
     unsigned seen, errcount;
     int bus_num, addr, hostfd;
     void *dh, *dev;
@@ -120,6 +120,9 @@ int main(void) {
     reset_case(0);a.errcount=2;b.errcount=3;da.address=9;usb_host_auto_check(NULL);da.address=7;
     bool reenumerated=requests==1 && !closed[0] && !closed[1] && a.errcount==2 && b.errcount==3;
     printf("AUTOSCAN_REENUMERATION: owner_request_only=%d\n",reenumerated);failures+=!reenumerated;
+    reset_case(1);a.test_runtime_in_error_once=true;b.test_runtime_in_error_once=true;usb_host_auto_check(NULL);
+    bool disarmed=!a.test_runtime_in_error_once && b.test_runtime_in_error_once && !closed[1];
+    printf("AUTOSCAN_TEST_PULSE: retired_owner_disarmed=%d\n",disarmed);failures+=!disarmed;
     return failures?1:0;
 }
 '''
