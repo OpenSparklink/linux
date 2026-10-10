@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/capability.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -316,6 +317,108 @@ static void eviction(int fd, uint64_t generation, const unsigned char *address)
 	printf(",\"retained_result\":"); hex(&repeated, sizeof(repeated)); counters(before, after);
 	puts("}"); fflush(stdout);
 }
+static void hold_ack(const char *expected, int timeout_ms)
+{
+	struct pollfd input = { .fd = STDIN_FILENO, .events = POLLIN };
+	char ack[32];
+	require(poll(&input, 1, timeout_ms) == 1 && (input.revents & POLLIN) &&
+		fgets(ack, sizeof(ack), stdin) && !strcmp(ack, expected), "bounded hold acknowledgment");
+}
+static void hold_phase(const char *phase)
+{
+	printf("{\"hold_phase\":\"%s\",\"wall_ns\":%llu}\n", phase,
+		(unsigned long long)now(CLOCK_REALTIME)); fflush(stdout);
+}
+static struct sle_diagnostic_result checked_result(int fd,
+		const struct sle_diagnostic_submit *cmd, uint32_t state, int error)
+{
+	struct sle_diagnostic_result r = request(cmd->generation, cmd->seq);
+	struct sle_diagnostic_result expected = r;
+	expected.opcode = cmd->opcode; expected.state = state; expected.error = error;
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &r) && !memcmp(&r, &expected, sizeof(r)),
+		"exact pending or canceled result");
+	return r;
+}
+static struct sle_diagnostic_submit cancel_command(int fd, struct sle_diagnostic_submit cmd)
+{
+	cmd.seq = 0; cmd.action = 2;
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) && cmd.seq, "cancel retains admission");
+	return cmd;
+}
+static void cancel_held(int fd, uint64_t generation, const unsigned char *address)
+{
+	/* QMP holds an actual successful host transfer; guest never injects data. */
+	hold_phase("arm_ready"); hold_ack("armed\n", 10000);
+	struct sle_mgmt_stats before = stats(fd);
+	struct sle_diagnostic_submit input[3], output[3], canceled[2];
+	uint64_t start = now(CLOCK_REALTIME);
+	for (size_t i = 0; i < 3; i++) {
+		input[i] = (struct sle_diagnostic_submit){ .version = 1, .generation = generation,
+			.request_id = 8+i, .timeout_ms = 5000, .opcode = i == 2 ? 0x0403 : 0x0406, .action = 1 };
+		output[i] = input[i];
+	}
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &output[0]) && output[0].seq, "held MAC admission");
+	checked_result(fd, &output[0], 1, 0);
+	hold_phase("wait_held"); hold_ack("held\n", 5000);
+	checked_result(fd, &output[0], 1, 0);
+	canceled[0] = cancel_command(fd, output[0]);
+	require(canceled[0].seq == output[0].seq, "active cancel same sequence");
+	for (size_t i = 1; i < 3; i++)
+		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &output[i]) &&
+			output[i].seq == output[i-1].seq+1, "FIFO queued admission");
+	checked_result(fd, &output[2], 1, 0);
+	canceled[1] = cancel_command(fd, output[2]);
+	require(canceled[1].seq == output[2].seq, "queued cancel same sequence");
+	struct sle_diagnostic_result active = checked_result(fd, &output[0], 3, -ECANCELED);
+	struct sle_diagnostic_result queued = checked_result(fd, &output[2], 3, -ECANCELED), pending;
+	uint64_t quiet_start = now(CLOCK_MONOTONIC), quiet_end = quiet_start + 50000000ULL;
+	unsigned observations = 0;
+	do {
+		pending = checked_result(fd, &output[1], 1, 0);
+		checked_result(fd, &output[0], 3, -ECANCELED); checked_result(fd, &output[2], 3, -ECANCELED);
+		for (size_t i = 0; i < 3; i++) {
+			struct sle_diagnostic_submit retry = input[i];
+			require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &retry) &&
+				!memcmp(&retry, &output[i], sizeof(retry)), "held ID retry unchanged");
+		}
+		for (size_t i = 0; i < 2; i++) {
+			struct sle_diagnostic_submit retry = cancel_command(fd, output[i ? 2 : 0]);
+			require(!memcmp(&retry, &canceled[i], sizeof(retry)), "repeated cancel unchanged");
+		}
+		observations++; usleep(1000);
+	} while (now(CLOCK_MONOTONIC) < quiet_end);
+	struct sle_mgmt_stats held = stats(fd);
+	require(held.total_submitted == before.total_submitted+3 && held.total_resolved == before.total_resolved+2 &&
+		!before.pending && held.pending == 1 && held.total_timeouts == before.total_timeouts,
+		"held cancel and replay accounting");
+	uint64_t held_end = now(CLOCK_REALTIME);
+	printf("{\"cancel\":\"held\",\"generation\":%llu,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"quiet_elapsed_ns\":%llu,\"observations\":%u,\"inputs\":[",
+		(unsigned long long)generation, (unsigned long long)start, (unsigned long long)held_end,
+		(unsigned long long)(now(CLOCK_MONOTONIC)-quiet_start), observations);
+	for (size_t i = 0; i < 3; i++) { if (i) putchar(','); hex(&input[i], sizeof(input[i])); }
+	printf("],\"outputs\":[");
+	for (size_t i = 0; i < 3; i++) { if (i) putchar(','); hex(&output[i], sizeof(output[i])); }
+	printf("],\"cancel_outputs\":["); hex(&canceled[0], sizeof(canceled[0])); putchar(','); hex(&canceled[1], sizeof(canceled[1]));
+	printf("],\"results\":["); hex(&active, sizeof(active)); putchar(','); hex(&pending, sizeof(pending)); putchar(','); hex(&queued, sizeof(queued));
+	putchar(']'); counters(before, held); puts("}"); fflush(stdout);
+	hold_phase("release_ready"); hold_ack("released\n", 1500);
+	struct sle_diagnostic_result final = completed(fd, &output[1], 6, now(CLOCK_MONOTONIC)+6000000000ULL);
+	require(!memcmp(final.data, address, 6), "fresh MAC reply");
+	uint64_t quiet = now(CLOCK_MONOTONIC)+100000000ULL;
+	do {
+		checked_result(fd, &output[0], 3, -ECANCELED); checked_result(fd, &output[2], 3, -ECANCELED);
+		struct sle_diagnostic_result retry = request(generation, output[1].seq);
+		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &retry) && !memcmp(&retry, &final, sizeof(retry)), "fresh final stable");
+		usleep(1000);
+	} while (now(CLOCK_MONOTONIC) < quiet);
+	struct sle_mgmt_stats after = stats(fd);
+	require(after.total_submitted == held.total_submitted && after.total_resolved == held.total_resolved+1 &&
+		!after.pending && after.total_timeouts == held.total_timeouts, "release resolves only fresh request");
+	printf("{\"cancel\":\"released\",\"generation\":%llu,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu,\"results\":[",
+		(unsigned long long)generation, (unsigned long long)held_end, (unsigned long long)now(CLOCK_REALTIME));
+	hex(&active, sizeof(active)); putchar(','); hex(&final, sizeof(final)); putchar(','); hex(&queued, sizeof(queued));
+	putchar(']'); counters(held, after); puts("}"); fflush(stdout);
+}
 static void caps_zero(int fd, uint64_t generation, uint32_t seq)
 {
 	fflush(stdout); pid_t pid = fork(); require(pid >= 0, "fork");
@@ -354,7 +457,9 @@ int main(int argc, char **argv)
 {
 	char cmdline[4096] = { 0 }, *end; struct stat s;
 	FILE *f = fopen("/proc/cmdline", "r"); require(f && fgets(cmdline, sizeof(cmdline), f), "cmdline"); fclose(f);
-	require(argc == 2 && !getuid() && !geteuid() && !stat("/scratch-root-uuid", &s) &&
+	int cancellation = argc == 3 && !strcmp(argv[2], "cancel");
+	require((argc == 2 || cancellation) && (!cancellation || strstr(cmdline, "ws73.diagnostic_cancel=1")) &&
+		!getuid() && !geteuid() && !stat("/scratch-root-uuid", &s) &&
 		strstr(cmdline, "ws73.diagnostic=1"), "opt-in scratch-root VM only");
 	long index = strtol(argv[1], &end, 10); require(*argv[1] && !*end && index >= 0 && index < 16, "index");
 	int fd = bound(index);
@@ -393,6 +498,7 @@ int main(int argc, char **argv)
 	rejected(fd, "wrong_generation", request(generation + 1, mac.seq), ENODEV);
 	rejected(fd, "missing_sequence", request(generation, UINT32_MAX), ENOENT);
 	legacy_poll_faults(fd, generation, snapshot.address);
+	if (cancellation) cancel_held(fd, generation, snapshot.address);
 	release(fd, &lease);
 	int other = bound(index); lease = acquire(other, generation);
 	rejected(other, "foreign_author_with_lease", request(generation, mac.seq), EPERM);
