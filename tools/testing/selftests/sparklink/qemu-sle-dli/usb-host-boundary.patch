@@ -1,0 +1,89 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+Subject: usb-host: allow opt-out from host driver detach and lifecycle reset
+
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -94,6 +94,8 @@
+     bool                             allow_one_guest_reset;
+     bool                             allow_all_guest_resets;
+     bool                             suppress_remote_wake;
++    bool                             allow_kernel_driver_detach;
++    bool                             allow_host_reset;
+
+     /* state */
+     QTAILQ_ENTRY(USBHostDevice)      next;
+@@ -943,6 +945,14 @@
+     }
+
+     libusb_free_config_descriptor(conf);
++}
++
++/* Host open-failure/close/exit reset is separate from guest bus reset. */
++static void usb_host_lifecycle_reset(USBHostDevice *s)
++{
++    if (s->allow_host_reset) {
++        libusb_reset_device(s->dh);
++    }
+ }
+
+ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
+@@ -1060,7 +1070,7 @@
+     trace_usb_host_open_failure(bus_num, addr);
+     if (s->dh != NULL) {
+         usb_host_release_interfaces(s);
+-        libusb_reset_device(s->dh);
++        usb_host_lifecycle_reset(s);
+         usb_host_attach_kernel(s);
+         libusb_close(s->dh);
+         s->dh = NULL;
+@@ -1117,7 +1127,7 @@
+     }
+
+     usb_host_release_interfaces(s);
+-    libusb_reset_device(s->dh);
++    usb_host_lifecycle_reset(s);
+     usb_host_attach_kernel(s);
+     libusb_close(s->dh);
+     s->dh = NULL;
+@@ -1154,7 +1164,7 @@
+     if (s->dh) {
+         usb_host_abort_xfers(s);
+         usb_host_release_interfaces(s);
+-        libusb_reset_device(s->dh);
++        usb_host_lifecycle_reset(s);
+         usb_host_attach_kernel(s);
+         libusb_close(s->dh);
+     }
+@@ -1297,6 +1307,10 @@
+     struct libusb_config_descriptor *conf;
+     int rc, i;
+
++    if (!s->allow_kernel_driver_detach) {
++        return;
++    }
++
+     rc = libusb_get_active_config_descriptor(s->dev, &conf);
+     if (rc != 0) {
+         return;
+@@ -1322,6 +1336,10 @@
+ {
+     struct libusb_config_descriptor *conf;
+     int rc, i;
++
++    if (!s->allow_kernel_driver_detach) {
++        return;
++    }
+
+     rc = libusb_get_active_config_descriptor(s->dev, &conf);
+     if (rc != 0) {
+@@ -1769,6 +1787,10 @@
+ #endif
+     DEFINE_PROP_UINT32("isobufs",  USBHostDevice, iso_urb_count,    4),
+     DEFINE_PROP_UINT32("isobsize", USBHostDevice, iso_urb_frames,   32),
++    DEFINE_PROP_BOOL("kernel-driver-detach", USBHostDevice,
++                     allow_kernel_driver_detach, true),
++    DEFINE_PROP_BOOL("host-reset", USBHostDevice,
++                     allow_host_reset, true),
+     DEFINE_PROP_BOOL("guest-reset", USBHostDevice,
+                      allow_one_guest_reset, true),
+     DEFINE_PROP_BOOL("guest-resets-all", USBHostDevice,

@@ -84,6 +84,35 @@ JOBS=4 ./build-qemu.sh
 
 构建产物在 `bin/bin/qemu-system-x86_64`。
 
+真实 USB 开发客体需要 libusb 开发头文件与链接库；configure 现在显式
+`--enable-libusb`，缺依赖时构建失败，不能把仅有模型的 QEMU 用作透传环境。
+本机无 sudo 时可以将发行版已验证签名的开发 RPM 解包至工作区并配置
+PKG_CONFIG_PATH，不安装到主机；保留实际依赖、私有 pc 修改及 runtime library hash。
+
+构建脚本另应用 `usb-host-boundary.patch`。QEMU 的 host open-failure/close/exit
+默认会 reset，打开和配置时会 detach kernel driver。新增
+`kernel-driver-detach` / `host-reset` 两个 bool，默认 true 保留其他调用方行为。
+WS73 实机 runner 同时设置两者 false、`guest-reset=false`、
+`guest-resets-all=false`，并匹配固定 hostbus/hostport 和 vendorid=65535/
+productid=14131。补丁禁止该对象的 detach/attach 与主机生命周期 reset；
+guest reset 保持原独立开关。固件自身重新枚举和物理拔插仍照常发生。
+已由其他驱动占用的接口不会因此被释放，guest 初始化可能失败，应保留错误。
+默认 QEMU 没有这两个扩展属性；实机入口须拒绝并要求重建，不能静默省略。
+
+检查实际生产函数体（libusb 调用由计数 mock 代替）、三处生命周期路由、
+补丁的新应用/重复应用/漂移拒绝及可选实际二进制的 QMP 属性：
+
+```sh
+python3 check-usb-host-boundary.py \
+  --source .build/qemu-9.2.0 \
+  --qemu bin/bin/qemu-system-x86_64 \
+  --output /absolute/private/fresh-usb-host-check
+```
+
+QMP 检查使用暂停的 TCG 客体，hostbus=255/hostport=255 与限定 VID/PID，
+验证对象未 attached、VM 未运行、属性值可读回。它不选择主机设备，生产函数
+mock 也不进行 libusb I/O；这两种检查均不证明真实透传/ROM/RF 或主机绑定竞争。
+
 构建输出保留完整 configure/compiler/install 诊断。固定的 QEMU 9.2.0
 包含仅用于构建的 libfdt const 声明修正，以兼容 glibc 2.43/GCC 16；
 不改变虚拟控制器的协议行为。无 sudo 环境可使用工作区解包的官方

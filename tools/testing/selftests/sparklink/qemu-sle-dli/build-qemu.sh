@@ -73,6 +73,7 @@ patch_qemu() {
     info "Installing usb-sle-dli device into QEMU source..."
     cp "$DEVICE_SRC" "$dest"
     cp "$SCRIPT_DIR/usb-ws73-test.c" "$QEMU_SRC/hw/usb/dev-ws73-test.c"
+    python3 "$SCRIPT_DIR/apply-usb-host-boundary.py" "$QEMU_SRC"
 
     # glibc 2.43 preserves memchr's const qualifier with GCC 16. QEMU 9.2's
     # bundled libfdt only reads this separator, so retain that qualifier.
@@ -128,6 +129,7 @@ build_qemu() {
         --disable-opengl \
         --disable-virglrenderer \
         --enable-kvm \
+        --enable-libusb \
         --disable-linux-aio \
         --disable-debug-info \
         --disable-werror

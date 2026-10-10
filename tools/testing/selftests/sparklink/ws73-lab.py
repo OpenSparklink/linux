@@ -534,7 +534,7 @@ def run_vm(args, run_dir, devices, manifest):
     # once ready, so the final gate still checks all interfaces simultaneously.
     for index, port in enumerate(args.ports[:1]):
         bus, path = port.split('-', 1)
-        command += ['-device', f'usb-host,id=ws73_{index},bus=ws73xhci.0,port={index + 1},hostbus={int(bus)},hostport={path},guest-reset=false']
+        command += ['-device', f'usb-host,id=ws73_{index},bus=ws73xhci.0,port={index + 1},hostbus={int(bus)},hostport={path},vendorid=65535,productid=14131,guest-reset=false,guest-resets-all=false,kernel-driver-detach=false,host-reset=false']
     write_json(run_dir / 'command.json', command)
     manifest['qemu_command'] = command
     write_json(run_dir / 'manifest.json', manifest)
@@ -571,7 +571,9 @@ def run_vm(args, run_dir, devices, manifest):
                     bus, path = port.split('-', 1)
                     monitor.execute('device_add', dict(driver='usb-host', id=identity,
                         bus='ws73xhci.0', port=str(index + 1), hostbus=int(bus),
-                        hostport=path, **{'guest-reset': False}))
+                        hostport=path, vendorid=0xffff, productid=0x3733,
+                        **{'guest-reset': False, 'guest-resets-all': False,
+                           'kernel-driver-detach': False, 'host-reset': False}))
                     addresses[port] = device['address']
                     reattached.append(dict(port=port, address=device['address']))
                     write_json(run_dir / 'reattach.json', reattached)
@@ -581,7 +583,9 @@ def run_vm(args, run_dir, devices, manifest):
                     bus, path = args.ports[active].split('-', 1)
                     monitor.execute('device_add', dict(driver='usb-host', id=f'ws73_{active}',
                         bus='ws73xhci.0', port=str(active + 1), hostbus=int(bus),
-                        hostport=path, **{'guest-reset': False}))
+                        hostport=path, vendorid=0xffff, productid=0x3733,
+                        **{'guest-reset': False, 'guest-resets-all': False,
+                           'kernel-driver-detach': False, 'host-reset': False}))
                     active += 1
                 time.sleep(0.5)
         finally:
