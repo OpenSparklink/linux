@@ -6,6 +6,7 @@ TEST_GEN_PROGS_EXTENDED := sparklink_runtime_test ws73_native_runtime_test spark
 TEST_GEN_PROGS_EXTENDED += ws73_native_tx_fault_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_open_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_rpc_fault_test
+TEST_GEN_PROGS_EXTENDED += sparklink_event_copy_test
 
 TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containment.py
 TEST_PROGS += run_connection_tx.py run_ssap_containment.py
