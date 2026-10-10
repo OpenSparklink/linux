@@ -151,6 +151,26 @@ static void codec_tests(void)
 	CHECK(ws73_wire_status(rx + 96, 8, &type, &message) == -ENOMSG);
 	put16(rx + 98, 5);
 	CHECK(ws73_wire_status(rx + 96, 8, &type, &message) == -EPROTO);
+	/* BSLE has its own tag length inside an RX allocation. Nonzero HCC
+	 * padding is not status data. Cover both status kinds and every padded
+	 * length, including the real 32-byte allocation and 86-byte slot. */
+	for (unsigned int kind = 2; kind <= 4; kind += 2) {
+		ack_packet(rx, kind, 2);
+		for (i = 104; i < 178; i++)
+			rx[i] = i ^ 0xa5;
+		for (unsigned int size = 8; size <= 82; size++) {
+			CHECK(ws73_wire_status(rx + 96, size, &type, &message) == 0);
+			CHECK(type == kind && message == 2);
+		}
+		put32(rx + 4, 178); put16(rx + 12, 86); put16(rx + 94, 32);
+		r = (struct received) { 0 };
+		CHECK(ws73_wire_receive(rx, 178, consume, &r) == 0);
+		CHECK(r.frames == 1 && r.type == kind && r.message == 2);
+		for (unsigned int length = 0; length <= 33; length++) {
+			put16(rx + 98, length);
+			CHECK(ws73_wire_status(rx + 96, 32, &type, &message) == (length == 4 ? 0 : -EPROTO));
+		}
+	}
 }
 
 enum fault {

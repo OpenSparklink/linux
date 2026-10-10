@@ -69,6 +69,8 @@ struct ws73_usb {
 	u16 controller_error;
 	u8 int_interval;
 	enum ws73_stage stage;
+	enum ws73_stage failure_stage;
+	u64 failure_ms;
 	int last_error;
 	bool stopping;
 	u8 bulk_in;
@@ -282,6 +284,8 @@ out:
 	for (i = 0; i < ARRAY_SIZE(images); i++)
 		release_firmware(images[i]);
 	if (ret && !READ_ONCE(ws->stopping)) {
+		WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
+		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
 		WRITE_ONCE(ws->last_error, ret);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "boot failed: %d\n", ret);
@@ -404,6 +408,8 @@ static void ws73_fault_work(struct work_struct *work)
 			sparklink_native_unregister(ws->native_id, ws->native_generation);
 			WRITE_ONCE(ws->native_id, -1);
 		}
+		WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
+		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
 		WRITE_ONCE(ws->last_error, READ_ONCE(ws->asynchronous_error));
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "native RX stopped: %d\n", ws->last_error);
@@ -430,6 +436,13 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 	if (service != WS73_WIRE_SLE_SERVICE || queue != WS73_WIRE_SLE_QUEUE)
 		return 0;
 	sparklink_native_snoop_rx(ws->native_id, ws->native_generation, data, size);
+	ret = ws73_dli_validate_link_event(data, size);
+	if (!ret)
+		return sparklink_native_event(ws->native_id, ws->native_generation,
+					      SPARKLINK_NATIVE_WS73_HCC,
+					      get_unaligned_le16(data + 1), data + 5, size - 5);
+	if (ret != -ENOMSG)
+		return ret;
 	if (size >= 3 && data[0] == 0xa2 &&
 	    (get_unaligned_le16(data + 1) == 1 || get_unaligned_le16(data + 1) == 2)) {
 		ret = ws73_dli_validate_reply(data, size);
@@ -682,12 +695,16 @@ out:
 	release_firmware(pm);
 	release_firmware(custom);
 	if (ret && !READ_ONCE(ws->stopping)) {
+		WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
+		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
 		WRITE_ONCE(ws->last_error, ret);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "runtime bring-up failed: %d\n", ret);
 		if (ws->dli_result.opcode)
-			dev_err(&ws->intf->dev, "DLI query opcode=%04x controller_status=%x\n",
-				ws->dli_result.opcode, ws->dli_result.status);
+			dev_err(&ws->intf->dev,
+				"DLI query opcode=%04x controller_status=%x event=%04x hardware_error=%x\n",
+				ws->dli_result.opcode, ws->dli_result.status,
+				ws->dli_result.event, ws->dli_result.hardware_error);
 	}
 	mutex_unlock(&ws->phase_lock);
 }
@@ -716,6 +733,24 @@ static ssize_t boot_error_show(struct device *dev,
 	return sysfs_emit(buf, "%d\n", READ_ONCE(ws->last_error));
 }
 static DEVICE_ATTR_RO(boot_error);
+
+/* Diagnostic samples, not an atomic protocol snapshot or recovery authority.
+ * Preserve the failed phase instead of replacing it with the generic FAILED.
+ */
+static ssize_t failure_diagnostics_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+
+	return sysfs_emit(buf,
+		"phase=%u error=%d at_ms=%llu tx_sequence=%u id=%d generation=%llu opcode=%04x command_status=%x event=%04x hardware_error=%x\n",
+		READ_ONCE(ws->failure_stage), READ_ONCE(ws->last_error),
+		READ_ONCE(ws->failure_ms), READ_ONCE(ws->tx_sequence),
+		READ_ONCE(ws->native_id), READ_ONCE(ws->native_generation),
+		READ_ONCE(ws->dli_result.opcode), READ_ONCE(ws->dli_result.status),
+		READ_ONCE(ws->dli_result.event), READ_ONCE(ws->dli_result.hardware_error));
+}
+static DEVICE_ATTR_RO(failure_diagnostics);
 
 static ssize_t runtime_transport_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
@@ -769,6 +804,7 @@ static DEVICE_ATTR_RO(native_runtime);
 static struct attribute *ws73_attrs[] = {
 	&dev_attr_boot_stage.attr,
 	&dev_attr_boot_error.attr,
+	&dev_attr_failure_diagnostics.attr,
 	&dev_attr_runtime_transport.attr,
 	&dev_attr_metadata_valid.attr,
 	&dev_attr_native_runtime.attr,
@@ -831,6 +867,8 @@ static int ws73_probe(struct usb_interface *intf, const struct usb_device_id *id
 	mutex_init(&ws->tx_lock);
 	ws->native_id = -1;
 	ws->controller_error = 0x100; /* no controller error byte observed */
+	ws->dli_result.status = 0x100;
+	ws->dli_result.hardware_error = 0x100;
 	atomic_set(&ws->unsupported_rx, 0);
 	ws->udev = usb_get_dev(interface_to_usbdev(intf));
 	ws->intf = intf;

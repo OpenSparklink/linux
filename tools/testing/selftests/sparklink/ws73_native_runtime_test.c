@@ -28,6 +28,7 @@ _Static_assert(SL_IOCTL_MANAGEMENT_ACQUIRE == 0xc020538bU, "management acquire A
 _Static_assert(SL_IOCTL_MANAGEMENT_RELEASE == 0x4020538cU, "management release ABI");
 _Static_assert(SL_IOCTL_MANAGEMENT_QUERY == 0xc030538dU, "management query ABI");
 static int failed;
+static int link_events_mode;
 
 static int fail(const char *why)
 {
@@ -160,8 +161,6 @@ static int query(int fd, const struct sci_dev_info *info, unsigned int opcode, u
 	double deadline = now() + 10;
 	int received = 0;
 
-	if (opcode == 0x0406)
-		cmd.param_len = 1; /* explicit public address type 0 */
 	if (ioctl(fd, SL_IOCTL_MGMT_STATS, &before) || before.pending ||
 	    ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &cmd))
 		return fail("query submit/quiet baseline");
@@ -273,7 +272,8 @@ static int events_wait_burst(const struct sci_dev_info *info,
         if (!ioctl(guard, SL_IOCTL_CONTROLLER_EVENT_GET, &q)) {
             close(guard);
             if (q.event.seq != 40 || q.event.generation != generation ||
-                q.event.dev_index != info->index || q.event.event_code != 0x180b)
+                q.event.dev_index != info->index ||
+                q.event.event_code != (link_events_mode ? 0x1405 : 0x180b))
                 return fail("event barrier final record identity");
             printf("NATIVE_EVENT_BARRIER: index=%u generation=%llu last=40\n", info->index, generation);
             return 0;
@@ -302,23 +302,37 @@ static int events_read(int fd, const struct sci_dev_info *info, unsigned long lo
         const struct sle_controller_event *e = &request.event;
         const unsigned char *b = e->payload;
         if (e->seq != ordinal || e->generation != generation || e->dev_index != info->index ||
-            e->profile != 1 || e->event_code != 0x180b || e->payload_len != 278 ||
-            e->flags || e->_reserved || e->lost != (ordinal == 9 ? 8U : 0U) ||
-            !e->timestamp_ns || e->timestamp_ns < timestamp || b[0] != 3 || b[1] != 6 ||
-            memcmp(b + 2, "\xaa\xbb\xcc\xdd\xee", 5) || b[7] != info->addr[5] ||
-            b[8] != 4 || memcmp(b + 9, "\x09\x08\x07\x06\x05\x04", 6) ||
-            memcmp(b + 15, "\x01\x02\x03\x44\x55\xa7\xd6\xff", 8)) {
-            fprintf(stderr, "NATIVE_EVENT_MISMATCH: expected=%u seq=%llu lost=%llu generation=%llu length=%u\n",
-                    ordinal, (unsigned long long)e->seq, (unsigned long long)e->lost,
-                    (unsigned long long)e->generation, e->payload_len);
-            return fail("native identity/header/loss/timestamp preserved");
+            e->profile != 1 || e->flags || e->_reserved ||
+            e->lost != (ordinal == 9 ? 8U : 0U) || !e->timestamp_ns || e->timestamp_ns < timestamp)
+            return fail("native event identity/loss/timestamp preserved");
+        unsigned int payload_size = 278;
+        if (link_events_mode) {
+            const unsigned int codes[] = { 0x0015, 0x1401, 0x0005, 0x1405 };
+            const unsigned int sizes[] = { 32, 11, 4, 4 };
+            unsigned int kind = (ordinal - 1) % 4;
+            payload_size = sizes[kind];
+            if (e->event_code != codes[kind] || e->payload_len != payload_size ||
+                b[0] != (ordinal % 3 ? 0xfe : 0) || b[1] != ordinal ||
+                b[2] != info->addr[5] || b[3] != 0xff)
+                return fail("link event exact code/status/handle/role or reason");
+            if (kind < 2) {
+                if (b[4] != 0xa6) return fail("opaque link address type");
+                for (unsigned int i = 5; i < payload_size; i++)
+                    if (b[i] != (unsigned char)(i ^ ordinal))
+                        return fail("link address and full extension preserved");
+            }
+        } else {
+            if (e->event_code != 0x180b || e->payload_len != 278 || b[0] != 3 || b[1] != 6 ||
+                memcmp(b + 2, "\xaa\xbb\xcc\xdd\xee", 5) || b[7] != info->addr[5] ||
+                b[8] != 4 || memcmp(b + 9, "\x09\x08\x07\x06\x05\x04", 6) ||
+                memcmp(b + 15, "\x01\x02\x03\x44\x55\xa7\xd6\xff", 8))
+                return fail("native discovery header preserved");
+            for (unsigned int i = 0; i < 255; i++)
+                if (b[23 + i] != (unsigned char)(i ^ ordinal))
+                    return fail("maximum report data is not truncated");
         }
-        for (unsigned int i = 0; i < 255; i++)
-            if (b[23 + i] != (unsigned char)(i ^ ordinal))
-                return fail("maximum report data is not truncated");
-        for (unsigned int i = 278; i < sizeof(e->payload); i++)
-            if (b[i])
-                return fail("unused event bytes are zero");
+        for (unsigned int i = payload_size; i < sizeof(e->payload); i++)
+            if (b[i]) return fail("unused event bytes are zero");
         if (ordinal == 9)
             *first = *e;
         timestamp = e->timestamp_ns;
@@ -369,7 +383,15 @@ static int events_gate(int fd, int reader, const struct sci_dev_info *info,
     if (result != -1 || error != EFAULT || events_read(fd, info, generation, &first) ||
         events_read(reader, info, generation, &second) || memcmp(&first, &second, sizeof(first)))
         return fail("copy fault retry and independent complete fanout");
-    printf("NATIVE_EVENTS: index=%u retained=32 first=9 last=40 lost=8 payload=278 fanout=2 fault_retry=1 poll=1\n", info->index);
+    if (link_events_mode) {
+        struct sle_controller_snapshot snapshot = { .version = 1, .generation = generation };
+        if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &snapshot) || snapshot.flags != 2 ||
+            snapshot.profile != 1 || snapshot.generation != generation || snapshot.error)
+            return fail("observed link outcomes cannot claim Ready or fault Host");
+        printf("NATIVE_LINK_EVENTS: index=%u retained=32 first=9 last=40 lost=8 kinds=4 lengths=32/11/4 fanout=2 fault_retry=1 poll=1 setup=1\n", info->index);
+    } else {
+        printf("NATIVE_EVENTS: index=%u retained=32 first=9 last=40 lost=8 payload=278 fanout=2 fault_retry=1 poll=1\n", info->index);
+    }
     return 0;
 }
 
@@ -971,7 +993,8 @@ int main(int argc, char **argv)
 	int complete = 0, readers[2] = { -1, -1 };
 	pid_t children[2];
 	int fault_mode = argc == 2 && !strcmp(argv[1], "--fault");
-	int event_mode = argc == 2 && !strcmp(argv[1], "--events");
+	link_events_mode = argc == 2 && !strcmp(argv[1], "--link-events");
+	int event_mode = link_events_mode || (argc == 2 && !strcmp(argv[1], "--events"));
 	int discovery_mode = argc == 2 && !strcmp(argv[1], "--discovery");
 	int management_test = argc == 2 && !strcmp(argv[1], "--owners");
 	int tx_test = argc == 2 && !strcmp(argv[1], "--tx-barrier");
@@ -1016,7 +1039,7 @@ int main(int argc, char **argv)
 			goto out;
 	}
 	if (fault_mode) {
-		struct sle_dli_cmd cmd = { .opcode = 0x0406, .param_len = 1 };
+		struct sle_dli_cmd cmd = { .opcode = 0x0406 };
 		if (exercise(b, &b_info) ||
 		    management_mode(a, a_gen, SLE_MANAGEMENT_DIAGNOSTIC) ||
             ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||

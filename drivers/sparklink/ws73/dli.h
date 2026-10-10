@@ -17,6 +17,8 @@ struct ws73_dli_info {
 struct ws73_dli_result {
 	unsigned int opcode;
 	unsigned int status; /* exact controller status; not an errno alias */
+	unsigned int event; /* last observed bootstrap DLI event */
+	unsigned int hardware_error; /* raw Hardware Error byte; 0x100 = absent */
 };
 
 /* Runtime support policy: metadata queries only until the discovery Host
@@ -31,6 +33,14 @@ int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
  * still checked. A rejected reply must never release a Host transaction.
  */
 int ws73_dli_validate_reply(const unsigned char *data, size_t size);
+
+/* Recognize WS73 connection/disconnection outcomes, including the controller's
+ * opcode-block event numbers. Validate framing and the known prefix only;
+ * connection extension bytes, status, role and address type remain opaque.
+ * No command completion, connection ownership or Ready state is inferred.
+ * Returns -ENOMSG for another event kind, -EPROTO for a malformed outcome.
+ */
+int ws73_dli_validate_link_event(const unsigned char *data, size_t size);
 
 /* Fresh BSLE-open instance only. The caller provides its initial probe
  * window (one); every subsequent grant is an absolute controller credit.

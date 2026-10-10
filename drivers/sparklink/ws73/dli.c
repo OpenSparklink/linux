@@ -20,9 +20,8 @@ int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
 	case 0x0402:
 	case 0x0403:
 	case 0x0404:
-		return size ? -EINVAL : 0;
 	case 0x0406:
-		return size == 1 && params[0] <= 1 ? 0 : -EINVAL;
+		return size ? -EINVAL : 0;
 	default:
 		/* WS73 0401 is SetEventMask, not standard ReadCmdLen. */
 		return -EOPNOTSUPP;
@@ -41,6 +40,35 @@ struct ws73_query {
 static unsigned int dli_u16(const unsigned char *p)
 {
 	return (unsigned int)p[0] | (unsigned int)p[1] << 8;
+}
+
+int ws73_dli_validate_link_event(const unsigned char *data, size_t size)
+{
+	unsigned int event;
+	size_t params;
+
+	if (!data)
+		return -EINVAL;
+	if (size < 3 || data[0] != 0xa2)
+		return -ENOMSG;
+	event = dli_u16(data + 1);
+	if (event != 0x0015 && event != 0x1401 &&
+	    event != 0x0005 && event != 0x1405)
+		return -ENOMSG;
+	if (size < 5)
+		return -EPROTO;
+	params = dli_u16(data + 3);
+	if (params != size - 5)
+		return -EPROTO;
+	/* Connection: status, handle, role, peer type and six address bytes.
+	 * The standard's longer body and vendor extensions stay in the record.
+	 * Disconnection has an exact status/handle/reason body.
+	 * Facts checked against T/XS 10003-2025 9.1.14/9.1.5 and the independent
+	 * libws73-usb f4d85d0 connection reference; no source is incorporated.
+	 */
+	if (event == 0x0005 || event == 0x1405)
+		return params == 4 ? 0 : -EPROTO;
+	return params >= 11 ? 0 : -EPROTO;
 }
 
 int ws73_dli_validate_reply(const unsigned char *data, size_t size)
@@ -113,8 +141,13 @@ static int ws73_query_receive(void *context, unsigned int service, unsigned int 
 	params = dli_u16(data + 3);
 	if (params != size - 5)
 		return -EPROTO;
-	if (event == 0x000a)
+	query->result->event = event;
+	if (event == 0x000a) {
+		if (params != 1)
+			return -EPROTO;
+		query->result->hardware_error = data[5];
 		return -EIO;
+	}
 	if (event != 1 && event != 2)
 		return 0;
 	if (ws73_dli_validate_reply(data, size))
@@ -201,6 +234,8 @@ static int ws73_query_one(struct ws73_bsle_io *io, unsigned int *credits,
 
 	result->opcode = opcode;
 	result->status = 0x100; /* no controller status received */
+	result->event = 0;
+	result->hardware_error = 0x100; /* no Hardware Error event received */
 	if (!*credits) {
 		ret = ws73_query_poll(io, &query, 1);
 		if (ret)
@@ -225,7 +260,7 @@ int ws73_dli_query(struct ws73_bsle_io *io, unsigned int *credits,
 		   struct ws73_dli_info *info, struct ws73_dli_result *result)
 {
 	struct ws73_dli_info candidate = {};
-	unsigned char buffer[6], address_type = 0;
+	unsigned char buffer[6];
 	unsigned int i;
 	int ret;
 
@@ -263,11 +298,12 @@ int ws73_dli_query(struct ws73_bsle_io *io, unsigned int *credits,
 	ret = ws73_query_one(io, credits, 0x0403, NULL, 0, candidate.features, 10, result);
 	if (ret)
 		return ret;
-	/* Address read carries the explicit address-type byte (§8.1.6).
-	 * This command's availability on the WS73 firmware must be verified;
-	 * failure never falls back to a synthesized/cached public address.
+	/* WS73 SDK ARM shared and static host libraries both send 0406 with
+	 * no parameters. This differs from standard DLI's address-type byte.
+	 * Keep the quirk here, not in the standard Host command schema; failure
+	 * never falls back to a synthesized/cached public address.
 	 */
-	ret = ws73_query_one(io, credits, 0x0406, &address_type, 1, candidate.address, 6, result);
+	ret = ws73_query_one(io, credits, 0x0406, NULL, 0, candidate.address, 6, result);
 	if (ret)
 		return ret;
 	for (i = 0; i < 6 && !candidate.address[i]; i++)

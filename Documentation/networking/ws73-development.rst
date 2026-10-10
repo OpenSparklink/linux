@@ -74,7 +74,8 @@ raw-netbuf fallback.
 ``runtime_transport`` is a read-only descriptor-validation flag, independent
 of the handshake phase. The boot-only lab uses this flag to count bound
 five-endpoint interfaces even if later BSLE bring-up fails. Inspect
-``boot_stage``, ``boot_error`` and the complete kernel log separately; the
+``boot_stage``, ``boot_error``, ``failure_diagnostics`` and the complete kernel
+log separately; the
 existing WS73_BOOT_GATE marker intentionally does not certify BSLE or RF.
 Disconnect stops new I/O and joins bootstrap/fault work, the per-owner
 protocol workers and both native RX URBs before releasing its retained
@@ -103,10 +104,14 @@ Native metadata queries
 
 After fresh BSLE open, the same instance selects SLE queue 8 and queries
 version (0x0404, five bytes), buffer capacities (0x0402, six bytes), the
-80-bit feature map (0x0403, ten bytes), and public address (0x0406, explicit
-address-type parameter 0, six bytes). This last command is specified by
-T/XS 10003-2025 section 8.1.6; its availability on this WS73 firmware is
-unverified. Failure never substitutes an assigned or cached address.
+80-bit feature map (0x0403, ten bytes), and public address (0x0406, no
+parameters, six returned bytes). The WS73 SDK ARM shared/static libraries both
+send this command without the standard address-type byte. The former
+one-byte request produced a real Hardware Error; the zero-byte request now
+returns the real controller address. This is a WS73 dialect rule, not a change
+to T/XS 10003-2025 section 8.1.6 or standard DLI. Failure never substitutes an
+assigned or cached address. libws73-usb get_local_addr returns its cache after
+SetPublicAddress; that cache is not evidence of a fresh controller query.
 0x0401 is deliberately not sent as ReadCmdLen: the inspected WS73 dialect
 assigns it to SetEventMask. No full command-length negotiation is claimed.
 
@@ -126,8 +131,11 @@ all FF. ``metadata_valid`` and ``controller_information`` expose
 this immutable metadata. A successful query sequence now creates a pending
 Rust ControllerRuntime after its two RX URBs open, but does not publish Ready.
 ``boot_stage`` and ``boot_error`` remain the bring-up observability interface.
-Only native metadata queries are enabled; complete discovery transactions
-remain the next protocol dependency.
+Typed discovery transactions are separate from these bootstrap queries. A
+physical controller now reaches Setup with all four queries; its initial
+ADV_STOP returns raw status 0x1e (unknown advertising identifier), so slkd
+correctly withholds Ready pending advertiser-instance initialization. Real
+dual-controller RF acceptance has not passed.
 
 The direct-production-code synthetic test covers independent instances,
 zero/final-zero credit, unsolicited grants, wrong opcode, successful Status
@@ -890,3 +898,28 @@ capture. Evidence is local in ``.dev/rpc-fault-final-evidence.json``. Rust
 companion sources/programs and QEMU inputs are unchanged. These results do
 not qualify real WS73/RF, four devices, full lifecycle or the retained S0-S6
 plan; original incomplete issues remain open.
+
+BSLE padding, diagnostics and link observation
+---------------------------------------------
+
+Real BSLE replies may declare an HCC allocation of 32 bytes while the inner
+tag declares only four status bytes. The parser uses the bounded inner tag
+length and ignores allocation padding, including nonzero padding. Aggregate
+and slot bounds still pass before any delivery; malformed known tags fail.
+The model generates synthetic nonzero padding to exercise the production codec.
+
+Read-only ``failure_diagnostics`` retains failed phase, errno, timestamp,
+TX sequence, owner id/generation, last query opcode, raw command status, event
+and Hardware Error byte. Value 0x100 means no status/error was received; raw
+hardware byte zero is still a Hardware Error. These sampled diagnostic fields
+do not grant authority or replace the state machine. Per-device bounded
+automatic recovery is planned and remains unimplemented.
+
+Validated Connection Complete (0x0015/0x1401, at least the 11-byte prefix) and
+Disconnected (0x0005/0x1405, exactly four bytes) are forwarded as raw native
+events. The complete bounded payload, including standard extensions and unknown
+status/role/address-type values, is retained for observers. This does not
+create a link, authorize data/security operations or promote Setup to Ready.
+Use ``run_runtime_lifecycle.py --native-ws73 --native-ws73-link-events`` for
+synthetic fanout, overflow, EFAULT retry, retirement and survivor coverage.
+These events have not been verified over a real WS73 link.

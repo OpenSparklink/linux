@@ -30,6 +30,7 @@ struct USBWs73Test {
     uint8_t runtime_status;
     uint8_t runtime_fault;
     uint8_t runtime_reports;
+    bool runtime_link_events;
     bool runtime_policy;
     bool runtime_zlp;
     uint8_t runtime_medium;
@@ -121,7 +122,10 @@ static void queue_frame(USBWs73Test *s, uint8_t service, uint8_t queue,
 
 static void bsle_ack(USBWs73Test *s, unsigned int message)
 {
-    uint8_t data[8] = { 2, 0, 4, 0 };
+    uint8_t data[32] = { 2, 0, 4, 0 };
+    /* Model the independently captured RX allocation padding, using an
+     * explicitly synthetic nonzero pattern rather than device memory. */
+    for (unsigned int i = 8; i < sizeof(data); i++) data[i] = i ^ 0xa5;
     put32(data + 4, message);
     queue_frame(s, 5, 10, data, sizeof(data));
 }
@@ -159,6 +163,21 @@ static void report_events(USBWs73Test *s)
     for (unsigned int ordinal = 1; ordinal <= s->runtime_reports; ordinal++) {
         uint8_t data[283] = { 0xa2 };
         uint8_t *body = data + 5;
+        if (s->runtime_link_events) {
+            static const unsigned int codes[] = { 0x0015, 0x1401, 0x0005, 0x1405 };
+            static const unsigned int sizes[] = { 32, 11, 4, 4 };
+            unsigned int kind = (ordinal - 1) % 4, size = sizes[kind];
+            put16(data + 1, codes[kind]); put16(data + 3, size);
+            body[0] = ordinal % 3 ? 0xfe : 0;
+            body[1] = ordinal; body[2] = s->serial;
+            body[3] = 0xff; /* raw role or reason, never normalize */
+            if (kind < 2) {
+                body[4] = 0xa6;
+                for (unsigned int i = 5; i < size; i++) { body[i] = i ^ ordinal; }
+            }
+            queue_frame(s, 10, 8, data, 5 + size);
+            continue;
+        }
         put16(data + 1, 0x180b); put16(data + 3, 278);
         body[0] = 3; body[1] = 6;
         memcpy(body + 2, "\xaa\xbb\xcc\xdd\xee", 5); body[7] = s->serial;
@@ -241,7 +260,7 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         memset(value, s->serial, 10); size = 10;
         break;
     case 0x0406:
-        if (n != 1 || p[5]) { return false; }
+        if (n) { return false; } /* WS73 SDK dialect, not standard DLI */
         memcpy(value, "\x02\x73\x00\x00\x00", 5); value[5] = s->serial; size = 6;
         break;
     case 0x0c02:
@@ -524,6 +543,7 @@ static Property properties[] = {
     DEFINE_PROP_UINT8("runtime-status", USBWs73Test, runtime_status, 0),
     DEFINE_PROP_UINT8("runtime-fault", USBWs73Test, runtime_fault, 0),
     DEFINE_PROP_UINT8("runtime-reports", USBWs73Test, runtime_reports, 0),
+    DEFINE_PROP_BOOL("runtime-link-events", USBWs73Test, runtime_link_events, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 

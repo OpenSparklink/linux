@@ -85,7 +85,7 @@ def check(args):
     maximum = re.search(r'^#define USB_MAX_INTERFACES (\d+)$',
                         (args.source/'include/hw/usb.h').read_text(), re.M)[1]
     functions = ['usb_host_detach_kernel', 'usb_host_attach_kernel', 'usb_host_lifecycle_reset',
-                 'usb_host_set_retry']
+                 'usb_host_set_retry', 'usb_host_port_reenumerated']
     production = '\n\n'.join(body(source, name) for name in functions)
     (args.output/'production.h').write_text(production+'\n')
     for name in ['usb_host_open','usb_host_close','usb_host_exit_notifier']:
@@ -96,18 +96,24 @@ def check(args):
     assert source.count('usb_host_lifecycle_reset(s);') == 3
     guest = body(source, 'usb_host_handle_reset')
     assert '!s->allow_one_guest_reset && !s->allow_all_guest_resets' in guest
+    autoscan = body(source, 'usb_host_auto_check')
+    assert autoscan.count('usb_host_port_reenumerated(s, devs[i])') == 1
+    assert autoscan.index('usb_host_port_reenumerated(s, devs[i])') < autoscan.index('if (s->dh != NULL)')
+    assert re.search(r'if \(usb_host_port_reenumerated\(s, devs\[i\]\)\) \{\s+usb_host_nodev\(s\);\s+continue;', autoscan)
     code = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 struct libusb_config_descriptor { int unused; };
+typedef struct { int bus, address; } libusb_device;
 typedef struct {
     bool allow_kernel_driver_detach, allow_host_reset;
     bool attached, needs_autoscan;
     int errcount;
     void *dh, *dev;
     int bus_num, addr;
+    struct { int bus_num; const char *port; } match;
     struct { bool detached; } ifs[USB_MAX_INTERFACES];
 } USBHostDevice;
 typedef USBHostDevice Object;
@@ -129,6 +135,8 @@ static int libusb_attach_kernel_driver(void *handle, int interface)
 { (void)handle; (void)interface; attached++; return 0; }
 static int libusb_reset_device(void *handle)
 { (void)handle; resets++; return 0; }
+static int libusb_get_bus_number(libusb_device *dev) { return dev->bus; }
+static int libusb_get_device_address(libusb_device *dev) { return dev->address; }
 static void libusb_free_config_descriptor(struct libusb_config_descriptor *out)
 { assert(out==&config); freed++; }
 static void usb_host_libusb_error(const char *name, int result)
@@ -177,6 +185,17 @@ int main(void)
     assert(queries==3 && active==USB_MAX_INTERFACES && detached==USB_MAX_INTERFACES &&
            attached==USB_MAX_INTERFACES && resets==1 && freed==2);
     puts("USB_HOST_RETRY: PASS 5 cases (production setter, no libusb calls, no physical USB)");
+    libusb_device original={.bus=1,.address=84}, replacement={.bus=1,.address=88};
+    USBHostDevice fixed={.dh=&original,.bus_num=1,.addr=84,.match={.bus_num=1,.port="2.1.1"}};
+    assert(!usb_host_port_reenumerated(&fixed,&original));
+    assert(usb_host_port_reenumerated(&fixed,&replacement));
+    fixed.dh=NULL; assert(!usb_host_port_reenumerated(&fixed,&replacement)); fixed.dh=&original;
+    fixed.match.port=NULL; assert(!usb_host_port_reenumerated(&fixed,&replacement)); fixed.match.port="2.1.1";
+    fixed.match.bus_num=0; assert(!usb_host_port_reenumerated(&fixed,&replacement)); fixed.match.bus_num=1;
+    replacement.bus=2; assert(!usb_host_port_reenumerated(&fixed,&replacement));
+    assert(queries==3 && active==USB_MAX_INTERFACES && detached==USB_MAX_INTERFACES &&
+           attached==USB_MAX_INTERFACES && resets==1 && freed==2);
+    puts("USB_HOST_REENUMERATION: PASS 6 cases (production predicate/autoscan routing, no physical USB)");
 }
 '''
     (args.output/'guards.c').write_text('#define USB_MAX_INTERFACES '+maximum+'\n'+code)
@@ -188,7 +207,7 @@ int main(void)
     (args.output/'guards.log').write_text(result)
     print(result,end='')
     patches = [Path(__file__).with_name(name).resolve() for name in
-               ['usb-host-boundary.patch','usb-host-retry.patch']]
+               ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -203,13 +222,19 @@ int main(void)
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
+        copy.write_text(host.read_text().replace('s->addr != libusb_get_device_address(dev)',
+                                                's->addr == libusb_get_device_address(dev)',1))
+        drift=copy.read_bytes()
+        denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
+        assert denied.returncode!=0 and copy.read_bytes()==drift
         copy.write_text(host.read_text().replace('object_property_add_bool(obj, "host-retry"',
                                                 'object_property_add_bool(obj, "unexpected-retry"',1))
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
-             'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'host_lifecycle_sites':3,'patch_cases':4,
+             'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'reenumeration_cases':6,
+             'host_lifecycle_sites':3,'patch_cases':5,
              'source_sha256':hashlib.sha256(host.read_bytes()).hexdigest(),
              'production_sha256':hashlib.sha256(production.encode()).hexdigest()}
     if args.qemu:

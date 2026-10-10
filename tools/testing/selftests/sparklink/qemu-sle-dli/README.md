@@ -104,6 +104,16 @@ false。true 仅在该对象无 libusb handle、未 attached 且使用 autoscan 
 时清零失败重试计数；后续仍由既有 autoscan timer 打开。已打开/附着对象收到
 脉冲也不受影响，不触发 close/reset/detach，不修改其他对象或全局 timer。
 
+另应用 `usb-host-reenumeration.patch`：固定 hostbus/hostport 的新设备地址
+与已打开地址不同时，先调度现有 nodev BH 取消旧传输和关闭旧 handle，
+由后续 autoscan 打开新 incarnation。旧 autoscan 会在 seen 后直接保留非空
+旧 handle，实机出现 attached=true 但没有当前节点 live fd 的超时；新路径
+已在实机固件重枚举后自动重新持有新节点。它不删除QMP对象，沿用上述
+禁止主机reset/detach的边界；仅广泛VID/PID匹配的对象不受此规则影响。
+地址复用为相同数值的情况并未由此谓词解决，不宣称所有重枚举故障已解决。
+检查编译实际地址变化谓词并覆盖六种固定端口/地址/handle组合，验证三补丁
+新应用、重复应用及逐个漂移拒绝。
+
 两个物理 launcher 共用 `ws73-lab.py` 的非阻塞 ReattachmentWatcher：新地址
 先等最多20秒，只有 attached 和该子进程当前USB节点的live fd均确认才更新
 地址。udev/usbfs交接窗口继续等待；没有占用/attached/live fd且等待满6秒时

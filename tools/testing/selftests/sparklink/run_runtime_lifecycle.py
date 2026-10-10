@@ -69,7 +69,7 @@ def assess(console, qemu_exit, recipes=False):
     return errors
 
 
-def assess_native(console, qemu_exit, fault=False, events=False, discovery=False, management=False):
+def assess_native(console, qemu_exit, fault=False, events=False, discovery=False, management=False, link_events=False):
     console = console.replace('\r', '')
     errors = []
     if qemu_exit:
@@ -107,11 +107,16 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
             errors.append('invalid native generation isolation')
     if re.findall(r'^RUNTIME_GUEST_EXIT: (\d+)$', console, re.MULTILINE) != ['0']:
         errors.append('missing or unsuccessful guest exit')
-    event_evidence = re.findall(r'^NATIVE_EVENTS: index=(\d+) retained=32 first=9 last=40 '
-                                r'lost=8 payload=278 fanout=2 fault_retry=1 poll=1$',
-                                console, re.MULTILINE)
+    pattern = (r'^NATIVE_LINK_EVENTS: index=(\d+) retained=32 first=9 last=40 '
+               r'lost=8 kinds=4 lengths=32/11/4 fanout=2 fault_retry=1 poll=1 setup=1$'
+               if link_events else r'^NATIVE_EVENTS: index=(\d+) retained=32 first=9 last=40 '
+               r'lost=8 payload=278 fanout=2 fault_retry=1 poll=1$')
+    event_evidence = re.findall(pattern, console, re.MULTILINE)
     if sorted(event_evidence) != (['0', '1'] if events else []):
         errors.append('missing, duplicate or unexpected complete native event evidence')
+    if console.count('NATIVE_LINK_EVENTS:') != (2 if link_events else 0) or \
+            console.count('NATIVE_EVENTS:') != (2 if events and not link_events else 0):
+        errors.append('incorrect native event dialect evidence')
     replug = 'NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1'
     if console.count(replug) != (1 if events else 0):
         errors.append('missing, duplicate or unexpected native event replug evidence')
@@ -305,7 +310,11 @@ def main():
                         help='hold USB OUT after early Complete; verify unlocked state and pending result')
     parser.add_argument('--native-ws73-tx-terminal', choices=['out-error', 'short-out', 'unplug'],
                         help='early Complete then OUT error/short write or in-flight unplug; synthetic only')
+    parser.add_argument('--native-ws73-link-events', action='store_true',
+                        help='synthetic WS73 connection/disconnection event fanout; no real link')
     args = parser.parse_args()
+    if args.native_ws73_link_events:
+        args.native_ws73_events = True
     tx_gate = args.native_ws73_tx_barrier or args.native_ws73_tx_terminal
     if args.native_ws73_tx_terminal and (not args.native_ws73 or args.native_ws73_tx_barrier or
             args.native_ws73_fault or args.native_ws73_events or args.native_ws73_discovery or
@@ -337,6 +346,7 @@ def main():
                     standard_host_recipes=args.standard_host_recipes,
                     native_fault_mode=args.native_ws73_fault_mode if args.native_ws73_fault else None,
                     native_event_stream=args.native_ws73_events,
+                    native_link_events=args.native_ws73_link_events,
                     native_discovery=args.native_ws73_discovery,
                     native_management=args.native_ws73_management,
                     native_tx_barrier=args.native_ws73_tx_barrier,
@@ -412,7 +422,7 @@ poweroff -f
         if args.native_ws73_events:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
-                                                          '/bin/sparklink_runtime_test --events\n'))
+                                                          '/bin/sparklink_runtime_test --link-events\n' if args.native_ws73_link_events else '/bin/sparklink_runtime_test --events\n'))
         if args.native_ws73_management:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n', '/bin/sparklink_runtime_test --owners\n'))
@@ -457,6 +467,7 @@ poweroff -f
                             args.native_ws73_fault_mode]) if args.native_ws73_fault else
                         ',runtime-status=254' if args.native_ws73 else '') +
                        (',runtime-reports=40' if args.native_ws73_events else '') +
+                       (',runtime-link-events=on' if args.native_ws73_link_events else '') +
                        (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
@@ -484,6 +495,8 @@ poweroff -f
                 wait_marker(process, console, f'{prefix}_ADD_SECOND')
                 monitor = load_qmp()(sock, output / 'qmp.jsonl')
                 event_properties = {'runtime-reports': 40} if args.native_ws73_events else {}
+                if args.native_ws73_link_events:
+                    event_properties['runtime-link-events'] = True
                 if args.native_ws73_discovery or args.native_ws73_management:
                     event_properties['runtime-discovery'] = True
                 if args.standard_host_recipes:
@@ -523,7 +536,8 @@ poweroff -f
                           manifest.get('early_in_while_out_pending', False),
                           manifest.get('cancel_pending_confirmed', False)) if args.native_ws73_tx_terminal else
                       verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
-                             args.native_ws73_events, args.native_ws73_discovery, args.native_ws73_management)
+                             args.native_ws73_events, args.native_ws73_discovery, args.native_ws73_management,
+                             args.native_ws73_link_events)
                       if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code,
                                                      args.standard_host_recipes))
             if errors:

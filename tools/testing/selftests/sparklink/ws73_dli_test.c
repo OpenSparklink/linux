@@ -66,9 +66,7 @@ static int send_data(void *context, size_t size)
 	CHECK(size == 128 && !f->tx[0]);
 	CHECK(!memcmp(f->tx + 64, "\xa0\x08", 2) && f->tx[68] == 0xa1);
 	CHECK(f->commands < 4 && u16(f->tx + 69) == ops[f->commands]);
-	CHECK(u16(f->tx + 71) == (f->commands == 3 ? 1 : 0));
-	if (f->commands == 3)
-		CHECK(f->tx[73] == 0); /* explicit public-address type */
+	CHECK(u16(f->tx + 71) == 0); /* WS73 SDK 0406 has no address-type byte */
 	f->commands++;
 	f->pending_opcode = u16(f->tx + 69);
 	f->reply_stage = 0;
@@ -121,6 +119,10 @@ static int receive_data(void *context, unsigned int timeout)
 		return -ENODEV;
 	if (f->fault == HARDWARE_ERROR) {
 		packet(f, 0x000a, opcode, 0, 0, NULL, 0);
+		/* Hardware Error has one raw byte, not the command-echo envelope. */
+		put16(f->rx + 94, 6);
+		put16(f->rx + 99, 1);
+		f->rx[101] = 0;
 		return 156;
 	}
 	if (f->fault == WRONG_OPCODE && !f->reply_stage++) {
@@ -224,11 +226,11 @@ static void command_tests(void)
 		CHECK(ws73_dli_validate_command(op, NULL, 0) == 0);
 		CHECK(ws73_dli_validate_command(op, params, 1) == -EINVAL);
 	}
-	CHECK(ws73_dli_validate_command(0x0406, NULL, 0) == -EINVAL);
+	CHECK(ws73_dli_validate_command(0x0406, NULL, 0) == 0);
 	CHECK(ws73_dli_validate_command(0x0406, NULL, 1) == -EINVAL);
 	for (i = 0; i < 256; i++) {
 		params[0] = i;
-		CHECK(ws73_dli_validate_command(0x0406, params, 1) == (i <= 1 ? 0 : -EINVAL));
+		CHECK(ws73_dli_validate_command(0x0406, params, 1) == -EINVAL);
 	}
 	CHECK(ws73_dli_validate_command(0x0401, NULL, 0) == -EOPNOTSUPP);
 	CHECK(ws73_dli_validate_command(0x1001, params, 8) == -EOPNOTSUPP);
@@ -332,6 +334,9 @@ static void query_tests(void)
 			CHECK(a.commands <= 4 && a.now <= 11000);
 			if (i == FAILURE_STATUS)
 				CHECK(result.status == 0xfe && result.opcode == 0x0404);
+			if (i == HARDWARE_ERROR)
+				CHECK(result.event == 0x000a && result.hardware_error == 0 &&
+				      result.status == 0x100 && result.opcode == 0x0404);
 			if (i == NO_GRANT)
 				CHECK(a.commands == 1 && a.credits == 0 && result.opcode == 0x0402);
 		} else {
@@ -359,8 +364,40 @@ static void query_tests(void)
 	CHECK(a.controls == 0 && a.commands == 0);
 }
 
+static void link_event_tests(void)
+{
+	unsigned char data[284] = { 0xa2 }, before[284];
+	const unsigned int codes[] = { 0x0015, 0x1401, 0x0005, 0x1405 };
+
+	CHECK(ws73_dli_validate_link_event(NULL, 0) == -EINVAL);
+	for (unsigned int kind = 0; kind < 4; kind++) {
+		put16(data + 1, codes[kind]);
+		for (unsigned int n = 0; n <= 278; n++) {
+			put16(data + 3, n);
+			for (unsigned int i = 0; i < n; i++) data[5 + i] = i ^ n;
+			memcpy(before, data, sizeof(data));
+			CHECK(ws73_dli_validate_link_event(data, 5 + n) ==
+			      ((kind < 2 ? n >= 11 : n == 4) ? 0 : -EPROTO));
+			CHECK(!memcmp(before, data, sizeof(data)));
+			CHECK(ws73_dli_validate_link_event(data, 4 + n) == -EPROTO);
+			CHECK(ws73_dli_validate_link_event(data, 6 + n) == -EPROTO);
+		}
+		CHECK(ws73_dli_validate_link_event(data, 3) == -EPROTO);
+		CHECK(ws73_dli_validate_link_event(data, 4) == -EPROTO);
+	}
+	put16(data + 1, 0x0401);
+	CHECK(ws73_dli_validate_link_event(data, 5) == -ENOMSG);
+	put16(data + 1, 2); /* management Complete is never a link outcome */
+	CHECK(ws73_dli_validate_link_event(data, 9) == -ENOMSG);
+	data[0] = 0xa1;
+	put16(data + 1, 0x1401);
+	CHECK(ws73_dli_validate_link_event(data, 16) == -ENOMSG);
+	CHECK(ws73_dli_validate_link_event(data, 0) == -ENOMSG);
+}
+
 int main(void)
 {
+	link_event_tests();
 	reply_tests();
 	command_tests();
 	query_tests();

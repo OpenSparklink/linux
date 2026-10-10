@@ -192,12 +192,17 @@ int ws73_wire_receive(const unsigned char *data, size_t size,
 int ws73_wire_status(const unsigned char *data, size_t size,
 		     unsigned int *type, unsigned int *message)
 {
-	if (!data || !type || !message || size < 4 || wire_u16(data + 2) != size - 4)
+	if (!data || !type || !message || size < 4 || wire_u16(data + 2) > size - 4)
 		return -EPROTO;
 	*type = wire_u16(data);
 	if (*type != 2 && *type != 4)
 		return -ENOMSG;
-	if (size != 8)
+	/* RX HCC pay_len can include allocation padding. Real customize ACKs
+	 * advertise 32 bytes while the BSLE tag declares a four-byte message.
+	 * Consume only that declared message; padding is not another status and
+	 * need not be zero. Aggregate bounds were validated by wire_receive.
+	 */
+	if (wire_u16(data + 2) != 4 || size < 8)
 		return -EPROTO;
 	*message = wire_u32(data + 4);
 	return 0;
