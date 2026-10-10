@@ -3311,7 +3311,7 @@ fn ioctl_diagnostic_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     let mut watermark = me.diagnostic_request_id.lock();
     {
         let mut state = context.lock()?;
-        let state = state.as_mut().ok_or(ENODEV)?;
+        let state = Option::as_mut(&mut *state).ok_or(ENODEV)?;
         if !matches!(input.opcode, 0x0402 | 0x0403 | 0x0404 | 0x0406) {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
@@ -3360,7 +3360,7 @@ fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if *owner.schedule_gate.lock() { return Err(ENODEV); }
     owner.management.lock().authorize(me.file_id, sle_management::DIAGNOSTIC).map_err(management_error)?;
     let mut guard = context.lock()?;
-    let state = guard.as_mut().ok_or(ENODEV)?;
+    let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
     state.cmd_pending.expire_stale();
     let entry = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;
     if entry.file_id != me.file_id { return Err(EPERM); }
