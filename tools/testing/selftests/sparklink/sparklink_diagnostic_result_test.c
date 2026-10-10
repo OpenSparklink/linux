@@ -139,9 +139,14 @@ int main(int argc, char **argv)
 	struct sle_controller_snapshot snapshot = { .version = 1 };
 	uint64_t deadline = now(CLOCK_MONOTONIC) + 90000000000ULL;
 	for (;;) {
+		snapshot.flags = 0; /* Output flags are not valid query-input flags. */
 		require(!ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &snapshot), "snapshot");
-		if (snapshot.flags == SLE_CONTROLLER_READY && snapshot.valid_fields == SLE_CONTROLLER_FULL_METADATA) break;
-		require(now(CLOCK_MONOTONIC) < deadline, "Ready deadline"); usleep(10000);
+		/* Diagnostics precede Managed radio initialization. Metadata availability
+		 * is sufficient; do not pretend Setup has confirmed radio Off/Ready. */
+		if ((snapshot.flags == SLE_CONTROLLER_SETUP || snapshot.flags == SLE_CONTROLLER_READY) &&
+		    snapshot.profile == 1 && snapshot.valid_fields == SLE_CONTROLLER_FULL_METADATA && !snapshot.error) break;
+		require(snapshot.flags != SLE_CONTROLLER_FAULT && now(CLOCK_MONOTONIC) < deadline,
+			"metadata availability deadline"); usleep(10000);
 	}
 	uint64_t generation = snapshot.generation;
 	struct sle_management_request lease = acquire(fd, generation);
