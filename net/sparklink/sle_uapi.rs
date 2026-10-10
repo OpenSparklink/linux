@@ -75,12 +75,6 @@ impl CheckReserved for i16 {}
 pub(crate) const ADV_NAME_MAX: usize = 32;
 /// Maximum advertising/scan data payload.
 pub(crate) const ADV_DATA_MAX: usize = 252;
-/// Maximum SM3 hash input length.
-pub(crate) const HASH_INPUT_MAX: usize = 220;
-/// Maximum HMAC key length.
-pub(crate) const HMAC_KEY_MAX: usize = 64;
-/// Maximum HMAC data length.
-pub(crate) const HMAC_DATA_MAX: usize = 160;
 /// Maximum SSAP read/write/notification data length.
 pub(crate) const SSAP_DATA_MAX: usize = 252;
 /// Maximum SSAP property value length.

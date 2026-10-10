@@ -7,7 +7,7 @@ TEST_GEN_PROGS_EXTENDED += ws73_native_tx_fault_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_open_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_rpc_fault_test
 
-TEST_PROGS := run_qemu_test.sh
+TEST_PROGS := run_qemu_test.sh run_security_remediation.py
 
 include ../lib.mk
 

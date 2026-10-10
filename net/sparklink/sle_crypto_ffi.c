@@ -191,6 +191,8 @@ int sle_sm4_ctr_crypt(const u8 *key, u8 *iv,
 	struct skcipher_request *req;
 	struct scatterlist sg;
 	DECLARE_CRYPTO_WAIT(wait);
+	u8 *scratch;
+	u8 next_iv[SM4_BLOCK_SIZE];
 	int ret;
 
 	if (data_len == 0)
@@ -210,15 +212,30 @@ int sle_sm4_ctr_crypt(const u8 *key, u8 *iv,
 		goto out_tfm;
 	}
 
-	sg_init_one(&sg, data, data_len);
+	/* A failed asynchronous cipher may already have changed its destination.
+	 * Commit data and IV only after the entire request succeeds. */
+	scratch = kmemdup(data, data_len, GFP_KERNEL);
+	if (!scratch) {
+		ret = -ENOMEM;
+		goto out_req;
+	}
+	memcpy(next_iv, iv, sizeof(next_iv));
+	sg_init_one(&sg, scratch, data_len);
 
 	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
 				      crypto_req_done, &wait);
-	skcipher_request_set_crypt(req, &sg, &sg, data_len, iv);
+	skcipher_request_set_crypt(req, &sg, &sg, data_len, next_iv);
 
 	/* CTR mode: encrypt == decrypt */
 	ret = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
+	if (!ret) {
+		memcpy(data, scratch, data_len);
+		memcpy(iv, next_iv, sizeof(next_iv));
+	}
+	memzero_explicit(next_iv, sizeof(next_iv));
+	kfree_sensitive(scratch);
 
+out_req:
 	skcipher_request_free(req);
 out_tfm:
 	crypto_free_skcipher(tfm);

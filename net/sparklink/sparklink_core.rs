@@ -1674,7 +1674,7 @@ fn ioctl_dispatch_ext_adv(context: &RuntimeContext, cmd: u32, arg: usize) -> Res
             if s.rpa_tick_accum >= 100 {
                 // 100 * 10ms = 1 second
                 s.rpa_tick_accum = 0;
-                s.rpa.rpa_tick(1);
+                s.rpa.rpa_tick(1)?;
             }
             Ok(disabled as c_long)
         }
@@ -2405,7 +2405,7 @@ fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isiz
                 info.method = s.security.method as u8;
                 info.mode = s.security.mode as u8;
                 info.enc_enabled = if s.security.is_encrypted() { 1 } else { 0 };
-                info.enc_key_fingerprint = s.security.enc_key_fingerprint();
+                info.enc_key_fingerprint = s.security.enc_key_fingerprint()?;
                 info
             };
             write_user_struct(arg, &info)?;
@@ -2418,55 +2418,13 @@ fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isiz
             s.controller.start_encrypt()?;
             Ok(0)
         }
-        SL_IOCTL_SEC_SM3_TEST => {
-            let mut ht: SleHashTest = read_user_struct(arg)?;
-            let in_len = (ht.in_len as usize).min(HASH_INPUT_MAX);
-            let digest = SecurityInner::sm3_hash(&ht.data[..in_len]);
-            ht.digest = digest;
-            write_user_struct(arg, &ht)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_SM4_ENC_TEST => {
-            let mut cd: SleConnData = read_user_struct(arg)?;
-            let len = (cd.length as usize).min(CONN_DATA_MAX);
-            {
-                let mut ss = context.lock()?;
-                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-                s.security.encrypt_test(&mut cd.data[..len])?;
-            }
-            write_user_struct(arg, &cd)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_SM4_DEC_TEST => {
-            let mut cd: SleConnData = read_user_struct(arg)?;
-            let len = (cd.length as usize).min(CONN_DATA_MAX);
-            {
-                let mut ss = context.lock()?;
-                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-                s.security.decrypt_test(&mut cd.data[..len])?;
-            }
-            write_user_struct(arg, &cd)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_SM4_BLOCK_TEST => {
-            let mut bt: SleSm4BlockTest = read_user_struct(arg)?;
-            let ctx = sle_crypto::Sm4Key::new(&bt.key);
-            bt.output = if bt.decrypt != 0 {
-                ctx.decrypt_block(&bt.input)
-            } else {
-                ctx.encrypt_block(&bt.input)
-            };
-            write_user_struct(arg, &bt)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_HMAC_TEST => {
-            let mut ht: SleHmacTest = read_user_struct(arg)?;
-            let klen = (ht.key_len as usize).min(HMAC_KEY_MAX);
-            let dlen = (ht.data_len as usize).min(HMAC_DATA_MAX);
-            ht.digest = sle_crypto::hmac_sm3(&ht.key[..klen], &ht.data[..dlen]);
-            write_user_struct(arg, &ht)?;
-            Ok(0)
-        }
+        // Legacy test ioctls are not a production crypto interface. Algorithm
+        // and failure tests exercise the wrappers in dedicated selftests.
+        SL_IOCTL_SEC_SM3_TEST
+        | SL_IOCTL_SEC_SM4_ENC_TEST
+        | SL_IOCTL_SEC_SM4_DEC_TEST
+        | SL_IOCTL_SEC_SM4_BLOCK_TEST
+        | SL_IOCTL_SEC_HMAC_TEST => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_SEC_RESET => {
             let mut ss = context.lock()?;
             let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
@@ -2892,7 +2850,7 @@ fn ioctl_set_oob(context: &RuntimeContext, arg: usize) -> Result {
     let params: SleOobData = read_user_struct(arg)?;
     let mut ss = context.lock()?;
     let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    s.security.set_oob_data(&params.data);
+    s.security.set_oob_data(&params.data)?;
     Ok(())
 }
 

@@ -1,0 +1,22 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Run from the kernel tree:
+  CC=clang python3 tools/testing/selftests/sparklink/run_security_remediation.py
+
+Requires Rust with the current kernel-supported syntax and a C compiler with
+ASan/UBSan runtimes. LeakSanitizer requires an environment without ptrace.
+Missing tools/runtimes or failed assertions fail the test; there is no fallback
+PASS or skipped assertion. No production fault switches are introduced.
+
+The runner copies the exact production Rust crypto/security sources to a private
+build directory, appends child tests for private state, and links controllable FFI
+dependencies. It compiles the exact production C CTR function against counted
+allocation/crypto dependencies. These verify errno propagation, fail-closed legacy
+pairing, KDF commit, counter overflow and failure commit of data/IV/address. They
+are not real crypto algorithms, standard vectors, peer interoperability or RF.
+
+Pairing is deliberately unavailable pending authenticated per-connection state.
+Unpublished legacy test ioctl numbers still exist for caller migration, but their
+production handlers return EOPNOTSUPP. Tests call actual wrappers instead.
+The real WS73 Native discovery implementation is untouched and needs regression
+on each new kernel in a VM with real devices before hardware preservation claims.
