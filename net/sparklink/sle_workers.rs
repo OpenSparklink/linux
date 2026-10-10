@@ -16,7 +16,6 @@ use super::sle_conn;
 use super::sle_dli;
 use super::sle_dli::SleController;
 use super::sle_event;
-use super::sle_ssap;
 use super::sle_uapi::*;
 use super::sle_usb;
 use super::{ControllerRuntime, ControllerState};
@@ -136,29 +135,6 @@ fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error:
     state.adv_scan.abort_scanning();
 }
 
-/// Send a credit grant PDU on the management channel (CMTC).
-///
-/// Format per T/XS 20002-2025 §7.3.3 control signaling:
-/// `[TCID_CMTC] [code=0xFC] [identifier] [length LE16=0x0003] [target_tcid] [credits LE16]`
-pub(crate) fn send_credit_grant(
-    ctrl: &sle_dli::ControllerBackend,
-    handle: u16,
-    target_tcid: u16,
-    credits: u16,
-    identifier: u8,
-) {
-    let mut buf = [0u8; sle_conn::CREDIT_GRANT_PDU_SIZE];
-    buf[0] = sle_conn::tcid::MANAGEMENT as u8;
-    buf[1] = sle_conn::CREDIT_GRANT_PDU_TYPE;
-    buf[2] = identifier;
-    buf[3] = 0x03; // length LE16 low byte: target_tcid(1) + credits(2)
-    buf[4] = 0x00; // length LE16 high byte
-    buf[5] = target_tcid as u8;
-    let c = credits.to_le_bytes();
-    buf[6] = c[0];
-    buf[7] = c[1];
-    let _ = ctrl.send_data(handle, &buf);
-}
 
 /// Process a single controller event: resolve pending commands, drive
 /// state machine transitions, and publish to broadcast ring / DLI ring.
@@ -297,95 +273,11 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
                 if resp_len > 0 {
                     let _ = shared.controller.send_data(*handle, &resp_buf[..resp_len]);
                 }
-            } else if u16::from(raw[0]) == sle_conn::tcid::SERVICE_MGMT && raw.len() > 1 {
-                // SSAP PDU on service management channel (TCID 0x0A).
-                // Track RX credit for the reliable SMTC channel.
-                let needs_grant = shared
-                    .conn
-                    .consume_rx_credit(*handle, sle_conn::tcid::SERVICE_MGMT);
-                let pdu_data = &raw[1..];
-                let mut resp_buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-                let resp_len = shared
-                    .process_ssap_pdu(*handle, pdu_data, &mut resp_buf)
-                    .unwrap_or(0);
-                // Send response PDU back with TCID prefix, consuming TX credit.
-                if resp_len > 0
-                    && shared
-                        .conn
-                        .consume_tx_credit(*handle, sle_conn::tcid::SERVICE_MGMT)
-                        .is_ok()
-                {
-                    let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                    tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                    tx_buf[1..1 + resp_len].copy_from_slice(&resp_buf[..resp_len]);
-                    let _ = shared
-                        .controller
-                        .send_data(*handle, &tx_buf[..1 + resp_len]);
-                }
-                // Drain pending notifications/indications triggered by the PDU.
-                while let Some(n) = shared.ssap.dequeue_notification() {
-                    if shared
-                        .conn
-                        .consume_tx_credit(*handle, sle_conn::tcid::SERVICE_MGMT)
-                        .is_err()
-                    {
-                        break; // No credits remaining for notifications.
-                    }
-                    let pdu = if n.indication {
-                        sle_ssap::SsapPdu::ValueInd {
-                            handle: n.handle,
-                            data: n.data,
-                        }
-                    } else {
-                        sle_ssap::SsapPdu::ValueNtf {
-                            handle: n.handle,
-                            data: n.data,
-                        }
-                    };
-                    let mut ntf_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                    ntf_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                    if let Ok(pdu_len) = pdu.encode(&mut ntf_buf[1..]) {
-                        if pdu_len > 0 {
-                            let _ = shared
-                                .controller
-                                .send_data(*handle, &ntf_buf[..1 + pdu_len]);
-                        }
-                    }
-                }
-                // Send credit grant if RX credits are low.
-                if needs_grant {
-                    if let Ok((granted, id)) = shared
-                        .conn
-                        .grant_credits(*handle, sle_conn::tcid::SERVICE_MGMT)
-                    {
-                        send_credit_grant(
-                            &shared.controller,
-                            *handle,
-                            sle_conn::tcid::SERVICE_MGMT,
-                            granted,
-                            id,
-                        );
-                    }
-                }
-                // After ExchangeInfo negotiation: if reliable mode is agreed
-                // but the reliable channel is not yet created, initiate
-                // TCID_Connect_Req on the management channel.
-                let needs_connect = shared
-                    .conn
-                    .get_ssap_session(*handle)
-                    .map(|sess| sess.reliable_mode && sess.reliable_tcid.is_none())
-                    .unwrap_or(false);
-                if needs_connect {
-                    let cfg = sle_conn::ReliableModeConfig::default();
-                    let mut sig_buf = [0u8; 24];
-                    if let Ok(sig_len) =
-                        shared
-                            .conn
-                            .build_tcid_connect_req(*handle, &cfg, &mut sig_buf)
-                    {
-                        let _ = shared.controller.send_data(*handle, &sig_buf[..sig_len]);
-                    }
-                }
+            } else if u16::from(raw[0]) == sle_conn::tcid::SERVICE_MGMT {
+                // No standard SSAP Engine/PDU owner is registered. Reject this
+                // channel without parsing, ACKing, consuming credit or draining
+                // notifications belonging to another peer.
+                return;
             } else {
                 // Check if this is an SSAP PDU on the dynamic reliable channel.
                 let first_byte_tcid = u16::from(raw[0]);
@@ -396,39 +288,8 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
                         .map(|t| t == first_byte_tcid)
                         .unwrap_or(false);
                 if is_ssap_reliable {
-                    // SSAP PDU on reliable transport channel.
-                    let needs_grant = shared.conn.consume_rx_credit(*handle, first_byte_tcid);
-                    let pdu_data = &raw[1..];
-                    let mut resp_buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-                    let resp_len = shared
-                        .process_ssap_pdu(*handle, pdu_data, &mut resp_buf)
-                        .unwrap_or(0);
-                    if resp_len > 0
-                        && shared
-                            .conn
-                            .consume_tx_credit(*handle, first_byte_tcid)
-                            .is_ok()
-                    {
-                        let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                        tx_buf[0] = first_byte_tcid as u8;
-                        tx_buf[1..1 + resp_len].copy_from_slice(&resp_buf[..resp_len]);
-                        let _ = shared
-                            .controller
-                            .send_data(*handle, &tx_buf[..1 + resp_len]);
-                    }
-                    if needs_grant {
-                        if let Ok((granted, id)) =
-                            shared.conn.grant_credits(*handle, first_byte_tcid)
-                        {
-                            send_credit_grant(
-                                &shared.controller,
-                                *handle,
-                                first_byte_tcid,
-                                granted,
-                                id,
-                            );
-                        }
-                    }
+                    // Legacy SSAP reliable-channel processing is unsupported.
+                    return;
                 } else {
                     // User data — strip TCID prefix if present, enqueue to rx_queue.
                     let tcid = if u16::from(raw[0]) == sle_conn::tcid::DEFAULT_DATA && raw.len() > 1

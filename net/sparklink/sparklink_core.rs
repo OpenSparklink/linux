@@ -49,7 +49,7 @@ mod sle_workers;
 
 use sle_dli::SleController;
 use sle_uapi::*;
-use sle_workers::{drain_controller_events, send_credit_grant};
+use sle_workers::drain_controller_events;
 use sle_irq_lock::{IrqLockBackend, new_irq_lock};
 use kernel::sync::lock::Lock;
 use kernel::workqueue::{DelayedWork, new_delayed_work};
@@ -491,9 +491,6 @@ impl ControllerState {
         )
     }
 
-    pub(crate) fn process_ssap_pdu(&mut self, handle: u16, data: &[u8], response: &mut [u8]) -> Result<usize> {
-        self.conn.process_ssap_pdu(handle, data, &mut self.ssap, response)
-    }
 
     pub(crate) fn push_dli_event(&mut self, ev: SleDliEvent) {
         self.dli_ring[self.dli_tail] = ev;
@@ -2147,77 +2144,8 @@ fn ioctl_inject_conn_data(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
             }
         } else if !raw.is_empty()
             && u16::from(raw[0]) == sle_conn::tcid::SERVICE_MGMT
-            && raw.len() > 1
         {
-            let needs_grant = s
-                .conn
-                .consume_rx_credit(handle, sle_conn::tcid::SERVICE_MGMT);
-            let pdu_data = &raw[1..];
-            let mut resp_buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let resp_len = s.process_ssap_pdu(handle, pdu_data, &mut resp_buf)
-                .unwrap_or(0);
-            if resp_len > 0
-                && s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)
-                    .is_ok()
-            {
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + resp_len].copy_from_slice(&resp_buf[..resp_len]);
-                let _ = s.controller.send_data(handle, &tx_buf[..1 + resp_len]);
-            }
-            // Drain at most 8 queued notifications to bound lock hold time.
-            for _ in 0..8 {
-                let n = match s.ssap.dequeue_notification() {
-                    Some(n) => n,
-                    None => break,
-                };
-                if s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)
-                    .is_err()
-                {
-                    break;
-                }
-                let pdu = if n.indication {
-                    sle_ssap::SsapPdu::ValueInd {
-                        handle: n.handle,
-                        data: n.data,
-                    }
-                } else {
-                    sle_ssap::SsapPdu::ValueNtf {
-                        handle: n.handle,
-                        data: n.data,
-                    }
-                };
-                let mut ntf_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                ntf_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                if let Ok(pdu_len) = pdu.encode(&mut ntf_buf[1..]) {
-                    if pdu_len > 0 {
-                        let _ = s.controller.send_data(handle, &ntf_buf[..1 + pdu_len]);
-                    }
-                }
-            }
-            if needs_grant {
-                if let Ok((granted, id)) = s.conn.grant_credits(handle, sle_conn::tcid::SERVICE_MGMT) {
-                    send_credit_grant(&s.controller, handle, sle_conn::tcid::SERVICE_MGMT, granted, id);
-                }
-            }
-            // After ExchangeInfo negotiation: if reliable mode is agreed
-            // but the reliable channel is not yet created, initiate TCID_Connect_Req.
-            let needs_connect = s
-                .conn
-                .get_ssap_session(handle)
-                .map(|sess| sess.reliable_mode && sess.reliable_tcid.is_none())
-                .unwrap_or(false);
-            if needs_connect {
-                let cfg = sle_conn::ReliableModeConfig::default();
-                let mut sig_buf = [0u8; 24];
-                if let Ok(sig_len) =
-                    s.conn.build_tcid_connect_req(handle, &cfg, &mut sig_buf)
-                {
-                    let _ = s.controller.send_data(handle, &sig_buf[..sig_len]);
-                }
-            }
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         } else {
             // Check if this is an SSAP PDU on the dynamic reliable channel.
             let first_byte_tcid = u16::from(raw[0]);
@@ -2227,24 +2155,7 @@ fn ioctl_inject_conn_data(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
                     .map(|t| t == first_byte_tcid)
                     .unwrap_or(false);
             if is_ssap_reliable {
-                let needs_grant = s.conn.consume_rx_credit(handle, first_byte_tcid);
-                let pdu_data = &raw[1..];
-                let mut resp_buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-                let resp_len = s.process_ssap_pdu(handle, pdu_data, &mut resp_buf)
-                    .unwrap_or(0);
-                if resp_len > 0
-                    && s.conn.consume_tx_credit(handle, first_byte_tcid).is_ok()
-                {
-                    let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                    tx_buf[0] = first_byte_tcid as u8;
-                    tx_buf[1..1 + resp_len].copy_from_slice(&resp_buf[..resp_len]);
-                    let _ = s.controller.send_data(handle, &tx_buf[..1 + resp_len]);
-                }
-                if needs_grant {
-                    if let Ok((granted, id)) = s.conn.grant_credits(handle, first_byte_tcid) {
-                        send_credit_grant(&s.controller, handle, first_byte_tcid, granted, id);
-                    }
-                }
+                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
             } else {
                 let payload = if !raw.is_empty()
                     && u16::from(raw[0]) == sle_conn::tcid::DEFAULT_DATA
@@ -2526,7 +2437,10 @@ fn ioctl_ssap_local(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<is
         }
         SL_IOCTL_SSAP_WRITE => {
             let rw: SsapReadWrite = read_user_struct(arg)?;
-            let len = (rw.length as usize).min(SSAP_DATA_MAX);
+            let len = rw.length as usize;
+            if len > SSAP_DATA_MAX {
+                return Err(EINVAL);
+            }
             let mut ss = context.lock()?;
             let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
             s.ssap.write_property(rw.handle, &rw.data[..len])?;
@@ -2557,23 +2471,7 @@ fn ioctl_ssap_local(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<is
             Ok(0)
         }
         SL_IOCTL_SSAP_DEQUEUE_NTF => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let ntf = s.ssap.dequeue_notification();
-            match ntf {
-                Some(n) => {
-                    let mut out: SsapNotification = unsafe { core::mem::zeroed() };
-                    out.handle = n.handle;
-                    out.indication = if n.indication { 1 } else { 0 };
-                    let copy_len = n.data.len().min(SSAP_DATA_MAX);
-                    out.length = copy_len as u8;
-                    out.data[..copy_len].copy_from_slice(&n.data[..copy_len]);
-                    drop(ss);
-                    write_user_struct(arg, &out)?;
-                    Ok(0)
-                }
-                None => Err(EAGAIN),
-            }
+            Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
         }
         SL_IOCTL_SSAP_ADD_SVC => {
             let mut cmd_data: SsapAddService = read_user_struct(arg)?;
@@ -2595,7 +2493,10 @@ fn ioctl_ssap_local(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<is
             let mut cmd_data: SsapAddProperty = read_user_struct(arg)?;
             let uuid = sle_ssap::SsapUuid::Uuid16(cmd_data.uuid16);
             let ops = sle_ssap::OpIndicator::from_raw(u32::from(cmd_data.ops));
-            let len = (cmd_data.value_len as usize).min(SSAP_VALUE_MAX);
+            let len = cmd_data.value_len as usize;
+            if len > SSAP_VALUE_MAX {
+                return Err(EINVAL);
+            }
             let mut ss = context.lock()?;
             let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
             let handle = s.ssap.add_property(uuid, ops, &cmd_data.value[..len])?;
@@ -2669,190 +2570,14 @@ fn ioctl_dispatch_sec_ssap(context: &RuntimeContext, cmd: u32, arg: usize) -> Re
 
 /// Remote SSAP client-side ioctl sub-dispatcher.
 ///
-/// Sends SSAP request PDUs to connected remote peers via the SMTC
-/// service management channel. Responses arrive asynchronously through
-/// the normal PDU receive path and are cached in `remote_db`.
+/// Retained unpublished ioctl numbers reject remote operations explicitly.
+/// They are removed with the userspace Engine/channel caller migration.
 #[inline(never)]
-fn ioctl_ssap_remote(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_SSAP_EXCHANGE_INFO => {
-            let params: SsapRemoteCmd = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_exchange_info_req(247, &mut buf)?;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_REMOTE_DISCOVER => {
-            let mut params: SsapRemoteDiscover = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_find_structure_req(
-                params.start_handle,
-                params.end_handle,
-                &mut buf,
-            )?;
-            // Return current remote_db entry count before sending
-            params.count = session.remote_db.entry_count() as u16;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            drop(ss);
-            write_user_struct(arg, &params)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_REMOTE_READ => {
-            let params: SsapRemoteReadWrite = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_read_req(params.handle, &mut buf)?;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_REMOTE_WRITE => {
-            let params: SsapRemoteReadWrite = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let data_len = (params.length as usize).min(params.data.len());
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_write_req(
-                params.handle,
-                &params.data[..data_len],
-                &mut buf,
-            )?;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_REMOTE_EVENT => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            // Pop remote event from the first connection that has one
-            let evt = s.conn.pop_any_remote_event();
-            match evt {
-                Some((conn_handle, re)) => {
-                    let mut out: SsapNotification = unsafe { core::mem::zeroed() };
-                    out.handle = re.handle;
-                    out.indication = re.indication as u8;
-                    let copy_len = re.data.len().min(out.data.len());
-                    out.data[..copy_len].copy_from_slice(&re.data[..copy_len]);
-                    out.length = copy_len as u8;
-                    // Encode conn_handle in unused notification_count area
-                    let _ = conn_handle;
-                    drop(ss);
-                    write_user_struct(arg, &out)?;
-                    Ok(0)
-                }
-                None => Err(EAGAIN),
-            }
-        }
-        SL_IOCTL_SSAP_CALL_METHOD => {
-            let params: SsapRemoteReadWrite = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let data_len = (params.length as usize).min(params.data.len());
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_call_method_req(
-                params.handle,
-                &params.data[..data_len],
-                &mut buf,
-            )?;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_FIND_BY_UUID => {
-            let params: SsapUuidOp = read_user_struct(arg)?;
-            let uuid = if params.uuid16 != 0 {
-                sle_ssap::SsapUuid::Uuid16(params.uuid16)
-            } else {
-                sle_ssap::SsapUuid::Uuid128(params.uuid128)
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_find_by_uuid_req(&uuid, &mut buf)?;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_READ_BY_UUID => {
-            let params: SsapUuidOp = read_user_struct(arg)?;
-            let uuid = if params.uuid16 != 0 {
-                sle_ssap::SsapUuid::Uuid16(params.uuid16)
-            } else {
-                sle_ssap::SsapUuid::Uuid128(params.uuid128)
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.conn_handle)?;
-            let mut buf = [0u8; sle_ssap::SSAP_PDU_MAX];
-            let session = s.conn.get_ssap_session(handle).ok_or(ENOENT)?;
-            let pdu_len = session.build_read_by_uuid_req(&uuid, &mut buf)?;
-            if pdu_len > 0 {
-                s.conn
-                    .consume_tx_credit(handle, sle_conn::tcid::SERVICE_MGMT)?;
-                let mut tx_buf = [0u8; 1 + sle_ssap::SSAP_PDU_MAX];
-                tx_buf[0] = sle_conn::tcid::SERVICE_MGMT as u8;
-                tx_buf[1..1 + pdu_len].copy_from_slice(&buf[..pdu_len]);
-                s.controller.send_data(handle, &tx_buf[..1 + pdu_len])?;
-            }
-            Ok(0)
-        }
-        _ => Err(EINVAL),
-    }
+fn ioctl_ssap_remote(_context: &RuntimeContext, _cmd: u32, _arg: usize) -> Result<isize> {
+    // The historical offset codec is not standard SSAP. Do not allocate,
+    // consume credit or claim a request was accepted before the replacement
+    // userspace Engine and per-connection channel contract are implemented.
+    Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
 }
 
 /// Handle SEC_SET_OOB ioctl in a separate stack frame to avoid

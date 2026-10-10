@@ -1679,25 +1679,6 @@ impl ConnManager {
         }
     }
 
-    /// Process a received SSAP PDU on a connection's service management channel.
-    ///
-    /// Routes the raw PDU through the per-connection SSAP session, which
-    /// handles service discovery, property read/write, and notifications.
-    /// Returns the response PDU length written to `resp_buf` (0 if none).
-    pub fn process_ssap_pdu(
-        &mut self,
-        handle: u16,
-        pdu_data: &[u8],
-        ssap: &mut super::sle_ssap::SsapInner,
-        resp_buf: &mut [u8],
-    ) -> Result<usize> {
-        let entry = self.find_mut(handle)?;
-        if entry.state != ConnState::Connected {
-            return Err(EPIPE);
-        }
-        let session = entry.ssap_session.as_mut().ok_or(ENODEV)?;
-        session.process_incoming(ssap, pdu_data, resp_buf)
-    }
 
     /// Build a TCID_Connect_Req PDU for reliable-mode channel creation.
     ///

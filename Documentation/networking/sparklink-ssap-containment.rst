@@ -1,0 +1,27 @@
+Legacy SSAP containment
+=======================
+
+The unpublished legacy remote SSAP ioctls return ``EOPNOTSUPP``. The offset-based
+wire codec and unbounded read/write transaction engine were removed from
+production; the codec remains only in ``selftests/sparklink/ssap`` as historical
+test material. T/XS 20001-2025 table 32 defines permissions; tables 72, 75 and 76
+use message-control fields for fragmentation and write commit/cancel. Checking
+the old accumulator length would not make that codec standard-compatible.
+
+Both legacy ingress paths reject the service-management channel without
+parsing, credit/ACK side effects or draining another peer's notifications. The
+unowned notification queue and duplicate drains are removed. Notification,
+indication and method-without-callback operations explicitly return unsupported;
+there is no default method echo. Local service staging remains for caller
+migration, with atomic value replacement after allocation success and rejection
+of oversized ioctl inputs instead of truncation. It does not publish a service.
+
+The target Engine belongs to slkd; the kernel supplies complete connection PDU
+channels, ordering, backpressure, disconnection and security context. Socket
+ownership and budgets, standard codec/control flags, per-peer service and security
+state, deadlines, cancellation, indication ACKs and real SSAP interoperability
+are not implemented by this change. R04/R07/R08 and connection issues remain open.
+
+The Native WS73 typed discovery path does not use this legacy Engine. Every new
+kernel must still pass the real VM-only two-device discovery/recovery regression;
+fixture success alone cannot qualify firmware, physical recovery or SSAP support.
