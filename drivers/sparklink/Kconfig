@@ -25,19 +25,23 @@ config SPARKLINK_WS73_USB
 	  Wait for BSP_READY, send configuration and open SLE, requiring actual
 	  CUSTOMIZE_RECEIVED and BOOT_FINISH replies. This experimental driver
 	  queries actual DLI metadata and registers an independent native
-	  Runtime in SETUP with bulk/notification URBs. Only metadata commands
-	  are supported so far; full discovery transactions and real RF
-	  validation remain required before Ready. Native fault recovery/PM
-	  are not implemented.
+	  Runtime in SETUP with bulk/notification URBs. Metadata, native
+	  advertising and scanning transactions have real two-device VM
+	  evidence. Per-device protocol recovery has bounded retries and
+	  diagnostics, but natural-fault/disappearance recovery and the full
+	  single/two/four-device matrix remain unqualified. Connection,
+	  security, board calibration qualification and USB PM remain open.
+	  Do not treat this experimental option as full protocol support.
 
 	  The module is called sparklink_ws73_usb.
 
 config SPARKLINK_VIRTUAL
 	tristate "Virtual SparkLink controller (testing)"
 	help
-	  A virtual SparkLink controller driver for development and testing
-	  purposes. This driver does not require real hardware and can be
-	  used to test the SparkLink protocol stack.
+	  Placeholder module for the planned driver-owned virtual controller.
+	  It currently logs load/unload and does not register a controller.
+	  Existing virtual development tests use the separate core test path;
+	  this module is not a usable virtual device or a hardware gate.
 
 	  To compile this as a module, choose M here:
 	  the module will be called sparklink_virtual.

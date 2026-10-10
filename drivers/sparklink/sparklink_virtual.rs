@@ -2,9 +2,9 @@
 
 //! Virtual SparkLink controller driver for testing.
 //!
-//! This driver registers a virtual SCI device that can be used to test the
-//! SparkLink protocol stack without real hardware. It emulates a SparkLink
-//! SLE controller, responding to SCI commands with simulated behavior.
+//! This placeholder only logs module load/unload. It does not register a
+//! controller. Existing core-owned virtual development tests are separate;
+//! driver registration and lifecycle migration remain open in issues #9/#12.
 
 use kernel::prelude::*;
 
