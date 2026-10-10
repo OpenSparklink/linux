@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <termios.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
 
@@ -877,6 +878,81 @@ static int discovery_timeout(int fd, unsigned long long gen,
 	return 0;
 }
 
+/* Host signals only after QEMU has both a held OUT and a Complete delivered
+ * on IN. This is a synthetic transport race, never evidence of real RF. */
+static int tx_barrier(int a, const struct sci_dev_info *a_info,
+                      unsigned long long a_gen, int b,
+                      const struct sci_dev_info *b_info)
+{
+    struct sle_dli_cmd cmd = { .opcode = 0x0403 };
+    struct sle_controller_snapshot snap = { .version = 1, .generation = a_gen };
+    struct sle_controller_snapshot before = snap;
+    struct sle_mgmt_stats stats;
+    struct sle_dli_event event = { 0 };
+    int uart = open("/dev/ttyS1", O_RDONLY | O_NONBLOCK);
+    struct termios terminal;
+    char line[32] = { 0 };
+    if (uart < 0 || tcgetattr(uart, &terminal)) return fail("barrier UART configuration");
+    cfmakeraw(&terminal);
+    terminal.c_cflag |= CLOCAL | CREAD;
+    if (tcsetattr(uart, TCSANOW, &terminal) || ioctl(a, SL_IOCTL_CONTROLLER_SNAPSHOT, &before) ||
+        management_mode(a, a_gen, SLE_MANAGEMENT_DIAGNOSTIC) ||
+        ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd)) return fail("barrier submit/UART");
+    puts("NATIVE_TX_SUBMITTED");
+    struct pollfd poller = { .fd = uart, .events = POLLIN };
+    size_t used = 0;
+    double barrier_deadline = now() + 1.5;
+    while (now() < barrier_deadline && used < sizeof(line) - 1 && !strchr(line, '\n')) {
+        if (poll(&poller, 1, 100) > 0) {
+            ssize_t count = read(uart, line + used, sizeof(line) - 1 - used);
+            if (count > 0) used += count;
+            else if (count < 0 && errno != EAGAIN) break;
+        }
+    }
+    if (strcmp(line, "out-held\n")) { close(uart); return fail("early IN/held OUT host barrier"); }
+    close(uart);
+    double start = now();
+    if (ioctl(a, SL_IOCTL_CONTROLLER_SNAPSHOT, &snap)) return fail("held OUT snapshot");
+    double elapsed = now() - start;
+    printf("NATIVE_TX_SNAPSHOT: elapsed_ms=%.3f\n", elapsed * 1000);
+    if (elapsed >= 0.2 || snap.generation != a_gen || snap.flags != before.flags ||
+        snap.error != before.error || memcmp(snap.address, before.address, 6))
+        return fail("snapshot blocked by OUT or registration state changed");
+    if (query(b, b_info, 0x0406, 0)) return fail("held OUT survivor query");
+    start = now();
+    unsigned int accepted = 0;
+    do {
+        errno = 0;
+        int ret = ioctl(a, SL_IOCTL_DLI_POLL_EVENT, &event);
+        if (!ret) {
+            /* Acceptance Status and unsolicited credit grants are observable;
+             * neither may resolve this raw query before successful OUT. */
+            if (event.opcode == 0x0403 && event.event_type == 2 &&
+                !event.status && !event.data_len) accepted++;
+            else if (event.opcode || event.event_type != 1 || event.status ||
+                     event.data_len != 1) return fail("terminal reply before OUT success");
+        } else if (errno != EAGAIN) return fail("held OUT raw poll");
+        if (ioctl(a, SL_IOCTL_MGMT_STATS, &stats) || stats.pending != 1)
+            return fail("early Complete published before OUT success");
+        usleep(1000);
+    } while (now() - start < 0.1);
+    if (accepted != 1) return fail("acceptance Status not processed during held OUT");
+    double deadline = now() + 4;
+    do {
+        if (!ioctl(a, SL_IOCTL_DLI_POLL_EVENT, &event)) {
+            if (event.opcode != 0x0403 || event.event_type != 1 || event.status ||
+                event.data_len != 10) return fail("barrier final Complete schema");
+            for (unsigned i = 0; i < 10; i++)
+                if (event.data[i] != a_info->addr[5]) return fail("barrier features identity");
+            puts("NATIVE_TX_BARRIER: snapshot=1 early_reply_pending=1 survivor=1 final_reply=1");
+            return 0;
+        }
+        if (errno != EAGAIN) return fail("barrier final poll");
+        usleep(1000);
+    } while (now() < deadline);
+    return fail("barrier final deadline");
+}
+
 int main(int argc, char **argv)
 {
 	struct sci_dev_info a_info, b_info, replacement_info;
@@ -889,7 +965,8 @@ int main(int argc, char **argv)
 	int event_mode = argc == 2 && !strcmp(argv[1], "--events");
 	int discovery_mode = argc == 2 && !strcmp(argv[1], "--discovery");
 	int management_test = argc == 2 && !strcmp(argv[1], "--owners");
-	if (argc != 1 && !fault_mode && !event_mode && !discovery_mode && !management_test)
+	int tx_test = argc == 2 && !strcmp(argv[1], "--tx-barrier");
+	if (argc != 1 && !fault_mode && !event_mode && !discovery_mode && !management_test && !tx_test)
 		return 2;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -915,6 +992,7 @@ int main(int argc, char **argv)
 	b = bind_owner(1, &b_info, &b_gen);
 	if (b < 0 || same(a, &a_info, a_gen))
 		goto out;
+	if (tx_test && tx_barrier(a, &a_info, a_gen, b, &b_info)) goto out;
 	if (event_mode) {
 		struct sci_dev_info unused;
 		unsigned long long reader_gen;

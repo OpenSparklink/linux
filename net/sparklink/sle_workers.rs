@@ -829,12 +829,35 @@ impl WorkItem<1> for ControllerRuntime {
                     Err(error) => { fail_host(&this, runtime, error); return; }
                 };
                 if let Some(request) = request {
+                    if let sle_dli::ControllerBackend::Ws73(controller) = &runtime.controller {
+                        let transport = controller.command_transport();
+                        // Own the transport independently. RPC snapshots and
+                        // RX processing must not wait for a blocking USB OUT.
+                        drop(guard);
+                        match transport.send(request.opcode,
+                            &request.params[..request.param_len as usize], request.recipe) {
+                            Ok(()) => {
+                                if this.host.lock().transport_complete(request.cookie) {
+                                    this.schedule_rx(0);
+                                }
+                            }
+                            Err(error) => {
+                                let mut guard = this.state.lock();
+                                if let Some(runtime) = Option::as_mut(&mut *guard) {
+                                    fail_host(&this, runtime, error);
+                                }
+                            }
+                        }
+                        return;
+                    }
                     if let Err(error) = runtime.controller.send_command_transport(
                         request.opcode,
                         &request.params[..request.param_len as usize],
                         request.recipe,
                     ) {
                         fail_host(&this, runtime, error);
+                    } else if this.host.lock().transport_complete(request.cookie) {
+                        this.schedule_rx(0);
                     }
                 }
                 // Reply consumption, not bulk acceptance, releases this slot.

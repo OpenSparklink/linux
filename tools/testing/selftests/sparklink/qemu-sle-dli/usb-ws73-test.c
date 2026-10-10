@@ -20,6 +20,10 @@ struct USBWs73Test {
     unsigned int packet_size[64];
     int64_t ready_at[64];
     QEMUTimer *wake;
+    QEMUTimer *out_timer;
+    USBPacket *out_packet;
+    uint32_t runtime_out_delay_ms;
+    bool out_delayed, out_replied;
     bool in_flight;
     unsigned int head, count, sequence, commands, serial;
     uint8_t runtime_status;
@@ -380,6 +384,42 @@ static void reset(USBDevice *dev)
     s->reports_emitted = false;
     s->adv_data_len = 0;
     if (s->wake) { timer_del(s->wake); }
+    if (s->out_timer) { timer_del(s->out_timer); }
+    s->out_packet = NULL;
+    s->out_delayed = s->out_replied = false;
+}
+
+static void out_complete(void *opaque)
+{
+    USBWs73Test *s = opaque;
+    USBPacket *p = s->out_packet;
+
+    g_assert(p);
+    s->out_packet = NULL; /* completion can reenter the device */
+    p->status = USB_RET_SUCCESS;
+    fprintf(stderr, "WS73_TEST_OUT_COMPLETE: serial=%u\n", s->serial);
+    usb_packet_complete(&s->parent_obj, p);
+}
+
+static void cancel_packet(USBDevice *dev, USBPacket *p)
+{
+    USBWs73Test *s = USB_WS73_TEST(dev);
+
+    if (s->out_packet == p) {
+        timer_del(s->out_timer);
+        s->out_packet = NULL;
+        fprintf(stderr, "WS73_TEST_OUT_CANCEL: serial=%u\n", s->serial);
+    }
+}
+
+static bool out_pending(Object *obj, Error **errp)
+{
+    return USB_WS73_TEST(obj)->out_packet != NULL;
+}
+
+static bool out_replied(Object *obj, Error **errp)
+{
+    return USB_WS73_TEST(obj)->out_replied;
 }
 
 static void wakeup(void *opaque)
@@ -393,9 +433,11 @@ static void realize(USBDevice *dev, Error **errp)
     USBWs73Test *s = USB_WS73_TEST(dev);
     usb_desc_create_serial(dev); usb_desc_init(dev);
     s->wake = timer_new_ms(QEMU_CLOCK_VIRTUAL, wakeup, s);
+    s->out_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, out_complete, s);
     s->serial = ++instances;
     g_assert(s->serial < 255);
     g_assert(s->runtime_reports <= 40);
+    g_assert(s->runtime_out_delay_ms <= 2000);
     g_assert(!s->runtime_policy || s->runtime_discovery);
     medium_devices[s->serial] = s;
     reset(dev);
@@ -432,17 +474,38 @@ static void transfer(USBDevice *dev, USBPacket *p)
         }
         if (s->packet_size[s->head] >= 105 && s->packets[s->head][96] == 0xa2 && le16(s->packets[s->head] + 97) == 2
             && le16(s->packets[s->head] + 101)) { s->in_flight = false; }
+        if (s->out_packet && s->packet_size[s->head] >= 105 &&
+            s->packets[s->head][96] == 0xa2 &&
+            le16(s->packets[s->head] + 97) == 2 &&
+            le16(s->packets[s->head] + 101) == 0x0403) {
+            s->out_replied = true;
+            fprintf(stderr, "WS73_TEST_EARLY_REPLY: serial=%u\n", s->serial);
+        }
         usb_packet_copy(p, s->packets[s->head], s->packet_size[s->head]);
         s->head = (s->head + 1) % 64; s->count--;
     } else if (p->pid == USB_TOKEN_OUT && p->ep->nr == 1 && n <= sizeof(out)) {
         usb_packet_copy(p, out, n);
         if (!outgoing(s, out, n)) { p->status = USB_RET_STALL; }
-        else { usb_wakeup(usb_ep_get(dev, USB_TOKEN_IN, 1), 0); }
+        else {
+            if (s->runtime_out_delay_ms && !s->out_delayed && s->commands > 4 &&
+                n >= 73 && out[64] == 0xa0 && out[65] == 8 &&
+                out[68] == 0xa1 && le16(out + 69) == 0x0403) {
+                g_assert(!s->out_packet);
+                s->out_delayed = true;
+                s->out_packet = p;
+                p->status = USB_RET_ASYNC;
+                timer_mod(s->out_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->runtime_out_delay_ms);
+                fprintf(stderr, "WS73_TEST_OUT_PENDING: serial=%u delay=%u\n",
+                        s->serial, s->runtime_out_delay_ms);
+            }
+            usb_wakeup(usb_ep_get(dev, USB_TOKEN_IN, 1), 0);
+        }
     } else { p->status = USB_RET_STALL; }
 }
 
 static Property properties[] = {
     DEFINE_PROP_BOOL("runtime-policy", USBWs73Test, runtime_policy, false),
+    DEFINE_PROP_UINT32("runtime-out-delay-ms", USBWs73Test, runtime_out_delay_ms, 0),
     DEFINE_PROP_BOOL("runtime-zlp", USBWs73Test, runtime_zlp, false),
     DEFINE_PROP_UINT8("runtime-medium", USBWs73Test, runtime_medium, 0),
     DEFINE_PROP_BOOL("runtime-discovery", USBWs73Test, runtime_discovery, false),
@@ -457,6 +520,8 @@ static void unrealize(USBDevice *dev)
     USBWs73Test *s = USB_WS73_TEST(dev);
     medium_devices[s->serial] = NULL;
     timer_free(s->wake); s->wake = NULL;
+    g_assert(!s->out_packet);
+    timer_free(s->out_timer); s->out_timer = NULL;
 }
 
 static void class_init(ObjectClass *klass, void *data)
@@ -465,6 +530,9 @@ static void class_init(ObjectClass *klass, void *data)
     uc->realize = realize; uc->unrealize = unrealize; uc->usb_desc = &descriptor;
     uc->product_desc = "Synthetic WS73 runtime (NO RF)";
     uc->handle_reset = reset; uc->handle_control = control; uc->handle_data = transfer;
+    uc->cancel_packet = cancel_packet;
+    object_class_property_add_bool(klass, "runtime-out-pending", out_pending, NULL);
+    object_class_property_add_bool(klass, "runtime-out-replied", out_replied, NULL);
     device_class_set_props(DEVICE_CLASS(klass), properties);
 }
 

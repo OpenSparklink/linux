@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -171,6 +172,26 @@ def file_record(path):
     return dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
 
 
+def assess_tx_barrier(console, stderr, early_in_while_out_pending):
+    """Require the delayed transfer, timely RPC and deferred result together."""
+    console = console.replace('\r', '')
+    errors = []
+    proof = 'NATIVE_TX_BARRIER: snapshot=1 early_reply_pending=1 survivor=1 final_reply=1'
+    latency = re.findall(r'^NATIVE_TX_SNAPSHOT: elapsed_ms=([0-9.]+)$', console, re.MULTILINE)
+    phases = ['NATIVE_TX_SUBMITTED', 'NATIVE_TX_SNAPSHOT:', proof, 'NATIVE_REMOVE_FIRST']
+    if (not early_in_while_out_pending or any(console.count(p) != 1 for p in phases)
+            or [console.find(p) for p in phases] != sorted(console.find(p) for p in phases)):
+        errors.append('missing, duplicate or out-of-order TX barrier proof')
+    if len(latency) != 1 or not 0 <= float(latency[0]) < 200:
+        errors.append('state snapshot blocked by transport')
+    expected = ['WS73_TEST_OUT_PENDING: serial=1 delay=2000',
+                'WS73_TEST_EARLY_REPLY: serial=1', 'WS73_TEST_OUT_COMPLETE: serial=1']
+    observed = re.findall(r'^WS73_TEST_.*$', stderr, re.MULTILINE)
+    if observed != expected:
+        errors.append('missing, duplicate or incorrect actual model OUT/IN completion order')
+    return errors
+
+
 def wait_marker(process, console, marker):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -216,7 +237,12 @@ def main():
     parser.add_argument('--native-ws73-events', action='store_true',
                         help='synthetic maximum reports, fanout/loss/poll/copy-fault and replug')
     parser.add_argument('--native-ws73-management', action='store_true', help='exclusive native file ownership, close/revocation and fault support gate')
+    parser.add_argument('--native-ws73-tx-barrier', action='store_true',
+                        help='hold USB OUT after early Complete; verify unlocked state and pending result')
     args = parser.parse_args()
+    if args.native_ws73_tx_barrier and (not args.native_ws73 or args.native_ws73_fault or
+            args.native_ws73_events or args.native_ws73_discovery or args.native_ws73_management):
+        parser.error('TX barrier requires independent native mode')
     if args.native_ws73_management and (not args.native_ws73 or args.native_ws73_fault or args.native_ws73_events or args.native_ws73_discovery):
         raise SystemExit('management gate requires independent native mode')
     if args.standard_host_recipes and args.native_ws73:
@@ -242,8 +268,9 @@ def main():
                     native_event_stream=args.native_ws73_events,
                     native_discovery=args.native_ws73_discovery,
                     native_management=args.native_ws73_management,
+                    native_tx_barrier=args.native_ws73_tx_barrier,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
-    process = monitor = None
+    process = monitor = barrier = None
     try:
         config = (build / '.config').read_text()
         for symbol in ['RUST', 'SPARKLINK', 'USB', 'SPARKLINK_SLE']:
@@ -315,6 +342,9 @@ poweroff -f
         if args.native_ws73_management:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n', '/bin/sparklink_runtime_test --owners\n'))
+        if args.native_ws73_tx_barrier:
+            initfile = initroot / 'init'
+            initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n', '/bin/sparklink_runtime_test --tx-barrier\n'))
         if args.native_ws73_discovery:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
@@ -338,6 +368,7 @@ poweroff -f
         manifest['initramfs'] = file_record(archive)
         with tempfile.TemporaryDirectory(prefix='sparklink-runtime-qmp-') as temp:
             sock = Path(temp) / 'monitor.sock'
+            barrier_sock = Path(temp) / 'barrier.sock'
             command = [str(args.qemu.resolve()), '-kernel', str(kernel), '-initrd', str(archive),
                        '-append', 'console=ttyS0 loglevel=5 log_buf_len=4M panic=1 oops=panic',
                        '-serial', f'file:{console}', '-display', 'none', '-no-reboot',
@@ -351,11 +382,25 @@ poweroff -f
                        (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
+            if args.native_ws73_tx_barrier:
+                command[-1] += ',runtime-out-delay-ms=2000'
+                command += ['-serial', f'unix:{barrier_sock},server=on,wait=off']
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
                 command.append('-enable-kvm')
             manifest['qemu_args'] = command
             with (output / 'qemu_stderr.log').open('wb') as stderr:
                 process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+                if args.native_ws73_tx_barrier:
+                    barrier = socket.socket(socket.AF_UNIX)
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            barrier.connect(str(barrier_sock))
+                            break
+                        except FileNotFoundError:
+                            if time.monotonic() >= deadline or process.poll() is not None:
+                                raise RuntimeError('TX barrier UART not available')
+                            time.sleep(0.01)
                 wait_marker(process, console, f'{prefix}_ADD_SECOND')
                 monitor = load_qmp()(sock, output / 'qmp.jsonl')
                 event_properties = {'runtime-reports': 40} if args.native_ws73_events else {}
@@ -365,6 +410,20 @@ poweroff -f
                     event_properties['recipe-status'] = True
                 monitor.execute('device_add', dict(driver=model, id='sle1',
                                                     bus='xhci.0', port='2', **event_properties))
+                if args.native_ws73_tx_barrier:
+                    wait_marker(process, console, 'NATIVE_TX_SUBMITTED')
+                    deadline = time.monotonic() + 1
+                    while time.monotonic() < deadline:
+                        path = '/machine/peripheral/sle0'
+                        pending = monitor.execute('qom-get', dict(path=path, property='runtime-out-pending'))
+                        replied = monitor.execute('qom-get', dict(path=path, property='runtime-out-replied'))
+                        if pending and replied:
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise RuntimeError('model did not deliver Complete while OUT held')
+                    barrier.sendall(b'out-held\n')
+                    manifest['early_in_while_out_pending'] = True
                 wait_marker(process, console, f'{prefix}_FAULT_FIRST' if args.native_ws73_fault
                             else f'{prefix}_REMOVE_FIRST')
                 monitor.execute('device_del', dict(id='sle0'))
@@ -381,11 +440,21 @@ poweroff -f
                                                      args.standard_host_recipes))
             if errors:
                 raise RuntimeError('; '.join(errors))
+            if args.native_ws73_tx_barrier:
+                data = console.read_text(errors='replace').replace('\r', '')
+                errors = assess_tx_barrier(data, (output / 'qemu_stderr.log').read_text(),
+                                           manifest.get('early_in_while_out_pending', False))
+                if errors:
+                    raise RuntimeError('; '.join(errors))
+                latencies = re.findall(r'^NATIVE_TX_SNAPSHOT: elapsed_ms=([0-9.]+)$', data, re.MULTILINE)
+                manifest['snapshot_elapsed_ms'] = float(latencies[0])
         manifest['status'] = 'PASS'
     except Exception as error:
         manifest['status'] = 'FAIL'
         manifest['error'] = f'{type(error).__name__}: {error}'
     finally:
+        if barrier:
+            barrier.close()
         if monitor:
             monitor.close()
         if process and process.poll() is None:

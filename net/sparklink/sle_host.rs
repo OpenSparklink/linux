@@ -21,6 +21,7 @@ struct InFlight {
     peer_addr: Option<[u8; 6]>,
     deadline: u64,
     recipe: Option<RecipeTag>,
+    transport_done: bool,
 }
 
 pub(crate) struct HostReply {
@@ -274,6 +275,7 @@ impl CommandHost {
                 .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64)
                 .min(if request.recipe.is_some() { request.deadline } else { u64::MAX }),
             recipe: request.recipe,
+            transport_done: false,
         });
         Ok(Some(request))
     }
@@ -334,9 +336,20 @@ impl CommandHost {
         }
     }
 
+    /// A device reply may arrive before the blocking OUT call returns. Retain
+    /// it, but do not publish terminal success until the transfer succeeded.
+    pub(crate) fn transport_complete(&mut self, cookie: u64) -> bool {
+        if self.fault.is_some() { return false; }
+        let Some(active) = self.active.as_mut() else { return false; };
+        if active.cookie != cookie { return false; }
+        active.transport_done = true;
+        self.reply.is_some()
+    }
+
     /// The protocol consumer releases the on-wire slot. Keeping it occupied
     /// until consumption bounds management delivery even if RX is busy.
     pub(crate) fn take_reply(&mut self) -> Option<HostReply> {
+        if !self.active.as_ref().is_some_and(|active| active.transport_done) { return None; }
         let (event, received) = self.reply.take()?;
         let active = self.active.take()?;
         let current_intent = if let Some(tag) = active.recipe {
@@ -422,11 +435,10 @@ impl CommandHost {
         // SAFETY: reading jiffies is safe in process/IRQ context.
         let now = unsafe { kernel::bindings::jiffies_64 };
         (self.revoking && self.revoke_done != 3 && now >= self.revoke_deadline)
-            || (self.reply.is_none()
-            && self
+            || self
                 .active
                 .as_ref()
-                .is_some_and(|active| now >= active.deadline))
+                .is_some_and(|active| (!active.transport_done || self.reply.is_none()) && now >= active.deadline)
             || self
                 .requests
                 .first_deadline()

@@ -3,6 +3,7 @@
 #include <linux/build_bug.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/sparklink_native.h>
 #include <uapi/linux/sparklink_ioctl.h>
@@ -60,6 +61,7 @@ static_assert(offsetof(struct sparklink_discovery_scan_params, filter_duplicates
 
 /* The copied operations and retained context outlive the Rust Backend. */
 struct sparklink_native_transport {
+	refcount_t references;
 	struct sparklink_native_ops ops;
 	void *context;
 };
@@ -84,6 +86,7 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 		return -ENODEV;
 	}
 	transport->ops = *ops;
+	refcount_set(&transport->references, 1);
 	transport->context = context;
 	ops->get(context);
 	/* Rust consumes this reference on both success and failure. */
@@ -91,10 +94,17 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 }
 EXPORT_SYMBOL_GPL(sparklink_native_register);
 
+void sparklink_native_transport_get(struct sparklink_native_transport *transport)
+{
+	refcount_inc(&transport->references);
+}
+
 void sparklink_native_transport_free(struct sparklink_native_transport *transport)
 {
 	struct module *owner = transport->ops.owner;
 
+	if (!refcount_dec_and_test(&transport->references))
+		return;
 	transport->ops.put(transport->context);
 	kfree(transport);
 	module_put(owner);

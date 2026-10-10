@@ -190,3 +190,12 @@ URBs, Host credit/status handling and two-owner remove/re-add gate. Add
 `--native-ws73-fault` for a malformed aggregate on A with B left usable. The
 same runner's default standard-DLI test remains independent. See
 `Documentation/networking/ws73-development.rst` for scope and commands.
+
+`--native-ws73-tx-barrier` independently enables `runtime-out-delay-ms=2000` on
+the first fixture. It defers the first post-bootstrap ReadLocalFeatures OUT
+using an asynchronous USB packet while delivering the device Complete on IN.
+Read-only `runtime-out-pending` and `runtime-out-replied` properties provide the
+host/guest UART barrier. The timer completes the held packet; packet cancellation
+removes that timer and reference. The delay is off by default and limited to
+2000 ms, below the production driver's OUT timeout. This is a transport race
+fixture; it does not execute firmware or provide RF evidence.

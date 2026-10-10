@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Native virtual verdict tests; no USB, SDK, KVM or hardware evidence."""
 import unittest
-from run_runtime_lifecycle import assess_native
+from run_runtime_lifecycle import assess_native, assess_tx_barrier
 
 GOOD = '''NATIVE_RAW_STATUS: fe preserved
 NATIVE_ADD_SECOND
@@ -211,3 +211,44 @@ class ManagementSchemaVerdict(unittest.TestCase):
         self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('schema=6','schema=0'), 0, management=True))
     def test_raw_failure_status_required(self):
         self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('status=253','status=0'), 0, management=True))
+
+
+class TxBarrierVerdict(unittest.TestCase):
+    CONSOLE = ('NATIVE_TX_SUBMITTED\nNATIVE_TX_SNAPSHOT: elapsed_ms=0.05\n'
+               'NATIVE_TX_BARRIER: snapshot=1 early_reply_pending=1 survivor=1 final_reply=1\n'
+               'NATIVE_REMOVE_FIRST\n')
+    STDERR = ('WS73_TEST_OUT_PENDING: serial=1 delay=2000\n'
+              'WS73_TEST_EARLY_REPLY: serial=1\nWS73_TEST_OUT_COMPLETE: serial=1\n')
+
+    def test_actual_out_in_and_rpc_proof_required_together(self):
+        self.assertEqual(assess_tx_barrier(self.CONSOLE, self.STDERR, True), [])
+        self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR, False))
+
+    def test_blocking_latency_rejected(self):
+        for latency in ['200', '1973.731', 'nan', '-1']:
+            with self.subTest(latency=latency):
+                self.assertTrue(assess_tx_barrier(self.CONSOLE.replace('0.05', latency), self.STDERR, True))
+
+    def test_missing_or_duplicate_phase_rejected(self):
+        for line in self.CONSOLE.splitlines(keepends=True):
+            with self.subTest(line=line):
+                self.assertTrue(assess_tx_barrier(self.CONSOLE.replace(line, ''), self.STDERR, True))
+                self.assertTrue(assess_tx_barrier(self.CONSOLE + line, self.STDERR, True))
+
+    def test_late_proof_rejected(self):
+        lines = self.CONSOLE.splitlines(keepends=True)
+        lines[2], lines[3] = lines[3], lines[2]
+        self.assertTrue(assess_tx_barrier(''.join(lines), self.STDERR, True))
+
+    def test_out_completion_before_early_reply_rejected(self):
+        lines = self.STDERR.splitlines(keepends=True)
+        lines[1], lines[2] = lines[2], lines[1]
+        self.assertTrue(assess_tx_barrier(self.CONSOLE, ''.join(lines), True))
+
+    def test_model_missing_duplicate_wrong_owner_or_cancel_rejected(self):
+        for line in self.STDERR.splitlines(keepends=True):
+            with self.subTest(line=line):
+                self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR.replace(line, ''), True))
+                self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR + line, True))
+        self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR.replace('serial=1', 'serial=2'), True))
+        self.assertTrue(assess_tx_barrier(self.CONSOLE, self.STDERR.replace('OUT_COMPLETE', 'OUT_CANCEL'), True))

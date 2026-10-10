@@ -17,6 +17,7 @@ int sparklink_native_event_rust(u16 id, u64 generation, u32 profile, u16 event_c
 				const u8 *params, size_t length);
 
 void sparklink_native_transport_free(struct sparklink_native_transport *transport);
+void sparklink_native_transport_get(struct sparklink_native_transport *transport);
 int sparklink_native_transport_open(struct sparklink_native_transport *transport,
 				    u16 id, u64 generation);
 void sparklink_native_transport_close(struct sparklink_native_transport *transport);

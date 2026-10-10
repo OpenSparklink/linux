@@ -648,3 +648,57 @@ independent invocation lower bound against older queued RX. Query delays count
 against the window. No fallback to daemon poll time or a narrower admission
 window is permitted. The explicit model tests remain software support only;
 physical firmware/RF and all real North Star checks require hardware evidence.
+
+WS73 blocking OUT and early replies
+----------------------------------
+
+The native TX worker acquires a separate reference to the copied C transport
+under its owner's protocol mutex, then releases that mutex before validation
+and blocking USB OUT. The transport context and module reference remain alive
+until the last reference drops. Invalidation stops admission and joins the TX
+worker before closing the Backend; the retained handle never looks up a reused
+controller index. The standard USB and legacy Backend paths still have separate
+lock migration work and are not covered by this native-only change.
+
+The command Host can receive a Complete before USB OUT returns. It retains that
+reply and its original CLOCK_BOOTTIME, but releases neither the active slot nor
+the terminal result until successful transport completion with the matching
+cookie. An early reply does not disable the command deadline. Failed OUT or
+invalidation discards a pending reply; a late transport notification cannot
+revive a faulted Host. Acceptance Status and credit grants remain observable
+without resolving the command.
+
+Build the custom QEMU from the current model and run the following independent
+synthetic gate with a fresh output directory::
+
+  python3 tools/testing/selftests/sparklink/run_runtime_lifecycle.py \
+    --kernel-build /absolute/path/to/kernel-build \
+    --qemu /absolute/path/to/qemu-system-x86_64 \
+    --busybox /absolute/path/to/static-busybox \
+    --output /absolute/path/to/new-run-directory \
+    --native-ws73 --native-ws73-tx-barrier
+
+Only the first post-bootstrap ReadLocalFeatures OUT is deferred for two seconds.
+The host observes both a held OUT and the Complete delivered through IN before
+signalling the guest on a separate UART. The guest requires its own snapshot
+within 200 ms, an unaffected owner's actual DLI query, exactly one acceptance
+Status, an unresolved query throughout a 100 ms observation, and the final
+correct feature reply after OUT success. The full existing remove/re-add gate
+then runs. QMP, actual model OUT/IN order, latency, complete kernel log and
+source/input hashes are retained. The fixture's initial native registration is
+SETUP; this race gate requires its state to remain unchanged, not native Ready.
+
+Local kernel #71 passes with a 0.004 ms snapshot; exact old kernel #69 blocks
+for about 1.97 seconds and fails the same gate. Nine standard/native lifecycle,
+recipe, malformed reply, event, discovery and ownership gates pass. The original
+three-controller 96-case suite passes with 1056 OK, no FAIL/SKIP and three
+existing WARN. The companion ordinary-user synthetic 20+2 discovery rounds,
+TX-off controls and hotplug run also pass; these are not physical WS73 evidence.
+
+Kernel build commands must select a toolchain with matching rust-src explicitly
+(``ws73-lab.py --rustc /absolute/toolchain/bin/rustc``). A stable proxy without
+rust-src caused the first local build to remove Rust/SparkLink configuration;
+the pre-boot gate rejected that image. The rejected build and initial test
+failures remain alongside the qualified fixed-toolchain run. Evidence is frozen
+locally in ``.dev/tx-unlock-final-evidence.json``; all real North Star checks and
+the remaining full issue requirements stay open.
