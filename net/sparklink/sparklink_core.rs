@@ -3293,6 +3293,7 @@ fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if me.target.lock().as_ref().map(|t| t.identity) != Some(owner.identity) { return Err(EINVAL); }
     if input.generation != owner.identity.generation { return Err(ENODEV); }
     if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if *owner.schedule_gate.lock() { return Err(ENODEV); }
     owner.management.lock().authorize(me.file_id, sle_management::DIAGNOSTIC).map_err(management_error)?;
     let state = context.lock()?;
     let entry = state.as_ref().ok_or(ENODEV)?.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;

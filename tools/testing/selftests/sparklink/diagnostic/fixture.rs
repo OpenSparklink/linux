@@ -64,6 +64,7 @@ mod sle_management { pub const DIAGNOSTIC: u32 = 2; }
 fn management_error(e: Error) -> Error { e }
 struct Owner {
     identity: Identity, protocol_profile: u32, management: TestMutex<Management>,
+    schedule_gate: TestMutex<bool>,
 }
 struct State { cmd_pending: CmdPendingQueue }
 struct RuntimeContext { owner: Option<Owner>, state: TestMutex<Option<State>> }
@@ -100,6 +101,7 @@ fn setup(author: u64) -> (RuntimeContext, SparkLinkCtl, u32) {
     queue.assign_owner(seq, author);
     let ctx = RuntimeContext {
         owner: Some(Owner { identity, protocol_profile: 1,
+                          schedule_gate: TestMutex::new(false),
                           management: TestMutex::new(Management { file: 42 }) }),
         state: TestMutex::new(Some(State { cmd_pending: queue })),
     };
@@ -171,5 +173,14 @@ fn identity_version_profile_and_missing_sequence_fail() {
     *ctl.target.lock() = None;
     assert_eq!(ioctl_diagnostic_result(&ctx, Pin::new(&ctl), 1), Err(EINVAL));
     ctx.owner = None;
+    assert_eq!(ioctl_diagnostic_result(&ctx, Pin::new(&ctl), 1), Err(ENODEV));
+}
+
+#[test]
+fn retired_runtime_is_enodev_before_revoked_lease_permission() {
+    let (ctx, ctl, _) = setup(42);
+    let owner = ctx.owner.as_ref().unwrap();
+    *owner.schedule_gate.lock() = true;
+    owner.management.lock().file = 0;
     assert_eq!(ioctl_diagnostic_result(&ctx, Pin::new(&ctl), 1), Err(ENODEV));
 }

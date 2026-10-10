@@ -34,7 +34,7 @@ def run(output):
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 10,
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 11,
               'scope': 'actual pending module and result handler; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},
