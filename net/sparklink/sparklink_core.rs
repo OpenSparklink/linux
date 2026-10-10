@@ -449,7 +449,6 @@ pub(crate) struct ControllerState {
     pub(crate) rpa_tick_accum: u16,
     pub(crate) ssap: SsapInner,
     pub(crate) power: PowerInner,
-    pub(crate) phy: sle_phy::PhyConfig,
     pub(crate) local_role: GtRole,
     pub(crate) broadcast: sle_event::BroadcastRing,
     pub(crate) dli_ring: [SleDliEvent; DLI_RING_SIZE],
@@ -475,7 +474,6 @@ impl ControllerState {
                 rpa_tick_accum: 0,
                 ssap: SsapInner::new(),
                 power: PowerInner::new(),
-                phy: sle_phy::PhyConfig::default_config(),
                 local_role: GtRole::TNode,
                 broadcast <- sle_event::BroadcastRing::new_in_place(),
                 // Initialize slots at their final address. A by-value zeroed
@@ -2338,7 +2336,6 @@ fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isiz
             let mut ss = context.lock()?;
             let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
             s.security.enable_encryption()?;
-            s.controller.start_encrypt()?;
             Ok(0)
         }
         // Legacy test ioctls are not a production crypto interface. Algorithm
@@ -3494,104 +3491,16 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             Ok(0)
         }
         SL_IOCTL_USB_DEV_COUNT => Ok(sle_usb::usb_device_count() as isize),
-        SL_IOCTL_PHY_INFO => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let mcs = sle_phy::mcs_lookup(s.phy.mcs_index);
-            let info = SlePhyInfo {
-                mcs_index: s.phy.mcs_index,
-                bandwidth_mhz: s.phy.bandwidth_mhz,
-                pilot_density: s.phy.pilot_density,
-                tx_power_dbm: s.phy.tx_power_dbm,
-                mimo_mode: s.phy.antenna.mode as u8,
-                num_tx_ant: s.phy.antenna.num_tx,
-                num_rx_ant: s.phy.antenna.num_rx,
-                ofdm: if mcs.is_some_and(|m| m.ofdm) { 1 } else { 0 },
-                data_rate_kbps: s.phy.effective_data_rate_kbps(),
-                hop_channel: s.phy.hopping.last_channel,
-                hop_increment: s.phy.hopping.hop_increment,
-                hop_used_channels: s.phy.hopping.channel_map.used_count(),
-                modulation: mcs.map_or(0, |m| m.modulation as u8),
-                code_rate_num: mcs.map_or(0, |m| m.code_rate.num),
-                code_rate_den: mcs.map_or(0, |m| m.code_rate.den),
-                ..Default::default()
-            };
-            drop(ss);
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_SET_MCS => {
-            let cmd_data: SlePhyMcsCmd = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.phy.set_mcs(cmd_data.mcs_index)?;
-            s.controller.set_coding_modulation(cmd_data.mcs_index)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_SET_TXPOWER => {
-            let cmd_data: SlePhyTxPowerCmd = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.phy.set_tx_power(cmd_data.tx_power_dbm)?;
-            s.controller.set_tx_power(cmd_data.tx_power_dbm)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_MCS_SELECT => {
-            let mut sel: SlePhyMcsSelect = read_user_struct(arg)?;
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let best = sle_phy::mcs_select_with_thresholds(
-                sel.min_kbps,
-                sel.bandwidth_mhz,
-                sel.sinr_db_x10,
-                &s.phy.sinr_thresholds,
-            );
-            sel.selected_mcs = best;
-            sel.effective_kbps = sle_phy::data_rate_kbps(best, sel.bandwidth_mhz).unwrap_or(0);
-            drop(ss);
-            write_user_struct(arg, &sel)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_HOP_NEXT => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let ch = s.phy.hopping.next_channel();
-            let info = SlePhyHopInfo {
-                channel: ch,
-                freq_mhz: sle_phy::HoppingState::channel_to_freq(ch),
-                event_counter: s.phy.hopping.event_counter,
-                ..Default::default()
-            };
-            drop(ss);
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_SET_BW => {
-            let cmd_data: SlePhyBwCmd = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.phy.set_bandwidth(cmd_data.bandwidth_mhz)?;
-            s.controller.set_bandwidth(cmd_data.bandwidth_mhz)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_GET_SINR => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let out = SleSinrThresholds {
-                thresholds: s.phy.sinr_thresholds,
-                _pad: [0; 2],
-            };
-            drop(ss);
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_PHY_SET_SINR => {
-            let cmd_data: SleSinrThresholds = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.phy.sinr_thresholds = cmd_data.thresholds;
-            Ok(0)
-        }
+        // No authenticated PHY transaction or confirmed hardware snapshot is
+        // implemented. Local models must not impersonate controller state.
+        SL_IOCTL_PHY_INFO
+        | SL_IOCTL_PHY_SET_MCS
+        | SL_IOCTL_PHY_SET_TXPOWER
+        | SL_IOCTL_PHY_MCS_SELECT
+        | SL_IOCTL_PHY_HOP_NEXT
+        | SL_IOCTL_PHY_SET_BW
+        | SL_IOCTL_PHY_GET_SINR
+        | SL_IOCTL_PHY_SET_SINR => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_SET_ROLE => {
             let role_byte: u8 = read_user_struct(arg)?;
             let role = match role_byte {

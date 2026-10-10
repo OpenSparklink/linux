@@ -346,19 +346,11 @@ impl SecurityInner {
         Ok(())
     }
 
-    /// Enable encryption on the data path.
-    ///
-    /// Requires pairing to be complete (Paired state).
+    /// Legacy adapter-global enable cannot establish a per-connection key,
+    /// installation transaction, or matching hardware completion. Reject it
+    /// without modifying credentials, counters or the reported security state.
     pub fn enable_encryption(&mut self) -> Result {
-        if self.state != SecurityState::Paired {
-            return Err(EBUSY);
-        }
-        if self.sm4_ctx.is_none() {
-            return Err(EINVAL);
-        }
-        self.state = SecurityState::Encrypted;
-        pr_info!("sparklink: encryption enabled\n");
-        Ok(())
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
     /// Check if encryption is active.

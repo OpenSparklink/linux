@@ -55,7 +55,7 @@ def run(output):
               'scope': 'actual Rust wrappers/security + C CTR body; mocked dependencies, not crypto vectors or RF',
               'sources': {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()},
               'ctr_body_sha256': hashlib.sha256(ctr.encode()).hexdigest(),
-              'rust_tests': 6, 'c_fault_stages': 5,
+              'rust_tests': 7, 'c_fault_stages': 5,
               'remaining': ['Per-connection authenticated pairing/relay/real encryption installation',
                             'Standard crypto vectors, zeroization audit and real peer interoperability',
                             'New kernel VM WS73 discovery/recovery regression']}

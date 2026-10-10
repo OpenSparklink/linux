@@ -1409,23 +1409,6 @@ impl ControllerBackend {
         self.send_command(SleOpcode::EnableScan, &[u8::from(enable)])
     }
 
-    /// Set the coding & modulation scheme (MCS index, section 8.5.3).
-    pub fn set_coding_modulation(&self, mcs_index: u8) -> Result {
-        self.send_command(SleOpcode::SetCodingModulation, &[mcs_index])
-    }
-
-    /// Set transmit power in dBm (section 8.5.5, sub-type 0x01).
-    pub fn set_tx_power(&self, dbm: i8) -> Result {
-        let p = [0x01, dbm as u8];
-        self.send_command(SleOpcode::SetPhyParam, &p)
-    }
-
-    /// Set channel bandwidth in MHz (section 8.5.5, sub-type 0x02).
-    pub fn set_bandwidth(&self, mhz: u8) -> Result {
-        let p = [0x02, mhz];
-        self.send_command(SleOpcode::SetPhyParam, &p)
-    }
-
     /// Initiate a connection to a peer (section 8.4.1).
     pub fn create_connection(&self, peer_addr: &[u8; 6]) -> Result {
         self.send_command(SleOpcode::CreateConnection, peer_addr)
@@ -1472,10 +1455,7 @@ impl ControllerBackend {
         self.send_command(SleOpcode::DhkeyVerify, params)
     }
 
-    /// Start link encryption (§8.6.3).
-    pub fn start_encrypt(&self) -> Result {
-        self.send_command(SleOpcode::StartEncrypt, &[])
-    }
+
 }
 
 impl SleController for ControllerBackend {

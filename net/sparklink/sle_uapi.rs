@@ -10,7 +10,6 @@ use kernel::prelude::*;
 use kernel::transmute::FromBytes;
 
 use super::sle_dli;
-use super::sle_phy;
 
 // ---------------------------------------------------------------------------
 // Padding / reserved field validation (per botching-up-ioctls.rst)
@@ -2664,7 +2663,7 @@ pub(crate) struct SleSinrThresholds {
 impl Default for SleSinrThresholds {
     fn default() -> Self {
         Self {
-            thresholds: sle_phy::DEFAULT_SINR_THRESHOLDS,
+            thresholds: [0; 13],
             _pad: [0; 2],
         }
     }

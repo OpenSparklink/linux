@@ -57,7 +57,30 @@ mod remediation_tests {
         unsupported(s.input_passkey(123456));
         empty(&s);
         assert_eq!(CALLS.load(SeqCst), 0);
-        assert_eq!(s.enable_encryption(), Err(EBUSY));
+        unsupported(s.enable_encryption());
+    }
+    #[test]
+    fn legacy_enable_never_claims_hardware_state_or_changes_keys() {
+        inject(0, 0);
+        for state in [SecurityState::Idle, SecurityState::Pairing,
+                      SecurityState::Paired, SecurityState::Encrypted] {
+            let mut s = SecurityInner::new();
+            s.state = state;
+            s.link_key = Some([1; 16]);
+            s.enc_key = Some([2; 16]);
+            s.int_key = Some([3; 16]);
+            s.sm4_ctx = Some(Sm4Key::new(&[2; 16]));
+            s.tx_counter = 7;
+            s.rx_counter = 9;
+            unsupported(s.enable_encryption());
+            assert_eq!(s.state, state);
+            assert_eq!(s.link_key, Some([1; 16]));
+            assert_eq!(s.enc_key, Some([2; 16]));
+            assert_eq!(s.int_key, Some([3; 16]));
+            assert!(s.sm4_ctx.is_some());
+            assert_eq!((s.tx_counter, s.rx_counter), (7, 9));
+            assert_eq!(CALLS.load(SeqCst), 0);
+        }
     }
     #[test]
     fn crypto_wrappers_preserve_original_errors() {
