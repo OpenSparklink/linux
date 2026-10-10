@@ -233,3 +233,43 @@ fn standby_never_confirms_off_on_configuration_status_or_cancelled_prefix() {
         assert_eq!(o.find(1).unwrap().state, State::Failed);
     }
 }
+
+#[test]
+fn scan_standby_requires_on_then_off_and_preserves_unknown_after_fail_cancel() {
+    for status in [0, 0x0b] {
+        let mut o = Operations::new();
+        assert!(!o.can_initialize_scan());
+        o.advertising = 1;
+        assert!(o.can_initialize_scan());
+        add(&mut o, 1, I::ScanningStandby, 3);
+        assert!(!o.can_initialize_scan());
+        assert!(!I::ScanningStandby.enabled());
+        assert!(I::ScanningStandby.has_enable());
+        assert!(I::ScanningStandby.enables_step(1, 3));
+        assert!(!I::ScanningStandby.enables_step(0, 3));
+        assert!(!I::ScanningStandby.enables_step(2, 3));
+        o.sent(1, 0, 0x1001);o.reply(1, 0, true, 0, &[], true, 1);
+        o.sent(1, 1, 0x1002);o.reply(1, 1, false, 0, &[], true, 2);
+        o.reply(1, 1, true, 0, &[], true, 3);
+        assert_eq!(o.scanning, 0);
+        assert!(!o.initialized);
+        o.sent(1, 2, 0x1002);o.reply(1, 2, false, 0, &[], true, 4);
+        assert!(!o.initialized);
+        o.reply(1, 2, true, status, &[], true, 5);
+        assert_eq!(o.scanning, if status == 0 { 1 } else { 0 });
+        assert_eq!(o.initialized, status == 0);
+        assert_eq!(o.find(1).unwrap().status, status);
+        assert_eq!(o.find(1).unwrap().state, if status == 0 { State::Succeeded } else { State::Failed });
+    }
+    for step in 0..3 {
+        let mut o = Operations::new();
+        o.advertising = 1;
+        add(&mut o, 1, I::ScanningStandby, 3);
+        o.sent(1, step, if step == 0 { 0x1001 } else { 0x1002 });
+        o.cancel_domain(I::Scanning(false), -125);
+        o.reply(1, step, true, 0, &[], false, 6);
+        assert_eq!(o.scanning, if step == 2 { 1 } else { 0 });
+        assert!(!o.initialized);
+        assert_eq!(o.find(1).unwrap().state, State::Cancelled);
+    }
+}

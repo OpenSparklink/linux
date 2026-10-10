@@ -250,12 +250,19 @@ int ws73_discovery_validate_step(unsigned int operation, unsigned int step,
 		expected = 0x0c05;
 		enable = 0;
 		break;
+	case SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF:
+		if (count != 3)
+			return -EINVAL;
+		expected = step == 0 ? 0x1001 : 0x1002;
+		if (step != 0)
+			enable = step == 1;
+		break;
 	case SPARKLINK_DISCOVERY_SCAN_START:
 		if (count != 2)
 			return -EINVAL;
 		expected = step == 0 ? 0x1001 : 0x1002;
 		if (step == 1)
-			enable = 1;
+			enable = operation == SPARKLINK_DISCOVERY_SCAN_START;
 		break;
 	case SPARKLINK_DISCOVERY_SCAN_STOP:
 		if (count != 1)
@@ -269,6 +276,10 @@ int ws73_discovery_validate_step(unsigned int operation, unsigned int step,
 	if (opcode != expected)
 		return -EINVAL;
 	if (enable >= 0 && (!params || !size || params[0] != enable))
+		return -EINVAL;
+	if (operation == SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF &&
+	    ((step == 0 && (size != 8 || !params || params[3])) ||
+	     (step != 0 && (size != 2 || !params || params[1]))))
 		return -EINVAL;
 	return ws73_discovery_validate_command(opcode, params, size);
 }
@@ -328,15 +339,17 @@ static int ws73_discovery_build(const struct sparklink_discovery_request *r,
 						       r->handle, 0, 0));
 		break;
 	case SPARKLINK_DISCOVERY_SCAN_START:
-		count = 2;
+	case SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF:
+		count = r->operation == SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF ? 3 : 2;
 		PART(0x1001,
 		     ws73_discovery_scan_params(
 			     p, sizeof(scratch), scan->own_address_type,
 			     scan->filter, scan->frame_types, scan->active,
 			     scan->interval, scan->window));
-		PART(0x1002,
-		     ws73_discovery_scan_enable(p, sizeof(scratch), 1,
-						scan->filter_duplicates));
+		PART(0x1002, ws73_discovery_scan_enable(p, sizeof(scratch), 1,
+						       scan->filter_duplicates));
+		if (r->operation == SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF)
+			PART(0x1002, ws73_discovery_scan_enable(p, sizeof(scratch), 0, 0));
 		break;
 	case SPARKLINK_DISCOVERY_SCAN_STOP:
 		count = 1;
@@ -373,7 +386,10 @@ int ws73_discovery_prepare(const struct sparklink_discovery_request *r,
 			return -EINVAL;
 		break;
 	case SPARKLINK_DISCOVERY_SCAN_START:
-		if (!r->scanning || r->advertising)
+	case SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF:
+		if (!r->scanning || r->advertising || r->scanning->filter_duplicates > 1 ||
+		    (r->operation == SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF &&
+		     (r->scanning->active || r->scanning->filter_duplicates)))
 			return -EINVAL;
 		break;
 	case SPARKLINK_DISCOVERY_ADV_STOP:

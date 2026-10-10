@@ -950,3 +950,29 @@ subtypes, malformed bounds and fresh-advertiser initialization.
 The physical devices are now warm. Testing re-customize/open recovery without
 requiring another manual hub replug is the next dependency; automatic recovery
 and the full native-host/real-QEMU single/multiple-device matrix remain open.
+
+Bounded warm adoption and passive scanner initialization
+-------------------------------------------------------
+
+Only an initial BSP_READY timeout before Runtime publication admits one warm
+attempt per probe. Drain at most64 packets/1000ms, require a fresh CLOSE30
+(type4/action3) reply, then repeat PM/customize/OPEN29/BOOT_FINISH and all four
+queries. No host/hub reset, detach or firmware upload is part of this slice.
+The read-only warm_recovery sample records the attempt, cause and result.
+This is not a persistent port budget or full runtime/disappearance recovery.
+
+Real111 rejects initial scan OFF with raw0b even after successful parameters.
+Typed operation6 SCAN_INITIALIZE_OFF uses passive parameters/ON/OFF, each with
+successful Complete. The intermediate ON never establishes Ready; cancellation
+or failed final OFF leaves unknown state. Active/duplicate scanning is rejected
+for this initializer; it requires advertising confirmed OFF and no conflicting
+operation. Operation5 advertiser standby still never enables advertising.
+
+A frozen kernel90 physical initial-phase receipt has20 alternating actual
+slctl rounds, matched marker/data/address/RSSI in298--615ms,1161 USB packets and
+zero kernel drops, with ordinary uid1000/capabilities0. Firmware is mixed:
+port1-2.1.1 uploaded111 in that run, port1-2.1.3 retained110. This receipt is not
+full North Star acceptance. Earlier physical removal changed the survivor's
+registration, and that session timed out before capture statistics. Preserve
+both failures; isolation, replug, native-host comparisons, disappearance root
+cause, bounded automatic recovery and four-device parallelism remain open.

@@ -108,7 +108,7 @@ impl CommandHost {
 
     fn cancel_recipe_progress(&mut self, intent: DiscoveryIntent) {
         if let Some((tag, progress)) = &mut self.recipe {
-            if tag.intent.same_domain(intent) && tag.intent.enabled() { progress.cancel(); }
+            if tag.intent.same_domain(intent) && tag.intent.has_enable() { progress.cancel(); }
         }
     }
 
@@ -132,7 +132,7 @@ impl CommandHost {
         self.next_cookie = next_cookie;
         match intent {
             DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.broadcast_cookie = cookie,
-            DiscoveryIntent::Scanning(_) => self.scan_cookie = cookie,
+            DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => self.scan_cookie = cookie,
         }
         Ok(())
     }
@@ -148,6 +148,7 @@ impl CommandHost {
             AdmissionError::Full => EBUSY,
         })?;
         if intent.enabled() && !self.operations.can_start(intent) { return Err(EBUSY); }
+        if intent == DiscoveryIntent::ScanningStandby && !self.operations.can_initialize_scan() { return Err(EBUSY); }
         let cookie = self.next_cookie;
         self.enqueue_recipe(intent, parts)?;
         // Queue/cookie admission succeeded. Neither failure path above changed
@@ -209,7 +210,7 @@ impl CommandHost {
     fn current_recipe(&self, tag: RecipeTag) -> bool {
         tag.cookie == match tag.intent {
             DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.broadcast_cookie,
-            DiscoveryIntent::Scanning(_) => self.scan_cookie,
+            DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => self.scan_cookie,
         }
     }
 
@@ -227,7 +228,7 @@ impl CommandHost {
         let request = loop {
             let Some(request) = self.requests.pop() else { return Ok(None) };
             if let Some(tag) = request.recipe {
-                if tag.intent.enabled() && !self.current_recipe(tag) { continue; }
+                if tag.intent.has_enable() && !self.current_recipe(tag) { continue; }
                 // SAFETY: only reads the kernel clock.
                 if unsafe { kernel::bindings::jiffies_64 } >= request.deadline {
                     return Err(ETIMEDOUT);
@@ -378,7 +379,7 @@ impl CommandHost {
                 _ => (false, 0),
             };
             let outcome = if let Some((root, progress)) = &mut self.recipe {
-                if (!current_intent && tag.intent.enabled()) || root.cookie != tag.cookie {
+                if (!current_intent && tag.intent.has_enable()) || root.cookie != tag.cookie {
                     progress.cancel();
                     RecipeReply::Ignored
                 } else {

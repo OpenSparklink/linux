@@ -176,12 +176,14 @@ static void codec_tests(void)
 enum fault {
 	NORMAL, NO_BSP, NO_CUSTOM, ACTION_ONLY, PANIC, BAD_AGGREGATE,
 	SEND_ERROR, OPEN_ERROR, DISCONNECTED, DEADLINE_ACK,
+	DRAIN_BUSY, DRAIN_PANIC, DRAIN_OVERSIZE, DRAIN_ERROR, DRAIN_DEADLINE,
 };
 
 struct fake {
 	struct ws73_bsle_io io;
 	unsigned char tx[864], rx[220];
 	unsigned int sequence, sends, opens, notifications, bulk_reads, boot_reads;
+	unsigned int drains, closes, close_reads;
 	unsigned long long now;
 	enum ws73_bsle_phase phase;
 	enum fault fault;
@@ -232,6 +234,10 @@ static int notification(void *context, unsigned int timeout, unsigned int *bits)
 		*bits = 1U << 6;
 		return 0;
 	}
+	if (f->fault == DRAIN_PANIC && f->phase == WS73_BSLE_DRAINING) {
+		*bits = 1U << 6;
+		return 0;
+	}
 	f->now += timeout;
 	return -ETIMEDOUT;
 }
@@ -243,6 +249,30 @@ static int receive_data(void *context, unsigned int timeout)
 	CHECK(timeout > 0 && timeout <= 500);
 	f->bulk_reads++;
 	f->now++;
+	if (f->phase == WS73_BSLE_DRAINING) {
+		f->drains++;
+		if (f->fault == DRAIN_ERROR)
+			return -EPIPE;
+		if (f->fault == DRAIN_OVERSIZE)
+			return f->io.rx_capacity + 1;
+		if (f->fault == DRAIN_DEADLINE) {
+			f->now += 1000;
+			return -ETIMEDOUT;
+		}
+		/* Both a stale BOOT_FINISH and stale CLOSE must be discarded. */
+		if (f->drains <= 2 || f->fault == DRAIN_BUSY) {
+			ack_packet(f->rx, f->drains == 1 ? 2 : 4, f->drains == 1 ? 1 : 3);
+			return 156;
+		}
+		f->now += timeout;
+		return -ETIMEDOUT;
+	}
+	if (f->phase == WS73_BSLE_WAIT_CLOSE) {
+		f->close_reads++;
+		ack_packet(f->rx, f->close_reads == 1 ? 2 : 4,
+			   f->close_reads == 1 ? 1 : f->close_reads == 2 || f->fault == ACTION_ONLY ? 2 : 3);
+		return 156;
+	}
 	if (f->phase == WS73_BSLE_WAIT_CUSTOMIZE) {
 		/* A pre-open BOOT_FINISH cannot be saved to confirm the later open. */
 		ack_packet(f->rx, 2, f->fault == NO_CUSTOM ? 1 : 2);
@@ -271,6 +301,15 @@ static int open_sle(void *context)
 	return f->fault == OPEN_ERROR ? -EREMOTEIO : 0;
 }
 
+static int close_sle(void *context)
+{
+	struct fake *f = context;
+
+	CHECK(f->phase == WS73_BSLE_CLOSING && !f->sends && !f->opens);
+	f->closes++;
+	return f->fault == OPEN_ERROR ? -EREMOTEIO : 0;
+}
+
 static void init_fake(struct fake *f, enum fault fault)
 {
 	memset(f, 0, sizeof(*f));
@@ -279,8 +318,52 @@ static void init_fake(struct fake *f, enum fault fault)
 		.context = f, .tx = f->tx, .tx_capacity = sizeof(f->tx),
 		.rx = f->rx, .rx_capacity = sizeof(f->rx), .sequence = &f->sequence,
 		.now_ms = now_ms, .send = send_data, .receive = receive_data,
-		.notification = notification, .open = open_sle, .phase = phase,
+		.notification = notification, .open = open_sle, .close = close_sle, .phase = phase,
 	};
+}
+
+static void warm_tests(void)
+{
+	const unsigned char pm[4] = { 1 }, custom[140] = { 1 };
+	struct fake a, b;
+	const enum fault faults[] = { NORMAL, ACTION_ONLY, OPEN_ERROR, NO_CUSTOM, BAD_AGGREGATE,
+				     PANIC, SEND_ERROR, DISCONNECTED, DEADLINE_ACK };
+	const int errors[] = { 0, -ETIMEDOUT, -EREMOTEIO, -ETIMEDOUT, -EPROTO,
+			      -EIO, -EREMOTEIO, -ENODEV, -ETIMEDOUT };
+
+	for (unsigned int i = 0; i < sizeof(faults) / sizeof(faults[0]); i++) {
+		init_fake(&a, faults[i]);
+		CHECK(ws73_bsle_restore(&a.io, pm, 4, custom, 140) == errors[i]);
+		CHECK(a.drains == 3 && a.closes == 1);
+		CHECK(!(a.phase_history & (1U << WS73_BSLE_WAIT_BSP)));
+		CHECK(a.now < 21000);
+		if (!i) {
+			CHECK(a.close_reads == 3 && a.opens == 1 && a.sends == 6 && a.sequence == 6);
+			CHECK(a.phase == WS73_BSLE_TRANSPORT_OPEN);
+		} else {
+			CHECK(!(a.phase_history & (1U << WS73_BSLE_TRANSPORT_OPEN)));
+		}
+		init_fake(&b, NORMAL);
+		CHECK(ws73_bsle_start(&b.io, pm, 4, custom, 140) == 0);
+		CHECK(!b.closes && b.sequence == 6);
+	}
+	init_fake(&a, NORMAL);
+	CHECK(ws73_bsle_restore(&a.io, pm, 3, custom, 140) == -EINVAL);
+	CHECK(!a.drains && !a.closes && !a.sends);
+	a.io.close = NULL;
+	CHECK(ws73_bsle_restore(&a.io, pm, 4, custom, 140) == -EINVAL);
+	CHECK(!a.drains && !a.closes);
+	CHECK(ws73_bsle_restore(NULL, pm, 4, custom, 140) == -EINVAL);
+	const enum fault drain_faults[] = { DRAIN_BUSY, DRAIN_PANIC, DRAIN_OVERSIZE,
+					  DRAIN_ERROR, DRAIN_DEADLINE };
+	const int drain_errors[] = { -ETIMEDOUT, -EIO, -EOVERFLOW, -EPIPE, -ETIMEDOUT };
+	for (unsigned int i = 0; i < sizeof(drain_faults) / sizeof(drain_faults[0]); i++) {
+		init_fake(&a, drain_faults[i]);
+		CHECK(ws73_bsle_restore(&a.io, pm, 4, custom, 140) == drain_errors[i]);
+		CHECK(!a.closes && !a.opens && !a.sends && a.drains <= 64);
+		if (!i)
+			CHECK(a.drains == 64);
+	}
 }
 
 static void handshake_tests(void)
@@ -324,6 +407,7 @@ int main(void)
 {
 	codec_tests();
 	handshake_tests();
+	warm_tests();
 	printf("WS73_WIRE_BSLE_TEST: %s (%u checks, %u failures; synthetic IO only)\n",
 	       failures ? "FAIL" : "PASS", checks, failures);
 	return failures ? 1 : 0;

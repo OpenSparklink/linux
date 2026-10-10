@@ -13,20 +13,31 @@ pub(crate) enum DiscoveryIntent {
     /// Explicit parameter configuration followed by OFF; no enable step.
     AdvertisingStandby,
     Scanning(bool),
+    /// Passive parameter/ON/OFF probe; only final OFF establishes readiness.
+    ScanningStandby,
 }
 
 impl DiscoveryIntent {
     pub(crate) fn enabled(self) -> bool {
         match self {
-            Self::AdvertisingStandby => false,
+            Self::AdvertisingStandby | Self::ScanningStandby => false,
             Self::Advertising(enable) | Self::Scanning(enable) => enable,
         }
+    }
+
+    pub(crate) fn has_enable(self) -> bool {
+        self.enabled() || self == Self::ScanningStandby
+    }
+
+    pub(crate) fn enables_step(self, step: u8, count: u8) -> bool {
+        if self == Self::ScanningStandby { step == 1 }
+        else { self.enabled() && step + 1 == count }
     }
 
     pub(crate) fn same_domain(self, other: Self) -> bool {
         matches!(
             (self, other),
-            (Self::Advertising(_) | Self::AdvertisingStandby, Self::Advertising(_) | Self::AdvertisingStandby) | (Self::Scanning(_), Self::Scanning(_))
+            (Self::Advertising(_) | Self::AdvertisingStandby, Self::Advertising(_) | Self::AdvertisingStandby) | (Self::Scanning(_) | Self::ScanningStandby, Self::Scanning(_) | Self::ScanningStandby)
         )
     }
 }

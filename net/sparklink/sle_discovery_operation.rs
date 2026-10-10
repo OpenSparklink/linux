@@ -105,13 +105,18 @@ impl Operations {
                 self.scanning,
                 DiscoveryIntent::Scanning(true),
             ),
-            DiscoveryIntent::Scanning(_) => (
+            DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => (
                 self.scanning,
                 self.advertising,
                 DiscoveryIntent::Advertising(true),
             ),
         };
         own == 1 && other == 1 && !self.pending(intent) && !self.pending(other_intent)
+    }
+    pub(crate) fn can_initialize_scan(&self) -> bool {
+        self.advertising == 1 && self.scanning != 2
+            && !self.pending(DiscoveryIntent::Scanning(false))
+            && !self.pending(DiscoveryIntent::Advertising(false))
     }
     pub(crate) fn cancel_domain(&mut self, intent: DiscoveryIntent, error: i32) {
         for op in self.entries.iter_mut().flatten() {
@@ -128,6 +133,10 @@ impl Operations {
             .flatten()
             .find(|op| op.cookie == cookie && !op.state.terminal())
         {
+            if op.intent == DiscoveryIntent::ScanningStandby && op.intent.enables_step(step, op.count) {
+                self.scanning = 0;
+                self.initialized = false;
+            }
             op.state = State::Pending;
             op.step = step;
             op.opcode = opcode;
@@ -156,23 +165,22 @@ impl Operations {
         };
         if op.state.terminal() {
             if op.state == State::Cancelled
-                && op.intent.enabled()
+                && op.intent.enables_step(step, op.count)
                 && complete
                 && status == 0
-                && step + 1 == op.count
             {
                 // A cancelled on-wire enable may have reached the radio. Do
                 // not confirm the replacement intent or pretend it stayed off.
                 match op.intent {
                     DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.advertising = 0,
-                    DiscoveryIntent::Scanning(_) => self.scanning = 0,
+                    DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => self.scanning = 0,
                 }
             }
             if op.state == State::Cancelled && !op.intent.enabled() && complete && status == 0
                 && step + 1 == op.count {
                 match op.intent {
                     DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.advertising = 1,
-                    DiscoveryIntent::Scanning(_) => self.scanning = 1,
+                    DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => self.scanning = 1,
                 }
             }
             return;
@@ -198,7 +206,7 @@ impl Operations {
             let radio = if op.intent.enabled() { 2 } else { 1 };
             match op.intent {
                 DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.advertising = radio,
-                DiscoveryIntent::Scanning(_) => self.scanning = radio,
+                DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => self.scanning = radio,
             }
             if self.advertising == 1 && self.scanning == 1 {
                 self.initialized = true;

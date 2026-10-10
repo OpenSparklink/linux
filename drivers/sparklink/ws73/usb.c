@@ -46,6 +46,9 @@ enum ws73_stage {
 	WS73_NATIVE_SETUP,
 	WS73_FAILED,
 	WS73_REMOVING,
+	WS73_RECOVERY_DRAIN,
+	WS73_RECOVERY_CLOSE,
+	WS73_RECOVERY_WAIT_CLOSE,
 };
 
 struct ws73_usb {
@@ -86,6 +89,10 @@ struct ws73_usb {
 	u32 tx_sequence;
 	bool runtime_transport;
 	bool metadata_valid;
+	unsigned int warm_recovery_attempts;
+	int warm_recovery_cause;
+	int warm_recovery_result;
+	u64 warm_recovery_started_ms;
 	unsigned int command_credits;
 	struct ws73_dli_info info;
 	struct ws73_dli_result dli_result;
@@ -333,19 +340,29 @@ static int ws73_notification(void *context, unsigned int timeout_ms, unsigned in
 	return 0;
 }
 
-static int ws73_open_sle(void *context)
+static int ws73_sle_action(void *context, unsigned int action)
 {
 	struct ws73_usb *ws = context;
 	int ret;
 
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken))
 		return -ENODEV;
-	/* H2D_MSG_SLE_OPEN is the ordinal 29, not a bit mask. */
-	put_unaligned_le32(29, ws->tx);
+	/* H2D_MSG_SLE_OPEN/CLOSE are ordinals 29/30, not bit masks. */
+	put_unaligned_le32(action, ws->tx);
 	ret = usb_control_msg(ws->udev, usb_sndctrlpipe(ws->udev, 0), 0,
 			      USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			      0, 0, ws->tx, 4, WS73_TX_TIMEOUT);
 	return ret < 0 ? ret : ret == 4 ? 0 : -EREMOTEIO;
+}
+
+static int ws73_open_sle(void *context)
+{
+	return ws73_sle_action(context, 29);
+}
+
+static int ws73_close_sle(void *context)
+{
+	return ws73_sle_action(context, 30);
 }
 
 static void ws73_runtime_phase(void *context, enum ws73_bsle_phase phase)
@@ -354,6 +371,7 @@ static void ws73_runtime_phase(void *context, enum ws73_bsle_phase phase)
 	static const enum ws73_stage stages[] = {
 		WS73_WAIT_BSP, WS73_CONFIGURING, WS73_WAIT_CUSTOMIZE,
 		WS73_OPENING, WS73_WAIT_BOOT, WS73_TRANSPORT_OPEN,
+		WS73_RECOVERY_DRAIN, WS73_RECOVERY_CLOSE, WS73_RECOVERY_WAIT_CLOSE,
 	};
 
 	if (!READ_ONCE(ws->stopping)) {
@@ -630,6 +648,7 @@ static void ws73_runtime_work(struct work_struct *work)
 		.receive = ws73_runtime_receive,
 		.notification = ws73_notification,
 		.open = ws73_open_sle,
+		.close = ws73_close_sle,
 		.phase = ws73_runtime_phase,
 	};
 	u8 digest[SHA256_DIGEST_SIZE];
@@ -658,6 +677,23 @@ static void ws73_runtime_work(struct work_struct *work)
 	sha256(pm->data, pm->size, digest);
 	dev_info(&ws->intf->dev, "PM config SHA256=%*phN\n", (int)sizeof(digest), digest);
 	ret = ws73_bsle_start(&io, pm->data, pm->size, custom->data, custom->size);
+	if (ret == -ETIMEDOUT && READ_ONCE(ws->stage) == WS73_WAIT_BSP &&
+	    !READ_ONCE(ws->stopping) && !ws->warm_recovery_attempts) {
+		/* BSP_READY is one-shot. A freshly adopted runtime interface can
+		 * have consumed it in an earlier host session. Exactly one warm
+		 * recovery attempt before any Runtime/URB publication; no reset,
+		 * driver detach, firmware re-upload or effect on another owner.
+		 */
+		ws->warm_recovery_attempts++;
+		ws->warm_recovery_cause = ret;
+		ws->warm_recovery_result = -EINPROGRESS;
+		ws->warm_recovery_started_ms = ws73_now_ms(ws);
+		dev_info(&ws->intf->dev, "warm recovery attempt=1 cause=%d\n", ret);
+		ret = ws73_bsle_restore(&io, pm->data, pm->size, custom->data, custom->size);
+		ws->warm_recovery_result = ret;
+		dev_info(&ws->intf->dev, "warm recovery result=%d elapsed_ms=%llu\n", ret,
+			 ws73_now_ms(ws) - ws->warm_recovery_started_ms);
+	}
 	if (ret)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_QUERYING);
@@ -719,6 +755,7 @@ static ssize_t boot_stage_show(struct device *dev,
 		"bsle-opening", "bsle-wait-boot", "sle-awaiting-dli",
 		"dli-querying", "dli-awaiting-runtime", "native-runtime-setup",
 		"failed", "removing",
+		"recovery-draining", "recovery-closing", "recovery-wait-close",
 	};
 
 	return sysfs_emit(buf, "%s\n", names[READ_ONCE(ws->stage)]);
@@ -733,6 +770,17 @@ static ssize_t boot_error_show(struct device *dev,
 	return sysfs_emit(buf, "%d\n", READ_ONCE(ws->last_error));
 }
 static DEVICE_ATTR_RO(boot_error);
+
+static ssize_t warm_recovery_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+
+	return sysfs_emit(buf, "attempts=%u limit=1 cause=%d result=%d started_ms=%llu\n",
+		READ_ONCE(ws->warm_recovery_attempts), READ_ONCE(ws->warm_recovery_cause),
+		READ_ONCE(ws->warm_recovery_result), READ_ONCE(ws->warm_recovery_started_ms));
+}
+static DEVICE_ATTR_RO(warm_recovery);
 
 /* Diagnostic samples, not an atomic protocol snapshot or recovery authority.
  * Preserve the failed phase instead of replacing it with the generic FAILED.
@@ -804,6 +852,7 @@ static DEVICE_ATTR_RO(native_runtime);
 static struct attribute *ws73_attrs[] = {
 	&dev_attr_boot_stage.attr,
 	&dev_attr_boot_error.attr,
+	&dev_attr_warm_recovery.attr,
 	&dev_attr_failure_diagnostics.attr,
 	&dev_attr_runtime_transport.attr,
 	&dev_attr_metadata_valid.attr,

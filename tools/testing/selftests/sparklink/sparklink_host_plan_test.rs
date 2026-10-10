@@ -437,3 +437,23 @@ fn malformed_tags_are_rejected_without_raw_insertion() {
         }
     }
 }
+
+#[test]
+fn passive_probe_has_an_intermediate_enable_and_a_final_stop_barrier() {
+    let i = Intent::ScanningStandby;
+    assert!(!i.enabled());
+    assert!(i.has_enable());
+    for step in 0..3 { assert_eq!(i.enables_step(step, 3), step == 1); }
+    assert!(!Intent::AdvertisingStandby.has_enable());
+    assert!(Intent::Advertising(true).enables_step(2, 3));
+    let mut q = CmdRequestQueue::new();
+    let probe = [RecipePart { opcode: 0x1001, params: &[0;8] },
+                 RecipePart { opcode: 0x1002, params: &[1,0] },
+                 RecipePart { opcode: 0x1002, params: &[0,0] }];
+    q.push_recipe(&probe, 1, i, 100).unwrap();
+    q.push_recipe(&probe[..2], 2, Intent::Scanning(true), 100).unwrap();
+    // A new start must preserve the old final-OFF recipe as a barrier.
+    assert_eq!(q.pop().unwrap().cookie, 1);
+    q.remove_recipes(Intent::Scanning(false));
+    assert!(q.pop().is_none());
+}

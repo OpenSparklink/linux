@@ -149,7 +149,7 @@ impl NativeController {
         let input = NativeDiscoveryRequest {
             operation: request.operation,
             advertising: if matches!(request.operation, 1 | 5) { &request.advertising } else { core::ptr::null() },
-            scanning: if request.operation == 3 { &request.scanning } else { core::ptr::null() },
+            scanning: if matches!(request.operation, 3 | 6) { &request.scanning } else { core::ptr::null() },
             handle: request.handle, duration: request.duration, max_events: request.max_events,
             data: if request.data_len > 0 { request.data.as_ptr() } else { core::ptr::null() },
             data_size: request.data_len, scan_response_present: request.flags & 1,
@@ -239,6 +239,7 @@ impl NativeCommandTransport {
                 DiscoveryIntent::Scanning(true) => 3,
                 DiscoveryIntent::Scanning(false) => 4,
                 DiscoveryIntent::AdvertisingStandby => 5,
+                DiscoveryIntent::ScanningStandby => 6,
             };
             // SAFETY: retained driver/context and borrowed parameter buffer
             // are live throughout this side-effect-free validation call.

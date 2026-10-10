@@ -220,3 +220,13 @@ The guest rejects early success, observes owner retirement, driver error and
 survivor isolation, then retains old raw/event fds through replacement and a
 measured 2200 ms guard. These modes are standalone synthetic tests and cannot
 certify physical WS73 unplug or receiver RF.
+
+
+Warm-adoption fixture: `runtime-warm=true` suppresses the one-shot BSP interrupt
+and queues stale BOOT/CLOSE frames. Only a new CLOSE30 acknowledgement and fresh
+customize/open handshake may complete the one-attempt recovery. The default is
+false. `runtime-idle-scan-stop=true` returns raw0b on OFF while not scanning;
+this is an explicit synthetic model of the observed111 failure, not RF proof.
+The companion support runner enables it and exercises passive initializer6.
+Keep failures in lease cleanup/writer probes visible; older synthetic receipts
+with unconditional OFF success do not cover these preconditions.

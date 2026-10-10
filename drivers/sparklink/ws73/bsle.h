@@ -11,6 +11,9 @@ enum ws73_bsle_phase {
 	WS73_BSLE_OPENING,
 	WS73_BSLE_WAIT_BOOT,
 	WS73_BSLE_TRANSPORT_OPEN,
+	WS73_BSLE_DRAINING,
+	WS73_BSLE_CLOSING,
+	WS73_BSLE_WAIT_CLOSE,
 };
 
 /* Buffers and sequence belong to one USB interface. Transport callbacks
@@ -29,6 +32,7 @@ struct ws73_bsle_io {
 	int (*receive)(void *context, unsigned int timeout_ms);
 	int (*notification)(void *context, unsigned int timeout_ms, unsigned int *bits);
 	int (*open)(void *context);
+	int (*close)(void *context);
 	void (*phase)(void *context, enum ws73_bsle_phase phase);
 };
 
@@ -37,5 +41,12 @@ struct ws73_bsle_io {
  */
 int ws73_bsle_start(struct ws73_bsle_io *io, const unsigned char *pm, size_t pm_size,
 		    const unsigned char *custom, size_t custom_size);
+
+/* Adopt a warm device only after the owner has no live protocol/USB workers.
+ * No synthetic BSP_READY: drain, actual CLOSE action, reconfigure, actual
+ * BOOT_FINISH. The caller owns retry admission/budget; this makes one attempt.
+ */
+int ws73_bsle_restore(struct ws73_bsle_io *io, const unsigned char *pm, size_t pm_size,
+		      const unsigned char *custom, size_t custom_size);
 
 #endif

@@ -448,10 +448,25 @@ static void recipe_tests(void)
 	CHECK(plan.steps[1].opcode == 0x1002 && plan.steps[1].length == 2 &&
 	      plan.steps[1].params[0] == 1 && plan.steps[1].params[1] == 1);
 	before = plan;
+	request.operation = SPARKLINK_DISCOVERY_SCAN_INITIALIZE_OFF;
+	scan.active = scan.filter_duplicates = 0;
+	CHECK(ws73_discovery_prepare(&request, &plan) == 0);
+	CHECK(plan.operation == 6 && plan.count == 3 && plan.power_step == 3);
+	CHECK(plan.steps[0].opcode == 0x1001 && plan.steps[0].length == 8 &&
+	      plan.steps[0].params[3] == 0);
+	CHECK(plan.steps[1].opcode == 0x1002 && plan.steps[1].length == 2 &&
+	      plan.steps[1].params[0] == 1 && !plan.steps[1].params[1]);
+	CHECK(plan.steps[2].opcode == 0x1002 && plan.steps[2].length == 2 &&
+	      !plan.steps[2].params[0] && !plan.steps[2].params[1]);
+	before = plan;
+	scan.active = 1;
+	CHECK(ws73_discovery_prepare(&request, &plan) == -EINVAL);
+	CHECK(!memcmp(&plan, &before, sizeof(plan)));
+	scan.active = 0;
 	scan.filter_duplicates = 2;
 	CHECK(ws73_discovery_prepare(&request, &plan) == -EINVAL);
 	CHECK(!memcmp(&plan, &before, sizeof(plan)));
-	scan.filter_duplicates = 1;
+	scan.filter_duplicates = 0;
 	scan.frame_types = 3;
 	CHECK(ws73_discovery_prepare(&request, &plan) == -EOPNOTSUPP);
 	CHECK(!memcmp(&plan, &before, sizeof(plan)));
@@ -475,7 +490,7 @@ static void recipe_tests(void)
 	/* Exhaust sequence positions/counts and wrong action/enable combinations.
   * Only the complete plan's own positions are authorized by this validator.
   */
-	for (unsigned int op = 1; op <= 5; op++) {
+	for (unsigned int op = 1; op <= 6; op++) {
 		request =
 			(struct sparklink_discovery_request){ .operation = op };
 		if (op == 1 || op == 5) {
@@ -484,8 +499,10 @@ static void recipe_tests(void)
 		}
 		if (op == 2)
 			request.handle = 7;
-		if (op == 3)
+		if (op == 3 || op == 6) {
 			request.scanning = &scan;
+			if (op == 6) scan.active = scan.filter_duplicates = 0;
+		}
 		CHECK(ws73_discovery_prepare(&request, &plan) == 0);
 		for (unsigned int i = 0; i < plan.count; i++) {
 			struct sparklink_discovery_step *part = &plan.steps[i];
@@ -559,8 +576,10 @@ static void recipe_tests(void)
 			(struct sparklink_discovery_request){ .operation = op };
 		if (op == 2)
 			request.handle = 7;
-		if (op == 3)
+		if (op == 3 || op == 6) {
 			request.scanning = &scan;
+			if (op == 6) scan.active = scan.filter_duplicates = 0;
+		}
 		CHECK(ws73_discovery_prepare(&request, &plan) == 0);
 		before = plan;
 #define UNUSED(field, value)                                          \

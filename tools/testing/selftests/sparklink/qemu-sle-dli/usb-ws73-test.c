@@ -33,6 +33,8 @@ struct USBWs73Test {
     bool runtime_link_events;
     bool runtime_policy, runtime_fresh_advertiser, advertiser_created, runtime_sle_subtypes;
     bool runtime_zlp;
+    bool runtime_warm;
+    bool runtime_idle_scan_stop;
     uint8_t runtime_medium;
     uint8_t adv_data[251];
     unsigned int adv_data_len;
@@ -128,6 +130,12 @@ static void bsle_ack(USBWs73Test *s, unsigned int message)
      * explicitly synthetic nonzero pattern rather than device memory. */
     for (unsigned int i = 8; i < sizeof(data); i++) data[i] = i ^ 0xa5;
     put32(data + 4, message);
+    queue_frame(s, 5, 10, data, sizeof(data));
+}
+
+static void bsle_close_ack(USBWs73Test *s)
+{
+    uint8_t data[8] = { 4, 0, 4, 0, 3, 0, 0, 0 };
     queue_frame(s, 5, 10, data, sizeof(data));
 }
 
@@ -318,7 +326,9 @@ static bool command(USBWs73Test *s, const uint8_t *p, size_t length)
         if (!s->runtime_discovery || n != 2 || p[5] > 1 || p[6] > 1) { return false; }
         typed = true;
         if (p[5]) { g_assert(s->scan_phase == 1); s->scanning = true; }
-        else { s->scanning = false; }
+        else if (s->runtime_idle_scan_stop && !s->scanning) {
+            typed_status = 0x0b; /* idle OFF is CommandDisallowed, matching the observed real111 failure */
+        } else { s->scanning = false; }
         s->scan_phase = 0;
         break;
     default: return false; /* especially do not accept 0x0401 as ReadCmdLen */
@@ -407,6 +417,10 @@ static void reset(USBDevice *dev)
     s->advertiser_created = false;
     s->adv_phase = s->scan_phase = 0; s->fail_step = 255;
     s->bsp = true; s->pm = s->custom = s->opened = s->failed_once = s->in_flight = false;
+    if (s->runtime_warm) {
+        s->bsp = false; s->pm = s->custom = s->opened = true;
+        bsle_ack(s, 1); bsle_close_ack(s); /* stale, not fresh session evidence */
+    }
     s->reports_emitted = false;
     s->adv_data_len = 0;
     if (s->wake) { timer_del(s->wake); }
@@ -484,6 +498,13 @@ static void control(USBDevice *dev, USBPacket *p, int request, int value,
 {
     USBWs73Test *s = USB_WS73_TEST(dev);
     if (usb_desc_handle_control(dev, p, request, value, index, length, data) >= 0) { return; }
+    if (request == 0x2100 && !value && !index && length == 4 && le32(data) == 30) {
+        s->opened = s->pm = s->custom = false;
+        s->advertising = s->scanning = false; s->advertiser_created = false;
+        bsle_close_ack(s);
+        fprintf(stderr, "WS73_TEST_CLOSE: serial=%u\n", s->serial);
+        usb_wakeup(usb_ep_get(dev, USB_TOKEN_IN, 1), 0); return;
+    }
     if (request == 0x2100 && !value && !index && length == 4 && le32(data) == 29 && s->custom) {
         s->opened = true; bsle_ack(s, 1);
         usb_wakeup(usb_ep_get(dev, USB_TOKEN_IN, 1), 0); return;
@@ -541,6 +562,8 @@ static void transfer(USBDevice *dev, USBPacket *p)
 
 static Property properties[] = {
     DEFINE_PROP_BOOL("runtime-policy", USBWs73Test, runtime_policy, false),
+    DEFINE_PROP_BOOL("runtime-warm", USBWs73Test, runtime_warm, false),
+    DEFINE_PROP_BOOL("runtime-idle-scan-stop", USBWs73Test, runtime_idle_scan_stop, false),
     DEFINE_PROP_BOOL("runtime-sle-subtypes", USBWs73Test, runtime_sle_subtypes, false),
     DEFINE_PROP_BOOL("runtime-fresh-advertiser", USBWs73Test, runtime_fresh_advertiser, false),
     DEFINE_PROP_UINT32("runtime-out-delay-ms", USBWs73Test, runtime_out_delay_ms, 0),
