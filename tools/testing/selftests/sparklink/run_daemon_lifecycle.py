@@ -54,6 +54,9 @@ def assess(console, code, radio=False):
         errors.append('survivor changed or replacement generation reused')
     if re.findall(r'^DAEMON_GUEST_EXIT: (\d+)$', console, re.M) != ['0']:
         errors.append('guest exit missing or nonzero')
+    bus = re.findall(r'^DAEMON_BUS_IDENTITY: pid=([1-9][0-9]*) uid=1000 owner=(:[0-9]+\.[0-9]+) same_owner=1$',console,re.M)
+    if len(bus) != 1 or console.count('DAEMON_BUS_IDENTITY:') != 1:
+        errors.append('missing or changed bus-authenticated daemon identity')
     if console.count('DAEMON_KERNEL_LOG_BEGIN') != 1 or console.count('DAEMON_KERNEL_LOG_END') != 1:
         errors.append('complete kernel log missing')
     elif '[    0.000000]' not in console.split('DAEMON_KERNEL_LOG_BEGIN', 1)[1].split('DAEMON_KERNEL_LOG_END', 1)[0]:

@@ -26,6 +26,8 @@ user 'exec /bin/slkd --session --storage /tmp/bonds -n' > /tmp/slkd.log 2>&1 &
 wait_ready 1
 pid=$(pidof slkd)
 [ -n "$pid" ] || fail 'daemon pid'
+ctl daemon > /tmp/daemon-before || fail 'bus-authenticated daemon identity'
+grep -Eq "^DaemonIdentity: owner=:[0-9]+\.[0-9]+ pid=$pid uid=1000$" /tmp/daemon-before || fail 'daemon bus PID/UID mismatch'
 first=$(list | awk '{print $1}')
 ctl --adapter "$first" show || fail 'first show'
 echo 'DAEMON_ADD_SECOND'
@@ -55,6 +57,10 @@ ctl --adapter "$second" show || fail 'survivor changed after replug'
 if [ "$SPARKLINK_TEST_RADIO" = 1 ]; then
     radio_rounds 2 "$replacement" "$second" replug
 fi
+ctl daemon > /tmp/daemon-after || fail 'daemon bus identity after replug'
+/bin/busybox cmp /tmp/daemon-before /tmp/daemon-after || fail 'daemon bus owner changed'
+owner=$(awk '{sub(/^owner=/,"",$2);print $2}' /tmp/daemon-after)
+echo "DAEMON_BUS_IDENTITY: pid=$pid uid=1000 owner=$owner same_owner=1"
 echo 'DAEMON_HOTPLUG: independent=2 same_process=1 new_generation=1'
 kill -INT "$pid"
 for n in $(seq 1 100); do [ -z "$(pidof slkd)" ] && break; sleep 0.1; done

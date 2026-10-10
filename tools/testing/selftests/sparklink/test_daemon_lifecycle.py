@@ -11,6 +11,7 @@ def view(index, generation):
 GOOD = ('DAEMON_UID: 1000\n' + view(0, 1) + 'DAEMON_ADD_SECOND\n' + view(1, 2) +
         'DAEMON_REMOVE_FIRST\n' + view(1, 2) + 'DAEMON_STALE_SELECTION: rejected\n' +
         'DAEMON_READD_FIRST\n' + view(0, 3) + view(1, 2) +
+        'DAEMON_BUS_IDENTITY: pid=100 uid=1000 owner=:1.4 same_owner=1\n'
         'DAEMON_HOTPLUG: independent=2 same_process=1 new_generation=1\n'
         'DAEMON_LIFECYCLE: PASS\nDAEMON_GUEST_EXIT: 0\n'
         'DAEMON_KERNEL_LOG_BEGIN\n[    0.000000] early kernel\nDAEMON_KERNEL_LOG_END\n')
@@ -25,6 +26,8 @@ class DaemonVerdict(unittest.TestCase):
     def test_stale(self): self.assertTrue(assess(GOOD.replace('STALE_SELECTION: rejected', 'STALE_SELECTION: accepted'), 0))
     def test_generation_reuse(self): self.assertTrue(assess(GOOD.replace(view(0, 3), view(0, 1)), 0))
     def test_changed_survivor(self): self.assertTrue(assess(GOOD.replace(view(1, 2), view(1, 4), 1), 0))
+    def test_missing_bus_identity(self): self.assertTrue(assess(GOOD.replace('DAEMON_BUS_IDENTITY:', 'missing'),0))
+    def test_changed_bus_identity(self): self.assertTrue(assess(GOOD.replace('same_owner=1','same_owner=0'),0))
     def test_failure(self): self.assertTrue(assess(GOOD + 'DAEMON_FAILURE: assertion\n', 0))
     def test_missing_log(self): self.assertTrue(assess(GOOD.replace('DAEMON_KERNEL_LOG_END', 'missing'), 0))
     def test_truncated_log(self): self.assertTrue(assess(GOOD.replace('[    0.000000]', '[    1.000000]'), 0))
