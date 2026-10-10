@@ -3762,22 +3762,7 @@ impl MiscDevice for SparkLinkCtl {
         // Sync broadcast events into per-fd queue before reading.
         Self::sync_broadcast(me.as_ref());
         let mut guard = me.events.lock();
-        if !guard.has_events() {
-            return Err(EAGAIN);
-        }
-        let mut total = 0usize;
-        let evt_size = core::mem::size_of::<sle_event::SleWireEvent>();
-        while guard.has_events() && iov.len() >= evt_size {
-            if let Some(evt) = guard.dequeue() {
-                let bytes: &[u8] = evt.as_bytes();
-                let written = iov.copy_to_iter(bytes);
-                if written == 0 {
-                    break;
-                }
-                total += written;
-            }
-        }
-        Ok(total)
+        guard.copy_records(iov.len(), |bytes| iov.copy_to_iter(bytes))
     }
 
     fn poll(me: Pin<&SparkLinkCtl>, file: &FsFile, table: &PollTable<'_>) -> u32 {

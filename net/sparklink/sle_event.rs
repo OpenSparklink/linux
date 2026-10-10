@@ -1200,10 +1200,10 @@ impl EventQueue {
         self.enqueue(SleEventType::MeasQuantityReport, &payload);
     }
 
-    /// Dequeue the oldest event. Returns None if the queue is empty.
+    /// Commit delivery of the oldest event after a complete copy.
     ///
     /// O(1) — advances the ring buffer head pointer.
-    pub fn dequeue(&mut self) -> Option<SleWireEvent> {
+    fn dequeue(&mut self) -> Option<SleWireEvent> {
         if self.count == 0 {
             return None;
         }
@@ -1214,22 +1214,38 @@ impl EventQueue {
         Some(evt)
     }
 
-    /// Drain as many events as fit into the given buffer size.
-    /// Returns the total bytes written.
-    pub fn drain_to_buf(&mut self, buf: &mut [u8]) -> usize {
+    /// Copy whole records and consume each only after its complete copy.
+    ///
+    /// The caller must hold the per-fd queue mutex throughout this operation;
+    /// producers and other readers cannot replace the head while copying.
+    /// A partial copy leaves that record and delivery accounting unchanged.
+    /// Bytes in a partially copied record are outside the returned byte count
+    /// and must be ignored by userspace. A fault on the first record is EFAULT.
+    /// A buffer too small for one record is EINVAL, not an apparent EOF.
+    pub fn copy_records(
+        &mut self,
+        capacity: usize,
+        mut copy: impl FnMut(&[u8]) -> usize,
+    ) -> Result<usize> {
         let evt_size = core::mem::size_of::<SleWireEvent>();
-        let mut offset = 0;
-        while self.count > 0 {
-            if offset + evt_size > buf.len() {
-                break;
-            }
-            if let Some(evt) = self.dequeue() {
-                let bytes = evt.as_bytes();
-                buf[offset..offset + evt_size].copy_from_slice(bytes);
-                offset += evt_size;
-            }
+        if capacity == 0 {
+            return Ok(0);
         }
-        offset
+        if capacity < evt_size {
+            return Err(EINVAL);
+        }
+        if !self.has_events() {
+            return Err(EAGAIN);
+        }
+        let mut total = 0;
+        while self.has_events() && capacity - total >= evt_size {
+            if copy(self.buf[self.head].as_bytes()) != evt_size {
+                return if total == 0 { Err(EFAULT) } else { Ok(total) };
+            }
+            self.dequeue();
+            total += evt_size;
+        }
+        Ok(total)
     }
 
     /// Insert a pre-built wire event directly into the queue.
