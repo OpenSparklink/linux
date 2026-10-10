@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 import unittest
-from run_daemon_lifecycle import assess, assess_radio
+from run_daemon_lifecycle import assess, assess_radio, assess_management
 
 
 def view(index, generation):
@@ -33,6 +33,42 @@ class DaemonVerdict(unittest.TestCase):
     def test_missing_log(self): self.assertTrue(assess(GOOD.replace('DAEMON_KERNEL_LOG_END', 'missing'), 0))
     def test_truncated_log(self): self.assertTrue(assess(GOOD.replace('[    0.000000]', '[    1.000000]'), 0))
     def test_duplicate(self): self.assertTrue(assess(GOOD + 'DAEMON_LIFECYCLE: PASS\n', 0))
+    def test_missing_shell_dependency(self): self.assertTrue(assess(GOOD + '/bin/test-daemon: line 108: sort: not found\n',0))
+
+
+class ManagementVerdict(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        def observe(state, adv='1', scan='1'):
+            return (f'DAEMON_MANAGEMENT_OBSERVE: index=0 generation=3 state={state} token_hidden=1 adv={adv} scan=1\n'
+                    f'DAEMON_MANAGEMENT_OBSERVE: index=1 generation=2 state={state} token_hidden=1 adv=1 scan={scan}\n')
+        release_log = 'adapter management relinquished while fd retained\n' * 2
+        cls.proof = ('DAEMON_MANAGEMENT_BEGIN\n' + observe('held','2','2') + release_log + observe('free') +
+            'DAEMON_MANAGEMENT_RELEASE: signal=TERM retained_fd=2 actual_stop=2 free=2\n' + observe('held') +
+            'DAEMON_MANAGEMENT_RESTART: old_pid=100 new_pid=101 old_owner=:1.4 new_owner=:1.5 same_generation=2 ready=2\n' +
+            release_log + observe('free') + 'DAEMON_MANAGEMENT_END: signal=INT free=2\n')
+        cls.good = GOOD.replace('DAEMON_LIFECYCLE: PASS', cls.proof + 'DAEMON_LIFECYCLE: PASS')
+
+    def test_complete(self): self.assertEqual(assess(self.good,0,management_handoff=True), [])
+    def test_unrequested(self): self.assertTrue(assess(self.good,0))
+    def test_missing(self): self.assertTrue(assess(GOOD,0,management_handoff=True))
+    def test_duplicate(self): self.assertTrue(assess_management(self.good + self.proof))
+    def test_retained_authority(self): self.assertTrue(assess_management(self.good.replace('state=free','state=held',1)))
+    def test_token_exposed(self): self.assertTrue(assess_management(self.good.replace('token_hidden=1','token_hidden=0',1)))
+    def test_radio_not_stopped(self): self.assertTrue(assess_management(self.good.replace('state=free token_hidden=1 adv=1','state=free token_hidden=1 adv=2',1)))
+    def test_no_active_radio(self): self.assertTrue(assess_management(self.good.replace('adv=2','adv=1',1)))
+    def test_generation_reused(self): self.assertTrue(assess_management(self.good.replace('index=0 generation=3','index=0 generation=1',1)))
+    def test_pid_unchanged(self): self.assertTrue(assess_management(self.good.replace('new_pid=101','new_pid=100')))
+    def test_owner_unchanged(self): self.assertTrue(assess_management(self.good.replace('new_owner=:1.5','new_owner=:1.4')))
+    def test_identity_unrelated(self): self.assertTrue(assess_management(self.good.replace('old_owner=:1.4','old_owner=:1.9')))
+    def test_cleanup_error(self): self.assertTrue(assess_management(self.good + 'adapter management cleanup failed\n'))
+    def test_last_close_only(self): self.assertTrue(assess_management(self.good.replace('adapter management relinquished while fd retained','last close',1)))
+    def test_free_after_ack(self):
+        line = 'DAEMON_MANAGEMENT_RELEASE: signal=TERM retained_fd=2 actual_stop=2 free=2\n'
+        self.assertTrue(assess_management(self.good.replace(line,'',1).replace('state=free token_hidden',line+'state=free token_hidden',1)))
+    def test_observation_outside_phase(self):
+        line = next(x for x in self.good.splitlines() if x.startswith('DAEMON_MANAGEMENT_OBSERVE:')) + '\n'
+        self.assertTrue(assess_management(line + self.good.replace(line,'',1)))
 
 
 class RadioVerdict(unittest.TestCase):

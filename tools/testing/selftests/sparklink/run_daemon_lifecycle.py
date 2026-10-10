@@ -43,7 +43,7 @@ def copy_elf(source, target, root):
             shutil.copy2(path, dest)
 
 
-def assess(console, code, radio=False, production_policy=False, kernel_authorization=False):
+def assess(console, code, radio=False, production_policy=False, kernel_authorization=False, management_handoff=False):
     errors = []
     if code:
         errors.append(f'QEMU exit {code}')
@@ -53,6 +53,8 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors.append('userspace runtime panic')
     if 'DAEMON_FAILURE:' in console:
         errors.append('guest assertion failed')
+    if re.search(r'/bin/(?:test-daemon|test-radio):[^\n]*not found', console):
+        errors.append('guest shell dependency missing')
     markers = re.findall(r'^DAEMON_(UID: 1000|ADD_SECOND|REMOVE_FIRST|STALE_SELECTION: rejected|READD_FIRST|HOTPLUG: independent=2 same_process=1 new_generation=1|LIFECYCLE: PASS)$', console, re.M)
     if markers != ['UID: 1000', 'ADD_SECOND', 'REMOVE_FIRST', 'STALE_SELECTION: rejected',
                    'READD_FIRST', 'HOTPLUG: independent=2 same_process=1 new_generation=1', 'LIFECYCLE: PASS']:
@@ -104,6 +106,52 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors += assess_radio(console)
     elif 'DAEMON_RADIO_' in console:
         errors.append('unexpected radio evidence')
+    if management_handoff:
+        errors += assess_management(console)
+    elif 'DAEMON_MANAGEMENT_' in console:
+        errors.append('unexpected management handoff evidence')
+    return errors
+
+
+def assess_management(console):
+    errors = []
+    if console.count('DAEMON_MANAGEMENT_') != 12:
+        errors.append('unexpected or incomplete management evidence')
+    phases = re.findall(r'^DAEMON_MANAGEMENT_(BEGIN|RELEASE: signal=TERM retained_fd=2 actual_stop=2 free=2|RESTART: .*|END: signal=INT free=2)$', console, re.M)
+    if (len(phases) != 4 or sum(console.count('DAEMON_MANAGEMENT_' + label) for label in ['BEGIN','RELEASE:','RESTART:','END:']) != 4 or phases[0] != 'BEGIN' or
+        phases[1] != 'RELEASE: signal=TERM retained_fd=2 actual_stop=2 free=2' or
+        not phases[2].startswith('RESTART: ') or phases[3] != 'END: signal=INT free=2'):
+        errors.append('missing/duplicate/out-of-order management phases')
+    observations = re.findall(r'^DAEMON_MANAGEMENT_OBSERVE: index=(\d+) generation=(\d+) state=(held|free) token_hidden=1 adv=([12]) scan=([12])$', console, re.M)
+    views = re.findall(r'^Adapter /org/sparklink/slk(\d+)_g(\d+):', console, re.M)
+    if len(views) == 5:
+        a, b = views[3], views[4]
+        expected = [(a[0],a[1],'held','2','1'), (b[0],b[1],'held','1','2')]
+        expected += [(i,g,state,'1','1') for state in ['free','held','free'] for i,g in [a,b]]
+        if observations != expected or console.count('DAEMON_MANAGEMENT_OBSERVE:') != 8:
+            errors.append('management ownership/radio/generation observations incomplete')
+    else:
+        errors.append('management identity views missing')
+    restart = re.findall(r'^DAEMON_MANAGEMENT_RESTART: old_pid=(\d+) new_pid=(\d+) old_owner=(:\d+\.\d+) new_owner=(:\d+\.\d+) same_generation=2 ready=2$', console, re.M)
+    identity = re.findall(r'^DAEMON_BUS_IDENTITY: pid=(\d+) uid=0 owner=(:\d+\.\d+) same_owner=1$', console, re.M)
+    if (len(restart) != 1 or len(identity) != 1 or
+        restart[0][0] == restart[0][1] or restart[0][2] == restart[0][3] or
+        (restart[0][0],restart[0][2]) != identity[0] or int(restart[0][1]) == 0):
+        errors.append('management successor bus identity invalid')
+    labels = ['DAEMON_HOTPLUG:', 'DAEMON_MANAGEMENT_BEGIN', 'DAEMON_MANAGEMENT_RELEASE:',
+              'DAEMON_MANAGEMENT_RESTART:', 'DAEMON_MANAGEMENT_END:', 'DAEMON_LIFECYCLE:']
+    positions = [console.find(label) for label in labels]
+    if min(positions) < 0 or positions != sorted(positions):
+        errors.append('management proof outside shutdown/restart phase')
+    # Tie each observer result to its phase, rather than accepting a reordered
+    # transcript with all the right strings.
+    for n, match in enumerate(re.finditer(r'^DAEMON_MANAGEMENT_OBSERVE:', console, re.M)):
+        bounds = [(1,2),(1,2),(2,3),(3,4)][min(n // 2,3)]
+        if not positions[bounds[0]] < match.start() < positions[bounds[1]]:
+            errors.append('management observation outside expected phase')
+    if (console.count('adapter management relinquished while fd retained') != 4 or
+        'adapter management cleanup failed' in console):
+        errors.append('explicit retained-fd release missing or cleanup failed')
     return errors
 
 
@@ -187,13 +235,17 @@ def main():
     p.add_argument('--radio-policy', action='store_true', help='basic policy and explicit synthetic cross-controller medium; never real RF')
     p.add_argument('--production-policy', action='store_true', help='installed D-Bus policy, root daemon, uid-1000 control group and uid-1001 observer')
     p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd ioctl/configfs credential-drop matrix')
+    p.add_argument('--management-handoff', action='store_true', help='active radio cleanup on SIGTERM, same-generation successor, SIGINT cleanup; NO RF')
     a = p.parse_args()
+    if a.management_handoff and not a.radio_policy:
+        p.error('--management-handoff requires --radio-policy')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     manifest = {'scope': 'actual slkd and uid-1000 slctl on synthetic WS73: no firmware/RF acceptance',
                 'radio_policy': a.radio_policy,
                 'production_policy': a.production_policy,
                 'kernel_authorization': a.kernel_authorization,
+                'management_handoff': a.management_handoff,
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
@@ -207,6 +259,8 @@ def main():
             a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c']]
         if a.kernel_authorization:
             manifest['inputs'].append(file_record(HERE / 'kernel_authorization_test.c'))
+        if a.management_handoff:
+            manifest['inputs'].append(file_record(HERE / 'daemon_management_test.c'))
         tracked = subprocess.check_output(['git', 'ls-files', 'crates', 'Cargo.toml', 'Cargo.lock'],
                                          cwd=userspace, text=True).splitlines()
         # Include untracked new implementation files before committing them.
@@ -231,6 +285,11 @@ def main():
                 subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
                     '-o', str(root / 'bin/kernel-authorization'), str(HERE / 'kernel_authorization_test.c')],
                     stdout=log, stderr=subprocess.STDOUT, check=True)
+        if a.management_handoff:
+            with (output / 'management-build.log').open('w') as log:
+                subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+                    '-o', str(root / 'bin/daemon-management'), str(HERE / 'daemon_management_test.c')],
+                    stdout=log, stderr=subprocess.STDOUT, check=True)
         for name in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'su', 'id', 'grep',
                      'awk', 'seq', 'cat', 'pidof', 'chmod', 'mkdir']:
             (root / 'bin' / name).symlink_to('busybox')
@@ -247,6 +306,8 @@ def main():
             manifest['guest_strip_debug'] = True
         copy_elf(a.dbus_daemon, root / 'bin/dbus-daemon', root)
         programs = ['slkd', 'slctl', 'dbus-daemon'] + (['bus-policy-probe'] if a.production_policy else []) + (['kernel-authorization'] if a.kernel_authorization else [])
+        if a.management_handoff:
+            programs.append('daemon-management')
         manifest['guest_programs'] = [file_record(root / 'bin' / name) for name in programs]
         for name in ['proc', 'sys', 'dev', 'etc', 'tmp']:
             (root / name).mkdir()
@@ -299,6 +360,8 @@ poweroff -f
             f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_PRODUCTION_POLICY=1'))
         if a.kernel_authorization:
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_KERNEL_AUTHORIZATION=1'))
+        if a.management_handoff:
+            f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_MANAGEMENT_HANDOFF=1'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -338,7 +401,7 @@ poweroff -f
                 monitor.execute('device_add', dict(id='sle0', port='1', **props))
                 code = process.wait(timeout=30)
             manifest['qemu_exit'] = code
-            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy, a.kernel_authorization)
+            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy, a.kernel_authorization, a.management_handoff)
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'

@@ -1966,6 +1966,18 @@ owner credentials, duplicate last-close, confirmed cleanup, raw failure details,
 late timers and pending-reply close/timeouts on synthetic USB. It never proves
 physical WS73 firmware/RF acceptance or Proxy/PDU/Security ownership.
 
+Daemon handoff can be tested with ``run_daemon_lifecycle.py --radio-policy
+--management-handoff`` and optionally ``--production-policy
+--kernel-authorization`` (the usual image/QEMU/userspace paths are required).
+After the original alternating rounds and same-process hotplug checks, it
+leaves one synthetic advertiser and one scanner active, stops slkd via SIGTERM,
+and observes both registrations Free/Off/Ready through separate C observer fds.
+slkd explicitly releases the lease while its control fd remains alive, before
+waiting for event/interface/actor teardown. A new PID and D-Bus owner acquires
+the same generations without USB removal; SIGINT then relinquishes both again.
+This is successful cleanup integration, not physical RF, daemon failure recovery,
+or migration of the legacy profile-zero ownership contract.
+
 sparklink_ctl
 -------------
 

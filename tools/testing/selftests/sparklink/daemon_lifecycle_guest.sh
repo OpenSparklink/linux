@@ -8,7 +8,7 @@ ctl() { user "/bin/slctl --session $*"; }
 list() { ctl list | grep '^  /org/sparklink/'; }
 wait_ready() {
     for n in $(seq 1 100); do
-        paths=$(list)
+        paths=$(list 2>/dev/null)
         count=$(printf '%s\n' "$paths" | grep -c '^  /org/sparklink/')
         ready=0
         for path in $paths; do
@@ -75,8 +75,50 @@ ctl daemon > /tmp/daemon-after || fail 'daemon bus identity after replug'
 owner=$(awk '{sub(/^owner=/,"",$2);print $2}' /tmp/daemon-after)
 echo "DAEMON_BUS_IDENTITY: pid=$pid uid=$daemon_uid owner=$owner same_owner=1"
 echo 'DAEMON_HOTPLUG: independent=2 same_process=1 new_generation=1'
-kill -INT "$pid"
+if [ "$SPARKLINK_TEST_MANAGEMENT_HANDOFF" = 1 ]; then
+    echo 'DAEMON_MANAGEMENT_BEGIN'
+    # Leave both domains running. Shutdown must stop them, not rely on the
+    # previous rounds' explicit application stops or a USB generation change.
+    ctl --adapter "$replacement" advertise on > /tmp/handoff-adv || fail 'handoff advertiser'
+    ctl --adapter "$second" scan on > /tmp/handoff-scan || fail 'handoff scanner'
+    /bin/daemon-management "$replacement" held advertising || fail 'advertising owner'
+    /bin/daemon-management "$second" held scanning || fail 'scanning owner'
+    kill -TERM "$pid"
+else
+    kill -INT "$pid"
+fi
 for n in $(seq 1 100); do [ -z "$(pidof slkd)" ] && break; sleep 0.1; done
 [ -z "$(pidof slkd)" ] || fail 'daemon shutdown timeout'
 cat /tmp/slkd.log
+if [ "$SPARKLINK_TEST_MANAGEMENT_HANDOFF" = 1 ]; then
+    # Each worker observes Free while its own Arc<Adapter> is still alive.
+    [ "$(grep -c 'adapter management relinquished while fd retained' /tmp/slkd.log)" = 2 ] || fail 'explicit release missing'
+    grep -q 'adapter management cleanup failed' /tmp/slkd.log && fail 'cleanup fault'
+    /bin/daemon-management "$replacement" free off || fail 'advertiser not stopped/free'
+    /bin/daemon-management "$second" free off || fail 'scanner not stopped/free'
+    echo 'DAEMON_MANAGEMENT_RELEASE: signal=TERM retained_fd=2 actual_stop=2 free=2'
+    /bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd-restarted.log 2>&1 &
+    wait_ready 2
+    next_pid=$(pidof slkd)
+    [ -n "$next_pid" ] && [ "$next_pid" != "$pid" ] || fail 'new daemon PID'
+    ctl daemon > /tmp/daemon-restarted || fail 'new daemon bus identity'
+    grep -Eq "^DaemonIdentity: owner=:[0-9]+\.[0-9]+ pid=$next_pid uid=$daemon_uid$" /tmp/daemon-restarted || fail 'new bus PID/UID'
+    next_owner=$(awk '{sub(/^owner=/,"",$2);print $2}' /tmp/daemon-restarted)
+    [ "$next_owner" != "$owner" ] || fail 'new bus owner'
+    actual=$(list | awk '{print $1}' | /bin/busybox sort) || fail 'restart adapter list'
+    expected=$(printf '%s\n' "$replacement" "$second" | /bin/busybox sort) || fail 'restart expected list'
+    [ -n "$actual" ] && [ "$actual" = "$expected" ] || fail 'restart reused/replaced registration'
+    /bin/daemon-management "$replacement" held off || fail 'new advertising owner'
+    /bin/daemon-management "$second" held off || fail 'new scanning owner'
+    echo "DAEMON_MANAGEMENT_RESTART: old_pid=$pid new_pid=$next_pid old_owner=$owner new_owner=$next_owner same_generation=2 ready=2"
+    kill -INT "$next_pid"
+    for n in $(seq 1 100); do [ -z "$(pidof slkd)" ] && break; sleep 0.1; done
+    [ -z "$(pidof slkd)" ] || fail 'successor shutdown timeout'
+    cat /tmp/slkd-restarted.log
+    [ "$(grep -c 'adapter management relinquished while fd retained' /tmp/slkd-restarted.log)" = 2 ] || fail 'successor explicit release missing'
+    grep -q 'adapter management cleanup failed' /tmp/slkd-restarted.log && fail 'successor cleanup fault'
+    /bin/daemon-management "$replacement" free off || fail 'successor advertiser free'
+    /bin/daemon-management "$second" free off || fail 'successor scanner free'
+    echo 'DAEMON_MANAGEMENT_END: signal=INT free=2'
+fi
 echo 'DAEMON_LIFECYCLE: PASS'
