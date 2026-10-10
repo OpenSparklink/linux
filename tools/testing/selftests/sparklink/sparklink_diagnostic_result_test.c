@@ -60,7 +60,12 @@ static int bound(uint16_t index)
 static struct sle_management_request acquire(int fd, uint64_t generation)
 {
 	struct sle_management_request r = { .version = 1, .generation = generation, .mode = 2 };
-	require(!ioctl(fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &r) && r.lease, "Diagnostic acquire");
+	uint64_t deadline = now(CLOCK_MONOTONIC) + 6000000000ULL;
+	while (ioctl(fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &r)) {
+		require(errno == EAGAIN && !r.lease && now(CLOCK_MONOTONIC) < deadline,
+			"Diagnostic acquire"); usleep(10000);
+	}
+	require(r.lease != 0, "Diagnostic lease token");
 	return r;
 }
 static void release(int fd, struct sle_management_request *r)
