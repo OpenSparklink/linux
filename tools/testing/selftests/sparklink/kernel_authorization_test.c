@@ -23,6 +23,7 @@
 #include "../../../../include/uapi/linux/sparklink.h"
 
 static const unsigned long protected[] = {
+    SL_IOCTL_MANAGEMENT_ACQUIRE, SL_IOCTL_MANAGEMENT_RELEASE,
 	SL_IOCTL_AFH_CLASSIFY,
 	SL_IOCTL_AFH_HOP_NEXT,
 	SL_IOCTL_AFH_REPORT_RETX,
@@ -124,6 +125,7 @@ static const unsigned long protected[] = {
 	SL_IOCTL_SYNC_UCAST_REMOVE,
 };
 static const unsigned long observe[] = {
+    SL_IOCTL_MANAGEMENT_QUERY,
 	SL_IOCTL_AFH_GET_MAP,
 	SL_IOCTL_CONN_COUNT,
 	SL_IOCTL_CONN_INFO,

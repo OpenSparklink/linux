@@ -67,7 +67,7 @@ def assess(console, qemu_exit, recipes=False):
     return errors
 
 
-def assess_native(console, qemu_exit, fault=False, events=False, discovery=False):
+def assess_native(console, qemu_exit, fault=False, events=False, discovery=False, management=False):
     console = console.replace('\r', '')
     errors = []
     if qemu_exit:
@@ -146,6 +146,23 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
                 and console.find('NATIVE_READD_FIRST') < console.find(replug_discovery)
                     < console.find('NATIVE_LIFECYCLE: PASS')):
             errors.append('native discovery proof order invalid')
+    management_markers = [
+        'NATIVE_MANAGEMENT_CONTRACT: index=0 exclusive=1 mode=1 stale=1 selection=1 copyout=1 no_admission=1 schema=6',
+        'NATIVE_MANAGEMENT_CREDENTIALS: inherited_owner=1 uid=1001 caps=0 denied=3',
+        'NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=2 radio_off=1 ready=1',
+        'NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077',
+        'NATIVE_MANAGEMENT_PENDING_CLOSE: cancelled=1 wire_reserved=1 errno=110 radio_unknown=1',
+        'NATIVE_MANAGEMENT_REPLUG: fresh_lease=1 old_generation=1',
+    ]
+    actual = re.findall(r'^NATIVE_MANAGEMENT_.*$', console, re.MULTILINE)
+    if actual != (management_markers if management else []):
+        errors.append('missing, duplicate or incorrect native management proof')
+    elif management:
+        positions = [console.find(marker) for marker in management_markers]
+        if not (console.find('NATIVE_ADD_SECOND') < positions[0] < positions[1] < positions[2] < positions[3]
+                < console.find('NATIVE_REMOVE_FIRST') < console.find('NATIVE_READD_FIRST')
+                < positions[4] < positions[5] < console.find('NATIVE_LIFETIME:')):
+            errors.append('management proof outside live generation phase')
     return errors
 
 
@@ -198,7 +215,10 @@ def main():
                         default='hcc', help='fault boundary: HCC aggregate or successful Complete schema')
     parser.add_argument('--native-ws73-events', action='store_true',
                         help='synthetic maximum reports, fanout/loss/poll/copy-fault and replug')
+    parser.add_argument('--native-ws73-management', action='store_true', help='exclusive native file ownership, close/revocation and fault support gate')
     args = parser.parse_args()
+    if args.native_ws73_management and (not args.native_ws73 or args.native_ws73_fault or args.native_ws73_events or args.native_ws73_discovery):
+        raise SystemExit('management gate requires independent native mode')
     if args.standard_host_recipes and args.native_ws73:
         parser.error('--standard-host-recipes cannot use --native-ws73')
     if args.native_ws73_fault and not args.native_ws73:
@@ -221,6 +241,7 @@ def main():
                     native_fault_mode=args.native_ws73_fault_mode if args.native_ws73_fault else None,
                     native_event_stream=args.native_ws73_events,
                     native_discovery=args.native_ws73_discovery,
+                    native_management=args.native_ws73_management,
                     started_at=datetime.now(timezone.utc).isoformat(), status='running')
     process = monitor = None
     try:
@@ -291,6 +312,9 @@ poweroff -f
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
                                                           '/bin/sparklink_runtime_test --events\n'))
+        if args.native_ws73_management:
+            initfile = initroot / 'init'
+            initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n', '/bin/sparklink_runtime_test --owners\n'))
         if args.native_ws73_discovery:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
@@ -324,7 +348,7 @@ poweroff -f
                             args.native_ws73_fault_mode]) if args.native_ws73_fault else
                         ',runtime-status=254' if args.native_ws73 else '') +
                        (',runtime-reports=40' if args.native_ws73_events else '') +
-                       (',runtime-discovery=on' if args.native_ws73_discovery else '')]
+                       (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
             if os.access('/dev/kvm', os.R_OK | os.W_OK):
@@ -335,7 +359,7 @@ poweroff -f
                 wait_marker(process, console, f'{prefix}_ADD_SECOND')
                 monitor = load_qmp()(sock, output / 'qmp.jsonl')
                 event_properties = {'runtime-reports': 40} if args.native_ws73_events else {}
-                if args.native_ws73_discovery:
+                if args.native_ws73_discovery or args.native_ws73_management:
                     event_properties['runtime-discovery'] = True
                 if args.standard_host_recipes:
                     event_properties['recipe-status'] = True
@@ -352,7 +376,7 @@ poweroff -f
             manifest['qemu_exit'] = exit_code
             verify = assess_native if args.native_ws73 else assess
             errors = (verify(console.read_text(errors='replace'), exit_code, args.native_ws73_fault,
-                             args.native_ws73_events, args.native_ws73_discovery)
+                             args.native_ws73_events, args.native_ws73_discovery, args.native_ws73_management)
                       if args.native_ws73 else verify(console.read_text(errors='replace'), exit_code,
                                                      args.standard_host_recipes))
             if errors:

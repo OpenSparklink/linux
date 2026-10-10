@@ -16,6 +16,7 @@
 
 mod sle_adv;
 mod sle_authorization;
+mod sle_management;
 mod sle_configfs;
 mod sle_conn;
 mod sle_command_plan;
@@ -162,6 +163,7 @@ pub extern "C" fn sparklink_genl_get_role() -> u8 {
 pub extern "C" fn sparklink_genl_set_role(role: u8) -> i32 {
     if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
     let mut guard = context.lock().ok();
     let ss = guard.as_deref_mut();
     match ss.and_then(Option::as_mut) {
@@ -518,6 +520,8 @@ pub(crate) struct ControllerRuntime {
     pub(crate) identity: sle_dev::DeviceIdentity,
     pub(crate) protocol_profile: u32,
     #[pin]
+    management: Mutex<sle_management::Management>,
+    #[pin]
     pub(crate) controller_events: Lock<KBox<sle_controller_event::ControllerEventLog>, IrqLockBackend>,
     #[pin]
     pub(crate) controller_event_poll: PollCondVar,
@@ -556,6 +560,7 @@ impl ControllerRuntime {
         Arc::pin_init(pin_init!(Self {
             identity: dev.identity(),
             protocol_profile,
+            management <- new_mutex!(sle_management::Management::new(), "sparklink_management"),
             controller_events <- new_irq_lock!(controller_events, "sparklink_controller_events"),
             controller_event_poll <- new_poll_condvar!("sparklink_controller_event"),
             state <- new_mutex!(Some(state), "sparklink_runtime"),
@@ -573,6 +578,7 @@ impl ControllerRuntime {
     /// Called in process context without the registry lock. In-flight protocol
     /// operations finish before invalidation; subsequent accesses get ENODEV.
     pub(crate) fn invalidate(self: &Arc<Self>) {
+        self.management.lock().settled(ENODEV.to_errno());
         sle_usb::unpublish_runtime(self);
         self.stop_workers();
         let state = self.state.lock().take();
@@ -880,6 +886,7 @@ fn do_stop_scan(context: &RuntimeContext) -> Result<i32> {
 pub extern "C" fn sparklink_do_start_adv(interval_ms: u32, discovery_level: u8) -> i32 {
     if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
     let context = &context;
     match do_start_adv(context, interval_ms, discovery_level) {
         Ok(v) => v,
@@ -892,6 +899,7 @@ pub extern "C" fn sparklink_do_start_adv(interval_ms: u32, discovery_level: u8) 
 pub extern "C" fn sparklink_do_stop_adv() -> i32 {
     if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
     let context = &context;
     match do_stop_adv(context) {
         Ok(v) => v,
@@ -908,6 +916,7 @@ pub extern "C" fn sparklink_do_start_scan(
 ) -> i32 {
     if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
     let context = &context;
     match do_start_scan(context, window_ms, interval_ms, filter_level) {
         Ok(v) => v,
@@ -920,6 +929,7 @@ pub extern "C" fn sparklink_do_start_scan(
 pub extern "C" fn sparklink_do_stop_scan() -> i32 {
     if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
     let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
     let context = &context;
     match do_stop_scan(context) {
         Ok(v) => v,
@@ -1330,6 +1340,11 @@ fn init_subsystem() -> Result<SubsystemGuard> {
 
 #[pin_data(PinnedDrop)]
 struct SparkLinkCtl {
+    file_id: u64,
+    #[pin]
+    operation: Mutex<()>,
+    #[pin]
+    owned_target: Mutex<Option<Arc<ControllerRuntime>>>,
     #[pin]
     events: Mutex<EventQueue>,
     #[pin]
@@ -1398,6 +1413,7 @@ fn ioctl_dev_switch(arg: usize) -> Result<isize> {
 /// subsequent ioctl the handler will auto-switch if needed.
 #[inline(never)]
 fn ioctl_dev_select(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    if me.owned_target.lock().is_some() { return Err(EBUSY); }
     let val: i16 = read_user_struct(arg)?;
     if val < -1 {
         return Err(EINVAL);
@@ -3170,6 +3186,118 @@ fn ioctl_dli_send_cmd(context: &RuntimeContext, arg: usize) -> Result<isize> {
     Ok(0)
 }
 
+fn management_error(error: sle_management::Failure) -> Error {
+    match error {
+        sle_management::Failure::Busy => EBUSY,
+        sle_management::Failure::Permission => EPERM,
+        sle_management::Failure::Overflow => EOVERFLOW,
+        sle_management::Failure::Invalid => EINVAL,
+    }
+}
+
+/// Called with management mutex held, in process context. No registry or IRQ
+/// lock spans allocation, driver preparation, copyout or transport operations.
+#[inline(never)]
+fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::Management, mode: u32) {
+    let result = (|| -> Result {
+        let mut state = owner.state.lock();
+        let state = Option::as_mut(&mut *state).ok_or(ENODEV)?;
+        if *owner.schedule_gate.lock() { return Err(ENODEV); }
+        {
+            let host = owner.host.lock();
+            if let Some(error) = host.controller_status().2 { return Err(error); }
+            let (adv, scan, _) = host.discovery_radio();
+            // The native raw whitelist contains queries only. A quiet diagnostic
+            // reader has not changed radio policy. Managed requires confirmed Off.
+            if host.quiet() && (mode == sle_management::DIAGNOSTIC || (adv == 1 && scan == 1)) {
+                gate.settled(0); return Ok(());
+            }
+        }
+        let controller = match &state.controller {
+            sle_dli::ControllerBackend::Ws73(controller) => controller,
+            _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        };
+        let request = SleDiscoverySubmit {
+            version: 1, generation: owner.identity.generation,
+            profile: owner.protocol_profile, operation: 2,
+            // SAFETY: integer-only structure with a valid all-zero baseline.
+            ..unsafe { core::mem::zeroed() }
+        };
+        let adv = controller.prepare_discovery(&request)?;
+        let scan = controller.prepare_discovery(&SleDiscoverySubmit { operation: 4, ..request })?;
+        let mut adv_parts = [sle_command_plan::RecipePart { opcode: 0, params: &[] }; 4];
+        let mut scan_parts = [sle_command_plan::RecipePart { opcode: 0, params: &[] }; 4];
+        for (i, step) in adv.steps[..adv.count as usize].iter().enumerate() {
+            adv_parts[i] = sle_command_plan::RecipePart { opcode: step.opcode, params: &step.params[..step.length as usize] };
+        }
+        for (i, step) in scan.steps[..scan.count as usize].iter().enumerate() {
+            scan_parts[i] = sle_command_plan::RecipePart { opcode: step.opcode, params: &step.params[..step.length as usize] };
+        }
+        let mut host = owner.host.lock();
+        // Preserve the active reply reservation and its deadline. Only queued
+        // work is cancelled; cleanup stops follow the outstanding wire slot.
+        while let Some(request) = host.cancel_next() {
+            state.cmd_pending.resolve_seq(request.seq, 0x03, &[]);
+        }
+        host.begin_revoke(&adv_parts[..adv.count as usize], &scan_parts[..scan.count as usize])
+    })();
+    if let Err(error) = result {
+        owner.host.lock().fail(error);
+        gate.settled(error.to_errno());
+    }
+    owner.kick_commands();
+    owner.schedule_rx(0);
+}
+
+#[inline(never)]
+fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    if me.target.lock().as_ref().map(|target| target.identity) != Some(owner.identity) { return Err(EINVAL); }
+    if owner.protocol_profile == 0 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    let mut gate = owner.management.lock();
+    if *owner.schedule_gate.lock() { return Err(ENODEV); }
+    if gate.state == sle_management::REVOKING {
+        if let Some(result) = owner.host.lock().revocation_result() {
+            gate.settled(result.err().map_or(0, |error| error.to_errno()));
+        }
+    }
+    if cmd == SL_IOCTL_MANAGEMENT_QUERY {
+        let input: SleManagementQuery = read_user_struct(arg)?;
+        if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+        if input.generation != 0 && input.generation != owner.identity.generation { return Err(ENODEV); }
+        let detail = if gate.state == sle_management::FAULTED { owner.host.lock().revocation_detail() } else { (0, 0, false) };
+        let output = SleManagementQuery {
+            version: 1, generation: owner.identity.generation,
+            lease: gate.token_for(me.file_id), mode: gate.mode, state: gate.state,
+            flags: u32::from(gate.owns(me.file_id)) | (u32::from(detail.2) << 1),
+            error: gate.error, status: detail.0 as u32, opcode: detail.1 as u32, reserved: 0,
+        };
+        write_user_struct(arg, &output)?;
+        return Ok(0);
+    }
+    let mut request: SleManagementRequest = read_user_struct(arg)?;
+    if request.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if request.generation == 0 || request.generation != owner.identity.generation { return Err(ENODEV); }
+    if cmd == SL_IOCTL_MANAGEMENT_ACQUIRE {
+        if request.lease != 0 || me.owned_target.lock().is_some() { return Err(EINVAL); }
+        if let Some(error) = owner.host.lock().controller_status().2 { return Err(error); }
+        let token = gate.prepare(request.mode).map_err(management_error)?;
+        if !owner.host.lock().quiet() { return Err(EBUSY); }
+        request.lease = token;
+        // No command has been admitted. EFAULT leaves ownership and counter
+        // unchanged; commit cannot fail while the management mutex is held.
+        write_user_struct(arg, &request)?;
+        gate.commit(me.file_id, request.mode, token);
+        *me.owned_target.lock() = Some(owner.clone());
+    } else {
+        if request.mode != gate.mode { return Err(EPERM); }
+        gate.release(me.file_id, request.lease).map_err(management_error)?;
+        *me.owned_target.lock() = None;
+        revoke_management(owner, &mut gate, request.mode);
+    }
+    Ok(0)
+}
+
 /// Typed discovery is registration-bound, never a global/default route.
 fn discovery_owner(context: &RuntimeContext, me: Pin<&SparkLinkCtl>) -> Result<Arc<ControllerRuntime>> {
     let selected = me.target.lock().clone().ok_or(EINVAL)?;
@@ -3801,11 +3929,16 @@ impl MiscDevice for SparkLinkCtl {
                 return Err(ENODEV);
             }
         }
+        static NEXT_FILE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        let file_id = NEXT_FILE.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |next| next.checked_add(1)).map_err(|_| EOVERFLOW)?;
         OPEN_FD_COUNT.fetch_add(1u32, Relaxed);
 
         KBox::try_pin_init(
             try_pin_init! {
                 SparkLinkCtl {
+                    file_id,
+                    operation <- new_mutex!(()),
+                    owned_target <- new_mutex!(None),
                     events <- new_mutex!(EventQueue::new()),
                     event_poll <- new_poll_condvar!("sparklink_event"),
                     dev: dev,
@@ -3871,6 +4004,7 @@ impl MiscDevice for SparkLinkCtl {
     }
 
     fn ioctl(me: Pin<&SparkLinkCtl>, _file: &FsFile, cmd: u32, arg: usize) -> Result<isize> {
+        let _operation = me.operation.lock();
         let access = sle_authorization::classify(cmd)?;
         if access == sle_authorization::Access::Protected {
             sle_authorization::require_admin()?;
@@ -3899,6 +4033,21 @@ impl MiscDevice for SparkLinkCtl {
             }
         };
         let context = &context;
+        if matches!(cmd, SL_IOCTL_MANAGEMENT_ACQUIRE | SL_IOCTL_MANAGEMENT_RELEASE | SL_IOCTL_MANAGEMENT_QUERY) {
+            return ioctl_management(context, me, cmd, arg);
+        }
+        // Admission serialization lasts through dispatch. Workers do not take
+        // this mutex under the protocol mutex; revocation completion is in Host.
+        let mut management_guard = if access == sle_authorization::Access::Protected && !registration_only {
+            context.owner.as_ref().filter(|owner| owner.protocol_profile != 0).map(|owner| owner.management.lock())
+        } else { None };
+        if let Some(gate) = management_guard.as_mut() {
+            if *context.owner.as_ref().ok_or(ENODEV)?.schedule_gate.lock() { return Err(ENODEV); }
+            let required_mode = if matches!(cmd, SL_IOCTL_DLI_SEND_CMD | SL_IOCTL_DLI_POLL_EVENT | SL_IOCTL_DLI_RESET) {
+                sle_management::DIAGNOSTIC
+            } else { sle_management::MANAGED };
+            gate.authorize(me.file_id, required_mode).map_err(management_error)?;
+        }
         // Observation never applies global policy or modifies Runtime state.
         if !registration_only && access == sle_authorization::Access::Protected {
             Self::sync_power_mode(context)?;
@@ -4129,6 +4278,15 @@ impl SparkLinkCtl {
 #[pinned_drop]
 impl PinnedDrop for SparkLinkCtl {
     fn drop(self: Pin<&mut Self>) {
+        if let Some(owner) = self.owned_target.lock().take() {
+            let mut gate = owner.management.lock();
+            if gate.owns(self.file_id) {
+                let mode = gate.mode;
+                let token = gate.token_for(self.file_id);
+                let _ = gate.release(self.file_id, token);
+                revoke_management(&owner, &mut gate, mode);
+            }
+        }
         OPEN_FD_COUNT.fetch_add(u32::MAX, Relaxed); // wrapping decrement
         dev_info!(self.dev, "sparklink: control interface closed\n");
     }

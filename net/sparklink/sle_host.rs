@@ -46,6 +46,13 @@ pub(crate) struct CommandHost {
     scan_cookie: u64,
     recipe: Option<(RecipeTag, RecipeProgress)>,
     operations: Operations,
+    revoking: bool,
+    revoke_cookies: [u64; 2],
+    revoke_done: u8,
+    revoke_deadline: u64,
+    revoke_status: u8,
+    revoke_opcode: u16,
+    revoke_reply: bool,
 }
 
 impl CommandHost {
@@ -61,6 +68,8 @@ impl CommandHost {
             broadcast_cookie: 0,
             scan_cookie: 0,
             recipe: None,
+                revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
+                revoke_status: 0, revoke_opcode: 0, revoke_reply: false,
                 operations <- init!(Operations {
                     entries <- pin_init::init_array_from_fn(|_| None),
                     initialized: false,
@@ -149,6 +158,36 @@ impl CommandHost {
             power_step, selected_power: None,
         });
         Ok(())
+    }
+
+    /// Retain any active wire slot, but prevent queued enables from escaping.
+    /// Caller drains raw pending entries before providing driver-prepared stops.
+    pub(crate) fn begin_revoke(&mut self, adv: &[RecipePart<'_>], scan: &[RecipePart<'_>]) -> Result {
+        if let Some(error) = self.fault { return Err(error); }
+        self.operations.cancel_domain(DiscoveryIntent::Advertising(false), -(kernel::bindings::ECANCELED as i32));
+        self.operations.cancel_domain(DiscoveryIntent::Scanning(false), -(kernel::bindings::ECANCELED as i32));
+        self.revoke_cookies[0] = self.next_cookie;
+        self.enqueue_recipe(DiscoveryIntent::Advertising(false), adv)?;
+        self.revoke_cookies[1] = self.next_cookie;
+        if let Err(error) = self.enqueue_recipe(DiscoveryIntent::Scanning(false), scan) {
+            self.fail(error); return Err(error);
+        }
+        self.revoking = true; self.revoke_done = 0;
+        self.revoke_status = 0; self.revoke_opcode = 0; self.revoke_reply = false;
+        // SAFETY: reading the kernel clock has no pointer preconditions.
+        self.revoke_deadline = unsafe { kernel::bindings::jiffies_64 }
+            .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
+        Ok(())
+    }
+    pub(crate) fn quiet(&self) -> bool {
+        self.active.is_none() && self.reply.is_none() && self.requests.is_empty()
+    }
+    pub(crate) fn revocation_detail(&self) -> (u8, u16, bool) {
+        (self.revoke_status, self.revoke_opcode, self.revoke_reply)
+    }
+    pub(crate) fn revocation_result(&self) -> Option<Result> {
+        if let Some(error) = self.fault { return Some(Err(error)); }
+        if self.revoking && self.revoke_done == 3 && self.quiet() { Some(Ok(())) } else { None }
     }
 
     pub(crate) fn controller_status(&self) -> (u8, bool, Option<Error>) {
@@ -341,6 +380,31 @@ impl CommandHost {
             }
             (tag.intent, outcome)
         });
+        if let Some((_, outcome)) = recipe {
+            if self.revoking {
+                for i in 0..2 {
+                    if self.revoke_cookies[i] != active.cookie { continue; }
+                    match outcome {
+                        RecipeReply::Finished => {
+                            self.revoke_done |= 1 << i;
+                            if i == 0 { self.operations.advertising = 1; }
+                            else { self.operations.scanning = 1; }
+                            if self.revoke_done == 3 { self.operations.initialized = true; }
+                        }
+                        RecipeReply::Failed => {
+                            self.revoke_status = match &event {
+                                SleEvent::NativeCommandReply { status, .. } => *status,
+                                SleEvent::CommandComplete { status, .. } | SleEvent::CommandStatus { status, .. } => *status as u8,
+                                _ => 0,
+                            };
+                            self.revoke_opcode = active.opcode; self.revoke_reply = true;
+                            self.fail(EIO);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         Some(HostReply {
             seq: active.seq,
             event,
@@ -352,9 +416,11 @@ impl CommandHost {
     }
 
     pub(crate) fn timed_out(&self) -> bool {
+        if self.fault.is_some() { return false; }
         // SAFETY: reading jiffies is safe in process/IRQ context.
         let now = unsafe { kernel::bindings::jiffies_64 };
-        (self.reply.is_none()
+        (self.revoking && self.revoke_done != 3 && now >= self.revoke_deadline)
+            || (self.reply.is_none()
             && self
                 .active
                 .as_ref()
@@ -368,7 +434,10 @@ impl CommandHost {
     /// Latch a fault; never invent credits after uncertain transport outcome.
     /// The caller drains remaining requests and resolves that owner's entries.
     pub(crate) fn fail(&mut self, error: Error) -> Option<u32> {
-        self.fault = Some(error);
+        if self.fault.is_none() && self.revoking && !self.revoke_reply {
+            self.revoke_opcode = self.active.as_ref().map_or(0, |active| active.opcode);
+        }
+        let error = *self.fault.get_or_insert(error);
         self.operations.fault(error.to_errno());
         self.credits = 0;
         self.reply = None;

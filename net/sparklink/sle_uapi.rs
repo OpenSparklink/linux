@@ -3088,3 +3088,36 @@ impl CheckReserved for SleControllerSnapshot {
     }
 }
 const _: () = assert!(core::mem::size_of::<SleControllerSnapshot>() == 64);
+
+
+pub(crate) const SL_IOCTL_MANAGEMENT_ACQUIRE: u32 = _IOWR::<SleManagementRequest>(SL_MAGIC, 0x8b);
+pub(crate) const SL_IOCTL_MANAGEMENT_RELEASE: u32 = _IOW::<SleManagementRequest>(SL_MAGIC, 0x8c);
+pub(crate) const SL_IOCTL_MANAGEMENT_QUERY: u32 = _IOWR::<SleManagementQuery>(SL_MAGIC, 0x8d);
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct SleManagementRequest {
+    pub generation: u64, pub lease: u64,
+    pub version: u32, pub mode: u32, pub flags: u32, pub reserved: u32,
+}
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct SleManagementQuery {
+    pub generation: u64, pub lease: u64,
+    pub version: u32, pub mode: u32, pub state: u32, pub flags: u32,
+    pub error: i32, pub status: u32, pub opcode: u32, pub reserved: u32,
+}
+// SAFETY: integer-only repr(C) types; all bit patterns valid.
+unsafe impl FromBytes for SleManagementRequest {}
+// SAFETY: integer-only repr(C) types; all bit patterns valid.
+unsafe impl FromBytes for SleManagementQuery {}
+impl CheckReserved for SleManagementRequest {
+    fn check_reserved(&self) -> Result { if self.flags != 0 || self.reserved != 0 { Err(EINVAL) } else { Ok(()) } }
+}
+impl CheckReserved for SleManagementQuery {
+    fn check_reserved(&self) -> Result {
+        if self.lease != 0 || self.mode != 0 || self.state != 0 || self.flags != 0
+            || self.error != 0 || self.status != 0 || self.opcode != 0 || self.reserved != 0 { Err(EINVAL) } else { Ok(()) }
+    }
+}
+const _: () = assert!(core::mem::size_of::<SleManagementRequest>() == 32);
+const _: () = assert!(core::mem::size_of::<SleManagementQuery>() == 48);

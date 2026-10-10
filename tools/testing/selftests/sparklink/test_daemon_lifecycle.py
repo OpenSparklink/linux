@@ -112,7 +112,7 @@ class AuthorizationVerdict(unittest.TestCase):
 class KernelAuthorizationVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected=99 denied=99 observe=34 configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
+        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected=101 denied=101 observe=35 configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
                              for uid,gid in [(1001,1001),(1000,1002),(0,0)])
         cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 observe_no_power_sync=1\n'
         cls.good = GOOD + cls.matrix + cls.state
@@ -123,7 +123,7 @@ class KernelAuthorizationVerdict(unittest.TestCase):
     def test_missing_root_without_cap(self): self.assertTrue(assess(self.good.replace('uid=0 gid=0', 'uid=1 gid=1'), 0, kernel_authorization=True))
     def test_missing_control_uid(self): self.assertTrue(assess(self.good.replace('uid=1000 gid=1002','uid=0 gid=0'),0,kernel_authorization=True))
     def test_capabilities(self): self.assertTrue(assess(self.good.replace('caps=0','caps=1',1),0,kernel_authorization=True))
-    def test_wrong_deny_count(self): self.assertTrue(assess(self.good.replace('denied=99','denied=98',1),0,kernel_authorization=True))
+    def test_wrong_deny_count(self): self.assertTrue(assess(self.good.replace('denied=101','denied=100',1),0,kernel_authorization=True))
     def test_missing_fd_inheritance(self): self.assertTrue(assess(self.good.replace('inherited_fd=1','inherited_fd=0',1),0,kernel_authorization=True))
     def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('configfs_denied=5','configfs_denied=4',1),0,kernel_authorization=True))
     def test_genl_bypass(self): self.assertTrue(assess(self.good.replace('genl_denied=5','genl_denied=4',1),0,kernel_authorization=True))

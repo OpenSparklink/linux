@@ -172,3 +172,42 @@ class DiscoveryVerdict(unittest.TestCase):
     def test_wrong_radio(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('radio_unknown=1', 'radio_unknown=0'), 0, discovery=True))
     def test_wrong_order(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace(DISCOVERY, '')+DISCOVERY, 0, discovery=True))
     def test_wrong_replug(self): self.assertTrue(assess_native(DISCOVERY_GOOD.replace('fault_reset=1', 'fault_reset=0'), 0, discovery=True))
+
+
+MANAGEMENT_INITIAL = """NATIVE_MANAGEMENT_CONTRACT: index=0 exclusive=1 mode=1 stale=1 selection=1 copyout=1 no_admission=1 schema=6
+NATIVE_MANAGEMENT_CREDENTIALS: inherited_owner=1 uid=1001 caps=0 denied=3
+NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=2 radio_off=1 ready=1
+NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077
+"""
+MANAGEMENT_REPLUG = """NATIVE_MANAGEMENT_PENDING_CLOSE: cancelled=1 wire_reserved=1 errno=110 radio_unknown=1
+NATIVE_MANAGEMENT_REPLUG: fresh_lease=1 old_generation=1
+"""
+MANAGEMENT_GOOD = GOOD.replace('NATIVE_REMOVE_FIRST', MANAGEMENT_INITIAL+'NATIVE_REMOVE_FIRST').replace('NATIVE_LIFETIME:', MANAGEMENT_REPLUG+'NATIVE_LIFETIME:')
+
+class ManagementVerdict(unittest.TestCase):
+    def test_full(self): self.assertEqual(assess_native(MANAGEMENT_GOOD, 0, management=True), [])
+    def test_missing(self): self.assertTrue(assess_native(GOOD, 0, management=True))
+    def test_unexpected(self): self.assertTrue(assess_native(MANAGEMENT_GOOD, 0))
+    def test_missing_each_proof(self):
+        for line in (MANAGEMENT_INITIAL+MANAGEMENT_REPLUG).splitlines():
+            with self.subTest(line=line):
+                self.assertTrue(assess_native(MANAGEMENT_GOOD.replace(line+'\n',''), 0, management=True))
+    def test_duplicate_proof(self): self.assertTrue(assess_native(MANAGEMENT_GOOD+MANAGEMENT_REPLUG, 0, management=True))
+    def test_malformed_extra(self): self.assertTrue(assess_native(MANAGEMENT_GOOD+'NATIVE_MANAGEMENT_UNKNOWN: pass\n', 0, management=True))
+    def test_failed_stop_claimed_off(self): self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('errno=5 radio_unknown=1','errno=5 radio_unknown=0'), 0, management=True))
+    def test_missing_wire_reservation(self): self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('wire_reserved=1','wire_reserved=0'), 0, management=True))
+    def test_wrong_phase(self):
+        misplaced = MANAGEMENT_GOOD.replace(MANAGEMENT_INITIAL, '').replace('NATIVE_LIFETIME:', MANAGEMENT_INITIAL+'NATIVE_LIFETIME:')
+        self.assertTrue(assess_native(misplaced, 0, management=True))
+
+class ManagementCredentialVerdict(unittest.TestCase):
+    def test_inherited_owner_identity_required(self):
+        self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('inherited_owner=1','inherited_owner=0'), 0, management=True))
+    def test_first_fault_must_stay_stable(self):
+        self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('first_fault_stable=1','first_fault_stable=0'), 0, management=True))
+
+class ManagementSchemaVerdict(unittest.TestCase):
+    def test_schema_checks_required(self):
+        self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('schema=6','schema=0'), 0, management=True))
+    def test_raw_failure_status_required(self):
+        self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('status=253','status=0'), 0, management=True))

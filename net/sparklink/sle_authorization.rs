@@ -11,7 +11,8 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
     match cmd {
         SL_IOCTL_DEV_GET_ACTIVE
         | SL_IOCTL_DEV_SELECT => Ok(Access::Affinity),
-        SL_IOCTL_AFH_GET_MAP
+        SL_IOCTL_MANAGEMENT_QUERY
+        | SL_IOCTL_AFH_GET_MAP
         | SL_IOCTL_CONN_COUNT
         | SL_IOCTL_CONN_INFO
         | SL_IOCTL_CONN_LIST
@@ -45,7 +46,9 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_SUBSYS_STATS
         | SL_IOCTL_SYNC_INFO
         | SL_IOCTL_USB_DEV_COUNT => Ok(Access::Observe),
-        SL_IOCTL_AFH_CLASSIFY
+        SL_IOCTL_MANAGEMENT_ACQUIRE
+        | SL_IOCTL_MANAGEMENT_RELEASE
+        | SL_IOCTL_AFH_CLASSIFY
         | SL_IOCTL_AFH_HOP_NEXT
         | SL_IOCTL_AFH_REPORT_RETX
         | SL_IOCTL_AFH_REPORT_RSSI

@@ -1936,6 +1936,36 @@ Complete precedes the model's report burst and cannot establish that ingress
 has finished.  The separate observer preserves both tested poll cursors;
 the bound, generation, payload, loss and hot-unplug assertions still apply.
 
+Native WS73 management ownership
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Native registrations require a version-one Managed or Diagnostic file lease.
+ACQUIRE (32 bytes, read/write), RELEASE (32 bytes, write) and QUERY (48 bytes,
+read/write) contain no pointers and use explicit eight-byte alignment. All
+138 public ioctls are classified: 35 observations, two affinity and 101 protected.
+Acquisition copies its generated registration-local token out before committing
+ownership; EFAULT admits neither a lease nor a command. Every protected call
+still checks current CAP_NET_ADMIN. Duplicate/inherited descriptions share the
+owner; a passed owner fd does not pass the caller's capability. Selection cannot
+change while held. Raw DLI requires Diagnostic; typed discovery requires Managed.
+Native genl bridges have no file lease and reject mutation. Legacy profile zero
+is not migrated and returns EOPNOTSUPP for the new lease API.
+
+Release/last-close removes user admission, cancels queued intent, preserves the
+active wire reply and submits driver-prepared stop barriers through the same
+Host credits. Successful confirmed stops allow a successor; failed/uncertain
+cleanup latches Fault/Unknown without invented credits. QUERY exposes Free,
+Held, Revoking and Faulted; flag bit zero identifies the owning description and
+bit one identifies an actual failure reply with raw status/opcode. First faults
+remain stable after later timer work. The current fault recovery is replug with
+new generation, not an unverified native Reset. Other registrations are isolated.
+
+``run_runtime_lifecycle.py --native-ws73 --native-ws73-management`` tests actual
+syscalls, competing descriptions, modes/identity, copyout rollback, inherited
+owner credentials, duplicate last-close, confirmed cleanup, raw failure details,
+late timers and pending-reply close/timeouts on synthetic USB. It never proves
+physical WS73 firmware/RF acceptance or Proxy/PDU/Security ownership.
+
 sparklink_ctl
 -------------
 

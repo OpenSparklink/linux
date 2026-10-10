@@ -1121,4 +1121,40 @@ struct sle_conn_phy_update {
 #define SLE_EVT_MEAS_STATE_CHANGE	0x27
 #define SLE_EVT_MEAS_QUANTITY		0x28
 
+
+/* Native management v1. Acquisition copyout precedes ownership commit and
+ * never admits a command. Lease tokens are registration-local, monotonic and
+ * bound to the open file description, not a PID/UID. Observers cannot write.
+ */
+#define SLE_MANAGEMENT_VERSION 1U
+#define SLE_MANAGEMENT_MANAGED 1U
+#define SLE_MANAGEMENT_DIAGNOSTIC 2U
+#define SLE_MANAGEMENT_FREE 0U
+#define SLE_MANAGEMENT_HELD 1U
+#define SLE_MANAGEMENT_REVOKING 2U
+#define SLE_MANAGEMENT_FAULTED 3U
+struct sle_management_request {
+    __aligned_u64 generation;
+    __aligned_u64 lease;
+    __u32 version;
+    __u32 mode;
+    __u32 flags;
+    __u32 reserved;
+};
+struct sle_management_query {
+    __aligned_u64 generation;
+    __aligned_u64 lease;
+    __u32 version;
+    __u32 mode;
+    __u32 state;
+    __u32 flags; /* bit 0: owning file; bit 1: raw failure reply valid */
+    __s32 error;
+    __u32 status;
+    __u32 opcode;
+    __u32 reserved;
+};
+#define SL_IOCTL_MANAGEMENT_ACQUIRE _IOWR(SL_MAGIC, 0x8b, struct sle_management_request)
+#define SL_IOCTL_MANAGEMENT_RELEASE _IOW(SL_MAGIC, 0x8c, struct sle_management_request)
+#define SL_IOCTL_MANAGEMENT_QUERY _IOWR(SL_MAGIC, 0x8d, struct sle_management_query)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

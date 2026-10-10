@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Synthetic WS73 USB/Runtime gate. No RF, slkd or ordinary-user acceptance. */
+#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +20,12 @@
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
 
+_Static_assert(sizeof(struct sle_management_request) == 32, "management request ABI");
+_Static_assert(sizeof(struct sle_management_query) == 48, "management query ABI");
+_Static_assert(_Alignof(struct sle_management_query) == 8, "management query alignment");
+_Static_assert(SL_IOCTL_MANAGEMENT_ACQUIRE == 0xc020538bU, "management acquire ABI");
+_Static_assert(SL_IOCTL_MANAGEMENT_RELEASE == 0x4020538cU, "management release ABI");
+_Static_assert(SL_IOCTL_MANAGEMENT_QUERY == 0xc030538dU, "management query ABI");
 static int failed;
 
 static int fail(const char *why)
@@ -111,8 +122,37 @@ static int bind_owner(unsigned int id, struct sci_dev_info *info, unsigned long 
 	return fail("bind native Runtime");
 }
 
+/* Explicit native file ownership. Role transitions retain the same selected
+ * generation; observations use independent unclaimed fds. */
+static int management_mode(int fd, unsigned long long generation, unsigned mode)
+{
+    struct sle_management_query q = { .version = 1, .generation = generation };
+    if (ioctl(fd, SL_IOCTL_MANAGEMENT_QUERY, &q)) return fail("management status");
+    if (q.flags == 1 && q.mode == mode) return 0;
+    if (q.flags == 1) {
+        struct sle_management_request release = { .version = 1, .generation = q.generation,
+            .lease = q.lease, .mode = q.mode };
+        if (ioctl(fd, SL_IOCTL_MANAGEMENT_RELEASE, &release)) return fail("management release");
+    }
+    double deadline = now() + 7;
+    do {
+        q = (struct sle_management_query){ .version = 1, .generation = generation };
+        if (ioctl(fd, SL_IOCTL_MANAGEMENT_QUERY, &q)) return fail("management revocation status");
+        if (q.state == SLE_MANAGEMENT_FREE) {
+            struct sle_management_request acquire = { .version = 1, .generation = q.generation, .mode = mode };
+            if (ioctl(fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) || !acquire.lease)
+                return fail("management acquire");
+            return 0;
+        }
+        if (q.state == SLE_MANAGEMENT_FAULTED) return fail("management revocation fault");
+        usleep(1000);
+    } while (now() < deadline);
+    return fail("management revocation deadline");
+}
+
 static int query(int fd, const struct sci_dev_info *info, unsigned int opcode, unsigned int status)
 {
+	if (management_mode(fd, 0, SLE_MANAGEMENT_DIAGNOSTIC)) return -1;
 	struct sle_dli_cmd cmd = { .opcode = opcode };
 	struct sle_mgmt_stats before, after;
 	unsigned int length = opcode == 0x0403 ? 10 : opcode == 0x0404 ? 5 : 6;
@@ -156,6 +196,7 @@ static int query(int fd, const struct sci_dev_info *info, unsigned int opcode, u
 
 static int exercise(int fd, const struct sci_dev_info *info)
 {
+    if (management_mode(fd, 0, SLE_MANAGEMENT_DIAGNOSTIC)) return -1;
 	struct sle_dli_cmd wrong = { .opcode = 0x0401 };
 	struct sle_mgmt_stats before, after;
 
@@ -526,6 +567,7 @@ static int controller_snapshot(int fd, unsigned long long gen,
 static int discovery_gate(int fd, unsigned long long gen,
 			  const struct sci_dev_info *info)
 {
+	if (management_mode(fd, gen, SLE_MANAGEMENT_MANAGED)) return -1;
 	struct sle_discovery_result result;
 	struct sle_discovery_submit r, stop;
 	if (discovery_read(fd, 0, 0, &result) || result.generation != gen ||
@@ -628,7 +670,8 @@ static int discovery_gate(int fd, unsigned long long gen,
 	struct sle_dli_cmd raw = { .opcode = 0x0c05, .param_len = 5 };
 	raw.params[1] = 7;
 	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &raw) != -1 ||
-	    errno != EOPNOTSUPP || query(fd, info, 0x0406, 0))
+	    errno != EPERM || management_mode(fd, gen, SLE_MANAGEMENT_DIAGNOSTIC) ||
+        ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &raw) != -1 || errno != EOPNOTSUPP || query(fd, info, 0x0406, 0))
 		return fail("typed support never broadens raw whitelist");
 	struct sle_controller_snapshot invalid = { .version = 1, .reserved_byte = 1 };
 	if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &invalid) != -1 || errno != EINVAL)
@@ -641,9 +684,178 @@ static int discovery_gate(int fd, unsigned long long gen,
 	       info->index);
 	return 0;
 }
+static int management_wait(int fd, unsigned long long gen, unsigned state, int error)
+{
+    double deadline = now() + 8;
+    do {
+        struct sle_management_query q = { .version = 1, .generation = gen };
+        if (ioctl(fd, SL_IOCTL_MANAGEMENT_QUERY, &q)) return fail("owner recovery query");
+        if (q.state == state) {
+            if (q.error != error || q.lease || (q.flags & 1) || q.mode ||
+                (error == -EIO && (q.flags != 2 || q.status != 0xfd || q.opcode != 0x0c05)) ||
+                (error == -ETIMEDOUT && (q.flags || q.status || q.opcode != 0x0c05)))
+                return fail("owner recovery exact state/error");
+            return 0;
+        }
+        if (q.state == SLE_MANAGEMENT_FAULTED) return fail("unexpected owner recovery fault");
+        usleep(1000);
+    } while (now() < deadline);
+    return fail("owner recovery wait deadline");
+}
+
+static int management_gate(int *fd, unsigned long long gen, const struct sci_dev_info *info)
+{
+    struct sle_discovery_result result;
+    struct sci_dev_info unused;
+    unsigned long long observer_gen;
+    if (management_mode(*fd, gen, SLE_MANAGEMENT_MANAGED) ||
+        discovery_do(*fd, gen, 2, info, &result) || discovery_do(*fd, gen, 4, info, &result)) return -1;
+    int observer = bind_owner(info->index, &unused, &observer_gen);
+    if (observer < 0 || observer_gen != gen) return fail("owner independent observer");
+    struct sle_management_query own = { .version = 1, .generation = gen };
+    struct sle_management_query other = own;
+    struct sle_management_request acquire = { .version = 1, .generation = gen, .mode = 1 };
+    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_QUERY, &own) || !own.lease || own.flags != 1 ||
+        ioctl(observer, SL_IOCTL_MANAGEMENT_QUERY, &other) || other.lease || other.flags || other.state != 1 ||
+        ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) != -1 || errno != EBUSY)
+        return fail("exclusive owner and unclaimed observation");
+    struct sle_mgmt_stats before, after;
+    struct sle_management_request release = { .version = 1, .generation = gen, .lease = own.lease, .mode = 1 };
+    if (ioctl(*fd, SL_IOCTL_MGMT_STATS, &before) ||
+        ioctl(observer, SL_IOCTL_MANAGEMENT_RELEASE, &release) != -1 || errno != EPERM ||
+        ioctl(observer, SL_IOCTL_DISCOVERY_SUBMIT, NULL) != -1 || errno != EPERM ||
+        ioctl(observer, SL_IOCTL_DLI_SEND_CMD, NULL) != -1 || errno != EPERM ||
+        ioctl(*fd, SL_IOCTL_DLI_POLL_EVENT, NULL) != -1 || errno != EPERM ||
+        ioctl(observer, SL_IOCTL_MGMT_STATS, &after) || memcmp(&before, &after, sizeof(before)))
+        return fail("file owner/mode checks precede user memory and admission");
+    release.generation++;
+    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_RELEASE, &release) != -1 || errno != ENODEV)
+        return fail("release generation");
+    release.generation = gen; release.lease++;
+    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_RELEASE, &release) != -1 || errno != EPERM)
+        return fail("release token");
+    __s16 selected = info->index;
+    if (ioctl(*fd, SL_IOCTL_DEV_SELECT, &selected) != -1 || errno != EBUSY)
+        return fail("owner cannot retarget without release");
+    release.lease = own.lease;
+    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_RELEASE, &release) || management_wait(observer, gen, 0, 0)) return -1;
+    struct sle_management_request invalid = acquire;
+    invalid.version = 2;
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &invalid) != -1 || errno != EOPNOTSUPP)
+        return fail("management version rejected");
+    invalid = acquire; invalid.mode = 3;
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &invalid) != -1 || errno != EINVAL)
+        return fail("management mode rejected");
+    invalid = acquire; invalid.flags = 1;
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &invalid) != -1 || errno != EINVAL)
+        return fail("management request flags rejected");
+    invalid = acquire; invalid.reserved = 1;
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &invalid) != -1 || errno != EINVAL)
+        return fail("management request reserved rejected");
+    invalid = acquire; invalid.generation = gen + 1000;
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &invalid) != -1 || errno != ENODEV)
+        return fail("management claim generation rejected");
+    other = (struct sle_management_query){ .version = 1, .generation = gen, .status = 1 };
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_QUERY, &other) != -1 || errno != EINVAL ||
+        management_wait(observer, gen, 0, 0)) return fail("query output fields cannot enter as input");
+    long page = sysconf(_SC_PAGESIZE);
+    void *readonly = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (readonly == MAP_FAILED) return fail("claim copyout page");
+    *(struct sle_management_request *)readonly = acquire;
+    if (mprotect(readonly, page, PROT_READ)) return fail("claim copyout protection");
+    int ret = ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, readonly), error = errno;
+    munmap(readonly, page);
+    if (ret != -1 || error != EFAULT || management_wait(observer, gen, 0, 0) ||
+        ioctl(*fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) || acquire.lease != own.lease + 1)
+        return fail("claim EFAULT does not commit ownership/counter");
+    printf("NATIVE_MANAGEMENT_CONTRACT: index=%u exclusive=1 mode=1 stale=1 selection=1 copyout=1 no_admission=1 schema=6\n", info->index);
+    pid_t child = fork();
+    if (child < 0) return fail("owner credential fork");
+    if (!child) {
+        struct __user_cap_header_struct header = { _LINUX_CAPABILITY_VERSION_3, 0 };
+        struct __user_cap_data_struct caps[2] = { 0 };
+        int ok = !setgroups(0, NULL) && !setresgid(1001, 1001, 1001) && !setresuid(1001, 1001, 1001)
+            && !prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+            && !syscall(SYS_capset, &header, caps) && !syscall(SYS_capget, &header, caps)
+            && getuid() == 1001 && geteuid() == 1001;
+        for (unsigned i = 0; i < 2; ++i)
+            ok &= !caps[i].effective && !caps[i].permitted && !caps[i].inheritable;
+        for (unsigned i = 0; i <= CAP_LAST_CAP; ++i)
+            ok &= prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, i, 0, 0) == 0;
+        struct sle_management_query inherited = { .version = 1, .generation = gen };
+        ok &= !ioctl(*fd, SL_IOCTL_MANAGEMENT_QUERY, &inherited) && inherited.flags == 1;
+        ok &= ioctl(*fd, SL_IOCTL_DISCOVERY_SUBMIT, NULL) == -1 && errno == EPERM;
+        ok &= ioctl(*fd, SL_IOCTL_MANAGEMENT_RELEASE, &release) == -1 && errno == EPERM;
+        ok &= ioctl(*fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) == -1 && errno == EPERM;
+        _exit(ok ? 0 : 1);
+    }
+    int child_status;
+    if (waitpid(child, &child_status, 0) != child || !WIFEXITED(child_status) || WEXITSTATUS(child_status))
+        return fail("inherited actual owner cannot transfer caller capability");
+    puts("NATIVE_MANAGEMENT_CREDENTIALS: inherited_owner=1 uid=1001 caps=0 denied=3");
+    int alias = dup(*fd);
+    if (alias < 0 || close(*fd)) return fail("owner duplicate description");
+    *fd = observer;
+    struct sle_management_request conflict = { .version = 1, .generation = gen, .mode = 2 };
+    if (ioctl(observer, SL_IOCTL_MANAGEMENT_ACQUIRE, &conflict) != -1 || errno != EBUSY ||
+        discovery_do(alias, gen, 1, info, &result) || result.radio_adv != 2 || close(alias))
+        return fail("duplicate holds owner until last close");
+    if (management_wait(observer, gen, 0, 0) || discovery_read(observer, 0, 0, &result) ||
+        result.radio_adv != 1 || result.radio_scan != 1 || result.flags ||
+        controller_snapshot(observer, gen, info, SLE_CONTROLLER_READY, 0))
+        return fail("last close confirms actual stops before successor");
+    puts("NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=2 radio_off=1 ready=1");
+    if (management_mode(observer, gen, 1)) return -1;
+    struct sle_discovery_submit r;
+    discovery_request(&r, gen, 1, info); r.advertising.mode = 0xee;
+    if (ioctl(observer, SL_IOCTL_DISCOVERY_SUBMIT, &r) || discovery_wait(observer, gen, &r, 3, &result) || close(observer))
+        return fail("failed cleanup setup/last close");
+    *fd = bind_owner(info->index, &unused, &observer_gen);
+    if (*fd < 0 || observer_gen != gen || management_wait(*fd, gen, 3, -EIO) ||
+        controller_snapshot(*fd, gen, info, SLE_CONTROLLER_FAULT, -EIO))
+        return fail("failed stop cannot grant successor or report Ready");
+    usleep(5500000);
+    if (management_wait(*fd, gen, 3, -EIO) || controller_snapshot(*fd, gen, info, SLE_CONTROLLER_FAULT, -EIO))
+        return fail("first stop fault survives later queued timer work");
+    acquire = (struct sle_management_request){ .version = 1, .generation = gen, .mode = 1 };
+    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) != -1 || errno != EIO)
+        return fail("failed cleanup admission");
+    puts("NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077");
+    return 0;
+}
+
+static int management_replug_gate(int *fd, unsigned long long gen, const struct sci_dev_info *info)
+{
+    struct sle_discovery_result result;
+    struct sle_discovery_submit r;
+    if (management_mode(*fd, gen, 1) || discovery_do(*fd, gen, 2, info, &result) ||
+        discovery_do(*fd, gen, 4, info, &result)) return -1;
+    discovery_request(&r, gen, 1, info); r.advertising.mode = 0xed;
+    if (ioctl(*fd, SL_IOCTL_DISCOVERY_SUBMIT, &r)) return fail("pending close start");
+    double deadline = now() + 2;
+    do {
+        if (discovery_read(*fd, gen, r.request_id, &result)) return -1;
+        if (result.state == 2 && result.step + 1 == result.count) break;
+        usleep(1000);
+    } while (now() < deadline);
+    if (result.state != 2 || result.step + 1 != result.count || close(*fd))
+        return fail("close retains missing Complete wire slot");
+    struct sci_dev_info unused; unsigned long long observed;
+    *fd = bind_owner(info->index, &unused, &observed);
+    if (*fd < 0 || observed != gen || management_wait(*fd, gen, 3, -ETIMEDOUT) ||
+        discovery_read(*fd, gen, r.request_id, &result) || result.state != 5 || result.error != -ECANCELED ||
+        result.radio_adv || result.radio_scan || result.flags != 1 ||
+        controller_snapshot(*fd, gen, info, SLE_CONTROLLER_FAULT, -ETIMEDOUT))
+        return fail("uncertain close bounded fault retains cancelled result");
+    puts("NATIVE_MANAGEMENT_PENDING_CLOSE: cancelled=1 wire_reserved=1 errno=110 radio_unknown=1");
+    puts("NATIVE_MANAGEMENT_REPLUG: fresh_lease=1 old_generation=1");
+    return 0;
+}
+
 static int discovery_timeout(int fd, unsigned long long gen,
 			     const struct sci_dev_info *info)
 {
+    if (management_mode(fd, gen, SLE_MANAGEMENT_MANAGED)) return -1;
 	struct sle_discovery_submit r;
 	struct sle_discovery_result result;
 	discovery_id = 10000; /* parent has not consumed child-generated ids */
@@ -676,7 +888,8 @@ int main(int argc, char **argv)
 	int fault_mode = argc == 2 && !strcmp(argv[1], "--fault");
 	int event_mode = argc == 2 && !strcmp(argv[1], "--events");
 	int discovery_mode = argc == 2 && !strcmp(argv[1], "--discovery");
-	if (argc != 1 && !fault_mode && !event_mode && !discovery_mode)
+	int management_test = argc == 2 && !strcmp(argv[1], "--owners");
+	if (argc != 1 && !fault_mode && !event_mode && !discovery_mode && !management_test)
 		return 2;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -718,7 +931,8 @@ int main(int argc, char **argv)
 	if (fault_mode) {
 		struct sle_dli_cmd cmd = { .opcode = 0x0406, .param_len = 1 };
 		if (exercise(b, &b_info) ||
-		    ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||
+		    management_mode(a, a_gen, SLE_MANAGEMENT_DIAGNOSTIC) ||
+            ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||
 		    mask_wait(control, 2) || stale(a) ||
 		    same(b, &b_info, b_gen) || query(b, &b_info, 0x0406, 0))
 			goto out;
@@ -750,6 +964,7 @@ int main(int argc, char **argv)
 		}
 		if (failed)
 			goto out;
+		if (management_test && management_gate(&a, a_gen, &a_info)) goto out;
 		if (event_mode && (events_gate(a, readers[0], &a_info, a_gen) ||
 				   events_gate(b, readers[1], &b_info, b_gen)))
 			goto out;
@@ -783,6 +998,7 @@ int main(int argc, char **argv)
 			goto out;
 		puts("NATIVE_EVENTS_REPLUG: seq=9 lost=8 old_hup=1 new_generation=1");
 	}
+	if (management_test && management_replug_gate(&replacement, replacement_gen, &replacement_info)) goto out;
 	if (discovery_mode) {
 		struct sle_discovery_result fresh;
 		if (discovery_read(replacement, 0, 0, &fresh) ||
