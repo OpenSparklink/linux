@@ -83,6 +83,10 @@ if [ "$SPARKLINK_TEST_MANAGEMENT_HANDOFF" = 1 ]; then
     ctl --adapter "$second" scan on > /tmp/handoff-scan || fail 'handoff scanner'
     /bin/daemon-management "$replacement" held advertising || fail 'advertising owner'
     /bin/daemon-management "$second" held scanning || fail 'scanning owner'
+    if [ "$SPARKLINK_TEST_DIAGNOSTIC_TOOLS" = 1 ]; then
+        . /bin/test-diagnostic
+        tool_managed "$replacement"
+    fi
     kill -TERM "$pid"
 else
     kill -INT "$pid"
@@ -97,6 +101,9 @@ if [ "$SPARKLINK_TEST_MANAGEMENT_HANDOFF" = 1 ]; then
     /bin/daemon-management "$replacement" free off || fail 'advertiser not stopped/free'
     /bin/daemon-management "$second" free off || fail 'scanner not stopped/free'
     echo 'DAEMON_MANAGEMENT_RELEASE: signal=TERM retained_fd=2 actual_stop=2 free=2'
+    if [ "$SPARKLINK_TEST_DIAGNOSTIC_TOOLS" = 1 ]; then
+        tool_released "$replacement" "$second"
+    fi
     /bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd-restarted.log 2>&1 &
     wait_ready 2
     next_pid=$(pidof slkd)

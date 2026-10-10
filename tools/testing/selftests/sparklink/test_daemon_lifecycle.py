@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 import unittest
-from run_daemon_lifecycle import assess, assess_radio, assess_management
+from run_daemon_lifecycle import assess, assess_radio, assess_management, assess_diagnostic
 
 
 def view(index, generation):
@@ -69,6 +69,34 @@ class ManagementVerdict(unittest.TestCase):
     def test_observation_outside_phase(self):
         line = next(x for x in self.good.splitlines() if x.startswith('DAEMON_MANAGEMENT_OBSERVE:')) + '\n'
         self.assertTrue(assess_management(line + self.good.replace(line,'',1)))
+
+
+class DiagnosticVerdict(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        ManagementVerdict.setUpClass()
+        pre = ('TOOL_DIAGNOSTIC_BEGIN\nTOOL_DIAGNOSTIC_DENIALS: index=0 generation=3 managed_busy=1 uid1000_caps0=1 schema=2 stale=1 legacy_reset=1 no_admission=1 observer=1\n')
+        out = []
+        for i,g in [(0,3),(1,2)]:
+            out.append(f'TOOL_DIAGNOSTIC_SEED: index={i} generation={g} baseline_empty=1 unread_query=1')
+            for seq,(op,drained,data) in enumerate([('0403',2,'02'*10),('0406',0,'027300000002'),('0404',0,'0201000120'),('0402',0,'fe0005000000')],2):
+                out.append(f'NativeDiagnosticQuery: index={i} generation={g} opcode=0x{op} admission_seq={seq} status=0x00 drained={drained} data={data}')
+        out.append('TOOL_DIAGNOSTIC_END: queried=2 queries=8 stale_commands=2 stale_pairs=2 free=2')
+        cls.good = ManagementVerdict.good.replace('DAEMON_MANAGEMENT_RELEASE:',pre+'DAEMON_MANAGEMENT_RELEASE:',1).replace('DAEMON_MANAGEMENT_RESTART:','\n'.join(out)+'\nDAEMON_MANAGEMENT_RESTART:',1)
+
+    def test_complete(self): self.assertEqual(assess(self.good,0,management_handoff=True,diagnostic_tools=True),[])
+    def test_unrequested(self): self.assertTrue(assess(self.good,0,management_handoff=True))
+    def test_missing_denials(self): self.assertTrue(assess_diagnostic(self.good.replace('managed_busy=1','managed_busy=0')))
+    def test_stale_reply(self): self.assertTrue(assess_diagnostic(self.good.replace('drained=2','drained=0',1)))
+    def test_wrong_controller(self): self.assertTrue(assess_diagnostic(self.good.replace('opcode=0x0406 admission_seq=3 status=0x00 drained=0 data=027300000002','opcode=0x0406 admission_seq=3 status=0x00 drained=0 data=027300000001',1)))
+    def test_short_features(self): self.assertTrue(assess_diagnostic(self.good.replace('data='+'02'*10,'data='+'02'*9,1)))
+    def test_failed_status(self): self.assertTrue(assess_diagnostic(self.good.replace('status=0x00','status=0xfd',1)))
+    def test_generation(self): self.assertTrue(assess_diagnostic(self.good.replace('NativeDiagnosticQuery: index=0 generation=3','NativeDiagnosticQuery: index=0 generation=1',1)))
+    def test_sequence_reuse(self): self.assertTrue(assess_diagnostic(self.good.replace('admission_seq=3','admission_seq=2',1)))
+    def test_query_before_release(self):
+        line=next(x for x in self.good.splitlines() if x.startswith('NativeDiagnosticQuery:'))+'\n'
+        self.assertTrue(assess_diagnostic(line+self.good.replace(line,'',1)))
+    def test_duplicate(self): self.assertTrue(assess_diagnostic(self.good+'TOOL_DIAGNOSTIC_BEGIN\n'))
 
 
 class RadioVerdict(unittest.TestCase):

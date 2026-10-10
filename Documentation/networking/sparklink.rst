@@ -1978,6 +1978,20 @@ the same generations without USB removal; SIGINT then relinquishes both again.
 This is successful cleanup integration, not physical RF, daemon failure recovery,
 or migration of the legacy profile-zero ownership contract.
 
+Adding ``--diagnostic-tools`` runs the actual slkconfig executable in that gate.
+Per-device CLI operations require explicit affinity; native offline queries also
+require the observed generation and a Diagnostic lease. Selected observations
+remain available to the ordinary application without ownership. Managed conflict,
+missing affinity/generation, stale generation, capability denial and unsupported
+native legacy Reset cannot admit a command. A C owner creates an unread query
+after draining old management projections; slkconfig then discards its historical
+Status/Complete pair (and possible credit notification), completes four restricted
+queries on each registration and releases ownership before daemon succession.
+Legacy raw poll records contain no reply sequence: admission sequence is reported
+as admission only. Exclusive ownership, an empty baseline and one in-flight query
+establish provenance. Success Status is not completion; Host alone owns credits.
+These synthetic gates do not prove physical RF or migrate all tools/bindings.
+
 sparklink_ctl
 -------------
 

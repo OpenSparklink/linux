@@ -43,7 +43,7 @@ def copy_elf(source, target, root):
             shutil.copy2(path, dest)
 
 
-def assess(console, code, radio=False, production_policy=False, kernel_authorization=False, management_handoff=False):
+def assess(console, code, radio=False, production_policy=False, kernel_authorization=False, management_handoff=False, diagnostic_tools=False):
     errors = []
     if code:
         errors.append(f'QEMU exit {code}')
@@ -53,7 +53,7 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors.append('userspace runtime panic')
     if 'DAEMON_FAILURE:' in console:
         errors.append('guest assertion failed')
-    if re.search(r'/bin/(?:test-daemon|test-radio):[^\n]*not found', console):
+    if re.search(r'/bin/(?:test-daemon|test-radio|test-diagnostic):[^\n]*not found', console):
         errors.append('guest shell dependency missing')
     markers = re.findall(r'^DAEMON_(UID: 1000|ADD_SECOND|REMOVE_FIRST|STALE_SELECTION: rejected|READD_FIRST|HOTPLUG: independent=2 same_process=1 new_generation=1|LIFECYCLE: PASS)$', console, re.M)
     if markers != ['UID: 1000', 'ADD_SECOND', 'REMOVE_FIRST', 'STALE_SELECTION: rejected',
@@ -110,6 +110,48 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors += assess_management(console)
     elif 'DAEMON_MANAGEMENT_' in console:
         errors.append('unexpected management handoff evidence')
+    if diagnostic_tools:
+        errors += assess_diagnostic(console)
+    elif 'TOOL_DIAGNOSTIC_' in console or 'NativeDiagnosticQuery:' in console:
+        errors.append('unexpected diagnostic tool evidence')
+    return errors
+
+
+def assess_diagnostic(console):
+    errors = []
+    views = re.findall(r'^Adapter /org/sparklink/slk(\d+)_g(\d+):\n  State:       Ready\n  Generation:  \d+\n  Address:     ([0-9A-F:]+)', console, re.M)
+    if len(views) != 5:
+        return ['diagnostic selected identities missing']
+    a,b = views[3],views[4]
+    expected_denial = f'TOOL_DIAGNOSTIC_DENIALS: index={a[0]} generation={a[1]} managed_busy=1 uid1000_caps0=1 schema=2 stale=1 legacy_reset=1 no_admission=1 observer=1'
+    if (re.findall(r'^TOOL_DIAGNOSTIC_DENIALS:.*$',console,re.M) != [expected_denial] or
+        console.count('TOOL_DIAGNOSTIC_') != 5):
+        errors.append('diagnostic denial matrix incomplete or duplicated')
+    seeds = re.findall(r'^TOOL_DIAGNOSTIC_SEED: index=(\d+) generation=(\d+) baseline_empty=1 unread_query=1$',console,re.M)
+    if seeds != [(a[0],a[1]),(b[0],b[1])]: errors.append('diagnostic stale seed identity missing')
+    queries = re.findall(r'^NativeDiagnosticQuery: index=(\d+) generation=(\d+) opcode=0x([0-9a-f]{4}) admission_seq=([1-9][0-9]*) status=0x00 drained=([0-9]+) data=([0-9a-f]+)$',console,re.M)
+    expected = []
+    for i,g,addr in [a,b]:
+        mac = addr.replace(':','').lower()
+        expected += [(i,g,opcode,data) for opcode,data in [
+            ('0403',mac[-2:]*10),('0406',mac),('0404','0201000120'),('0402','fe0005000000')]]
+    if ([(i,g,op,data) for i,g,op,seq,d,data in queries] != expected or
+        console.count('NativeDiagnosticQuery:') != 8):
+        errors.append('diagnostic actual query values/identity/length/drain incomplete')
+    for n,record in enumerate(queries):
+        if int(record[4]) not in ({2,3} if n%4==0 else {0,1}):
+            errors.append('diagnostic stale pair not drained or excessive old replies')
+    for group in [queries[:4],queries[4:]]:
+        if len(group)==4 and [int(x[3]) for x in group] != sorted(set(int(x[3]) for x in group)):
+            errors.append('diagnostic admission sequences reused or reversed')
+    labels = ['DAEMON_MANAGEMENT_BEGIN','TOOL_DIAGNOSTIC_BEGIN',expected_denial,'DAEMON_MANAGEMENT_RELEASE:',
+              'TOOL_DIAGNOSTIC_END: queried=2 queries=8 stale_commands=2 stale_pairs=2 free=2','DAEMON_MANAGEMENT_RESTART:']
+    positions = [console.find(x) for x in labels]
+    if (min(positions)<0 or positions!=sorted(positions) or
+        console.count('TOOL_DIAGNOSTIC_BEGIN')!=1 or console.count(labels[4])!=1):
+        errors.append('diagnostic proof order incomplete')
+    for m in re.finditer(r'^(?:NativeDiagnosticQuery:|TOOL_DIAGNOSTIC_SEED:)',console,re.M):
+        if not positions[3]<m.start()<positions[4]: errors.append('diagnostic query outside release/handoff phase')
     return errors
 
 
@@ -236,9 +278,12 @@ def main():
     p.add_argument('--production-policy', action='store_true', help='installed D-Bus policy, root daemon, uid-1000 control group and uid-1001 observer')
     p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd ioctl/configfs credential-drop matrix')
     p.add_argument('--management-handoff', action='store_true', help='active radio cleanup on SIGTERM, same-generation successor, SIGINT cleanup; NO RF')
+    p.add_argument('--diagnostic-tools', action='store_true', help='actual selected slkconfig observation/denial/exclusive native query and stale-drain gate')
     a = p.parse_args()
     if a.management_handoff and not a.radio_policy:
         p.error('--management-handoff requires --radio-policy')
+    if a.diagnostic_tools and not a.management_handoff:
+        p.error('--diagnostic-tools requires --management-handoff')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     manifest = {'scope': 'actual slkd and uid-1000 slctl on synthetic WS73: no firmware/RF acceptance',
@@ -246,6 +291,7 @@ def main():
                 'production_policy': a.production_policy,
                 'kernel_authorization': a.kernel_authorization,
                 'management_handoff': a.management_handoff,
+                'diagnostic_tools': a.diagnostic_tools,
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
@@ -261,6 +307,8 @@ def main():
             manifest['inputs'].append(file_record(HERE / 'kernel_authorization_test.c'))
         if a.management_handoff:
             manifest['inputs'].append(file_record(HERE / 'daemon_management_test.c'))
+        if a.diagnostic_tools:
+            manifest['inputs'].append(file_record(HERE / 'daemon_diagnostic_guest.sh'))
         tracked = subprocess.check_output(['git', 'ls-files', 'crates', 'Cargo.toml', 'Cargo.lock'],
                                          cwd=userspace, text=True).splitlines()
         # Include untracked new implementation files before committing them.
@@ -273,6 +321,8 @@ def main():
         manifest['userspace_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=userspace, text=True).strip()
         with (output / 'build.log').open('w') as log:
             build = ['cargo', 'build', '-p', 'slkd', '-p', 'slctl']
+            if a.diagnostic_tools:
+                build += ['-p','slkconfig']
             if a.production_policy:
                 build += ['--bins', '--examples']
             subprocess.run(build, cwd=userspace,
@@ -295,6 +345,8 @@ def main():
             (root / 'bin' / name).symlink_to('busybox')
         for name in ['slkd', 'slctl']:
             copy_elf(userspace / 'target/debug' / name, root / 'bin' / name, root)
+        if a.diagnostic_tools:
+            copy_elf(userspace / 'target/debug/slkconfig', root / 'bin/slkconfig', root)
         if a.production_policy:
             copy_elf(userspace / 'target/debug/examples/bus_policy_probe', root / 'bin/bus-policy-probe', root)
             # Additional debug Rust ELF can exhaust a 512M guest's initramfs.
@@ -304,10 +356,17 @@ def main():
             for name in ['slkd', 'slctl', 'bus-policy-probe']:
                 subprocess.run(['strip', '--strip-debug', str(root / 'bin' / name)], check=True)
             manifest['guest_strip_debug'] = True
+        if a.diagnostic_tools:
+            # Always keep the disposable initramfs bounded, including session mode.
+            subprocess.run(['strip','--strip-debug',str(root/'bin/slkconfig')],check=True)
+            manifest['unstripped_diagnostic_program']=file_record(userspace/'target/debug/slkconfig')
+            manifest['guest_diagnostic_strip_debug'] = True
         copy_elf(a.dbus_daemon, root / 'bin/dbus-daemon', root)
         programs = ['slkd', 'slctl', 'dbus-daemon'] + (['bus-policy-probe'] if a.production_policy else []) + (['kernel-authorization'] if a.kernel_authorization else [])
         if a.management_handoff:
             programs.append('daemon-management')
+        if a.diagnostic_tools:
+            programs.append('slkconfig')
         manifest['guest_programs'] = [file_record(root / 'bin' / name) for name in programs]
         for name in ['proc', 'sys', 'dev', 'etc', 'tmp']:
             (root / name).mkdir()
@@ -332,6 +391,8 @@ def main():
         (firmware / 'pm_config.bin').write_bytes(bytes.fromhex('01000000'))
         shutil.copy2(HERE / 'daemon_radio_guest.sh', root / 'bin/test-radio')
         shutil.copy2(HERE / 'daemon_lifecycle_guest.sh', root / 'bin/test-daemon')
+        if a.diagnostic_tools:
+            shutil.copy2(HERE / 'daemon_diagnostic_guest.sh',root/'bin/test-diagnostic')
         (root / 'bin/test-daemon').chmod(0o755)
         (root / 'init').write_text('''#!/bin/sh
 export PATH=/bin
@@ -362,6 +423,8 @@ poweroff -f
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_KERNEL_AUTHORIZATION=1'))
         if a.management_handoff:
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin', 'export PATH=/bin\nexport SPARKLINK_TEST_MANAGEMENT_HANDOFF=1'))
+        if a.diagnostic_tools:
+            f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin','export PATH=/bin\nexport SPARKLINK_TEST_DIAGNOSTIC_TOOLS=1'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -401,7 +464,7 @@ poweroff -f
                 monitor.execute('device_add', dict(id='sle0', port='1', **props))
                 code = process.wait(timeout=30)
             manifest['qemu_exit'] = code
-            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy, a.kernel_authorization, a.management_handoff)
+            errors = assess(console.read_text(errors='replace').replace('\r', ''), code, a.radio_policy, a.production_policy, a.kernel_authorization, a.management_handoff, a.diagnostic_tools)
             if errors:
                 raise RuntimeError('; '.join(errors))
         manifest['status'] = 'PASS'
