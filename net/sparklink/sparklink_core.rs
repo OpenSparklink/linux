@@ -498,11 +498,15 @@ impl ControllerState {
         }
     }
 
-    pub(crate) fn pop_dli_event(&mut self) -> Option<SleDliEvent> {
+    pub(crate) fn peek_dli_event(&self) -> Option<SleDliEvent> {
         if self.dli_head == self.dli_tail {
             return None;
         }
-        let ev = self.dli_ring[self.dli_head];
+        Some(self.dli_ring[self.dli_head])
+    }
+
+    pub(crate) fn pop_dli_event(&mut self) -> Option<SleDliEvent> {
+        let ev = self.peek_dli_event()?;
         self.dli_head = (self.dli_head + 1) % DLI_RING_SIZE;
         Some(ev)
     }
@@ -3262,6 +3266,29 @@ fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, 
     Ok(0)
 }
 
+/// Transitional legacy delivery. Keep the selected controller's state lock
+/// through copy and commit, so neither a competing consumer nor ring overflow
+/// can replace the copied head. A backend event is staged in the same ring
+/// before usercopy; EFAULT must not lose an already-consumed backend reply.
+/// This shared projection still needs removal after subscriber migration.
+#[inline(never)]
+fn ioctl_legacy_dli_poll(context: &RuntimeContext, arg: usize) -> Result<isize> {
+    let mut guard = context.lock()?;
+    let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+    let event = match state.peek_dli_event() {
+        Some(event) => event,
+        None => {
+            let event = state.controller.poll_event().ok_or(EAGAIN)?;
+            let wire = sle_dli_event_to_wire(&event);
+            state.push_dli_event(wire);
+            wire
+        }
+    };
+    write_user_struct(arg, &event)?;
+    let _ = state.pop_dli_event();
+    Ok(0)
+}
+
 #[inline(never)]
 fn ioctl_snoop_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     let mut query: SleSnoopQuery = read_user_struct(arg)?;
@@ -3529,24 +3556,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             write_user_struct(arg, &info)?;
             Ok(0)
         }
-        SL_IOCTL_DLI_POLL_EVENT => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            if let Some(dli_ev) = s.pop_dli_event() {
-                drop(ss);
-                write_user_struct(arg, &dli_ev)?;
-                return Ok(0);
-            }
-            match s.controller.poll_event() {
-                Some(ev) => {
-                    let dli_ev = sle_dli_event_to_wire(&ev);
-                    drop(ss);
-                    write_user_struct(arg, &dli_ev)?;
-                    Ok(0)
-                }
-                None => Err(EAGAIN),
-            }
-        }
+        SL_IOCTL_DLI_POLL_EVENT => ioctl_legacy_dli_poll(context, arg),
         SL_IOCTL_DLI_RESET => {
             let mut ss = context.lock()?;
             let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
