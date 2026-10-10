@@ -1063,3 +1063,40 @@ explicitly ``physical_acceptance=false``; .1 retained 111 and .3 retained 110,
 with board configuration NOT_ASSERTED. Original physical survivor shutdown,
 missing port .4, native-host comparisons, real runtime-fault RF recovery,
 chip/port-power reset and four-device parallelism remain open.
+
+USB-host autoscan reentrancy and enumeration failure
+--------------------------------------------------
+
+The development QEMU overlay now serializes autoscan invocations. Closing an
+absent object used to call autoscan recursively, clear the survivor's ``seen``
+and return to an outer loop that then closed/reopened the survivor. A negative
+libusb device-list result also used to close all existing objects. The new
+``usb-host-autoscan.patch`` leaves outer counters intact and retains existing
+handles on an enumeration failure; it does not reset or detach hardware.
+
+Compile the actual production autoscan/close bodies with counted mocks::
+
+  python3 tools/testing/selftests/sparklink/qemu-sle-dli/check-usb-host-autoscan.py \
+    --source <qemu-source>/hw/usb/host-libusb.c --output <new-directory>
+
+The same harness on the saved old source fails missing-A and negative-list
+cases, closing both A and B; the patched source passes all six cases and closes
+only A. Initialization retry, pause, normal scan and isolated reenumeration
+remain covered. Patch fresh/idempotent/drift rejection and paused QMP probes
+are separate gates. This is a deterministic QEMU bookkeeping counterexample,
+not a physical RF or unplug test. The old physical capture's A IN -71 followed
+by B IN -108 about 1.79 seconds later is consistent with the 2-second autoscan
+path; repaired physical unplug still needs testing before root-cause closure.
+
+Read-only host diagnosis is provided in the companion repository by
+``tools/ws73_host_diagnostics.py``. Journal evidence places missing physical
+port .4's address93--96 failures before this driver's probe. Port state/default
+and zero over-current do not prove electrical health or independent port-power
+capability. Direct dmesg access is restricted, but kernel journal is readable.
+Shared xHCI errors are preserved without inventing a single-device owner.
+
+New-QEMU validation reuses kernel97: 13 Runtime gates, 292 harness tests and
+108 companion-tool tests pass, together with 22 ordinary-user dual real-WS73
+QMP support RF rounds. Original physical isolation, native-host deployment,
+missing-device recovery and four-device matrix remain open; no new kernel or
+physical North Star completion is asserted.

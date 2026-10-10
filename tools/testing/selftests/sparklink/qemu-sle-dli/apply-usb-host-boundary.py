@@ -27,7 +27,7 @@ def apply_one(source, name):
 
 def apply(source):
     for name in ['usb-host-boundary.patch', 'usb-host-retry.patch',
-                 'usb-host-reenumeration.patch']:
+                 'usb-host-reenumeration.patch', 'usb-host-autoscan.patch']:
         apply_one(source, name)
 
 

@@ -207,7 +207,8 @@ int main(void)
     (args.output/'guards.log').write_text(result)
     print(result,end='')
     patches = [Path(__file__).with_name(name).resolve() for name in
-               ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch']]
+               ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
+                'usb-host-autoscan.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -219,6 +220,11 @@ int main(void)
             subprocess.run(command,cwd=tree,stdout=log,stderr=subprocess.STDOUT,check=True)
         assert copy.read_bytes()==host.read_bytes()
         copy.write_text(copy.read_text().replace('allow_host_reset, true','unexpected_drift, true',1))
+        drift=copy.read_bytes()
+        denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
+        assert denied.returncode!=0 and copy.read_bytes()==drift
+        copy.write_text(host.read_text().replace('usb_auto_check_running = true;',
+                                                'usb_auto_check_running = false;',1))
         drift=copy.read_bytes()
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
@@ -234,7 +240,7 @@ int main(void)
         assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
              'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'reenumeration_cases':6,
-             'host_lifecycle_sites':3,'patch_cases':5,
+             'host_lifecycle_sites':3,'patch_cases':6,
              'source_sha256':hashlib.sha256(host.read_bytes()).hexdigest(),
              'production_sha256':hashlib.sha256(production.encode()).hexdigest()}
     if args.qemu:
