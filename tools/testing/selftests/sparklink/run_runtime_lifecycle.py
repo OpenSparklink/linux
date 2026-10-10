@@ -120,6 +120,11 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
         errors.append('missing, duplicate or unexpected native discovery proof')
     if len(re.findall(r'^NATIVE_DISCOVERY:', console, re.MULTILINE)) != len(discovery_proofs):
         errors.append('malformed native discovery proof')
+    states = re.findall(r'^NATIVE_CONTROLLER_STATE: index=(\d+) setup_then_ready=1 version=5 features=80$', console, re.MULTILINE)
+    if sorted(states) != (['0', '1'] if discovery else []):
+        errors.append('missing, duplicate or unexpected controller readiness proof')
+    if console.count('NATIVE_CONTROLLER_FAULT: index=0 ready_cleared=1 errno=110') != int(discovery):
+        errors.append('missing/duplicate/unexpected Ready fault clearing')
     timeout = 'NATIVE_DISCOVERY_TIMEOUT: index=0 errno=110 radio_unknown=1'
     replug_discovery = 'NATIVE_DISCOVERY_REPLUG: fault_reset=1 old_generation=1'
     if console.count(timeout) != int(discovery) or console.count(replug_discovery) != int(discovery):

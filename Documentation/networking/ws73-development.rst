@@ -559,3 +559,48 @@ already running, and does not prove SLE readiness, DLI transactions, pairing
 or RF traffic. Use the download messages and the pre-run inventory to confirm
 the boot-to-runtime path. The initial implementation has no runtime PM or
 automatic firmware retry; failures expose ``boot_error`` on the interface.
+
+Controller snapshot and dynamic daemon (partial North Star work)
+---------------------------------------------------------------
+
+``CONTROLLER_SNAPSHOT`` (0x8a, 64 bytes, version 1) requires DEV_SELECT
+on the calling fd. generation zero probes that registration; a nonzero value
+must match. Input flags and reserved bytes must be zero. Returned fields
+include registration generation/index, bus/profile, current Host command
+credits, five version bytes, ten feature bytes, address and buffer capacities.
+``FULL_METADATA`` identifies the actual native query tuple; the legacy profile
+returns projected metadata and never sets that validity bit.
+
+Native Setup becomes Ready only after successful advertising-stop and scan-stop
+Complete events confirm initial off states. A failed Status does not establish
+Ready. Ready persists during subsequent radio operations: it describes Host
+usability, not RF activity, board qualification or calibration validity. A
+latched Host fault clears Ready and returns Fault plus the negative errno.
+Unplug invalidates selected fds and generation-specific queries with ENODEV.
+The registration/debugfs transport SETUP flag remains a bootstrap-stage marker;
+the new snapshot is the authority for Host readiness.
+
+slkd now enumerates the allocated-device mask, independently selects each
+registration for control and event fds, and publishes generation-specific paths
+``/org/sparklink/slk<ID>_g<GENERATION>``. It can start with no controllers and
+remove/recreate adapters without restarting. Native initialization submits the
+two typed stops and waits for their matching result records without holding
+business-state or directory locks. Native event subscriptions preserve complete
+WS73 report headers/data and explicit loss independently of the legacy ring.
+Native SSAP profiles and the legacy scan command are unsupported until their
+native policies/backends exist; metadata Ready does not imply that those
+features are implemented.
+
+The reproducible software integration gate is::
+
+  python3 tools/testing/selftests/sparklink/run_daemon_lifecycle.py \
+    --kernel-build <build-dir> --qemu <model-enabled-qemu> \
+    --busybox <static-busybox> --userspace <sparklink-checkout> \
+    --dbus-daemon <dbus-daemon> --output <new-evidence-directory>
+
+It runs actual slkd/slctl binaries as guest uid 1000 against synthetic WS73 USB
+controllers, verifies independent Ready, survivor identity, rejected stale
+selection, new generation and the same daemon process after hotplug, and saves
+source/image/program hashes, QMP traffic and complete kernel logs. It is not
+real WS73 firmware execution or RF/no-sudo acceptance on the user's machine.
+The original North Star criteria and full S0--S6 issues remain open.

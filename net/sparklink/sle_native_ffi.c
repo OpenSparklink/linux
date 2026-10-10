@@ -16,6 +16,7 @@ static_assert(offsetof(struct sle_controller_event, payload) == 48);
 static_assert(sizeof(struct sle_controller_event_query) == 360);
 static_assert(offsetof(struct sle_controller_event_query, event) == 24);
 
+static_assert(sizeof(struct sle_controller_snapshot) == 64);
 static_assert(sizeof(struct sle_discovery_submit) == 704);
 static_assert(sizeof(struct sle_discovery_result) == 64);
 static_assert(sizeof(struct sparklink_discovery_plan) == 1052);

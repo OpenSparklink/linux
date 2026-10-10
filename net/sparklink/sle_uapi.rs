@@ -3052,3 +3052,39 @@ const _: () = assert!(core::mem::size_of::<SleDiscoverySubmit>() == 704);
 const _: () = assert!(core::mem::offset_of!(SleDiscoverySubmit, data) == 200);
 const _: () = assert!(core::mem::size_of::<SleDiscoveryResult>() == 64);
 const _: () = assert!(core::mem::offset_of!(SleDiscoveryResult, dev_index) == 52);
+
+pub(crate) const SL_IOCTL_CONTROLLER_SNAPSHOT: u32 = _IOWR::<SleControllerSnapshot>(SL_MAGIC, 0x8a);
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleControllerSnapshot {
+    pub generation: u64,
+    pub version: u32,
+    pub flags: u32,
+    pub profile: u32,
+    pub valid_fields: u32,
+    pub dev_index: u16,
+    pub bus: u8,
+    pub command_credits: u8,
+    pub acb_length: u16,
+    pub icb_length: u16,
+    pub acb_count: u8,
+    pub icb_count: u8,
+    pub version_tuple: [u8; 5],
+    pub features: [u8; 10],
+    pub address: [u8; 6],
+    pub reserved_byte: u8,
+    pub error: i32,
+    pub reserved: [u8; 4],
+}
+// SAFETY: integer-only repr(C) type; every bit pattern is valid.
+unsafe impl FromBytes for SleControllerSnapshot {}
+impl CheckReserved for SleControllerSnapshot {
+    fn check_reserved(&self) -> Result {
+        if self.reserved_byte != 0 || self.reserved != [0; 4] {
+            Err(EINVAL)
+        } else {
+            Ok(())
+        }
+    }
+}
+const _: () = assert!(core::mem::size_of::<SleControllerSnapshot>() == 64);

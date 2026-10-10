@@ -133,7 +133,10 @@ class NativeFaultVerdict(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
-DISCOVERY = ("NATIVE_DISCOVERY: index=0 cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n"
+DISCOVERY = ("NATIVE_CONTROLLER_STATE: index=0 setup_then_ready=1 version=5 features=80\n"
+             "NATIVE_CONTROLLER_STATE: index=1 setup_then_ready=1 version=5 features=80\n"
+             "NATIVE_CONTROLLER_FAULT: index=0 ready_cleared=1 errno=110\n"
+             "NATIVE_DISCOVERY: index=0 cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n"
              "NATIVE_DISCOVERY: index=1 cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n"
              "NATIVE_DISCOVERY_TIMEOUT: index=0 errno=110 radio_unknown=1\n")
 DISCOVERY_GOOD = GOOD.replace('NATIVE_REMOVE_FIRST', DISCOVERY + 'NATIVE_REMOVE_FIRST').replace(

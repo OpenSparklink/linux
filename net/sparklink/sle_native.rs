@@ -110,6 +110,16 @@ impl NativeController {
         if ret < 0 { Err(Error::from_errno(ret)) } else { Ok(()) }
     }
 
+    pub(crate) fn fill_snapshot(&self, out: &mut super::sle_uapi::SleControllerSnapshot) {
+        out.valid_fields = 1;
+        out.version_tuple = self.metadata.version;
+        out.features = self.metadata.features;
+        out.address = self.metadata.address;
+        out.acb_length = self.metadata.acb_length;
+        out.icb_length = self.metadata.icb_length;
+        out.acb_count = self.metadata.acb_count;
+        out.icb_count = self.metadata.icb_count;
+    }
     pub(crate) fn prepare_discovery(&self, request: &SleDiscoverySubmit) -> Result<KBox<NativeDiscoveryPlan>> {
         let mut plan = KBox::init(init!(NativeDiscoveryPlan {
             operation: 0, count: 0, power_step: 0,

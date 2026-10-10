@@ -459,6 +459,26 @@ static int discovery_do(int fd, unsigned long long gen, unsigned int op,
 		return fail("actual selected power/full recipe");
 	return 0;
 }
+static int controller_snapshot(int fd, unsigned long long gen,
+                               const struct sci_dev_info *info,
+                               unsigned int expected, int expected_error)
+{
+    struct sle_controller_snapshot out = { .version = 1, .generation = gen };
+    const unsigned char version[5] = { 2, 1, 0, 1, 0x20 };
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &out) || out.generation != gen ||
+        out.version != 1 || out.profile != 1 || out.dev_index != info->index ||
+        out.flags != expected || out.error != expected_error || out.valid_fields != 1 ||
+        memcmp(out.version_tuple, version, 5) || memcmp(out.address, info->addr, 6) ||
+        out.acb_length != 254 || out.icb_length || out.acb_count != 5 || out.icb_count ||
+        out.reserved_byte || memcmp(out.reserved, "\0\0\0\0", 4))
+        return fail("complete controller snapshot metadata/state/error");
+    /* Synthetic query fixture returns this owner's serial in all ten bytes. */
+    for (unsigned int i = 0; i < 10; i++)
+        if (out.features[i] != info->addr[5])
+            return fail("all ten feature bytes queried for selected owner");
+    return 0;
+}
+
 static int discovery_gate(int fd, unsigned long long gen,
 			  const struct sci_dev_info *info)
 {
@@ -468,8 +488,11 @@ static int discovery_gate(int fd, unsigned long long gen,
 	    result.profile != 1 || result.dev_index != info->index ||
 	    result.radio_adv || result.radio_scan || result.flags)
 		return fail("initial identity/unknown radio probe");
-	if (discovery_do(fd, gen, 2, info, &result) ||
-	    discovery_do(fd, gen, 4, info, &result))
+	if (controller_snapshot(fd, gen, info, SLE_CONTROLLER_SETUP, 0) ||
+	    discovery_do(fd, gen, 2, info, &result) ||
+	    controller_snapshot(fd, gen, info, SLE_CONTROLLER_SETUP, 0) ||
+	    discovery_do(fd, gen, 4, info, &result) ||
+	    controller_snapshot(fd, gen, info, SLE_CONTROLLER_READY, 0))
 		return -1;
 	for (int round = 0; round < 5; round++) {
 		if (discovery_do(fd, gen, 1, info, &result) ||
@@ -563,6 +586,13 @@ static int discovery_gate(int fd, unsigned long long gen,
 	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &raw) != -1 ||
 	    errno != EOPNOTSUPP || query(fd, info, 0x0406, 0))
 		return fail("typed support never broadens raw whitelist");
+	struct sle_controller_snapshot invalid = { .version = 1, .reserved_byte = 1 };
+	if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &invalid) != -1 || errno != EINVAL)
+		return fail("snapshot reserved byte rejected");
+	invalid = (struct sle_controller_snapshot){ .version = 1, .generation = gen + 1000 };
+	if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &invalid) != -1 || errno != ENODEV)
+		return fail("snapshot generation rejected");
+	printf("NATIVE_CONTROLLER_STATE: index=%u setup_then_ready=1 version=5 features=80\n", info->index);
 	printf("NATIVE_DISCOVERY: index=%u cycles=5 failures=4 stop_failure=1 cancel=1 power=-42 snapshots=1 raw_reject=1 no_rsp=1\n",
 	       info->index);
 	return 0;
@@ -584,6 +614,9 @@ static int discovery_timeout(int fd, unsigned long long gen,
 	if (ioctl(fd, SL_IOCTL_DISCOVERY_SUBMIT, &r) != -1 ||
 	    errno != ETIMEDOUT)
 		return fail("fault cannot invent credits/recover silently");
+	if (controller_snapshot(fd, gen, info, SLE_CONTROLLER_FAULT, -ETIMEDOUT))
+		return -1;
+	puts("NATIVE_CONTROLLER_FAULT: index=0 ready_cleared=1 errno=110");
 	puts("NATIVE_DISCOVERY_TIMEOUT: index=0 errno=110 radio_unknown=1");
 	return 0;
 }
@@ -611,6 +644,9 @@ int main(int argc, char **argv)
 	if (!fault_mode)
 		puts("NATIVE_RAW_STATUS: fe preserved");
 	if (discovery_mode) {
+		struct sle_controller_snapshot unselected = { .version = 1 };
+		if (ioctl(control, SL_IOCTL_CONTROLLER_SNAPSHOT, &unselected) != -1 || errno != EINVAL)
+			goto out;
 		struct sle_discovery_result unbound = { .version = 1 };
 		if (ioctl(control, SL_IOCTL_DISCOVERY_RESULT, &unbound) != -1 ||
 		    errno != EINVAL)

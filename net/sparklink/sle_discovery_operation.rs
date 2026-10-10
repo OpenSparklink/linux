@@ -48,6 +48,7 @@ pub(crate) enum AdmissionError {
 pub(crate) struct Operations {
     pub(crate) entries: [Option<Operation>; CAPACITY],
     // 0 unknown, 1 confirmed off, 2 confirmed on. Never mark off on submit.
+    pub(crate) initialized: bool,
     pub(crate) advertising: u32,
     pub(crate) scanning: u32,
 }
@@ -57,6 +58,7 @@ impl Operations {
     pub(crate) const fn new() -> Self {
         Self {
             entries: [None; CAPACITY],
+            initialized: false,
             advertising: 0,
             scanning: 0,
         }
@@ -193,11 +195,15 @@ impl Operations {
                 DiscoveryIntent::Advertising(_) => self.advertising = radio,
                 DiscoveryIntent::Scanning(_) => self.scanning = radio,
             }
+            if self.advertising == 1 && self.scanning == 1 {
+                self.initialized = true;
+            }
         } else {
             op.state = State::Queued;
         }
     }
     pub(crate) fn fault(&mut self, error: i32) {
+        self.initialized = false;
         self.advertising = 0;
         self.scanning = 0;
         for op in self.entries.iter_mut().flatten() {

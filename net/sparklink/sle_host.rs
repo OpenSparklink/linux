@@ -63,6 +63,7 @@ impl CommandHost {
             recipe: None,
                 operations <- init!(Operations {
                     entries <- pin_init::init_array_from_fn(|_| None),
+                    initialized: false,
                     advertising: 0,
                     scanning: 0,
                 }),
@@ -148,6 +149,14 @@ impl CommandHost {
             power_step, selected_power: None,
         });
         Ok(())
+    }
+
+    pub(crate) fn controller_status(&self) -> (u8, bool, Option<Error>) {
+        (
+            self.credits,
+            self.operations.initialized && self.fault.is_none(),
+            self.fault,
+        )
     }
 
     pub(crate) fn discovery_result(&self, request_id: u64) -> Option<Operation> {

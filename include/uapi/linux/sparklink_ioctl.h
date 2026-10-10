@@ -551,6 +551,39 @@ struct sle_mgmt_stats {
 #define SL_IOCTL_DISCOVERY_SUBMIT _IOW(SL_MAGIC, 0x88, struct sle_discovery_submit)
 #define SL_IOCTL_DISCOVERY_RESULT _IOWR(SL_MAGIC, 0x89, struct sle_discovery_result)
 
+/* Explicitly selected registration. Native Ready means actual metadata and
+ * both initialization stop operations completed, with no Host fault. It is
+ * not an RF/calibration attestation. valid_fields bit 0 identifies the full
+ * queried native tuple; profile 0 supplies only legacy projected information.
+ */
+#define SLE_CONTROLLER_SNAPSHOT_VERSION 1U
+#define SLE_CONTROLLER_READY 1U
+#define SLE_CONTROLLER_SETUP 2U
+#define SLE_CONTROLLER_FAULT 4U
+#define SLE_CONTROLLER_FULL_METADATA 1U
+struct sle_controller_snapshot {
+	__aligned_u64 generation;
+	__u32 version;
+	__u32 flags;
+	__u32 profile;
+	__u32 valid_fields;
+	__u16 dev_index;
+	__u8 bus;
+	__u8 command_credits;
+	__u16 acb_length;
+	__u16 icb_length;
+	__u8 acb_count;
+	__u8 icb_count;
+	__u8 version_tuple[5];
+	__u8 features[10];
+	__u8 address[6];
+	__u8 reserved_byte;
+	__s32 error;
+	__u8 reserved[4];
+};
+#define SL_IOCTL_CONTROLLER_SNAPSHOT _IOWR(SL_MAGIC, 0x8a, struct sle_controller_snapshot)
+
+
 /* --- PHY layer ---------------------------------------------------------- */
 
 struct sle_phy_info {

@@ -3173,6 +3173,62 @@ fn discovery_owner(context: &RuntimeContext, me: Pin<&SparkLinkCtl>) -> Result<A
     Ok(owner.clone())
 }
 
+/// Snapshot needs explicit affinity for every profile; release registry before
+/// touching protocol state. Metadata remains available after an owner fault.
+#[inline(never)]
+fn ioctl_controller_snapshot(
+    context: &RuntimeContext,
+    me: Pin<&SparkLinkCtl>,
+    arg: usize,
+) -> Result<isize> {
+    let input: SleControllerSnapshot = read_user_struct(arg)?;
+    if input.version != 1 {
+        return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+    }
+    if input.flags != 0 {
+        return Err(EINVAL);
+    }
+    let selected = me.target.lock().clone().ok_or(EINVAL)?;
+    let owner = context.owner.as_ref().ok_or(ENODEV)?;
+    if selected.identity != owner.identity
+        || (input.generation != 0 && input.generation != owner.identity.generation)
+    {
+        return Err(ENODEV);
+    }
+    let guard = context.lock()?;
+    let state = guard.as_ref().ok_or(ENODEV)?;
+    // SAFETY: integer-only ABI, initializes padding and every output byte.
+    let mut out: SleControllerSnapshot = unsafe { core::mem::zeroed() };
+    out.version = 1;
+    out.generation = owner.identity.generation;
+    out.dev_index = owner.identity.id;
+    out.profile = owner.protocol_profile;
+    out.bus = state.controller.info().bus as u8;
+    let (credits, native_ready, fault) = owner.host.lock().controller_status();
+    out.command_credits = credits;
+    match &state.controller {
+        sle_dli::ControllerBackend::Ws73(controller) => {
+            controller.fill_snapshot(&mut out);
+            out.flags = if native_ready { 1 } else { 2 };
+        }
+        _ => {
+            let info = state.controller.info();
+            out.address = info.addr;
+            out.version_tuple[..4].copy_from_slice(&info.fw_version.to_le_bytes());
+            out.features[..8].copy_from_slice(&info.features.to_le_bytes());
+            out.features[8..].copy_from_slice(&info.features_ext.to_le_bytes());
+            out.flags = 1; // legacy Runtime availability, not full queried metadata
+        }
+    }
+    if let Some(error) = fault {
+        out.flags = 4;
+        out.error = error.to_errno();
+    }
+    drop(guard);
+    write_user_struct(arg, &out)?;
+    Ok(0)
+}
+
 /// Explicit host fields and unused bytes are checked before any admission.
 fn validate_discovery_submit(request: &SleDiscoverySubmit) -> Result<sle_command_plan::DiscoveryIntent> {
     use sle_command_plan::DiscoveryIntent;
@@ -3297,6 +3353,7 @@ fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, 
 #[inline(never)]
 fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
+        SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
         SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
         SL_IOCTL_CONTROLLER_EVENT_GET => ioctl_controller_event_get(context, me, arg),
@@ -3832,7 +3889,7 @@ impl MiscDevice for SparkLinkCtl {
             }
         };
         let context = &context;
-        if !registration_only && !matches!(cmd, SL_IOCTL_CONTROLLER_EVENT_GET | SL_IOCTL_DISCOVERY_RESULT) {
+        if !registration_only && !matches!(cmd, SL_IOCTL_CONTROLLER_EVENT_GET | SL_IOCTL_DISCOVERY_RESULT | SL_IOCTL_CONTROLLER_SNAPSHOT) {
             Self::sync_power_mode(context)?;
         }
 
@@ -3940,6 +3997,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_EVENT_STATS
             | SL_IOCTL_DLI_INFO
             | SL_IOCTL_CONTROLLER_EVENT_GET
+            | SL_IOCTL_CONTROLLER_SNAPSHOT
             | SL_IOCTL_DISCOVERY_SUBMIT
             | SL_IOCTL_DISCOVERY_RESULT
             | SL_IOCTL_DLI_POLL_EVENT

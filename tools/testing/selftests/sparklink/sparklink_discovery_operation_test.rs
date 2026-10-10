@@ -154,3 +154,27 @@ fn result_reads_are_independent_and_original_power_byte_survives() {
         assert_eq!(o.advertising, 2);
     }
 }
+
+#[test]
+fn readiness_requires_both_confirmed_stops_and_is_cleared_on_fault() {
+    let mut o = Operations::new();
+    assert!(!o.initialized);
+    add(&mut o, 1, I::Advertising(false), 1);
+    o.sent(1, 0, 0xc05);
+    o.reply(1, 0, true, 0, &[], true);
+    assert!(!o.initialized);
+    add(&mut o, 2, I::Scanning(false), 1);
+    o.sent(2, 0, 0x1002);
+    o.reply(2, 0, true, 0xfd, &[], true);
+    assert!(!o.initialized);
+    add(&mut o, 3, I::Scanning(false), 1);
+    o.sent(3, 0, 0x1002);
+    o.reply(3, 0, true, 0, &[], true);
+    assert!(o.initialized);
+    add(&mut o, 4, I::Advertising(true), 1);
+    o.sent(4, 0, 0xc05);
+    o.reply(4, 0, true, 0, &[], true);
+    assert!(o.initialized); // Ready is Host usability, not RF off.
+    o.fault(-110);
+    assert!(!o.initialized);
+}
