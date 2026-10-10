@@ -6,6 +6,7 @@
  */
 #include <crypto/sha2.h>
 #include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/firmware.h>
 #include <linux/hex.h>
 #include <linux/ktime.h>
@@ -21,6 +22,7 @@
 #include "bsle.h"
 #include "dli.h"
 #include "discovery.h"
+#include "recovery.h"
 
 #define WS73_VID		0xffff
 #define WS73_PID		0x3733
@@ -49,7 +51,23 @@ enum ws73_stage {
 	WS73_RECOVERY_DRAIN,
 	WS73_RECOVERY_CLOSE,
 	WS73_RECOVERY_WAIT_CLOSE,
+	WS73_RECOVERY_BACKOFF,
+	WS73_NATIVE_READY,
 };
+
+#define WS73_PORTS_MAX 64
+struct ws73_port {
+	struct device *controller;
+	unsigned int bus;
+	char path[16];
+	bool attached;
+	struct ws73_recovery_budget budget;
+};
+/* Keep identity/budget across USB address changes; never evict a failed port.
+ * Holding controller references prevents pointer reuse until module teardown.
+ */
+static DEFINE_MUTEX(ws73_ports_lock);
+static struct ws73_port ws73_ports[WS73_PORTS_MAX];
 
 struct ws73_usb {
 	struct usb_device *udev;
@@ -57,6 +75,12 @@ struct ws73_usb {
 	struct work_struct boot_work;
 	struct work_struct runtime_work;
 	struct work_struct fault_work;
+	struct delayed_work recovery_work;
+	struct delayed_work health_work;
+	struct ws73_port *port;
+	bool recovery_io;
+	u64 boot_deadline_ms;
+	int failure_error;
 	struct kref references;
 	struct mutex phase_lock;
 	struct mutex tx_lock;
@@ -98,6 +122,75 @@ struct ws73_usb {
 	struct ws73_dli_result dli_result;
 };
 
+static struct ws73_port *ws73_port_attach(struct usb_device *udev)
+{
+	struct ws73_port *empty = NULL, *result = ERR_PTR(-ENOSPC);
+	unsigned int i;
+
+	mutex_lock(&ws73_ports_lock);
+	for (i = 0; i < WS73_PORTS_MAX; i++) {
+		struct ws73_port *p = &ws73_ports[i];
+
+		if (!p->controller) {
+			if (!empty)
+				empty = p;
+			continue;
+		}
+		if (p->controller != udev->bus->controller || p->bus != udev->bus->busnum ||
+		    strcmp(p->path, udev->devpath))
+			continue;
+		if (p->attached) {
+			result = ERR_PTR(-EBUSY);
+			goto out;
+		}
+		p->attached = true;
+		result = p;
+		goto out;
+	}
+	if (empty) {
+		if (strscpy(empty->path, udev->devpath, sizeof(empty->path)) < 0) {
+			result = ERR_PTR(-ENAMETOOLONG);
+			goto out;
+		}
+		empty->controller = get_device(udev->bus->controller);
+		empty->bus = udev->bus->busnum;
+		empty->attached = true;
+		result = empty;
+	}
+out:
+	mutex_unlock(&ws73_ports_lock);
+	return result;
+}
+
+static unsigned int ws73_io_timeout(struct ws73_usb *ws, unsigned int requested)
+{
+	unsigned int timeout = requested;
+	u64 now = ktime_to_ms(ktime_get()), deadline = READ_ONCE(ws->boot_deadline_ms);
+
+	if (deadline) {
+		if (now >= deadline)
+			return 0;
+		timeout = min_t(u64, timeout, deadline - now);
+	}
+
+	if (READ_ONCE(ws->recovery_io)) {
+		mutex_lock(&ws73_ports_lock);
+		timeout = ws73_recovery_timeout(&ws->port->budget, now, timeout);
+		mutex_unlock(&ws73_ports_lock);
+	}
+	return timeout;
+}
+
+static int ws73_admit_recovery(struct ws73_usb *ws, int cause, unsigned int *delay)
+{
+	int ret;
+
+	mutex_lock(&ws73_ports_lock);
+	ret = ws73_recovery_admit(&ws->port->budget, ktime_to_ms(ktime_get()), cause, delay);
+	mutex_unlock(&ws73_ports_lock);
+	return ret;
+}
+
 static const struct {
 	const char *name;
 	u32 address;
@@ -126,16 +219,20 @@ static const struct {
 static int ws73_write(struct ws73_usb *ws, const void *data, size_t len)
 {
 	int ret, actual;
+	unsigned int timeout;
 
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken))
 		return -ENODEV;
 	if (!len || len > WS73_FW_CHUNK)
 		return -EINVAL;
+	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
+	if (!timeout)
+		return -ETIMEDOUT;
 	if (data != ws->tx)
 		memcpy(ws->tx, data, len);
 	ret = usb_bulk_msg(ws->udev,
 			   usb_sndbulkpipe(ws->udev, ws->bulk_out),
-			   ws->tx, len, &actual, WS73_TX_TIMEOUT);
+			   ws->tx, len, &actual, timeout);
 	if (ret)
 		return ret;
 	return actual == len ? 0 : -EREMOTEIO;
@@ -144,12 +241,15 @@ static int ws73_write(struct ws73_usb *ws, const void *data, size_t len)
 static int ws73_read(struct ws73_usb *ws, size_t len)
 {
 	int ret, actual;
+	unsigned int timeout = ws73_io_timeout(ws, WS73_RX_TIMEOUT);
 
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken))
 		return -ENODEV;
+	if (!timeout)
+		return -ETIMEDOUT;
 	ret = usb_bulk_msg(ws->udev,
 			   usb_rcvbulkpipe(ws->udev, ws->bulk_in),
-			   ws->rx, len, &actual, WS73_RX_TIMEOUT);
+			   ws->rx, len, &actual, timeout);
 	return ret ? ret : actual;
 }
 
@@ -243,6 +343,18 @@ static void ws73_boot_work(struct work_struct *work)
 	size_t i;
 	int ret = 0;
 
+	WRITE_ONCE(ws->boot_deadline_ms, ktime_to_ms(ktime_get()) + WS73_RECOVERY_TOTAL_MS);
+	mutex_lock(&ws73_ports_lock);
+	if (ws->port->budget.exhausted || ws->port->budget.uploads == WS73_RECOVERY_UPLOAD_LIMIT ||
+	    (ws->port->budget.deadline_ms && ktime_to_ms(ktime_get()) >= ws->port->budget.deadline_ms))
+		ret = -ELOOP;
+	else {
+		ws->port->budget.uploads++;
+		WRITE_ONCE(ws->recovery_io, !!ws->port->budget.deadline_ms);
+	}
+	mutex_unlock(&ws73_ports_lock);
+	if (ret)
+		goto out;
 	WRITE_ONCE(ws->stage, WS73_LOADING);
 	/* Validate all images before the first device write. */
 	for (i = 0; i < ARRAY_SIZE(images); i++) {
@@ -290,9 +402,12 @@ static void ws73_boot_work(struct work_struct *work)
 out:
 	for (i = 0; i < ARRAY_SIZE(images); i++)
 		release_firmware(images[i]);
+	WRITE_ONCE(ws->boot_deadline_ms, 0);
+	WRITE_ONCE(ws->recovery_io, false);
 	if (ret && !READ_ONCE(ws->stopping)) {
 		WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
 		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
+		WRITE_ONCE(ws->failure_error, ret);
 		WRITE_ONCE(ws->last_error, ret);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "boot failed: %d\n", ret);
@@ -318,6 +433,9 @@ static int ws73_runtime_receive(void *context, unsigned int timeout_ms)
 
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken))
 		return -ENODEV;
+	timeout_ms = ws73_io_timeout(ws, timeout_ms);
+	if (!timeout_ms)
+		return -ETIMEDOUT;
 	ret = usb_bulk_msg(ws->udev, usb_rcvbulkpipe(ws->udev, ws->bulk_in),
 			   ws->rx, ws->rx_size, &actual, timeout_ms);
 	return ret ? ret : actual;
@@ -330,6 +448,9 @@ static int ws73_notification(void *context, unsigned int timeout_ms, unsigned in
 
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken))
 		return -ENODEV;
+	timeout_ms = ws73_io_timeout(ws, timeout_ms);
+	if (!timeout_ms)
+		return -ETIMEDOUT;
 	ret = usb_interrupt_msg(ws->udev, usb_rcvintpipe(ws->udev, ws->int_in),
 				ws->notification, sizeof(ws->notification), &actual, timeout_ms);
 	if (ret)
@@ -344,14 +465,18 @@ static int ws73_sle_action(void *context, unsigned int action)
 {
 	struct ws73_usb *ws = context;
 	int ret;
+	unsigned int timeout;
 
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken))
 		return -ENODEV;
+	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
+	if (!timeout)
+		return -ETIMEDOUT;
 	/* H2D_MSG_SLE_OPEN/CLOSE are ordinals 29/30, not bit masks. */
 	put_unaligned_le32(action, ws->tx);
 	ret = usb_control_msg(ws->udev, usb_sndctrlpipe(ws->udev, 0), 0,
 			      USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			      0, 0, ws->tx, 4, WS73_TX_TIMEOUT);
+		      0, 0, ws->tx, 4, timeout);
 	return ret < 0 ? ret : ret == 4 ? 0 : -EREMOTEIO;
 }
 
@@ -415,23 +540,102 @@ static void ws73_native_close(void *context)
 	usb_kill_urb(ws->rx_urb);
 }
 
+static int ws73_runtime_start(struct ws73_usb *ws, bool restore);
+static void ws73_async_failure(struct ws73_usb *ws, int error);
+
 static void ws73_fault_work(struct work_struct *work)
 {
 	struct ws73_usb *ws = container_of(work, struct ws73_usb, fault_work);
+	unsigned int delay = 0;
+	int ret, cause = READ_ONCE(ws->asynchronous_error);
 
+	/* Join the watchdog before taking its mutex. Never wait while holding
+	 * a lock that a running watchdog needs to finish.
+	 */
+	cancel_delayed_work_sync(&ws->health_work);
 	/* Serialize with the bootstrap's registration, never unregister in IRQ. */
 	mutex_lock(&ws->phase_lock);
 	if (!READ_ONCE(ws->stopping)) {
+		/* Bootstrap already recorded its exact failed phase. Do not replace
+		 * that diagnostic with the generic FAILED stage during retirement.
+		 */
+		if (READ_ONCE(ws->stage) != WS73_FAILED) {
+			WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
+			WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
+		}
+		WRITE_ONCE(ws->failure_error, cause);
+		WRITE_ONCE(ws->last_error, cause);
 		if (ws->native_id >= 0) {
 			sparklink_native_unregister(ws->native_id, ws->native_generation);
 			WRITE_ONCE(ws->native_id, -1);
 		}
-		WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
-		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
-		WRITE_ONCE(ws->last_error, READ_ONCE(ws->asynchronous_error));
+		/* unregister joins the old Host/open/send callbacks before these
+		 * URBs and shared buffers can belong to another generation.
+		 */
+		ws73_native_close(ws);
+		usb_free_urb(ws->notification_urb);
+		usb_free_urb(ws->rx_urb);
+		ws->notification_urb = ws->rx_urb = NULL;
+		smp_store_release(&ws->metadata_valid, false);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "native RX stopped: %d\n", ws->last_error);
+		/* A genuine controller error is not a qualified protocol restore. */
+		ret = ws73_admit_recovery(ws, READ_ONCE(ws->controller_error) == 0x100 ? cause : -EIO, &delay);
+		if (!ret) {
+			WRITE_ONCE(ws->stage, WS73_RECOVERY_BACKOFF);
+			dev_info(&ws->intf->dev, "protocol recovery backoff=%u cause=%d\n", delay, cause);
+			schedule_delayed_work(&ws->recovery_work, msecs_to_jiffies(delay));
+		}
 	}
+	mutex_unlock(&ws->phase_lock);
+}
+
+static void ws73_health_work(struct work_struct *work)
+{
+	struct ws73_usb *ws = container_of(to_delayed_work(work), struct ws73_usb, health_work);
+	int health;
+
+	mutex_lock(&ws->phase_lock);
+	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) || ws->native_id < 0)
+		goto out;
+	health = sparklink_native_health(ws->native_id, ws->native_generation);
+	mutex_lock(&ws73_ports_lock);
+	ws73_recovery_observe(&ws->port->budget, ktime_to_ms(ktime_get()), health == 2);
+	mutex_unlock(&ws73_ports_lock);
+	if (health < 0) {
+		ws73_async_failure(ws, health);
+		goto out;
+	}
+	if (health == 2)
+		WRITE_ONCE(ws->stage, WS73_NATIVE_READY);
+	else
+		WRITE_ONCE(ws->stage, WS73_NATIVE_SETUP);
+	if (!READ_ONCE(ws->stopping) && !READ_ONCE(ws->broken))
+		schedule_delayed_work(&ws->health_work, msecs_to_jiffies(1000));
+out:
+	mutex_unlock(&ws->phase_lock);
+}
+
+static void ws73_recovery_work(struct work_struct *work)
+{
+	struct ws73_usb *ws = container_of(to_delayed_work(work), struct ws73_usb, recovery_work);
+	int ret;
+
+	mutex_lock(&ws->phase_lock);
+	if (READ_ONCE(ws->stopping))
+		goto out;
+	WRITE_ONCE(ws->recovery_io, true);
+	WRITE_ONCE(ws->broken, false);
+	WRITE_ONCE(ws->asynchronous_error, 0);
+	ret = ws73_io_timeout(ws, WS73_TX_TIMEOUT) ? ws73_runtime_start(ws, true) : -ETIMEDOUT;
+	mutex_lock(&ws73_ports_lock);
+	ws->port->budget.result = ret;
+	mutex_unlock(&ws73_ports_lock);
+	WRITE_ONCE(ws->recovery_io, false);
+	dev_info(&ws->intf->dev, "protocol recovery result=%d generation=%llu\n", ret, ws->native_generation);
+	if (ret)
+		ws73_async_failure(ws, ret);
+out:
 	mutex_unlock(&ws->phase_lock);
 }
 
@@ -632,9 +836,11 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.send_command = ws73_native_command,
 };
 
-static void ws73_runtime_work(struct work_struct *work)
+/* phase_lock held; previous generation's callbacks/URBs have been joined
+ * before a restore. Query fresh metadata and publish only a new Setup owner.
+ */
+static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 {
-	struct ws73_usb *ws = container_of(work, struct ws73_usb, runtime_work);
 	const struct firmware *custom = NULL, *pm = NULL;
 	struct ws73_bsle_io io = {
 		.context = ws,
@@ -657,7 +863,15 @@ static void ws73_runtime_work(struct work_struct *work)
 	unsigned int credits = 1; /* one probe window after fresh BSLE open */
 	int ret;
 
-	mutex_lock(&ws->phase_lock);
+	mutex_lock(&ws73_ports_lock);
+	ret = ws->port->budget.exhausted ||
+		(!restore && ws->port->budget.attempts == WS73_RECOVERY_LIMIT) ||
+		(ws->port->budget.deadline_ms && ktime_to_ms(ktime_get()) >= ws->port->budget.deadline_ms) ? -ETIMEDOUT : 0;
+	if (!ret && ws->port->budget.deadline_ms)
+		WRITE_ONCE(ws->recovery_io, true);
+	mutex_unlock(&ws73_ports_lock);
+	if (ret)
+		goto out;
 	/* Board configuration is supplied by deployment, never guessed from
 	 * another dongle or synthesized as an all-zero calibration block.
 	 * Validate both inputs before sending any runtime command.
@@ -676,19 +890,27 @@ static void ws73_runtime_work(struct work_struct *work)
 	dev_info(&ws->intf->dev, "BSLE customize SHA256=%*phN\n", (int)sizeof(digest), digest);
 	sha256(pm->data, pm->size, digest);
 	dev_info(&ws->intf->dev, "PM config SHA256=%*phN\n", (int)sizeof(digest), digest);
-	ret = ws73_bsle_start(&io, pm->data, pm->size, custom->data, custom->size);
+	ret = restore ? ws73_bsle_restore(&io, pm->data, pm->size, custom->data, custom->size) :
+		ws73_bsle_start(&io, pm->data, pm->size, custom->data, custom->size);
 	if (ret == -ETIMEDOUT && READ_ONCE(ws->stage) == WS73_WAIT_BSP &&
 	    !READ_ONCE(ws->stopping) && !ws->warm_recovery_attempts) {
+		unsigned int delay;
+
+		ret = ws73_admit_recovery(ws, ret, &delay);
+		if (ret)
+			goto out;
 		/* BSP_READY is one-shot. A freshly adopted runtime interface can
 		 * have consumed it in an earlier host session. Exactly one warm
 		 * recovery attempt before any Runtime/URB publication; no reset,
 		 * driver detach, firmware re-upload or effect on another owner.
 		 */
 		ws->warm_recovery_attempts++;
-		ws->warm_recovery_cause = ret;
+		ws->warm_recovery_cause = -ETIMEDOUT;
 		ws->warm_recovery_result = -EINPROGRESS;
 		ws->warm_recovery_started_ms = ws73_now_ms(ws);
-		dev_info(&ws->intf->dev, "warm recovery attempt=1 cause=%d\n", ret);
+		WRITE_ONCE(ws->recovery_io, true);
+		dev_info(&ws->intf->dev, "warm recovery attempt=1 cause=%d\n", ws->warm_recovery_cause);
+		msleep(delay);
 		ret = ws73_bsle_restore(&io, pm->data, pm->size, custom->data, custom->size);
 		ws->warm_recovery_result = ret;
 		dev_info(&ws->intf->dev, "warm recovery result=%d elapsed_ms=%llu\n", ret,
@@ -706,7 +928,9 @@ static void ws73_runtime_work(struct work_struct *work)
 		goto out;
 	}
 	ws->command_credits = credits;
-	/* info is immutable after this release publication until disconnect. */
+	/* New metadata belongs to the freshly registered generation. Sysfs
+	 * readers additionally serialize with phase_lock during recovery.
+	 */
 	smp_store_release(&ws->metadata_valid, true);
 	WRITE_ONCE(ws->stage, WS73_METADATA_VALID);
 	dev_info(&ws->intf->dev,
@@ -725,6 +949,8 @@ static void ws73_runtime_work(struct work_struct *work)
 	if (ret)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_NATIVE_SETUP);
+	WRITE_ONCE(ws->last_error, 0);
+	schedule_delayed_work(&ws->health_work, msecs_to_jiffies(1000));
 	dev_info(&ws->intf->dev, "native Runtime sle%u generation=%llu SETUP, not Ready\n",
 		 identity.id, identity.generation);
 out:
@@ -733,6 +959,7 @@ out:
 	if (ret && !READ_ONCE(ws->stopping)) {
 		WRITE_ONCE(ws->failure_stage, READ_ONCE(ws->stage));
 		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
+		WRITE_ONCE(ws->failure_error, ret);
 		WRITE_ONCE(ws->last_error, ret);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "runtime bring-up failed: %d\n", ret);
@@ -742,6 +969,22 @@ out:
 				ws->dli_result.opcode, ws->dli_result.status,
 				ws->dli_result.event, ws->dli_result.hardware_error);
 	}
+	mutex_lock(&ws73_ports_lock);
+	ws->port->budget.result = ret;
+	mutex_unlock(&ws73_ports_lock);
+	WRITE_ONCE(ws->recovery_io, false);
+	return ret;
+}
+
+static void ws73_runtime_work(struct work_struct *work)
+{
+	struct ws73_usb *ws = container_of(work, struct ws73_usb, runtime_work);
+	int ret;
+
+	mutex_lock(&ws->phase_lock);
+	ret = READ_ONCE(ws->stopping) ? -ENODEV : ws73_runtime_start(ws, false);
+	if (ret && !READ_ONCE(ws->stopping))
+		ws73_async_failure(ws, ret);
 	mutex_unlock(&ws->phase_lock);
 }
 
@@ -756,6 +999,7 @@ static ssize_t boot_stage_show(struct device *dev,
 		"dli-querying", "dli-awaiting-runtime", "native-runtime-setup",
 		"failed", "removing",
 		"recovery-draining", "recovery-closing", "recovery-wait-close",
+		"recovery-backoff", "native-runtime-ready",
 	};
 
 	return sysfs_emit(buf, "%s\n", names[READ_ONCE(ws->stage)]);
@@ -782,6 +1026,22 @@ static ssize_t warm_recovery_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(warm_recovery);
 
+static ssize_t recovery_budget_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	struct ws73_recovery_budget b;
+
+	mutex_lock(&ws73_ports_lock);
+	b = ws->port->budget;
+	mutex_unlock(&ws73_ports_lock);
+	return sysfs_emit(buf,
+		"attempts=%u limit=%u uploads=%u upload_limit=%u cause=%d result=%d exhausted=%d deadline_ms=%llu stable_since_ms=%llu\n",
+		b.attempts, WS73_RECOVERY_LIMIT, b.uploads, WS73_RECOVERY_UPLOAD_LIMIT,
+		b.cause, b.result, b.exhausted, b.deadline_ms, b.stable_since_ms);
+}
+static DEVICE_ATTR_RO(recovery_budget);
+
 /* Diagnostic samples, not an atomic protocol snapshot or recovery authority.
  * Preserve the failed phase instead of replacing it with the generic FAILED.
  */
@@ -792,7 +1052,7 @@ static ssize_t failure_diagnostics_show(struct device *dev,
 
 	return sysfs_emit(buf,
 		"phase=%u error=%d at_ms=%llu tx_sequence=%u id=%d generation=%llu opcode=%04x command_status=%x event=%04x hardware_error=%x\n",
-		READ_ONCE(ws->failure_stage), READ_ONCE(ws->last_error),
+		READ_ONCE(ws->failure_stage), READ_ONCE(ws->failure_error),
 		READ_ONCE(ws->failure_ms), READ_ONCE(ws->tx_sequence),
 		READ_ONCE(ws->native_id), READ_ONCE(ws->native_generation),
 		READ_ONCE(ws->dli_result.opcode), READ_ONCE(ws->dli_result.status),
@@ -823,15 +1083,25 @@ static ssize_t controller_information_show(struct device *dev,
 					   struct device_attribute *attr, char *buf)
 {
 	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	ssize_t ret;
 
-	/* Paired with runtime_work's release publication of immutable info. */
-	if (!smp_load_acquire(&ws->metadata_valid))
+	/* Recovery may rewrite metadata on this interface. Avoid blocking a
+	 * diagnostic reader through an entire BSLE transaction, and serialize
+	 * against invalidation/query instead of relying on publication alone.
+	 */
+	if (!mutex_trylock(&ws->phase_lock))
+		return -EAGAIN;
+	if (!smp_load_acquire(&ws->metadata_valid)) {
+		mutex_unlock(&ws->phase_lock);
 		return -ENODATA;
-	return sysfs_emit(buf,
+	}
+	ret = sysfs_emit(buf,
 			  "version=%5phN features=%10phN address=%pM acb=%u/%u icb=%u/%u bootstrap_credits=%u\n",
 			  ws->info.version, ws->info.features, ws->info.address,
 			  ws->info.acb_length, ws->info.acb_count,
 			  ws->info.icb_length, ws->info.icb_count, ws->command_credits);
+	mutex_unlock(&ws->phase_lock);
+	return ret;
 }
 static DEVICE_ATTR_RO(controller_information);
 
@@ -853,6 +1123,7 @@ static struct attribute *ws73_attrs[] = {
 	&dev_attr_boot_stage.attr,
 	&dev_attr_boot_error.attr,
 	&dev_attr_warm_recovery.attr,
+	&dev_attr_recovery_budget.attr,
 	&dev_attr_failure_diagnostics.attr,
 	&dev_attr_runtime_transport.attr,
 	&dev_attr_metadata_valid.attr,
@@ -920,12 +1191,21 @@ static int ws73_probe(struct usb_interface *intf, const struct usb_device_id *id
 	ws->dli_result.hardware_error = 0x100;
 	atomic_set(&ws->unsupported_rx, 0);
 	ws->udev = usb_get_dev(interface_to_usbdev(intf));
+	ws->port = ws73_port_attach(ws->udev);
+	if (IS_ERR(ws->port)) {
+		int ret = PTR_ERR(ws->port);
+
+		kref_put(&ws->references, ws73_release);
+		return ret;
+	}
 	ws->intf = intf;
 	ws->stage = eps == 2 ? WS73_BOOT : WS73_RUNTIME;
 	ws->runtime_transport = eps == 5;
 	INIT_WORK(&ws->boot_work, ws73_boot_work);
 	INIT_WORK(&ws->runtime_work, ws73_runtime_work);
 	INIT_WORK(&ws->fault_work, ws73_fault_work);
+	INIT_DELAYED_WORK(&ws->recovery_work, ws73_recovery_work);
+	INIT_DELAYED_WORK(&ws->health_work, ws73_health_work);
 	usb_set_intfdata(intf, ws);
 	dev_info(&intf->dev, "WS73 %s interface (%u endpoints)\n",
 		 eps == 2 ? "boot" : "runtime", eps);
@@ -944,9 +1224,11 @@ static void ws73_disconnect(struct usb_interface *intf)
 	struct ws73_usb *ws = usb_get_intfdata(intf);
 
 	WRITE_ONCE(ws->stopping, true);
+	cancel_delayed_work_sync(&ws->health_work);
 	cancel_work_sync(&ws->boot_work);
 	cancel_work_sync(&ws->runtime_work);
 	cancel_work_sync(&ws->fault_work);
+	cancel_delayed_work_sync(&ws->recovery_work);
 	if (ws->native_id >= 0) {
 		sparklink_native_unregister(ws->native_id, ws->native_generation);
 		ws->native_id = -1;
@@ -954,6 +1236,10 @@ static void ws73_disconnect(struct usb_interface *intf)
 	ws73_native_close(ws);
 	WRITE_ONCE(ws->stage, WS73_REMOVING);
 	usb_set_intfdata(intf, NULL);
+	mutex_lock(&ws73_ports_lock);
+	ws->port->attached = false;
+	ws->port->budget.stable_since_ms = 0;
+	mutex_unlock(&ws73_ports_lock);
 	kref_put(&ws->references, ws73_release);
 }
 
@@ -970,7 +1256,21 @@ static struct usb_driver ws73_driver = {
 	.id_table = ws73_ids,
 	.dev_groups = ws73_groups,
 };
-module_usb_driver(ws73_driver);
+static int __init ws73_init(void)
+{
+	return usb_register(&ws73_driver);
+}
+module_init(ws73_init);
+
+static void __exit ws73_exit(void)
+{
+	unsigned int i;
+
+	usb_deregister(&ws73_driver);
+	for (i = 0; i < WS73_PORTS_MAX; i++)
+		put_device(ws73_ports[i].controller);
+}
+module_exit(ws73_exit);
 
 MODULE_DESCRIPTION("WS73 USB firmware, BSLE and native Runtime transport for SparkLink");
 MODULE_LICENSE("GPL");

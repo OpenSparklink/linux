@@ -29,6 +29,7 @@ struct USBWs73Test {
     unsigned int head, count, sequence, commands, serial;
     uint8_t runtime_status;
     uint8_t runtime_fault;
+    bool runtime_fault_repeat;
     uint8_t runtime_reports;
     bool runtime_link_events;
     bool runtime_policy, runtime_fresh_advertiser, advertiser_created, runtime_sle_subtypes;
@@ -501,6 +502,7 @@ static void control(USBDevice *dev, USBPacket *p, int request, int value,
     if (request == 0x2100 && !value && !index && length == 4 && le32(data) == 30) {
         s->opened = s->pm = s->custom = false;
         s->advertising = s->scanning = false; s->advertiser_created = false;
+        if (s->runtime_fault_repeat) { s->failed_once = false; }
         bsle_close_ack(s);
         fprintf(stderr, "WS73_TEST_CLOSE: serial=%u\n", s->serial);
         usb_wakeup(usb_ep_get(dev, USB_TOKEN_IN, 1), 0); return;
@@ -573,6 +575,7 @@ static Property properties[] = {
     DEFINE_PROP_BOOL("runtime-discovery", USBWs73Test, runtime_discovery, false),
     DEFINE_PROP_UINT8("runtime-status", USBWs73Test, runtime_status, 0),
     DEFINE_PROP_UINT8("runtime-fault", USBWs73Test, runtime_fault, 0),
+    DEFINE_PROP_BOOL("runtime-fault-repeat", USBWs73Test, runtime_fault_repeat, false),
     DEFINE_PROP_UINT8("runtime-reports", USBWs73Test, runtime_reports, 0),
     DEFINE_PROP_BOOL("runtime-link-events", USBWs73Test, runtime_link_events, false),
     DEFINE_PROP_END_OF_LIST(),

@@ -67,6 +67,10 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 			      struct sparklink_native_identity *identity);
 /* Exact registration only; a stale identity cannot remove a reused index. */
 void sparklink_native_unregister(u16 id, u64 generation);
+/* Process-context observation only: 2 healthy Ready, 1 Setup, negative fault
+ * or retired identity. Never admits I/O, supplies credits or publishes Ready.
+ */
+int sparklink_native_health(u16 id, u64 generation);
 /* Valid during the callback; the core copies data and never retains its pointer.
  * Returns 0 if accepted, -ENODEV for a retired owner, -EPROTO for bad framing.
  * The driver must validate its dialect's management return schema before

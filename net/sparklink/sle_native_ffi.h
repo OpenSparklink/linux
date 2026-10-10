@@ -10,6 +10,7 @@ int sparklink_native_register_rust(const struct sparklink_native_info *info,
 				   struct sparklink_native_transport *transport,
 				   struct sparklink_native_identity *identity);
 void sparklink_native_unregister_rust(u16 id, u64 generation);
+int sparklink_native_health_rust(u16 id, u64 generation);
 void sparklink_native_snoop_rx_rust(u16 id, u64 generation, const u8 *data, size_t length);
 void sparklink_native_snoop_tx_rust(u16 id, u64 generation, u16 opcode, const u8 *params, size_t length, int status);
 int sparklink_native_receive_rust(u16 id, u64 generation, const u8 *data, size_t length);

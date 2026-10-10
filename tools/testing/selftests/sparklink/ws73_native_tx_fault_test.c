@@ -52,14 +52,19 @@ static int failed_transport(int expected)
         while ((entry = readdir(dir))) {
             char path[512], stage[64];
             int error = 0;
+            unsigned int phase;
             FILE *file;
             if (!strchr(entry->d_name, ':')) continue;
-            snprintf(path, sizeof(path), "/sys/bus/usb/drivers/sparklink_ws73_usb/%s/boot_error", entry->d_name);
+            snprintf(path, sizeof(path), "/sys/bus/usb/drivers/sparklink_ws73_usb/%s/failure_diagnostics", entry->d_name);
             file = fopen(path, "r");
             if (!file) continue;
-            int parsed = fscanf(file, "%d", &error);
+            int parsed = fscanf(file, "phase=%u error=%d", &phase, &error);
             fclose(file);
-            if (parsed != 1 || error != -expected) continue;
+            if (parsed != 2 || error != -expected) continue;
+            /* Short OUT is qualified for protocol restore. Its old fd stays
+             * retired and failure diagnostics must survive a fresh owner.
+             */
+            if (expected == EREMOTEIO) { count++; continue; }
             snprintf(path, sizeof(path), "/sys/bus/usb/drivers/sparklink_ws73_usb/%s/boot_stage", entry->d_name);
             file = fopen(path, "r");
             if (!file) continue;

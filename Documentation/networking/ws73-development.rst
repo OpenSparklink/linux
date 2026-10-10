@@ -917,7 +917,8 @@ TX sequence, owner id/generation, last query opcode, raw command status, event
 and Hardware Error byte. Value 0x100 means no status/error was received; raw
 hardware byte zero is still a Hardware Error. These sampled diagnostic fields
 do not grant authority or replace the state machine. Per-device bounded
-automatic recovery is planned and remains unimplemented.
+protocol recovery now has the bounded initial implementation described below;
+physical disappearance and the complete recovery matrix remain unqualified.
 
 Validated Connection Complete (0x0015/0x1401, at least the 11-byte prefix) and
 Disconnected (0x0005/0x1405, exactly four bytes) are forwarded as raw native
@@ -955,11 +956,12 @@ Bounded warm adoption and passive scanner initialization
 -------------------------------------------------------
 
 Only an initial BSP_READY timeout before Runtime publication admits one warm
-attempt per probe. Drain at most64 packets/1000ms, require a fresh CLOSE30
+attempt per probe. Drain at most 64 packets/1000ms, require a fresh CLOSE30
 (type4/action3) reply, then repeat PM/customize/OPEN29/BOOT_FINISH and all four
 queries. No host/hub reset, detach or firmware upload is part of this slice.
 The read-only warm_recovery sample records the attempt, cause and result.
-This is not a persistent port budget or full runtime/disappearance recovery.
+This original per-probe slice is now charged to the persistent port budget
+described below. It is not full disappearance recovery.
 
 Real111 rejects initial scan OFF with raw0b even after successful parameters.
 Typed operation6 SCAN_INITIALIZE_OFF uses passive parameters/ON/OFF, each with
@@ -971,7 +973,7 @@ operation. Operation5 advertiser standby still never enables advertising.
 A frozen kernel90 physical initial-phase receipt has20 alternating actual
 slctl rounds, matched marker/data/address/RSSI in298--615ms,1161 USB packets and
 zero kernel drops, with ordinary uid1000/capabilities0. Firmware is mixed:
-port1-2.1.1 uploaded111 in that run, port1-2.1.3 retained110. This receipt is not
+port1-2.1.1 uploaded111 in that run, port1-2.1.3 retained 110. This receipt is not
 full North Star acceptance. Earlier physical removal changed the survivor's
 registration, and that session timed out before capture statistics. Preserve
 both failures; isolation, replug, native-host comparisons, disappearance root
@@ -1002,3 +1004,62 @@ The old kernel90 failed suite is retained. These are synthetic receipts, not
 physical acceptance. Real North Star stays 4/8; physical survivor-generation
 change, automatic recovery, native-host comparison and four-device parallelism
 remain open. Current host inventory still lacks physical port 1-2.1.4.
+
+Bounded per-port protocol recovery
+---------------------------------
+
+The WS73 driver retains at most 64 controller-reference/bus/devpath records
+across USB address, probe and Runtime changes. It never evicts failed records
+to reopen a budget. Warm adoption and asynchronous protocol restores share
+two attempts, 1000/4000ms backoffs and a 120000ms recovery window. Recovery I/O
+uses the remaining window, and initial firmware uploads separately have a
+per-upload 120000ms I/O deadline and three admissions. Only 60000ms of observed
+healthy Ready renews a port; one reply or a new generation does not.
+
+ETIMEDOUT, EPROTO and EREMOTEIO qualify for protocol restore. EPIPE, EIO,
+Hardware Error, cancellation, disappearance and unsupported requests do not
+qualify. Fault handling unregisters the exact old identity and joins its Host
+callbacks/URBs before freeing or reusing transport buffers. It then performs
+bounded drain, a fresh CLOSE30 acknowledgement, PM/customize/OPEN29/BOOT and
+four queries on that interface. Publication creates a new Setup owner; it
+cannot transfer old leases, fds, pending commands, credits or events. Real
+successful initialization completes are still required for Ready.
+
+The one-second observational native-health watchdog notices Host timeout and
+cleanup faults without admitting I/O or creating readiness. ``recovery_budget``
+reports port counters, first cause, protocol result, exhaustion and deadlines.
+Failure phase/errno/time remain after recovery; other diagnostic fields remain
+samples, not an atomic faulty-frame snapshot. Metadata reads serialize with
+recovery and may return EAGAIN or ENODATA. Disconnect joins watchdog, startup,
+fault and restore work before retiring the current owner.
+
+Synthetic recovery reproduction, never physical RF acceptance::
+
+  python3 tools/testing/selftests/sparklink/run_runtime_lifecycle.py \
+    --kernel-build <build> --qemu <patched-qemu> --busybox <static-busybox> \
+    --native-ws73 --native-ws73-fault --output <new-directory>
+
+  python3 tools/testing/selftests/sparklink/run_runtime_lifecycle.py \
+    --kernel-build <build> --qemu <patched-qemu> --busybox <static-busybox> \
+    --native-ws73 --native-ws73-recovery-exhaustion --output <new-directory>
+
+Repeat the first command with ``--native-ws73-fault-mode short-reply`` and
+``trailing-reply``. Each one-shot fault restores the original interface without
+QMP recovery, checks fresh Ready/address/generation, retired fds and an unchanged
+survivor, then explicitly tests budget retention through QMP reprobe. Repeated
+corruption consumes exactly two restores and remains failed while the survivor
+continues queries; its QMP log has no recovery delete/add. EPIPE and controller
+cleanup EIO retire the owner without automatic protocol retry.
+
+Kernel97 passes all 13 Runtime gates, 2038 policy checks, 292 Python harness tests
+and 101 companion-tool tests. Actual two-WS73 ordinary-user RF retests complete
+20 alternating and two QMP-replug rounds in 306--607ms with RSSI -14..-7,
+1315 packets/zero drops, stable survivor and daemon, and two confirmed final
+stops. Synthetic control support passes 22 rounds/2557 packets/zero drops.
+Inputs, kernel objects/commands and rejected builds/test failures are retained
+privately in ``.dev/port-recovery-evidence.json``. No new clippy, host-kernel
+installation or full physical recovery is claimed. The real-QMP result is
+explicitly ``physical_acceptance=false``; .1 retained 111 and .3 retained 110,
+with board configuration NOT_ASSERTED. Original physical survivor shutdown,
+missing port .4, native-host comparisons, real runtime-fault RF recovery,
+chip/port-power reset and four-device parallelism remain open.

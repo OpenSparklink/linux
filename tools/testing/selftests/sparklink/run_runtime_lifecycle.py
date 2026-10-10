@@ -97,6 +97,13 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
     evidence = 'NATIVE_FAULT: id=0 removed errno=71' if fault else 'NATIVE_RAW_STATUS: fe preserved'
     if console.count(evidence) != 1:
         errors.append('missing or duplicate exact native status/fault evidence')
+    restores = re.findall(r'^NATIVE_AUTO_RECOVERY: old=(\d+) new=(\d+) unaffected=(\d+) '
+                          r'attempts=1 backoff=1 fresh_ready=1 same_address=1$', console, re.MULTILINE)
+    if len(restores) != int(fault) or console.count('NATIVE_AUTO_RECOVERY:') != int(fault):
+        errors.append('missing, duplicate or unexpected automatic protocol recovery')
+    retained = 'NATIVE_RECOVERY_REPROBE: attempts=1 retained=1'
+    if console.count(retained) != int(fault):
+        errors.append('missing, duplicate or unexpected persistent port budget')
     generations = re.findall(r'^NATIVE_LIFETIME: old=(\d+) new=(\d+) unaffected=(\d+)$',
                             console, re.MULTILINE)
     if len(generations) != 1:
@@ -105,6 +112,15 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
         old, new, unaffected = map(int, generations[0])
         if not old or new <= old or not unaffected or unaffected in (old, new):
             errors.append('invalid native generation isolation')
+        if fault and len(restores) == 1:
+            before, restored, survivor = map(int, restores[0])
+            if before != old or not old < restored < new or survivor != unaffected or restored == survivor:
+                errors.append('invalid automatic recovery generation isolation')
+            phases = [evidence, 'NATIVE_AUTO_RECOVERY:', 'NATIVE_FAULT_FIRST',
+                      'NATIVE_READD_FIRST', retained, 'NATIVE_LIFETIME:']
+            positions = [console.find(p) for p in phases]
+            if min(positions) < 0 or positions != sorted(positions):
+                errors.append('automatic recovery proof outside its live phase')
     if re.findall(r'^RUNTIME_GUEST_EXIT: (\d+)$', console, re.MULTILINE) != ['0']:
         errors.append('missing or unsuccessful guest exit')
     pattern = (r'^NATIVE_LINK_EVENTS: index=(\d+) retained=32 first=9 last=40 '
@@ -157,7 +173,7 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
         'NATIVE_MANAGEMENT_CONTRACT: index=0 exclusive=1 mode=1 stale=1 selection=1 copyout=1 no_admission=1 schema=6',
         'NATIVE_MANAGEMENT_CREDENTIALS: inherited_owner=1 uid=1001 caps=0 denied=3',
         'NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=1 retained_scan_off=1 radio_off=1 ready=1',
-        'NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077',
+        'NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 terminal_retired=1 status=253 opcode=3077',
         'NATIVE_MANAGEMENT_PENDING_CLOSE: cancelled=1 wire_reserved=1 errno=110 radio_unknown=1',
         'NATIVE_MANAGEMENT_REPLUG: fresh_lease=1 old_generation=1',
     ]
@@ -170,6 +186,27 @@ def assess_native(console, qemu_exit, fault=False, events=False, discovery=False
                 < console.find('NATIVE_REMOVE_FIRST') < console.find('NATIVE_READD_FIRST')
                 < positions[4] < positions[5] < console.find('NATIVE_LIFETIME:')):
             errors.append('management proof outside live generation phase')
+    return errors
+
+
+def assess_recovery_exhaustion(console, qemu_exit):
+    """Synthetic repeated fault only; no physical device disappearance proof."""
+    console = console.replace('\r', '')
+    errors = []
+    if qemu_exit != 0 or KERNEL_FAULT.search(console) or 'NATIVE_FAILURE:' in console:
+        errors.append('QEMU/guest/kernel failure')
+    expected = ['NATIVE_ADD_SECOND',
+                'NATIVE_HOST: index=1 queries=18 features=80 version=5 dialect_reject=1',
+                'NATIVE_FAULT: id=0 removed errno=71',
+                'NATIVE_RECOVERY_EXHAUSTED: attempts=2 limit=2 cause=71 result=110 old_stale=1 survivor=1 no_third_owner=1',
+                'NATIVE_LIFECYCLE: PASS']
+    if re.findall(r'^NATIVE_.*$', console, re.MULTILINE) != expected:
+        errors.append('missing, duplicate or wrong bounded recovery exhaustion proof')
+    if (console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1 or
+            console.count('RUNTIME_KERNEL_LOG_END') != 1 or
+            '[    0.000000]' not in console or
+            re.findall(r'^RUNTIME_GUEST_EXIT: (\d+)$', console, re.MULTILINE) != ['0']):
+        errors.append('missing complete guest/kernel exit evidence')
     return errors
 
 
@@ -301,6 +338,8 @@ def main():
                         help='synthetic full typed discovery transactions, never RF')
     parser.add_argument('--native-ws73-fault', action='store_true',
                         help='inject one malformed native aggregate, retaining the other owner')
+    parser.add_argument('--native-ws73-recovery-exhaustion', action='store_true',
+                        help='repeat corruption through two restores; no QMP recovery or RF proof')
     parser.add_argument('--native-ws73-fault-mode', choices=['hcc', 'short-reply', 'trailing-reply'],
                         default='hcc', help='fault boundary: HCC aggregate or successful Complete schema')
     parser.add_argument('--native-ws73-events', action='store_true',
@@ -313,6 +352,8 @@ def main():
     parser.add_argument('--native-ws73-link-events', action='store_true',
                         help='synthetic WS73 connection/disconnection event fanout; no real link')
     args = parser.parse_args()
+    if args.native_ws73_recovery_exhaustion:
+        args.native_ws73_fault = True
     if args.native_ws73_link_events:
         args.native_ws73_events = True
     tx_gate = args.native_ws73_tx_barrier or args.native_ws73_tx_terminal
@@ -343,6 +384,7 @@ def main():
     scope = ('synthetic WS73 USB HCC/BSLE/native SETUP lifetime; no ROM/RF/slkd/no-sudo acceptance'
              if args.native_ws73 else 'virtual standard-DLI Runtime lifetime; not WS73/RF/slkd/no-sudo acceptance')
     manifest = dict(scope=scope, native_fault_injection=args.native_ws73_fault,
+                    recovery_exhaustion=args.native_ws73_recovery_exhaustion,
                     standard_host_recipes=args.standard_host_recipes,
                     native_fault_mode=args.native_ws73_fault_mode if args.native_ws73_fault else None,
                     native_event_stream=args.native_ws73_events,
@@ -418,7 +460,7 @@ poweroff -f
         if args.native_ws73_fault:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
-                                                          '/bin/sparklink_runtime_test --fault\n'))
+                                                          '/bin/sparklink_runtime_test --recovery-exhaustion\n' if args.native_ws73_recovery_exhaustion else '/bin/sparklink_runtime_test --fault\n'))
         if args.native_ws73_events:
             initfile = initroot / 'init'
             initfile.write_text(initfile.read_text().replace('/bin/sparklink_runtime_test\n',
@@ -468,7 +510,8 @@ poweroff -f
                         ',runtime-status=254' if args.native_ws73 else '') +
                        (',runtime-reports=40' if args.native_ws73_events else '') +
                        (',runtime-link-events=on' if args.native_ws73_link_events else '') +
-                       (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management) else '') +
+                       (',runtime-discovery=on' if (args.native_ws73_discovery or args.native_ws73_management or args.native_ws73_fault) else '') +
+                       (',runtime-fault-repeat=on' if args.native_ws73_recovery_exhaustion else '') +
                        (',runtime-idle-scan-stop=on' if args.native_ws73_management else '')]
             if args.standard_host_recipes:
                 command[-1] += ',recipe-status=on'
@@ -520,21 +563,25 @@ poweroff -f
                         raise RuntimeError('model did not deliver Complete while OUT held')
                     barrier.sendall(b'out-held\n')
                     manifest['early_in_while_out_pending'] = True
-                wait_marker(process, console, f'{prefix}_FAULT_FIRST' if args.native_ws73_fault
-                            else f'{prefix}_REMOVE_FIRST')
-                if args.native_ws73_tx_terminal == 'unplug':
-                    if not monitor.execute('qom-get', dict(path='/machine/peripheral/sle0', property='runtime-out-pending')):
-                        raise RuntimeError('OUT finished before in-flight removal')
-                    manifest['cancel_pending_confirmed'] = True
-                monitor.execute('device_del', dict(id='sle0'))
-                monitor.wait_deleted('sle0')
-                wait_marker(process, console, f'{prefix}_READD_FIRST')
-                monitor.execute('device_add', dict(driver=model, id='sle0',
-                                                    bus='xhci.0', port='1', **event_properties))
+                if args.native_ws73_recovery_exhaustion:
+                    manifest['qmp_recovery_actions'] = 0
+                else:
+                    wait_marker(process, console, f'{prefix}_FAULT_FIRST' if args.native_ws73_fault
+                                else f'{prefix}_REMOVE_FIRST')
+                    if args.native_ws73_tx_terminal == 'unplug':
+                        if not monitor.execute('qom-get', dict(path='/machine/peripheral/sle0', property='runtime-out-pending')):
+                            raise RuntimeError('OUT finished before in-flight removal')
+                        manifest['cancel_pending_confirmed'] = True
+                    monitor.execute('device_del', dict(id='sle0'))
+                    monitor.wait_deleted('sle0')
+                    wait_marker(process, console, f'{prefix}_READD_FIRST')
+                    monitor.execute('device_add', dict(driver=model, id='sle0',
+                                                        bus='xhci.0', port='1', **event_properties))
                 exit_code = process.wait(timeout=30)
             manifest['qemu_exit'] = exit_code
             verify = assess_native if args.native_ws73 else assess
-            errors = (assess_tx_terminal(console.read_text(errors='replace'),
+            errors = (assess_recovery_exhaustion(console.read_text(errors='replace'), exit_code)
+                      if args.native_ws73_recovery_exhaustion else assess_tx_terminal(console.read_text(errors='replace'),
                           (output / 'qemu_stderr.log').read_text(), exit_code, args.native_ws73_tx_terminal,
                           manifest.get('early_in_while_out_pending', False),
                           manifest.get('cancel_pending_confirmed', False)) if args.native_ws73_tx_terminal else

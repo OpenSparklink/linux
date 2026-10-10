@@ -158,6 +158,12 @@ void sparklink_native_unregister(u16 id, u64 generation)
 }
 EXPORT_SYMBOL_GPL(sparklink_native_unregister);
 
+int sparklink_native_health(u16 id, u64 generation)
+{
+	return sparklink_native_health_rust(id, generation);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_health);
+
 int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t length)
 {
 	return sparklink_native_receive_rust(id, generation, data, length);

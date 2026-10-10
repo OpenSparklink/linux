@@ -90,7 +90,8 @@ static int native_identity(unsigned int id, unsigned long long *generation)
 			continue;
 		int read = fscanf(file, "%63s", stage);
 		fclose(file);
-		if (read != 1 || strcmp(stage, "native-runtime-setup") || !streaming || broken || !gen)
+		if (read != 1 || (strcmp(stage, "native-runtime-setup") &&
+				 strcmp(stage, "native-runtime-ready")) || !streaming || broken || !gen)
 			continue;
 		*generation = gen;
 		found++;
@@ -472,7 +473,7 @@ static int wait_failed_driver(void)
                 continue;
             parsed = fscanf(file, "%63s", stage);
             fclose(file);
-            if (parsed == 1 && !strcmp(stage, "failed"))
+            if (parsed == 1 && !strcmp(stage, "recovery-backoff"))
                 found++;
         }
         closedir(dir);
@@ -480,7 +481,85 @@ static int wait_failed_driver(void)
             return 0;
         usleep(10000);
     }
-    return fail("single native driver fault stage/errno");
+    return fail("single native driver recovery backoff/errno");
+}
+
+static int recovery_budget(unsigned int id, unsigned int expected)
+{
+    DIR *dir = opendir("/sys/bus/usb/drivers/sparklink_ws73_usb");
+    struct dirent *entry;
+    int found = 0;
+    if (!dir) return fail("recovery budget directory");
+    while ((entry = readdir(dir))) {
+        char path[512];
+        int index = -1, cause = 0, result = 0, exhausted = 1;
+        unsigned int attempts = 0, limit = 0, uploads = 0, upload_limit = 0;
+        FILE *f;
+        if (!strchr(entry->d_name, ':')) continue;
+        snprintf(path, sizeof(path), "/sys/bus/usb/drivers/sparklink_ws73_usb/%s/native_runtime", entry->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        int n = fscanf(f, "id=%d", &index);
+        fclose(f);
+        if (n != 1 || index != (int)id) continue;
+        snprintf(path, sizeof(path), "/sys/bus/usb/drivers/sparklink_ws73_usb/%s/recovery_budget", entry->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        n = fscanf(f, "attempts=%u limit=%u uploads=%u upload_limit=%u cause=%d result=%d exhausted=%d",
+                   &attempts, &limit, &uploads, &upload_limit, &cause, &result, &exhausted);
+        fclose(f);
+        if (n == 7 && attempts == expected && limit == 2 && uploads == 0 &&
+            upload_limit == 3 && cause == -EPROTO && !result && !exhausted) found++;
+    }
+    closedir(dir);
+    return found == 1 ? 0 : fail("port budget preserved across generations/reprobe");
+}
+
+static int recovery_exhaustion(int old, int survivor, unsigned long long survivor_gen,
+                               const struct sci_dev_info *survivor_info)
+{
+    double deadline = now() + 15;
+    do {
+        DIR *dir = opendir("/sys/bus/usb/drivers/sparklink_ws73_usb");
+        struct dirent *entry;
+        int found = 0;
+        if (!dir) return fail("exhaustion directory");
+        while ((entry = readdir(dir))) {
+            char path[512], stage[64];
+            unsigned int attempts, limit, uploads, upload_limit;
+            int cause, result, exhausted;
+            FILE *f;
+            if (!strchr(entry->d_name, ':')) continue;
+            snprintf(path,sizeof(path),"/sys/bus/usb/drivers/sparklink_ws73_usb/%s/recovery_budget",entry->d_name);
+            f=fopen(path,"r"); if (!f) continue;
+            int n=fscanf(f,"attempts=%u limit=%u uploads=%u upload_limit=%u cause=%d result=%d exhausted=%d",
+                         &attempts,&limit,&uploads,&upload_limit,&cause,&result,&exhausted);
+            fclose(f);
+            if (n!=7 || attempts!=2 || limit!=2 || uploads || upload_limit!=3 ||
+                cause!=-EPROTO || result!=-ETIMEDOUT || !exhausted) continue;
+            snprintf(path,sizeof(path),"/sys/bus/usb/drivers/sparklink_ws73_usb/%s/boot_stage",entry->d_name);
+            f=fopen(path,"r"); if (!f) continue;
+            n=fscanf(f,"%63s",stage); fclose(f);
+            if (n==1 && !strcmp(stage,"failed")) found++;
+        }
+        closedir(dir);
+        if (stale(old) || same(survivor,survivor_info,survivor_gen) ||
+            query(survivor,survivor_info,0x0406,0)) return -1;
+        if (found==1) {
+            /* Allow queued work another full second to expose an unintended
+             * third retry. The port remains failed and the survivor usable.
+             */
+            usleep(1500000);
+            unsigned long long forbidden;
+            if (!native_identity(0,&forbidden) || stale(old) ||
+                same(survivor,survivor_info,survivor_gen) || query(survivor,survivor_info,0x0406,0))
+                return fail("exhausted port reopened or affected survivor");
+            puts("NATIVE_RECOVERY_EXHAUSTED: attempts=2 limit=2 cause=71 result=110 old_stale=1 survivor=1 no_third_owner=1");
+            return 0;
+        }
+        usleep(100000);
+    } while (now()<deadline);
+    return fail("bounded automatic recovery exhaustion deadline");
 }
 
 static uint64_t discovery_id = 100;
@@ -503,9 +582,9 @@ static void discovery_request(struct sle_discovery_submit *r,
 					    .generation = gen,
 					    .request_id = discovery_id++,
 					    .operation = op };
-	if (op <= 2)
+	if (op <= 2 || op == SLE_DISCOVERY_ADV_CONFIGURE_OFF)
 		r->handle = 7;
-	if (op == 1) {
+	if (op == 1 || op == SLE_DISCOVERY_ADV_CONFIGURE_OFF) {
 		r->advertising.handle = 7;
 		r->advertising.interval_min = 800;
 		r->advertising.interval_max = 800;
@@ -513,6 +592,8 @@ static void discovery_request(struct sle_discovery_submit *r,
 		r->advertising.primary_frame = 1;
 		r->advertising.tx_power = 0;
 		memcpy(r->advertising.own_address, info->addr, 6);
+	}
+	if (op == 1) {
 		r->flags = 1;
 		r->data_len = 6;
 		r->scan_response_len = 6;
@@ -838,12 +919,12 @@ static int management_gate(int *fd, unsigned long long gen, const struct sci_dev
         controller_snapshot(*fd, gen, info, SLE_CONTROLLER_FAULT, -EIO))
         return fail("failed stop cannot grant successor or report Ready");
     usleep(5500000);
-    if (management_wait(*fd, gen, 3, -EIO) || controller_snapshot(*fd, gen, info, SLE_CONTROLLER_FAULT, -EIO))
-        return fail("first stop fault survives later queued timer work");
+    if (stale(*fd))
+        return fail("terminal stop fault retires old owner without automatic retry");
     acquire = (struct sle_management_request){ .version = 1, .generation = gen, .mode = 1 };
-    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) != -1 || errno != EIO)
+    if (ioctl(*fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire) != -1 || errno != ENODEV)
         return fail("failed cleanup admission");
-    puts("NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077");
+    puts("NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 terminal_retired=1 status=253 opcode=3077");
     return 0;
 }
 
@@ -992,7 +1073,8 @@ int main(int argc, char **argv)
 	    b = -1, replacement = -1;
 	int complete = 0, readers[2] = { -1, -1 };
 	pid_t children[2];
-	int fault_mode = argc == 2 && !strcmp(argv[1], "--fault");
+	int exhaustion = argc == 2 && !strcmp(argv[1], "--recovery-exhaustion");
+	int fault_mode = exhaustion || (argc == 2 && !strcmp(argv[1], "--fault"));
 	link_events_mode = argc == 2 && !strcmp(argv[1], "--link-events");
 	int event_mode = link_events_mode || (argc == 2 && !strcmp(argv[1], "--events"));
 	int discovery_mode = argc == 2 && !strcmp(argv[1], "--discovery");
@@ -1040,6 +1122,7 @@ int main(int argc, char **argv)
 	}
 	if (fault_mode) {
 		struct sle_dli_cmd cmd = { .opcode = 0x0406 };
+		double began = now();
 		if (exercise(b, &b_info) ||
 		    management_mode(a, a_gen, SLE_MANAGEMENT_DIAGNOSTIC) ||
             ioctl(a, SL_IOCTL_DLI_SEND_CMD, &cmd) ||
@@ -1049,6 +1132,32 @@ int main(int argc, char **argv)
 		if (wait_failed_driver())
 			goto out;
 		puts("NATIVE_FAULT: id=0 removed errno=71");
+		if (exhaustion) {
+			if (recovery_exhaustion(a,b,b_gen,&b_info)) goto out;
+			complete=1;
+			puts("NATIVE_LIFECYCLE: PASS");
+			goto out;
+		}
+		/* No QMP action has occurred. The original driver must restore the
+		 * protocol and publish a fresh generation on this same interface.
+		 */
+		struct sci_dev_info recovered_info;
+		unsigned long long recovered_gen;
+		int recovered = bind_owner(0, &recovered_info, &recovered_gen);
+		if (recovered < 0) goto out;
+		struct sle_discovery_result initialized;
+		int error = recovered_gen <= a_gen || now() - began < 1 ||
+			memcmp(recovered_info.addr, a_info.addr, 6) || stale(a) ||
+			same(b, &b_info, b_gen) || query(b, &b_info, 0x0406, 0) ||
+			recovery_budget(0, 1) || query(recovered, &recovered_info, 0x0406, 0) ||
+			management_mode(recovered, recovered_gen, SLE_MANAGEMENT_MANAGED) ||
+			discovery_do(recovered, recovered_gen, SLE_DISCOVERY_ADV_CONFIGURE_OFF, &recovered_info, &initialized) ||
+			discovery_do(recovered, recovered_gen, SLE_DISCOVERY_SCAN_INITIALIZE_OFF, &recovered_info, &initialized) ||
+			controller_snapshot(recovered, recovered_gen, &recovered_info, SLE_CONTROLLER_READY, 0);
+		close(recovered);
+		if (error) { fail("automatic protocol restore and fresh Ready"); goto out; }
+		printf("NATIVE_AUTO_RECOVERY: old=%llu new=%llu unaffected=%llu attempts=1 backoff=1 fresh_ready=1 same_address=1\n",
+		       a_gen, recovered_gen, b_gen);
 		puts("NATIVE_FAULT_FIRST");
 		if (wait_interfaces(1))
 			goto out;
@@ -1098,6 +1207,8 @@ int main(int argc, char **argv)
 	    query(replacement, &replacement_info, 0x0406, 0) ||
 	    query(b, &b_info, 0x0406, 0) || stale(a))
 		goto out;
+	if (fault_mode && recovery_budget(0, 1)) goto out;
+	if (fault_mode) puts("NATIVE_RECOVERY_REPROBE: attempts=1 retained=1");
 	if (event_mode) {
 		struct sle_controller_event first;
 		if (query(replacement, &replacement_info, 0x0404, 0) ||

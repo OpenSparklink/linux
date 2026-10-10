@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Native virtual verdict tests; no USB, SDK, KVM or hardware evidence."""
 import unittest
-from run_runtime_lifecycle import assess_native, assess_tx_barrier, assess_tx_terminal
+from run_runtime_lifecycle import assess_native, assess_tx_barrier, assess_tx_terminal, assess_recovery_exhaustion
 
 GOOD = '''NATIVE_RAW_STATUS: fe preserved
 NATIVE_ADD_SECOND
@@ -123,11 +123,28 @@ class NativeVerdict(unittest.TestCase):
 
 
 FAULT = GOOD.replace('NATIVE_RAW_STATUS: fe preserved', 'NATIVE_FAULT: id=0 removed errno=71').replace(
-    'NATIVE_REMOVE_FIRST', 'NATIVE_FAULT_FIRST').replace(
-    'NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1\n', '')
+    'NATIVE_REMOVE_FIRST', 'NATIVE_AUTO_RECOVERY: old=1 new=3 unaffected=2 attempts=1 backoff=1 fresh_ready=1 same_address=1\nNATIVE_FAULT_FIRST').replace(
+    'NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1\n', '').replace(
+    'NATIVE_LIFETIME: old=1 new=3 unaffected=2',
+    'NATIVE_RECOVERY_REPROBE: attempts=1 retained=1\nNATIVE_LIFETIME: old=1 new=4 unaffected=2')
 
 
 class NativeFaultVerdict(unittest.TestCase):
+    def test_recovery_required(self):
+        self.assertTrue(assess_native(FAULT.replace('NATIVE_AUTO_RECOVERY:', 'missing:'), 0, True))
+
+    def test_recovery_survivor_changed(self):
+        self.assertTrue(assess_native(FAULT.replace('new=3 unaffected=2', 'new=3 unaffected=3'), 0, True))
+
+    def test_recovery_reused_old_generation(self):
+        self.assertTrue(assess_native(FAULT.replace('old=1 new=3', 'old=1 new=1'), 0, True))
+
+    def test_reprobe_budget_reset(self):
+        self.assertTrue(assess_native(FAULT.replace('attempts=1 retained=1', 'attempts=0 retained=0'), 0, True))
+
+    def test_recovery_after_qmp_is_not_automatic(self):
+        self.assertTrue(assess_native(FAULT.replace('NATIVE_FAULT_FIRST', 'missing').replace(
+            'NATIVE_FAULT: id=0 removed errno=71', 'NATIVE_FAULT_FIRST\nNATIVE_FAULT: id=0 removed errno=71'), 0, True))
     def test_complete(self):
         self.assertEqual(assess_native(FAULT, 0, True), [])
 
@@ -148,6 +165,40 @@ class NativeFaultVerdict(unittest.TestCase):
 
     def test_kernel_error_still_fails(self):
         self.assertTrue(assess_native(FAULT + '[1.0] Oops: deadlock\n', 0, True))
+
+
+EXHAUSTED = '''NATIVE_ADD_SECOND
+NATIVE_HOST: index=1 queries=18 features=80 version=5 dialect_reject=1
+NATIVE_FAULT: id=0 removed errno=71
+NATIVE_RECOVERY_EXHAUSTED: attempts=2 limit=2 cause=71 result=110 old_stale=1 survivor=1 no_third_owner=1
+NATIVE_LIFECYCLE: PASS
+RUNTIME_GUEST_EXIT: 0
+RUNTIME_KERNEL_LOG_BEGIN
+[    0.000000] Linux version synthetic-verdict-fixture
+RUNTIME_KERNEL_LOG_END
+'''
+
+
+class RecoveryExhaustionVerdict(unittest.TestCase):
+    def test_complete(self):
+        self.assertEqual(assess_recovery_exhaustion(EXHAUSTED, 0), [])
+
+    def test_requires_bound_and_isolation(self):
+        for before,after in [('attempts=2','attempts=3'), ('survivor=1','survivor=0'),
+                             ('no_third_owner=1','no_third_owner=0'), ('old_stale=1','old_stale=0'),
+                             ('cause=71','cause=5'), ('limit=2','limit=3')]:
+            with self.subTest(before=before):
+                self.assertTrue(assess_recovery_exhaustion(EXHAUSTED.replace(before,after),0))
+
+    def test_duplicate_proof(self):
+        self.assertTrue(assess_recovery_exhaustion(EXHAUSTED+'NATIVE_LIFECYCLE: PASS\n',0))
+
+    def test_qmp_readd_is_not_exhaustion(self):
+        self.assertTrue(assess_recovery_exhaustion(EXHAUSTED.replace('NATIVE_LIFECYCLE: PASS',
+                                                                               'NATIVE_READD_FIRST\nNATIVE_LIFECYCLE: PASS'),0))
+
+    def test_kernel_failure(self):
+        self.assertTrue(assess_recovery_exhaustion(EXHAUSTED+'[1.0] Oops: crash\n',0))
 
 
 if __name__ == '__main__':
@@ -177,7 +228,7 @@ class DiscoveryVerdict(unittest.TestCase):
 MANAGEMENT_INITIAL = """NATIVE_MANAGEMENT_CONTRACT: index=0 exclusive=1 mode=1 stale=1 selection=1 copyout=1 no_admission=1 schema=6
 NATIVE_MANAGEMENT_CREDENTIALS: inherited_owner=1 uid=1001 caps=0 denied=3
 NATIVE_MANAGEMENT_CLOSE: last_fd=1 actual_stops=1 retained_scan_off=1 radio_off=1 ready=1
-NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 first_fault_stable=1 status=253 opcode=3077
+NATIVE_MANAGEMENT_STOP_FAULT: errno=5 radio_unknown=1 successor_denied=1 terminal_retired=1 status=253 opcode=3077
 """
 MANAGEMENT_REPLUG = """NATIVE_MANAGEMENT_PENDING_CLOSE: cancelled=1 wire_reserved=1 errno=110 radio_unknown=1
 NATIVE_MANAGEMENT_REPLUG: fresh_lease=1 old_generation=1
@@ -204,7 +255,7 @@ class ManagementCredentialVerdict(unittest.TestCase):
     def test_inherited_owner_identity_required(self):
         self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('inherited_owner=1','inherited_owner=0'), 0, management=True))
     def test_first_fault_must_stay_stable(self):
-        self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('first_fault_stable=1','first_fault_stable=0'), 0, management=True))
+        self.assertTrue(assess_native(MANAGEMENT_GOOD.replace('terminal_retired=1','first_fault_stable=0'), 0, management=True))
 
 class ManagementSchemaVerdict(unittest.TestCase):
     def test_schema_checks_required(self):

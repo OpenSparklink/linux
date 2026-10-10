@@ -407,6 +407,30 @@ pub(crate) extern "C" fn sparklink_native_unregister_rust(id: u16, generation: u
     }
 }
 
+/// Observational driver watchdog. The exact owner remains pinned while the
+/// Host is sampled; no Runtime/Host state or readiness is changed here.
+#[no_mangle]
+pub(crate) extern "C" fn sparklink_native_health_rust(id: u16, generation: u64) -> i32 {
+    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
+        return ENODEV.to_errno();
+    };
+    let gate = owner.schedule_gate.lock();
+    if *gate {
+        return ENODEV.to_errno();
+    }
+    let host = owner.host.lock();
+    let (_, ready, fault) = host.controller_status();
+    if let Some(error) = fault {
+        return error.to_errno();
+    }
+    let (advertising, scanning, _) = host.discovery_radio();
+    if ready && matches!(advertising, 1 | 2) && matches!(scanning, 1 | 2) {
+        2
+    } else {
+        1
+    }
+}
+
 /// Callback receives a validated HCC slot, not a complete USB aggregate.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_snoop_rx_rust(id:u16, generation:u64, data:*const u8, length:usize) {
