@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! Staging connection-operation contract. Not linked into the production
+//! kernel until Native typed submission, transport and revoke callers use it.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State { Queued, OnWire, AwaitingOutcome, Succeeded, Failed, Cancelled, Faulted }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent { Create { address_type: u8, address: [u8; 6] }, Disconnect { handle: u16 } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome { Connected { status: u8, handle: u16, address_type: u8, address: [u8; 6] }, Disconnected { status: u8, handle: u16 } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error { Invalid, Busy, Duplicate, Mismatch }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Operation {
+    pub id: u64, pub cookie: u64, pub intent: Intent, pub state: State,
+    pub error: i32, pub command_status: Option<u8>, pub outcome_status: Option<u8>,
+    pub fault_error: i32, pub handle: Option<u16>,
+    deadline: u64, sent: bool, out_complete: bool, accepted: bool,
+    outcome: Option<Outcome>,
+}
+
+pub struct Session {
+    generation: u64,
+    operation: Option<Operation>,
+    // Single outstanding procedure is a Host admission policy, not a claim
+    // about the controller's maximum connection count.
+    outstanding: bool,
+    uncertain: bool,
+}
+
+impl Session {
+    pub fn new(generation: u64) -> Result<Self, Error> {
+        if generation == 0 { return Err(Error::Invalid); }
+        Ok(Self { generation, operation: None, outstanding: false, uncertain: false })
+    }
+    pub fn query(&self, generation: u64, id: u64) -> Result<Option<Operation>, Error> {
+        if generation != self.generation { return Err(Error::Mismatch); }
+        Ok(self.operation.filter(|o| o.id == id))
+    }
+    pub fn reserve(&mut self, generation: u64, id: u64, cookie: u64, intent: Intent,
+                   now: u64, deadline: u64) -> Result<(), Error> {
+        if generation != self.generation { return Err(Error::Mismatch); }
+        if id == 0 || cookie == 0 || deadline <= now { return Err(Error::Invalid); }
+        if self.operation.is_some_and(|o| o.id == id) { return Err(Error::Duplicate); }
+        if self.outstanding || self.uncertain { return Err(Error::Busy); }
+        self.operation = Some(Operation { id, cookie, intent, state: State::Queued, error: 0,
+            command_status: None, outcome_status: None, fault_error: 0, handle: None, deadline, sent: false, out_complete: false,
+            accepted: false, outcome: None });
+        self.outstanding = true;
+        Ok(())
+    }
+    pub fn sent(&mut self, cookie: u64) -> Result<(), Error> {
+        let o = self.operation.as_mut().ok_or(Error::Invalid)?;
+        if o.cookie != cookie || o.state != State::Queued { return Err(Error::Mismatch); }
+        o.sent = true; o.state = State::OnWire; Ok(())
+    }
+    pub fn out_complete(&mut self, cookie: u64, result: Result<(), i32>) -> Result<(), Error> {
+        let o = self.operation.as_mut().ok_or(Error::Invalid)?;
+        if o.cookie != cookie || !o.sent { return Err(Error::Mismatch); }
+        if let Err(error) = result {
+            o.fault_error = error; if o.state != State::Cancelled { o.state = State::Faulted; o.error = error; }
+            self.uncertain = true; return Ok(());
+        }
+        o.out_complete = true; self.settle(); Ok(())
+    }
+    pub fn status(&mut self, cookie: u64, status: u8) -> Result<(), Error> {
+        let o = self.operation.as_mut().ok_or(Error::Invalid)?;
+        if o.cookie != cookie || !o.sent || o.accepted || o.command_status.is_some() { return Err(Error::Mismatch); }
+        o.command_status = Some(status); o.accepted = status == 0;
+        self.settle(); Ok(())
+    }
+    pub fn outcome(&mut self, generation: u64, value: Outcome) -> Result<(), Error> {
+        if generation != self.generation { return Err(Error::Mismatch); }
+        let o = self.operation.as_mut().ok_or(Error::Invalid)?;
+        if !o.sent || !self.outstanding || o.outcome.is_some() { return Err(Error::Mismatch); }
+        let matches = match (o.intent, value) {
+            (Intent::Create { address_type, address }, Outcome::Connected { address_type: t, address: a, .. }) => address_type == t && address == a,
+            (Intent::Disconnect { handle }, Outcome::Disconnected { handle: h, .. }) => handle == h,
+            _ => false,
+        };
+        if !matches { return Err(Error::Mismatch); }
+        o.outcome = Some(value); self.settle(); Ok(())
+    }
+    fn settle(&mut self) {
+        let Some(o) = self.operation.as_mut() else { return };
+        if !o.out_complete || self.uncertain { return; }
+        if o.command_status.is_some_and(|status| status != 0) {
+            // Contradictory success outcome cannot be discarded as harmless.
+            if o.outcome.is_some_and(|e| match e { Outcome::Connected { status, .. } | Outcome::Disconnected { status, .. } => status == 0 }) {
+                self.uncertain = true; o.fault_error = -71;
+                if o.state != State::Cancelled { o.state = State::Faulted; o.error = -71; }
+                return;
+            }
+            self.outstanding = false;
+            if o.state != State::Cancelled { o.state = State::Failed; o.error = -121; }
+            return;
+        }
+        if !o.accepted { return; }
+        let Some(outcome) = o.outcome else {
+            if o.state != State::Cancelled { o.state = State::AwaitingOutcome; }
+            return;
+        };
+        let (status,handle) = match outcome {
+            Outcome::Connected { status,handle,.. } | Outcome::Disconnected { status,handle } => (status,handle),
+        };
+        o.handle = Some(handle); o.outcome_status = Some(status); self.outstanding = false;
+        if o.state != State::Cancelled {
+            o.state = if status == 0 { State::Succeeded } else { State::Failed };
+            o.error = if status == 0 { 0 } else { -121 };
+        }
+    }
+    pub fn cancel(&mut self, id: u64) -> Result<(), Error> {
+        let o = self.operation.as_mut().ok_or(Error::Invalid)?;
+        if o.id != id || !self.outstanding { return Err(Error::Mismatch); }
+        o.state = State::Cancelled; o.error = -125;
+        if !o.sent { self.outstanding = false; }
+        // An on-wire author cancellation never cancels physical creation or
+        // releases its command/outcome reservation. Caller must close any
+        // late real link using its independently observed physical state.
+        Ok(())
+    }
+    pub fn expire(&mut self, now: u64) {
+        let Some(o) = self.operation.as_mut() else { return };
+        if !self.outstanding || now < o.deadline { return; }
+        o.fault_error = -110;
+        if o.state != State::Cancelled { o.error = -110; o.state = if o.sent { State::Faulted } else { State::Failed }; }
+        if o.sent { self.uncertain = true; } else { self.outstanding = false; }
+    }
+    pub fn reservation_clear(&self) -> bool { !self.outstanding && !self.uncertain }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn create()->Intent {Intent::Create {address_type:0,address:[1;6]}}
+    fn up(status:u8)->Outcome {Outcome::Connected {status,handle:7,address_type:0,address:[1;6]}}
+    fn session()->Session {let mut s=Session::new(1).unwrap();s.reserve(1,10,20,create(),0,30).unwrap();s.sent(20).unwrap();s}
+    #[test] fn status_is_acceptance_and_all_three_evidences_are_required() {
+        for order in [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
+            let mut s=session();
+            for (n,step) in order.into_iter().enumerate() {
+                match step {0=>s.out_complete(20,Ok(())).unwrap(),1=>s.status(20,0).unwrap(),_=>s.outcome(1,up(0)).unwrap()}
+                assert_eq!(s.query(1,10).unwrap().unwrap().state==State::Succeeded,n==2);
+            }
+            assert!(s.reservation_clear());
+        }
+    }
+    #[test] fn cancelled_author_does_not_become_successful_after_late_real_link() {
+        let mut s=session();s.cancel(10).unwrap();assert!(!s.reservation_clear());
+        s.outcome(1,up(0)).unwrap();s.status(20,0).unwrap();s.out_complete(20,Ok(())).unwrap();
+        let o=s.query(1,10).unwrap().unwrap();assert_eq!((o.state,o.error,o.handle),(State::Cancelled,-125,Some(7)));
+        assert!(s.reservation_clear()); // physical link obligation remains in separate observation domain
+    }
+    #[test] fn wrong_identity_cookie_peer_handle_and_event_kind_do_not_complete() {
+        let mut s=session();assert_eq!(s.out_complete(21,Ok(())),Err(Error::Mismatch));
+        assert_eq!(s.outcome(2,up(0)),Err(Error::Mismatch));
+        assert_eq!(s.outcome(1,Outcome::Connected{status:0,handle:7,address_type:1,address:[1;6]}),Err(Error::Mismatch));
+        assert_eq!(s.outcome(1,Outcome::Disconnected{status:0,handle:7}),Err(Error::Mismatch));
+        assert!(s.query(2,10).is_err());assert!(s.query(1,11).unwrap().is_none());
+        let mut d=Session::new(2).unwrap();d.reserve(2,1,2,Intent::Disconnect{handle:7},0,30).unwrap();d.sent(2).unwrap();
+        assert_eq!(d.outcome(2,Outcome::Disconnected{status:0,handle:8}),Err(Error::Mismatch));
+        d.status(2,0).unwrap();d.out_complete(2,Ok(())).unwrap();assert_eq!(d.query(2,1).unwrap().unwrap().state,State::AwaitingOutcome);
+        d.outcome(2,Outcome::Disconnected{status:0,handle:7}).unwrap();assert_eq!(d.query(2,1).unwrap().unwrap().state,State::Succeeded);
+    }
+    #[test] fn uncertain_send_and_accepted_timeout_block_reuse_and_late_success() {
+        for transport_error in [false,true] {
+            let mut s=session();s.status(20,0).unwrap();
+            if transport_error{s.out_complete(20,Err(-5)).unwrap()}else{s.out_complete(20,Ok(())).unwrap();s.expire(30)}
+            assert!(!s.reservation_clear());assert_eq!(s.query(1,10).unwrap().unwrap().state,State::Faulted);
+            s.outcome(1,up(0)).unwrap();assert_eq!(s.query(1,10).unwrap().unwrap().state,State::Faulted);
+            assert_eq!(s.reserve(1,11,21,create(),31,60),Err(Error::Busy));
+        }
+    }
+    #[test] fn never_selected_cancellation_and_timeout_need_no_wire_cleanup() {
+        for cancel in [false,true] {
+            let mut s=Session::new(1).unwrap();s.reserve(1,10,20,create(),0,30).unwrap();
+            if cancel{s.cancel(10).unwrap()}else{s.expire(30)}
+            assert!(s.reservation_clear());assert_eq!(s.sent(20),Err(Error::Mismatch));
+            s.reserve(1,11,21,create(),31,60).unwrap();
+        }
+    }
+    #[test] fn cancelled_author_error_survives_transport_fault_and_deadline() {
+        for fault in [false,true] {
+            let mut s=session();s.cancel(10).unwrap();
+            if fault{s.out_complete(20,Err(-5)).unwrap()}else{s.expire(30)}
+            let o=s.query(1,10).unwrap().unwrap();assert_eq!((o.state,o.error),(State::Cancelled,-125));
+            assert_eq!(o.fault_error,if fault{-5}else{-110});assert!(!s.reservation_clear());
+        }
+    }
+    #[test] fn status_failure_conflicting_with_physical_success_is_uncertain() {
+        let mut s=session();s.outcome(1,up(0)).unwrap();s.status(20,1).unwrap();s.out_complete(20,Ok(())).unwrap();
+        let o=s.query(1,10).unwrap().unwrap();assert_eq!((o.state,o.error,o.fault_error),(State::Faulted,-71,-71));
+        assert!(!s.reservation_clear());
+    }
+    #[test] fn failed_controller_status_and_outcome_preserve_raw_failures() {
+        let mut s=session();s.status(20,0x0f).unwrap();s.out_complete(20,Ok(())).unwrap();
+        let o=s.query(1,10).unwrap().unwrap();assert_eq!((o.state,o.command_status,o.outcome_status,o.error),(State::Failed,Some(0x0f),None,-121));
+        let mut s=session();s.status(20,0).unwrap();s.out_complete(20,Ok(())).unwrap();s.outcome(1,up(0x1c)).unwrap();
+        let o=s.query(1,10).unwrap().unwrap();assert_eq!((o.state,o.command_status,o.outcome_status,o.error),(State::Failed,Some(0),Some(0x1c),-121));
+    }
+}

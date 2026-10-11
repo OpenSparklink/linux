@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Explicit synthetic bytes, no firmware capability or RF qualification. */
+#include <assert.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include "ws73_connection_codec.h"
+int main(void)
+{
+    struct ws73_connection_parameters p = {.peer_address={0,1,9,0x32,0x54,0xf9},
+        .gt_negotiate=1,.frame=1,.scan_interval=32,.scan_window=32,
+        .interval_min=12,.interval_max=12,.supervision_timeout=508};
+    const unsigned char expected[27]={0,0,0,0,1,9,0x32,0x54,0xf9,1,1,32,0,32,0,12,0,12,0,0,0,0xfc,1,0,0,0,0};
+    unsigned char out[32], before[32]; memset(out,0xaa,sizeof(out));memcpy(before,out,sizeof(out));
+    for (size_t n=0;n<27;n++) {assert(ws73_connection_create(out,n,&p)==-ENOSPC);assert(!memcmp(out,before,32));}
+    assert(ws73_connection_create(out,32,&p)==27);assert(!memcmp(out,expected,27));assert(!memcmp(out+27,before+27,5));
+    assert(ws73_connection_validate(1,0x1401,out,27)==0);
+    assert(ws73_connection_validate(1,0x1401,out,6)==-EINVAL);
+    assert(ws73_connection_validate(1,0x1401,out,31)==-EINVAL);
+    assert(ws73_connection_validate(1,0x1403,out,27)==-EINVAL);
+    for (unsigned int kind=0;kind<8;kind++) {
+        struct ws73_connection_parameters bad=p;
+        switch(kind){case 0:bad.scan_window=33;break;case 1:bad.interval_min=13;break;
+        case 2:bad.supervision_timeout=0;break;case 3:bad.frame=2;break;case 4:bad.gt_negotiate=4;break;
+        case 5:bad.peer_address_type=256;break;case 6:bad.event_min=1;break;default:memset(bad.peer_address,0,6);}
+        memcpy(out,before,32);assert(ws73_connection_create(out,32,&bad)==-EINVAL);assert(!memcmp(out,before,32));
+    }
+    for(unsigned int handle=0;handle<=65535;handle+=257){
+        memcpy(out,before,32);assert(ws73_connection_disconnect(out,32,handle,0x13)==3);
+        assert(out[0]==(handle&255)&&out[1]==(handle>>8)&&out[2]==0x13);
+        assert(!memcmp(out+3,before+3,29));assert(ws73_connection_validate(2,0x1403,out,3)==0);
+    }
+    assert(ws73_connection_disconnect(out,32,65536,0x13)==-EINVAL);
+    assert(ws73_connection_disconnect(out,32,7,256)==-EINVAL);
+    assert(ws73_connection_validate(3,0x1402,NULL,0)==-EOPNOTSUPP); // cancel not qualified on v111
+    assert(ws73_connection_validate(1,0x1401,NULL,27)==-EINVAL);
+    puts("WS73_CONNECTION_CODEC_STAGING: PASS; not production or RF");return 0;
+}
