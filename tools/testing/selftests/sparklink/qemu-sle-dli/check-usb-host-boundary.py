@@ -268,7 +268,8 @@ int main(void)
     patches = [Path(__file__).with_name(name).resolve() for name in
                ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
                 'usb-host-autoscan.patch','usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch',
-                'usb-host-enumeration-once.patch','usb-host-runtime-selector.patch']]
+                'usb-host-enumeration-once.patch','usb-host-runtime-selector.patch',
+                'usb-host-runtime-drop.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -297,6 +298,7 @@ int main(void)
         denied=subprocess.run(commands[-1],cwd=tree,stdout=log,stderr=subprocess.STDOUT)
         assert denied.returncode!=0 and copy.read_bytes()==drift
         for before, after in [
+            ('WS73_TEST_RUNTIME_HOLD_DROP:', 'unexpected-hold-drop:'),
             ('"test-runtime-in-held"','"unexpected-held"'),
             ('timer_mod(s->test_runtime_hold_timer,',
              'timer_mod(s->test_runtime_hold_timer_drift,'),

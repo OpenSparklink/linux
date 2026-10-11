@@ -355,3 +355,23 @@ with counted dependency fixtures and can run ASan/UBSan. Those tests and QMP
 qualification do not establish real USB, scheduler, radio or automatic recovery
 acceptance. Later physical gates must match every skipped and retained frame
 hash/length to the actual capture and retain independent Ready peer activity.
+
+## Explicit original held-frame drop diagnostics
+
+`usb-host-runtime-drop.patch` adds a test-only log before the already-completed
+held transfer is freed by either request abort or packet cancellation. It records
+host bus/address, original length, drop count and SHA256. It does not copy a
+payload to the guest or create a successful USB/DLI completion. Default-disabled
+hold behavior is unchanged; timers and held identity are cleared before freeing.
+This allows QMP device deletion to archive evidence even after the object and
+its read-only counters are gone.
+
+The actual callback fixture covers cancel, live abort, dead abort and combined
+cancellation, requiring four ordered original-frame drop logs, no payload copy,
+no libusb re-cancellation, no timer replay and one free per allocation. Digest,
+timer, transport and USB combining dependencies remain explicit counted
+fixtures, not real USB or QEMU scheduler qualification. Run the pinned boundary
+chain with ASan/UBSan/LSan; every prior complete patch prefix is supported, and
+DROP log context drift must be rejected without mutating the caller's source.
+Actual cancellation/removal, physical hotplug and natural nonmanual recovery
+still require separate VM/hardware gates.

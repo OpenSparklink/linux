@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 import subprocess
 
@@ -25,7 +26,7 @@ def check(args):
         assert close.index('s->test_runtime_skip_'+field+' = 0;') < close.index('usb_host_abort_xfers(s);')
     assert close.index('s->test_runtime_skipped = 0;') < close.index('usb_host_abort_xfers(s);')
     assert close.index('usb_host_abort_xfers(s);') < close.index('libusb_close(s->dh);')
-    names = ['usb_host_test_clear_hold', 'usb_host_test_release_hold', 'usb_host_test_hold_timeout',
+    names = ['usb_host_test_record_drop', 'usb_host_test_clear_hold', 'usb_host_test_release_hold', 'usb_host_test_hold_timeout',
              'usb_host_req_complete_data', 'usb_host_req_abort', 'usb_host_cancel_packet',
              'usb_host_get_test_runtime_hold', 'usb_host_get_test_runtime_held',
              'usb_host_set_test_runtime_hold', 'usb_host_get_test_runtime_release',
@@ -208,7 +209,7 @@ int main(void) {
     arm(&s,&e);usb_host_set_test_runtime_in_error(&s,true,&e);
     assert(s.test_runtime_hold_once&&!s.test_runtime_in_error_once);
     usb_host_set_test_runtime_hold(&s,false,&e);
-    assert(allocated==freed&&timers==timer_frees&&digests==s.test_runtime_holds&&!nodev);
+    assert(allocated==freed&&timers==timer_frees&&digests==s.test_runtime_holds+s.test_runtime_hold_drops&&!nodev);
 
     /* Actual selector functions; timers/digest remain counted substitutes. */
     for(unsigned count=1;count<=2;count++) {
@@ -266,10 +267,16 @@ int main(void) {
     if args.sanitize:
         command[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     subprocess.run(command, check=True)
-    subprocess.run([str((args.output/'check').resolve())], check=True)
+    result=subprocess.run([str((args.output/'check').resolve())], capture_output=True, text=True)
+    (args.output/'stdout.txt').write_text(result.stdout)
+    (args.output/'stderr.txt').write_text(result.stderr)
+    result.check_returncode()
+    drops=re.findall(r'^WS73_TEST_RUNTIME_HOLD_DROP: dev 0:0 bytes=4 drops=(\d+) sha256=fixture$',result.stderr,re.M)
+    assert drops==['1','2','3','4'], 'exact abort/cancel original held-transfer diagnostics required'
+    assert 'RUNTIME_HOLD_DEPENDENCY_BOUNDARIES_PASS:' in result.stdout
     record = {'status':'PASS_ACTUAL_QEMU_HOLD_WITH_DEPENDENCY_FIXTURES',
               'scope':__doc__, 'live_usb_acceptance':False, 'live_on_wire_cancel_acceptance':False,
-              'qemu_scheduler_acceptance':False, 'actual_close_routing_audit':True,
+              'qemu_scheduler_acceptance':False, 'actual_close_routing_audit':True, 'actual_original_hold_drop_diagnostics':4,
               'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
               'actual_functions':names, 'production_sha256':hashlib.sha256(production.encode()).hexdigest(),
               'compile_command':command}
