@@ -2930,8 +2930,13 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
             if let Some(error) = host.controller_status().2 { return Err(error); }
             let (adv, scan, _) = host.discovery_radio();
             // The native raw whitelist contains queries only. A quiet diagnostic
-            // reader has not changed radio policy. Managed requires confirmed Off.
-            if host.quiet() && (mode == sle_management::DIAGNOSTIC || (adv == 1 && scan == 1)) {
+            // reader has not changed radio policy. Managed can also release an
+            // untouched Setup lease without sending a stop for a nonexistent
+            // advertising handle. Unknown after policy admission still requires
+            // real cleanup; this exception neither confirms Off nor sets Ready.
+            if host.quiet() && (mode == sle_management::DIAGNOSTIC
+                || (mode == sle_management::MANAGED
+                    && ((adv == 1 && scan == 1) || host.policy_untouched()))) {
                 gate.settled(0); return Ok(());
             }
         }

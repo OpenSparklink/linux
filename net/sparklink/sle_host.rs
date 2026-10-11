@@ -201,6 +201,17 @@ impl CommandHost {
     pub(crate) fn quiet(&self) -> bool {
         self.active.is_none() && self.reply.is_none() && self.requests.is_empty()
     }
+    /// An unconfigured controller has no advertising handle to stop. Derive
+    /// this exception from the same Host state that records policy admission;
+    /// unknown after any recipe, cancellation or fault is not untouched.
+    /// Settling a lease here does not establish Off or make the radio Ready.
+    pub(crate) fn policy_untouched(&self) -> bool {
+        self.quiet() && self.fault.is_none() && !self.revoking
+            && self.recipe.is_none() && self.broadcast_cookie == 0 && self.scan_cookie == 0
+            && !self.operations.initialized
+            && self.operations.advertising == 0 && self.operations.scanning == 0
+            && self.operations.entries.iter().all(Option::is_none)
+    }
     pub(crate) fn revocation_detail(&self) -> (u8, u16, bool) {
         (self.revoke_status, self.revoke_opcode, self.revoke_reply)
     }
