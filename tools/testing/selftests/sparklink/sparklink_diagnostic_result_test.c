@@ -369,7 +369,61 @@ static void print_deadline(const struct sle_diagnostic_submit *input,
 	}
 	printf("]}");
 }
-static void cancel_held(int fd, uint64_t generation, const unsigned char *address, int deadline_test)
+struct autonomous_observation {
+	struct sle_diagnostic_submit input, output;
+	struct sle_diagnostic_result initial, result;
+	struct sle_mgmt_stats before, after;
+	uint64_t admit_before, admit_after, quiet_before, quiet_after;
+	uint64_t stats_before, stats_after, result_before, result_after;
+};
+static void autonomous_wait(int fd, uint64_t generation, uint32_t seq,
+	struct autonomous_observation *row)
+{
+	row->input = (struct sle_diagnostic_submit){ .version = 1, .generation = generation,
+		.request_id = 12, .timeout_ms = 100, .opcode = 0x0403, .action = 1 };
+	row->output = row->input; row->admit_before = now(CLOCK_MONOTONIC);
+	require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &row->output) && row->output.seq == seq,
+		"autonomous queued admission");
+	row->admit_after = now(CLOCK_MONOTONIC);
+	row->initial = checked_result(fd, &row->output, 1, 0);
+	row->before = stats(fd);
+	row->quiet_before = now(CLOCK_MONOTONIC);
+	/* No submit, result, cancel or stats call during the passive window.
+	 * The first call afterward is observation-only MGMT_STATS; its dispatch
+	 * copies counters and never processes replies or expires requests.
+	 * Check that counter before the result ioctl could itself expire it. */
+	struct timespec quiet = { .tv_sec = 0, .tv_nsec = 800000000 };
+	require(!nanosleep(&quiet, NULL), "uninterrupted passive expiry window");
+	row->quiet_after = now(CLOCK_MONOTONIC);
+	row->stats_before = now(CLOCK_MONOTONIC); row->after = stats(fd);
+	row->stats_after = now(CLOCK_MONOTONIC);
+	require(row->after.total_submitted == row->before.total_submitted &&
+		row->before.pending == 2 && row->after.pending == 1 &&
+		row->after.total_resolved == row->before.total_resolved+1 &&
+		row->after.total_timeouts == row->before.total_timeouts+1,
+		"background timeout already counted before any result or retry");
+	row->result_before = now(CLOCK_MONOTONIC);
+	row->result = checked_result(fd, &row->output, 3, -ETIMEDOUT);
+	row->result_after = now(CLOCK_MONOTONIC);
+}
+static void print_autonomous(const struct autonomous_observation *row)
+{
+	printf(",\"autonomous\":{\"input\":"); hex(&row->input, sizeof(row->input));
+	printf(",\"output\":"); hex(&row->output, sizeof(row->output));
+	printf(",\"initial_result\":"); hex(&row->initial, sizeof(row->initial));
+	printf(",\"stats_before\":"); hex(&row->before, sizeof(row->before));
+	printf(",\"stats_after\":"); hex(&row->after, sizeof(row->after));
+	printf(",\"result\":"); hex(&row->result, sizeof(row->result));
+	printf(",\"admit_before_monotonic_ns\":%llu,\"admit_after_monotonic_ns\":%llu,"
+		"\"quiet_before_monotonic_ns\":%llu,\"quiet_after_monotonic_ns\":%llu,"
+		"\"stats_before_monotonic_ns\":%llu,\"stats_after_monotonic_ns\":%llu,"
+		"\"result_before_monotonic_ns\":%llu,\"result_after_monotonic_ns\":%llu}",
+		(unsigned long long)row->admit_before, (unsigned long long)row->admit_after,
+		(unsigned long long)row->quiet_before, (unsigned long long)row->quiet_after,
+		(unsigned long long)row->stats_before, (unsigned long long)row->stats_after,
+		(unsigned long long)row->result_before, (unsigned long long)row->result_after);
+}
+static void cancel_held(int fd, uint64_t generation, const unsigned char *address, int deadline_test, int autonomous_test)
 {
 	/* QMP holds an actual successful host transfer; guest never injects data. */
 	hold_phase("arm_ready"); hold_ack("armed\n", 10000);
@@ -400,6 +454,7 @@ static void cancel_held(int fd, uint64_t generation, const unsigned char *addres
 	struct sle_diagnostic_submit deadline_output = deadline_input;
 	struct sle_diagnostic_result deadline_initial = { 0 }, deadline_final = { 0 };
 	struct deadline_sample samples[DEADLINE_SAMPLES]; unsigned sample_count = 0;
+	struct autonomous_observation autonomous = { 0 };
 	uint64_t admit_before = 0, admit_after = 0, expired_after = 0;
 	uint64_t quiet_start = now(CLOCK_MONOTONIC), quiet_end = quiet_start + (deadline_test ? 150000000ULL : 50000000ULL);
 	if (deadline_test) {
@@ -442,9 +497,10 @@ static void cancel_held(int fd, uint64_t generation, const unsigned char *addres
 		}
 		observations++; usleep(1000);
 	} while (now(CLOCK_MONOTONIC) < quiet_end);
+	if (autonomous_test) autonomous_wait(fd, generation, deadline_output.seq+1, &autonomous);
 	struct sle_mgmt_stats held = stats(fd);
-	require(held.total_submitted == before.total_submitted+3+deadline_test && held.total_resolved == before.total_resolved+2+deadline_test &&
-		!before.pending && held.pending == 1 && held.total_timeouts == before.total_timeouts+deadline_test,
+	require(held.total_submitted == before.total_submitted+3+deadline_test+autonomous_test && held.total_resolved == before.total_resolved+2+deadline_test+autonomous_test &&
+		!before.pending && held.pending == 1 && held.total_timeouts == before.total_timeouts+deadline_test+autonomous_test,
 		"held cancel and replay accounting");
 	if (deadline_test) require(expired_after && expired_after >= admit_before+75000000ULL &&
 		expired_after <= admit_after+180000000ULL && sample_count >= 10, "original deadline not renewed by retries");
@@ -460,6 +516,7 @@ static void cancel_held(int fd, uint64_t generation, const unsigned char *addres
 	putchar(']'); counters(before, held);
 	if (deadline_test) print_deadline(&deadline_input, &deadline_output, &deadline_initial,
 		admit_before, admit_after, samples, sample_count);
+	if (autonomous_test) print_autonomous(&autonomous);
 	puts("}"); fflush(stdout);
 	hold_phase("release_ready"); hold_ack("released\n", 1500);
 	struct sle_diagnostic_result final = completed(fd, &output[1], 6, now(CLOCK_MONOTONIC)+6000000000ULL);
@@ -472,6 +529,12 @@ static void cancel_held(int fd, uint64_t generation, const unsigned char *addres
 			require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &retry) &&
 				!memcmp(&retry, &deadline_output, sizeof(retry)), "expired ID does not readmit after release");
 			checked_result(fd, &deadline_output, 3, -ETIMEDOUT);
+			if (autonomous_test) {
+				struct sle_diagnostic_submit retry = autonomous.input;
+				require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &retry) &&
+					!memcmp(&retry, &autonomous.output, sizeof(retry)), "autonomous expired ID remains original");
+				checked_result(fd, &autonomous.output, 3, -ETIMEDOUT);
+			}
 		}
 		struct sle_diagnostic_result retry = request(generation, output[1].seq);
 		require(!ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &retry) && !memcmp(&retry, &final, sizeof(retry)), "fresh final stable");
@@ -485,6 +548,7 @@ static void cancel_held(int fd, uint64_t generation, const unsigned char *addres
 	hex(&active, sizeof(active)); putchar(','); hex(&final, sizeof(final)); putchar(','); hex(&queued, sizeof(queued));
 	putchar(']'); counters(held, after);
 	if (deadline_test) { printf(",\"deadline\":{\"result\":"); hex(&deadline_final, sizeof(deadline_final)); printf("}"); }
+	if (autonomous_test) { printf(",\"autonomous\":{\"result\":"); hex(&autonomous.result, sizeof(autonomous.result)); printf("}"); }
 	puts("}"); fflush(stdout);
 }
 /* Removed commands remain literal only in rejection tests. No compatibility
@@ -579,10 +643,12 @@ int main(int argc, char **argv)
 {
 	char cmdline[4096] = { 0 }, *end; struct stat s;
 	FILE *f = fopen("/proc/cmdline", "r"); require(f && fgets(cmdline, sizeof(cmdline), f), "cmdline"); fclose(f);
-	int deadline_test = argc == 3 && !strcmp(argv[2], "deadline");
+	int autonomous_test = argc == 3 && !strcmp(argv[2], "autonomous");
+	int deadline_test = autonomous_test || (argc == 3 && !strcmp(argv[2], "deadline"));
 	int cancellation = deadline_test || (argc == 3 && !strcmp(argv[2], "cancel"));
 	require((argc == 2 || cancellation) && (!cancellation || strstr(cmdline, "ws73.diagnostic_cancel=1")) &&
 		(!deadline_test || strstr(cmdline, "ws73.diagnostic_deadline=1")) &&
+		(!autonomous_test || strstr(cmdline, "ws73.diagnostic_autonomous=1")) &&
 		!getuid() && !geteuid() && !stat("/scratch-root-uuid", &s) &&
 		strstr(cmdline, "ws73.diagnostic=1"), "opt-in scratch-root VM only");
 	long index = strtol(argv[1], &end, 10); require(*argv[1] && !*end && index >= 0 && index < 16, "index");
@@ -624,7 +690,7 @@ int main(int argc, char **argv)
 	rejected(fd, "wrong_generation", request(generation + 1, mac.seq), ENODEV);
 	rejected(fd, "missing_sequence", request(generation, UINT32_MAX), ENOENT);
 	legacy_poll_faults(fd, generation, snapshot.address);
-	if (cancellation) cancel_held(fd, generation, snapshot.address, deadline_test);
+	if (cancellation) cancel_held(fd, generation, snapshot.address, deadline_test, autonomous_test);
 	release(fd, &lease);
 	int other = bound(index); lease = acquire(other, generation);
 	rejected(other, "foreign_author_with_lease", request(generation, mac.seq), EPERM);
