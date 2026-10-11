@@ -1524,7 +1524,7 @@ fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<u16> {
                 let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
                 let kern_dev: &kernel::device::Device<kernel::device::Core> = interface.as_ref();
                 match super::sle_fw::load_usb_firmware(dev_id, fw_name, kern_dev) {
-                    Ok(r) => pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", r.size),
+                    Ok(size) => pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", size),
                     Err(_) => pr_debug!("sparklink-usb: firmware load skipped\n"),
                 }
             }
