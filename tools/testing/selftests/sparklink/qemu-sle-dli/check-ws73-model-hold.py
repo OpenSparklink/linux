@@ -21,7 +21,7 @@ def check(args):
     boundary = importlib.util.module_from_spec(spec); spec.loader.exec_module(boundary)
     names = ['reset', 'model_release', 'model_bounded_release', 'model_arm_get',
              'model_arm_set', 'model_held_get', 'model_armable_get', 'model_release_get',
-             'model_release_set', 'model_retain_terminal']
+             'model_release_set', 'model_skip_get','model_skip_set','model_retain_terminal']
     functions = '\n\n'.join(boundary.body(source, name) for name in names)
     structure = re.search(r'struct USBWs73Test \{.*?\n\};', source, re.S).group()
     # Audit actual call ordering, including disposal of an armed/held timer.
@@ -31,12 +31,13 @@ def check(args):
     assert 'timer_free(s->model_hold_timer); s->model_hold_timer = NULL;' in dispose
     assert 's->model_hold_once = s->model_held = false;' in dispose
     assert all(f'&s->{field}, OBJ_PROP_FLAG_READ' in source for field in [
-        'model_holds','model_releases','model_bounded_releases','model_drops'])
+        'model_holds','model_releases','model_bounded_releases','model_drops','model_skipped'])
     (args.output/'actual-functions.h').write_text(structure+'\n'+functions+'\n')
     fixture = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,7 @@ typedef struct { int unused; } USBPacket;
 typedef struct { int64_t deadline; unsigned mods, dels; } QEMUTimer;
 typedef struct { int calls; } Error;
 typedef struct USBWs73Test USBWs73Test;
+typedef struct { uint64_t input, output; bool valid, writing; } Visitor;
 #define USB_WS73_TEST(obj) ((USBWs73Test *)(obj))
 #define USB_TOKEN_IN 1
 #define QEMU_CLOCK_REALTIME 0
@@ -53,6 +55,10 @@ typedef struct USBWs73Test USBWs73Test;
 #define g_assert assert
 static unsigned wakes, digests, acks;
 static void error_setg(Error **errp, const char *format, ...) { assert(errp && *errp); (*errp)->calls++; }
+static bool visit_type_uint64(Visitor *v, const char *name, uint64_t *value, Error **errp) {
+    assert(v); if(!v->valid){error_setg(errp,"typed unsigned integer required");return false;}
+    if(v->writing){*value=v->input;}v->output=*value;return true;
+}
 static void timer_del(QEMUTimer *t) { assert(t); t->dels++; }
 static void timer_mod(QEMUTimer *t, int64_t deadline) { assert(t); t->deadline=deadline; t->mods++; }
 static int64_t qemu_clock_get_ms(int clock) { assert(clock==QEMU_CLOCK_REALTIME); return 100; }
@@ -113,6 +119,31 @@ int main(void) {
     assert(model_retain_terminal(&dropped));reset((USBDevice *)&dropped);
     assert(dropped.model_drops==1 && dropped.model_holds==1 && !dropped.count && !dropped.model_held);
     model_bounded_release(&dropped);assert(wakes==2 && digests==5 && !acks);
+    /* Nth terminal selection: filters do not spend skip budget; original
+     * bytes/queue/in-flight stay untouched until normal USB delivery. */
+    for(unsigned skip=1;skip<=2;skip++){
+        USBWs73Test later=controller(&t);Visitor visitor={.input=skip,.valid=true,.writing=true};
+        model_skip_set(&later,&visitor,"skip",NULL,&err);assert(later.model_skip_count==skip);
+        Visitor read={.valid=true};model_skip_get(&later,&read,"skip",NULL,&err);assert(read.output==skip);
+        model_arm_set(&later,true,&err);terminal(&later);
+        uint8_t original[384];memcpy(original,later.packets[0],384);
+        for(unsigned n=0;n<skip;n++){
+            later.packets[0][97]=1;assert(!model_retain_terminal(&later)&&later.model_skipped==n);
+            later.packets[0][97]=2;assert(!model_retain_terminal(&later));
+            assert(later.model_skipped==n+1&&later.model_hold_once&&!later.model_holds);
+            assert(later.count==1&&later.in_flight&&!memcmp(original,later.packets[0],384));
+        }
+        assert(model_retain_terminal(&later)&&later.model_holds==1);
+        int errors=e.calls;model_skip_set(&later,&visitor,"skip",NULL,&err);assert(e.calls==errors+1);
+        model_release_set(&later,true,&err);reset((USBDevice *)&later);later.opened=true;
+        assert(later.model_skip_count==skip&&later.model_skipped==skip&&!model_armable_get(&later,&err));
+    }
+    USBWs73Test invalid=controller(&t);Visitor bad={.input=UINT64_MAX,.valid=true,.writing=true};
+    int errors=e.calls;model_skip_set(&invalid,&bad,"skip",NULL,&err);assert(e.calls==errors+1&&!invalid.model_skip_count);
+    bad.valid=false;bad.input=1;model_skip_set(&invalid,&bad,"skip",NULL,&err);assert(e.calls==errors+2&&!invalid.model_skip_count);
+    USBWs73Test interrupted=controller(&t);Visitor one={.input=1,.valid=true,.writing=true};model_skip_set(&interrupted,&one,"skip",NULL,&err);
+    model_arm_set(&interrupted,true,&err);terminal(&interrupted);assert(!model_retain_terminal(&interrupted));
+    reset((USBDevice *)&interrupted);interrupted.opened=true;assert(interrupted.model_skipped==1&&!model_armable_get(&interrupted,&err));
     puts("MODEL_TERMINAL_HOLD_DEPENDENCY_BOUNDARIES_PASS");
 }
 '''

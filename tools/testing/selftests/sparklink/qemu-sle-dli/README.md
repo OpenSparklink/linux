@@ -12,7 +12,14 @@ Status、credit、其他帧不消费预算。`model-terminal-release` 交还原�
 提供有界释放（实际调度并非硬实时）。预算跨 reset 保持，reset/drop/unrealize
 清理 timer。它不保留真实 libusb transfer，不是 `usb-host` 的实际 IN81 hold，
 也不是自然故障或 RF 证据。用于同一生产内核的 fd/迟到回复清理开发支撑，
-真实设备验收必须仍使用上面的实际 usb-host hold 门禁。
+真实设备验收必须仍使用实际 usb-host hold 门禁。
+
+`model-terminal-skip-count` 是显式 uint64 配置，默认0、只接受0..2，且只能在
+opened/idle、未 arm/hold/消费的对象上设置。前N份符合终结帧条件的数据按
+原 USB 路径交还，不产生回复；只读 `model-terminal-skipped` 和原帧SHA日志
+记录消费。之后仍只保留一份原队首帧并有界交还。Status/credit/其他帧不消费
+skip预算，部分消费后reset也不能重配或重新arm。这为初始化后续步骤门禁
+提供开发支撑，尚未证明扫描START、内核 fd 或真实在途 libusb 回复验收。
 
 ```sh
 python3 check-ws73-model-hold.py --cc clang --sanitize \
@@ -20,7 +27,8 @@ python3 check-ws73-model-hold.py --cc clang --sanitize \
 ```
 
 该检查编译实际 retain/arm/release/reset 函数，计数依赖替代 timer/wakeup/digest，
-验证默认值、过滤、队列字节保持、跨对象拒绝、显式/有界释放及 reset 不补预算。
+验证默认值、过滤、队列字节保持、跨对象拒绝、显式/有界释放、后续帧选择、
+类型/范围拒绝及 reset 不补预算。
 它不验证 QEMU 调度、内核 fd 或真实 USB；这些须另跑相应 VM 门禁。
 
 这不是一个完整的 SparkLink 射频仿真器。它的目标是：

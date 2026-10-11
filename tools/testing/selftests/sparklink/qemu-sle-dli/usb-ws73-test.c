@@ -11,6 +11,7 @@
 #include "hw/usb/desc.h"
 #include "qom/object.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 
 #define TYPE_USB_WS73_TEST "usb-ws73-test"
 OBJECT_DECLARE_SIMPLE_TYPE(USBWs73Test, USB_WS73_TEST)
@@ -52,6 +53,7 @@ struct USBWs73Test {
     QEMUTimer *model_hold_timer;
     bool model_hold_once, model_held;
     uint64_t model_holds, model_releases, model_bounded_releases, model_drops;
+    uint64_t model_skip_count, model_skipped;
 };
 
 static unsigned int instances;
@@ -520,7 +522,7 @@ static void model_arm_set(Object *obj, bool value, Error **errp)
     USBWs73Test *s = USB_WS73_TEST(obj);
     if (!value) { s->model_hold_once = false; return; }
     if (!s->opened || !s->runtime_discovery || s->count || s->in_flight
-        || s->model_hold_once || s->model_held || s->model_holds) {
+        || s->model_hold_once || s->model_held || s->model_holds || s->model_skipped) {
         error_setg(errp, "model hold requires idle opened discovery fixture and unused object budget");
         return;
     }
@@ -536,7 +538,29 @@ static bool model_armable_get(Object *obj, Error **errp)
 {
     USBWs73Test *s = USB_WS73_TEST(obj);
     return s->opened && s->runtime_discovery && !s->count && !s->in_flight
-        && !s->model_hold_once && !s->model_held && !s->model_holds;
+        && !s->model_hold_once && !s->model_held && !s->model_holds && !s->model_skipped;
+}
+
+static void model_skip_get(Object *obj, Visitor *v, const char *name,
+                           void *opaque, Error **errp)
+{
+    uint64_t count = USB_WS73_TEST(obj)->model_skip_count;
+    visit_type_uint64(v, name, &count, errp);
+}
+
+static void model_skip_set(Object *obj, Visitor *v, const char *name,
+                           void *opaque, Error **errp)
+{
+    USBWs73Test *s = USB_WS73_TEST(obj);
+    uint64_t count;
+    if (!visit_type_uint64(v, name, &count, errp)) { return; }
+    /* Configure only an idle, unopened-budget fixture. Reset cannot renew
+     * a partially consumed selection by erasing earlier terminal evidence. */
+    if (count > 2 || !model_armable_get(obj, errp)) {
+        error_setg(errp, "model terminal skip requires idle unused budget and count 0..2");
+        return;
+    }
+    s->model_skip_count = count;
 }
 
 static bool model_release_get(Object *obj, Error **errp)
@@ -564,6 +588,15 @@ static bool model_retain_terminal(USBWs73Test *s)
         return false;
     }
     g_assert(s->model_holds == 0);
+    if (s->model_skipped < s->model_skip_count) {
+        char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, frame,
+                                                   s->packet_size[s->head]);
+        s->model_skipped++;
+        fprintf(stderr, "WS73_MODEL_TERMINAL_SKIP: serial=%u bytes=%u skipped=%" PRIu64 " sha256=%s\n",
+                s->serial, s->packet_size[s->head], s->model_skipped, digest);
+        g_free(digest);
+        return false; /* normal original-byte delivery, never a fake reply */
+    }
     s->model_hold_once = false; s->model_held = true; s->model_holds++;
     char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, frame,
                                                s->packet_size[s->head]);
@@ -705,6 +738,8 @@ static void class_init(ObjectClass *klass, void *data)
     object_class_property_add_bool(klass, "model-terminal-held", model_held_get, NULL);
     object_class_property_add_bool(klass, "model-terminal-armable", model_armable_get, NULL);
     object_class_property_add_bool(klass, "model-terminal-release", model_release_get, model_release_set);
+    object_class_property_add(klass, "model-terminal-skip-count", "uint64",
+                              model_skip_get, model_skip_set, NULL, NULL);
     device_class_set_props(DEVICE_CLASS(klass), properties);
 }
 
@@ -715,6 +750,7 @@ static void instance_init(Object *obj)
     object_property_add_uint64_ptr(obj, "model-terminal-releases", &s->model_releases, OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "model-terminal-bounded-releases", &s->model_bounded_releases, OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "model-terminal-drops", &s->model_drops, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "model-terminal-skipped", &s->model_skipped, OBJ_PROP_FLAG_READ);
 }
 
 static const TypeInfo type = {
