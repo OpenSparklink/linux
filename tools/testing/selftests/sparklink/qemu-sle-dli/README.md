@@ -19,7 +19,15 @@ opened/idle、未 arm/hold/消费的对象上设置。前N份符合终结帧条�
 原 USB 路径交还，不产生回复；只读 `model-terminal-skipped` 和原帧SHA日志
 记录消费。之后仍只保留一份原队首帧并有界交还。Status/credit/其他帧不消费
 skip预算，部分消费后reset也不能重配或重新arm。这为初始化后续步骤门禁
-提供开发支撑，尚未证明扫描START、内核 fd 或真实在途 libusb 回复验收。
+提供开发支撑；属性／函数检查自身不证明内核 fd 或真实在途 libusb 回复。
+
+[后续步骤模型 VM 证据](https://github.com/OpenSparklink/sparklink/blob/4dd391f1b6689a50a85d20dc9f79602e6d8be55d/docs/evidence/ws73-managed-later-partial-model-fd-20261011.json)
+另封存广告最后 STOP、扫描 START／最后 STOP × release／最后 fd／dup 九个
+成功案例和三个精确拒绝。实际签名生产内核 fd、原期限、Cancelled、早期帧
+及保留帧 SHA/长度逐一匹配；原最后 STOP 可确认 Off 而不重复 STOP／成功旧
+请求。扫描 START 清理必须真的发送 STOP。原 VM FAIL 与错误保持，未修改
+正式驱动／Rust。同行仍为模拟 Setup/Diagnostic；真实在途 libusb、活动
+Ready 同伴、RF、自动恢复和自然根因尚未验收，不能据此关闭整项 issue。
 
 ```sh
 python3 check-ws73-model-hold.py --cc clang --sanitize \
