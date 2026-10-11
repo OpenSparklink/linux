@@ -281,6 +281,13 @@ impl CmdPendingQueue {
         }
     }
 
+    /// Earliest unresolved author deadline, including requests still queued.
+    /// Observational only: scheduling must neither expire nor renew a result.
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        self.entries.iter().flatten().filter(|entry| entry.is_pending())
+            .map(|entry| entry.deadline).min()
+    }
+
     /// Expire all entries whose deadline has passed.
     ///
     /// Returns the number of entries that were timed out.

@@ -655,8 +655,18 @@ impl WorkItem<0> for ControllerRuntime {
         let can_send = {
             let state = this.state.lock();
             state.as_ref().is_some_and(|state| {
+                // Deadlines cover queue wait as well as transport/reply wait.
+                // Recompute after every wake: a retry or a busy event stream
+                // must not reset the original deadline to a fresh heartbeat.
+                // SAFETY: jiffies is a read-only kernel clock.
+                let now = unsafe { kernel::bindings::jiffies_64 };
+                let host = this.host.lock();
+                for deadline in [state.cmd_pending.next_deadline(), host.next_deadline()]
+                    .into_iter().flatten() {
+                    rearm_jiffies = rearm_jiffies.min(deadline.saturating_sub(now).max(1));
+                }
                 if state.controller.uses_command_host() {
-                    this.host.lock().can_send()
+                    host.can_send()
                 } else {
                     state.command_credits > 0 && !state.cmd_queue.is_empty()
                 }

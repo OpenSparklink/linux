@@ -52,8 +52,18 @@ def run(output):
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
+    with tempfile.TemporaryDirectory(prefix='sparklink-host-deadline-') as tmp:
+        tmp = Path(tmp)
+        for name in ['sle_command_queue.rs', 'sle_command_plan.rs']:
+            (tmp / name).write_bytes(inputs[name])
+        fixture = (here / 'diagnostic/host_deadline_fixture.rs').read_text()
+        fixture = fixture.replace('// @@HOST_DEADLINE@@', function(inputs['sle_host.rs'].decode(), 'next_deadline'))
+        (tmp / 'fixture.rs').write_text(fixture)
+        subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
+                        '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
+        subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 23, 'result_tests': 12, 'admission_tests': 11,
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 32, 'result_tests': 14, 'admission_tests': 12, 'host_deadline_tests': 6,
               'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},

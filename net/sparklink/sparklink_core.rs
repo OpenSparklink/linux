@@ -3351,6 +3351,10 @@ fn ioctl_diagnostic_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     drop(watermark);
     drop(management);
     owner.kick_commands();
+    // An existing idle heartbeat may be later than this admission's deadline.
+    // Wake RX to recompute the earliest absolute deadline under owner state.
+    // Delayed enqueue alone cannot shorten already pending delayed work.
+    owner.schedule_rx(0);
     // Committed ID/admission remain findable on EFAULT. Retrying cannot enqueue
     // a second command, extend its deadline or revive an evicted/cancelled ID.
     write_user_struct(arg, &input)?;

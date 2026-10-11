@@ -470,19 +470,22 @@ impl CommandHost {
         })
     }
 
+    /// Earliest wire/cleanup deadline, even after local author cancellation.
+    /// A delivered reply releases its slot only when the worker consumes it.
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        if self.fault.is_some() { return None; }
+        let revoke = (self.revoking && self.revoke_done != 3).then_some(self.revoke_deadline);
+        let active = self.active.as_ref()
+            .filter(|active| !active.transport_done || self.reply.is_none())
+            .map(|active| active.deadline);
+        [revoke, active, self.requests.first_recipe_deadline()]
+            .into_iter().flatten().min()
+    }
+
     pub(crate) fn timed_out(&self) -> bool {
-        if self.fault.is_some() { return false; }
         // SAFETY: reading jiffies is safe in process/IRQ context.
         let now = unsafe { kernel::bindings::jiffies_64 };
-        (self.revoking && self.revoke_done != 3 && now >= self.revoke_deadline)
-            || self
-                .active
-                .as_ref()
-                .is_some_and(|active| (!active.transport_done || self.reply.is_none()) && now >= active.deadline)
-            || self
-                .requests
-                .first_recipe_deadline()
-                .is_some_and(|deadline| now >= deadline)
+        self.next_deadline().is_some_and(|deadline| now >= deadline)
     }
 
     /// Latch a fault; never invent credits after uncertain transport outcome.

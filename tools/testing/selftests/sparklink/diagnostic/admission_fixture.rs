@@ -51,7 +51,8 @@ impl Host {
  // @@CANCEL@@
 }
 struct Owner {identity:Identity,protocol_profile:u32,management:TestMutex<Management>,schedule_gate:TestMutex<bool>,host:TestMutex<Host>}
-impl Owner {fn kick_commands(&self){}}
+impl Owner {fn schedule_rx(&self, delay: u32) {assert_eq!(delay,0); RX_WAKES.with(|n|n.set(n.get()+1));}
+    fn kick_commands(&self){}}
 struct Controller;
 impl Controller {fn validate_command(&self,opcode:u16,params:&[u8])->Result{if matches!(opcode,0x0402|0x0403|0x0404|0x0406)&&params.is_empty(){Ok(())}else{Err(Error(-95))}}}
 struct State {cmd_pending:CmdPendingQueue,controller:Controller}
@@ -67,7 +68,9 @@ fn read_user_struct(_:usize)->Result<SleDiagnosticSubmit>{INPUT.with(|p|{let v=*
 fn write_user_struct(arg:usize,v:&SleDiagnosticSubmit)->Result {if arg==0 {return Err(EFAULT)} OUTPUT.with(|p|*p.borrow_mut()=Some(*v));Ok(())}
 // @@SUBMIT_HANDLER@@
 fn request(id:u64)->SleDiagnosticSubmit{SleDiagnosticSubmit{version:1,flags:0,generation:7,request_id:id,timeout_ms:5000,opcode:0x0406,reserved:0,seq:0,action:1}}
+thread_local! {static RX_WAKES:std::cell::Cell<u32>=const {std::cell::Cell::new(0)};}
 fn setup()->(RuntimeContext,SparkLinkCtl){
+ RX_WAKES.with(|n|n.set(0));
  let _ = core::mem::size_of::<sle_mgmt::CmdRequest>();
  let identity=Identity{generation:7};
  (RuntimeContext{owner:Some(Owner{identity,protocol_profile:1,management:TestMutex::new(Management{file:42}),schedule_gate:TestMutex::new(false),host:TestMutex::new(Host{requests:sle_command_queue::CmdRequestQueue::new(),fault:None,next_cookie:1,active:None,credits:3,reply:None})}),state:TestMutex::new(Some(State{cmd_pending:CmdPendingQueue::new(),controller:Controller}))},SparkLinkCtl{file_id:42,target:TestMutex::new(Some(Target{identity})),diagnostic_request_id:TestMutex::new(0)})
@@ -153,4 +156,15 @@ fn seq()->u32{OUTPUT.with(|p|p.borrow().as_ref().unwrap().seq)}
  assert_eq!(submit(&c,&f,request(33),1),Err(EBUSY));assert_eq!(*f.diagnostic_request_id.lock(),32);
  let(c,f)=setup();{let mut h=c.owner.as_ref().unwrap().host.lock();for seq in 1..=64{h.requests.push_tagged(0x0406,&[],seq,0,None,5000).unwrap();}}
  assert_eq!(submit(&c,&f,request(1),1),Err(EBUSY));assert_eq!(*f.diagnostic_request_id.lock(),0);assert_eq!(c.state.lock().as_ref().unwrap().cmd_pending.total_submitted,0);
+}
+
+#[test] fn committed_admission_and_retry_wake_rx_but_rejection_does_not(){
+ let(c,f)=setup();assert_eq!(submit(&c,&f,request(1),0),Err(EFAULT));
+ assert_eq!(RX_WAKES.with(|n|n.get()),1);
+ let deadline=c.state.lock().as_ref().unwrap().cmd_pending.find_request(42,1).unwrap().deadline;
+ submit(&c,&f,request(1),1).unwrap();
+ assert_eq!(RX_WAKES.with(|n|n.get()),2);
+ assert_eq!(c.state.lock().as_ref().unwrap().cmd_pending.find_request(42,1).unwrap().deadline,deadline);
+ let mut bad=request(2);bad.timeout_ms=0;assert_eq!(submit(&c,&f,bad,1),Err(EINVAL));
+ assert_eq!(RX_WAKES.with(|n|n.get()),2);
 }
