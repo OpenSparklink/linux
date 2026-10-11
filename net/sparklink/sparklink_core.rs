@@ -2917,17 +2917,24 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
         let state = Option::as_mut(&mut *state).ok_or(ENODEV)?;
         if *owner.schedule_gate.lock() { return Err(ENODEV); }
         {
-            let host = owner.host.lock();
+            let mut host = owner.host.lock();
             if let Some(error) = host.controller_status().2 { return Err(error); }
             let (adv, scan, _) = host.discovery_radio();
             // The native raw whitelist contains queries only. A quiet diagnostic
             // reader has not changed radio policy. Managed can also release an
             // untouched Setup lease without sending a stop for a nonexistent
-            // advertising handle. Unknown after policy admission still requires
-            // real cleanup; this exception neither confirms Off nor sets Ready.
+            // advertising handle. Selected or uncertain policy still requires
+            // real cleanup; neither exception confirms Off nor sets Ready.
             if host.quiet() && (mode == sle_management::DIAGNOSTIC
                 || (mode == sle_management::MANAGED
                     && ((adv == 1 && scan == 1) || host.policy_untouched()))) {
+                gate.settled(0); return Ok(());
+            }
+            // Admission and state serialization exclude a concurrent submit
+            // or TX selection. Cancel never-selected typed policy without a
+            // stop for a handle that has not been configured; retain Unknown
+            // and cancelled operation results, rather than synthesizing Ready.
+            if mode == sle_management::MANAGED && host.cancel_unsubmitted_policy() {
                 gate.settled(0); return Ok(());
             }
         }

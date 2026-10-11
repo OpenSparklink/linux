@@ -8,17 +8,30 @@
 #[allow(dead_code)]
 #[path="sle_discovery_operation.rs"] mod sle_discovery_operation;
 #[path="sle_management.rs"] mod sle_management;
-use std::cell::{RefCell,Ref};
-use sle_command_queue::CmdRequestQueue;
+use std::cell::{RefCell,RefMut};
+use sle_command_queue::{CmdRequestQueue,CmdRequest};
+use sle_command_plan::{DiscoveryIntent,RecipeTag,RecipeProgress};
 use sle_discovery_operation::{Operations,Operation,State};
+mod under_test {
+use super::*;
 type Error=i32;
-type Result=std::result::Result<(),Error>;
+type Result<T=()>=std::result::Result<T,Error>;
+mod kernel {pub mod bindings {pub const ECANCELED:u32=125;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
+const EINVAL:i32=-22;const ETIMEDOUT:i32=-110;
+fn msecs_to_jiffies(ms:u32)->u64 {ms as u64}
+// @@TIMEOUT@@
+#[allow(dead_code)]
+enum SleOpcode {
+// @@OPCODES@@
+}
+#[allow(dead_code)]
+// @@IN_FLIGHT@@
 struct Lock(RefCell<Host>);
-impl Lock {fn lock(&self)->Ref<'_,Host>{self.0.borrow()}}
+impl Lock {fn lock(&self)->RefMut<'_,Host>{self.0.borrow_mut()}}
 struct Owner {host:Lock}
-struct Host {requests:CmdRequestQueue,credits:u8,active:Option<()>,reply:Option<()>,
- fault:Option<Error>,recipe:Option<()>,broadcast_cookie:u64,scan_cookie:u64,
- operations:Operations,revoking:bool,next_cookie:u64}
+struct Host {requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
+ fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
+ operations:Operations,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2]}
 impl Host {
  // @@HOST_METHODS@@
 }
@@ -28,7 +41,9 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
 }
 fn host()->Host {Host{requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),
- revoking:false,next_cookie:1}}
+ revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2]}}
+fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,transport_done:false}}
+fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
  intent:sle_command_plan::DiscoveryIntent::AdvertisingStandby,state:State::Cancelled,
  error:-125,status:0,opcode:0,step:0,count:4,power_step:0,selected_power:None,
@@ -83,13 +98,13 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
 }
 #[test] fn active_reply_or_queue_for_either_mode_must_drain(){
  for mode in [sle_management::MANAGED,sle_management::DIAGNOSTIC] {for kind in 0..3 {
-  let mut h=host();match kind {0=>h.active=Some(()),1=>h.reply=Some(()),_=>h.requests.push_tagged(0x0406,&[],1,1,None,100).unwrap()}
+  let mut h=host();match kind {0=>h.active=Some(active()),1=>h.reply=Some(()),_=>h.requests.push_tagged(0x0406,&[],1,1,None,100).unwrap()}
   assert!(!h.policy_untouched());let (_,g,r)=released(h,mode);
   assert_eq!(r,Err(-999));assert_eq!(g.state,sle_management::REVOKING);
  }}
 }
 #[test] fn unknown_with_recipe_revocation_or_initialized_history_is_not_pristine(){
- for kind in 0..3 {let mut h=host();match kind {0=>h.recipe=Some(()),1=>h.revoking=true,_=>h.operations.initialized=true}
+ for kind in 0..3 {let mut h=host();match kind {0=>h.recipe=Some(recipe()),1=>h.revoking=true,_=>h.operations.initialized=true}
   assert!(!h.policy_untouched());let (_,g,r)=released(h,sle_management::MANAGED);
   assert_eq!(r,Err(-999));assert_eq!(g.state,sle_management::REVOKING);
  }
@@ -111,4 +126,109 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
  let mut h=host();h.operations.entries[0]=Some(operation());h.broadcast_cookie=1;
  let (o,g,r)=released(h,sle_management::DIAGNOSTIC);assert_eq!(r,Ok(()));assert_eq!(g.state,sle_management::FREE);
  assert_eq!(o.host.lock().discovery_radio(),(0,0,None));
+}
+
+fn queued_policy()->Host {
+ let mut h=host();let mut op=operation();op.state=State::Queued;op.error=0;
+ h.broadcast_cookie=op.cookie;h.operations.entries[0]=Some(op);
+ h.requests.push_recipe(&[
+  sle_command_plan::RecipePart{opcode:0x0c02,params:&[0;49]},
+  sle_command_plan::RecipePart{opcode:0x0c05,params:&[0;5]},
+ ],op.cookie,op.intent,1000).unwrap();h.next_cookie=2;h
+}
+#[test] fn never_selected_queue_cancels_without_credit_or_radio_success(){
+ let h=queued_policy();assert!(!h.quiet());assert!(h.policy_unsubmitted());
+ let(o,g,r)=released(h,sle_management::MANAGED);assert_eq!(r,Ok(()));
+ assert_eq!((g.state,g.mode,g.error),(sle_management::FREE,0,0));
+ let h=o.host.lock();assert!(h.quiet());assert_eq!(h.controller_status(),(1,false,None));
+ assert_eq!(h.discovery_radio(),(0,0,None));assert_eq!((h.next_cookie,h.broadcast_cookie,h.scan_cookie),(2,1,0));
+ let op=h.operations.find(1).unwrap();assert_eq!(op.state,State::Cancelled);
+ assert_eq!((op.error,op.opcode,op.step,op.status,op.completed_boottime_ns),(-125,0,0,0,0));
+ assert!(op.selected_power.is_none());assert!(h.policy_unsubmitted());
+}
+#[test] fn selection_or_reserved_reply_blocks_no_io_cancellation_atomically(){
+ for kind in 0..3 {let mut h=queued_policy();match kind {0=>h.active=Some(active()),1=>h.reply=Some(()),_=>h.recipe=Some(recipe())}
+  assert!(!h.policy_unsubmitted());assert!(!h.cancel_unsubmitted_policy());
+  assert_eq!(h.requests.len(),2);assert_eq!(h.operations.find(1).unwrap().state,State::Queued);
+  let(_,g,r)=released(h,sle_management::MANAGED);assert_eq!(r,Err(-999));assert_eq!(g.state,sle_management::REVOKING);
+ }
+}
+#[test] fn every_piece_of_wire_or_terminal_evidence_rejects_fast_release(){
+ for kind in 0..12 {let mut h=queued_policy();let op=h.operations.entries[0].as_mut().unwrap();
+  match kind {0=>op.state=State::Pending,1=>op.state=State::Succeeded,2=>op.state=State::Failed,
+   3=>op.state=State::Faulted,4=>op.opcode=0x0c02,5=>op.step=1,6=>op.status=0x1e,
+   7=>op.selected_power=Some(0),8=>op.completed_boottime_ns=1,9=>op.error=-5,
+   10=>op.count=0,_=>op.power_step=op.count+1}
+  assert!(!h.cancel_unsubmitted_policy());assert_eq!(h.requests.len(),2);
+  let(_,g,r)=released(h,sle_management::MANAGED);assert_eq!(r,Err(-999));assert_eq!(g.state,sle_management::REVOKING);
+ }
+}
+#[test] fn raw_or_unowned_recipe_queue_requires_existing_cleanup(){
+ for kind in 0..3 {let mut h=queued_policy();h.requests=CmdRequestQueue::new();
+  match kind {0=>h.requests.push_tagged(0x0406,&[],1,2,None,1000).unwrap(),
+   1=>h.requests.push_tagged(0x0406,&[],0,2,None,1000).unwrap(),
+   _=>h.requests.push_recipe(&[sle_command_plan::RecipePart{opcode:0x0c05,params:&[0;5]}],2,sle_command_plan::DiscoveryIntent::Advertising(false),1000).unwrap()}
+  assert!(!h.cancel_unsubmitted_policy());assert_eq!(h.requests.len(),1);
+  let(_,g,r)=released(h,sle_management::MANAGED);assert_eq!(r,Err(-999));assert_eq!(g.state,sle_management::REVOKING);
+ }
+}
+#[test] fn cancellation_and_eviction_never_erase_selected_recipe_evidence(){
+ let mut h=queued_policy();h.recipe=Some(recipe());h.operations.entries[0].as_mut().unwrap().state=State::Cancelled;
+ h.operations.entries[0].as_mut().unwrap().error=-125;
+ assert!(!h.cancel_unsubmitted_policy());h.operations.entries=[None;sle_discovery_operation::CAPACITY];
+ h.broadcast_cookie=0;h.requests=CmdRequestQueue::new();assert!(!h.policy_unsubmitted());
+ assert!(!h.cancel_unsubmitted_policy());assert!(!h.policy_untouched());
+}
+#[test] fn cancelled_only_history_can_release_but_preserves_results_and_peer(){
+ let mut h=queued_policy();h.operations.cancel_domain(sle_command_plan::DiscoveryIntent::Advertising(false),-125);
+ h.requests=CmdRequestQueue::new();let peer=queued_policy();let(o,g,r)=released(h,sle_management::MANAGED);
+ assert_eq!(r,Ok(()));assert_eq!(g.state,sle_management::FREE);
+ assert_eq!(o.host.lock().operations.find(1).unwrap().state,State::Cancelled);
+ assert_eq!(peer.requests.len(),2);assert_eq!(peer.operations.find(1).unwrap().state,State::Queued);
+ let mut h=queued_policy();h.operations.entries[0].as_mut().unwrap().state=State::Cancelled;
+ h.operations.entries[0].as_mut().unwrap().error=-5;assert!(!h.cancel_unsubmitted_policy());
+}
+#[test] fn setup_fault_revocation_initialization_and_radio_changes_reject_cancellation(){
+ for kind in 0..5 {let mut h=queued_policy();match kind {0=>h.fault=Some(-5),1=>h.revoking=true,
+  2=>h.operations.initialized=true,3=>h.operations.advertising=1,_=>h.operations.scanning=2}
+  assert!(!h.cancel_unsubmitted_policy());assert_eq!(h.requests.len(),2);
+ }
+ let(_,g,r)=released(queued_policy(),sle_management::DIAGNOSTIC);
+ assert_eq!(r,Err(-999));assert_eq!(g.state,sle_management::REVOKING);
+}
+#[test] fn superseded_queue_history_and_zero_credit_are_not_hardware_mutation(){
+ for credit in [0,1,255] {let mut h=queued_policy();h.credits=credit;
+  let mut old=operation();old.request_id=2;old.cookie=1;old.error=-125;
+  h.operations.entries[1]=Some(old);
+  h.operations.entries[0].as_mut().unwrap().cookie=2;h.broadcast_cookie=2;
+  h.requests=CmdRequestQueue::new();h.requests.push_recipe(&[sle_command_plan::RecipePart{opcode:0x0c02,params:&[0;49]}],2,sle_command_plan::DiscoveryIntent::AdvertisingStandby,1000).unwrap();
+  let(o,g,r)=released(h,sle_management::MANAGED);assert_eq!(r,Ok(()));assert_eq!(g.state,sle_management::FREE);
+  let h=o.host.lock();assert_eq!(h.credits,credit);assert_eq!(h.discovery_radio(),(0,0,None));
+  assert_eq!(h.operations.find(2).unwrap().state,State::Cancelled);
+ }
+}
+#[test] fn actual_tx_selection_creates_durable_evidence_before_transport(){
+ let mut h=queued_policy();let request=h.next(|_|false).unwrap().unwrap();
+ assert_eq!((request.opcode,request.cookie,request.seq),(0x0c02,1,0));
+ assert!(h.recipe.is_some());assert!(h.active.is_some());assert_eq!(h.credits,0);
+ let op=h.operations.find(1).unwrap();assert_eq!(op.state,State::Pending);assert_eq!(op.opcode,0x0c02);
+ assert!(!h.cancel_unsubmitted_policy());assert_eq!(h.requests.len(),1);
+ // Fixture retirement/eviction, not a simulated production Complete.
+ h.active=None;h.requests=CmdRequestQueue::new();h.operations.entries=[None;sle_discovery_operation::CAPACITY];
+ h.broadcast_cookie=0;assert!(!h.cancel_unsubmitted_policy());assert!(h.recipe.is_some());
+}
+#[test] fn actual_zero_credit_selection_leaves_never_selected_queue_cancellable(){
+ let mut h=queued_policy();h.credits=0;assert!(h.next(|_|false).unwrap().is_none());
+ assert_eq!(h.requests.len(),2);assert!(h.recipe.is_none());assert!(h.active.is_none());
+ assert!(h.cancel_unsubmitted_policy());assert!(h.quiet());assert_eq!(h.credits,0);
+ assert_eq!(h.discovery_radio(),(0,0,None));assert!(!h.controller_status().1);
+}
+#[test] fn real_selection_and_local_cancellation_cannot_change_peer_queue(){
+ let mut target=queued_policy();let mut peer=queued_policy();
+ assert!(target.cancel_unsubmitted_policy());let r=peer.next(|_|false).unwrap().unwrap();
+ assert_eq!(r.opcode,0x0c02);assert_eq!(peer.operations.find(1).unwrap().state,State::Pending);
+ assert_eq!(target.operations.find(1).unwrap().state,State::Cancelled);
+ assert!(target.active.is_none());assert!(peer.active.is_some());assert_eq!(target.credits,1);
+}
+
 }

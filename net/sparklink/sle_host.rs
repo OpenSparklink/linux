@@ -212,6 +212,47 @@ impl CommandHost {
             && self.operations.advertising == 0 && self.operations.scanning == 0
             && self.operations.entries.iter().all(Option::is_none)
     }
+    /// Native raw admission is query-only. A typed recipe sets `recipe` before
+    /// handing any step to transport, and that evidence survives cancellation
+    /// and result eviction. Queued policy can therefore be cancelled locally
+    /// only while all of this owner's state proves it was never selected.
+    /// This is not a predicate for partially initialized or uncertain hardware.
+    pub(crate) fn policy_unsubmitted(&self) -> bool {
+        if self.policy_untouched() { return true; }
+        self.active.is_none() && self.reply.is_none() && self.fault.is_none()
+            && !self.revoking && self.recipe.is_none() && !self.operations.initialized
+            && self.operations.advertising == 0 && self.operations.scanning == 0
+            && self.operations.entries.iter().flatten().all(|op| {
+                ((op.state == State::Queued && op.error == 0)
+                    || (op.state == State::Cancelled && op.error == -(kernel::bindings::ECANCELED as i32)))
+                    && op.cookie != 0 && op.opcode == 0 && op.step == 0
+                    && (1..=4).contains(&op.count) && op.power_step <= op.count
+                    && op.status == 0 && op.selected_power.is_none()
+                    && op.completed_boottime_ns == 0
+                    && op.cookie <= match op.intent {
+                        DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => self.broadcast_cookie,
+                        DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => self.scan_cookie,
+                    }
+            })
+            && [self.broadcast_cookie, self.scan_cookie].into_iter().all(|cookie| {
+                cookie == 0 || self.operations.entries.iter().flatten().any(|op| op.cookie == cookie)
+            })
+            && self.requests.entries.iter().flatten().all(|request| {
+                request.seq == 0 && request.recipe.is_some_and(|tag| {
+                    self.operations.entries.iter().flatten().any(|op| op.cookie == tag.cookie)
+                })
+            })
+    }
+
+    /// Caller holds management admission and protocol state as well as Host.
+    /// No raw pending entry, active reservation, credit or radio state changes.
+    pub(crate) fn cancel_unsubmitted_policy(&mut self) -> bool {
+        if !self.policy_unsubmitted() { return false; }
+        while self.requests.pop().is_some() {}
+        self.operations.cancel_domain(DiscoveryIntent::Advertising(false), -(kernel::bindings::ECANCELED as i32));
+        self.operations.cancel_domain(DiscoveryIntent::Scanning(false), -(kernel::bindings::ECANCELED as i32));
+        true
+    }
     pub(crate) fn revocation_detail(&self) -> (u8, u16, bool) {
         (self.revoke_status, self.revoke_opcode, self.revoke_reply)
     }
