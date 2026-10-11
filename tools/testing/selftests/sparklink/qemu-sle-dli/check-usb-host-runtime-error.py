@@ -41,6 +41,7 @@ typedef struct USBHostDevice {
     struct USBHostRequest *test_runtime_held;
     void *test_runtime_hold_timer;
     uint64_t test_runtime_holds;
+    uint64_t test_runtime_skip_requested, test_runtime_skip_remaining, test_runtime_skipped;
     uint64_t test_runtime_in_errors;
     void *dh;
     struct { unsigned idVendor, idProduct; } ddesc;
