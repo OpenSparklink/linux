@@ -29,6 +29,12 @@ def run(output):
         end += 1
     decision = revoke[start:end]
     assert 'gate.settled(0)' in decision and 'policy_untouched()' in decision
+    acquire = function(inputs['sparklink_core.rs'].decode(), 'ioctl_management')
+    marker = '        {\n            // Copyout may sleep'
+    start = acquire.index(marker); brace = acquire.index('{', start); end, depth = brace+1, 1
+    while depth:
+        depth += (acquire[end]=='{')-(acquire[end]=='}'); end += 1
+    commit = acquire[start:end]
     methods = '\n'.join(function(inputs['sle_host.rs'].decode(), n) for n in
                         ['observe_link','links_clear_for_management','quiet', 'policy_untouched', 'policy_unsubmitted',
                          'cancel_unsubmitted_policy', 'controller_status', 'discovery_radio',
@@ -36,7 +42,7 @@ def run(output):
                          'retained_revocation_ready', 'next', 'cancel_recipe_progress', 'enqueue_recipe',
                          'begin_revoke', 'revocation_result', 'fail'])
     fixture = (here/'diagnostic/management_release_fixture.rs').read_text()
-    fixture = fixture.replace('// @@HOST_METHODS@@', methods.replace('Error::from_errno(', 'error_from_errno(')).replace('// @@CORE_DECISION@@', decision.replace('Error::from_errno(', 'error_from_errno('))
+    fixture = fixture.replace('// @@HOST_METHODS@@', methods.replace('Error::from_errno(', 'error_from_errno(')).replace('// @@CORE_DECISION@@', decision.replace('Error::from_errno(', 'error_from_errno(')).replace('// @@CORE_COMMIT@@', commit)
     host = inputs['sle_host.rs'].decode()
     start = host.index('struct InFlight {')
     end = host.index('\n}', start)+2
@@ -54,7 +60,7 @@ def run(output):
                         '-D', 'warnings', str(tmp/'fixture.rs'), '-o', str(tmp/'test')], check=True)
         subprocess.run([str(tmp/'test'), '--test-threads=1'], check=True)
     assert all((net/n).read_bytes() == b for n, b in inputs.items())
-    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 34,
+    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 35,
               'scope': 'actual Host predicates/TX selection/InFlight/domain revocation and core fast-release block; source queue/operation/lease modules and opcode/timeout constants; locks, clock scaling, dependency error adapters and surrounding transport dependencies are fixtures',
               'live_ioctl_acceptance': False, 'fd_close_acceptance': False,
               'automatic_fault_recovery_acceptance': False, 'physical_acceptance': False,

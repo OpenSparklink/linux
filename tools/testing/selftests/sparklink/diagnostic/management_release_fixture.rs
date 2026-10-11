@@ -20,6 +20,7 @@ type Result<T=()>=std::result::Result<T,Error>;
 mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EOPNOTSUPP:u32=95;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
 use kernel::bindings;
 fn error_from_errno(value:i32)->i32 {value}
+const ENODEV:i32=-19;const EBUSY:i32=-16;
 const EINVAL:i32=-22;const ETIMEDOUT:i32=-110;const EOVERFLOW:i32=-75;
 trait Errno {fn to_errno(self)->i32;}
 impl Errno for i32 {fn to_errno(self)->i32{self}}
@@ -35,7 +36,9 @@ enum SleOpcode {
 // @@IN_FLIGHT@@
 struct Lock(RefCell<Host>);
 impl Lock {fn lock(&self)->RefMut<'_,Host>{self.0.borrow_mut()}}
-struct Owner {host:Lock}
+struct BoolLock(RefCell<bool>);
+impl BoolLock {fn lock(&self)->RefMut<'_,bool>{self.0.borrow_mut()}}
+struct Owner {host:Lock,schedule_gate:BoolLock}
 struct Host {links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
  operations:Operations,selected_policy_domains:u8,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
@@ -49,6 +52,33 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
 fn host()->Host {Host{links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),
  selected_policy_domains:0,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
+struct Caller {file_id:u64}
+struct Request {mode:u32}
+fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:u64)->Result {
+ let me=Caller{file_id:42};let request=Request{mode:sle_management::MANAGED};
+ // @@CORE_COMMIT@@
+ Ok(())
+}
+#[test] fn sleeping_copyout_candidate_does_not_grant_authority_after_link_fault_or_retirement(){
+ for kind in 0..5 {
+  let owner=Owner{host:Lock(RefCell::new(host())),schedule_gate:BoolLock(RefCell::new(false))};
+  let mut gate=sle_management::Management::new();let token=gate.prepare(sle_management::MANAGED).unwrap();
+  // The user candidate has been copied, but the source commit is not yet run.
+  match kind {
+   0=>owner.host.lock().observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address:[1;6],reserved:[0;2]}),
+   1=>owner.host.lock().active=Some(active()),
+   2=>owner.host.lock().fault=Some(-5),
+   3=>*owner.schedule_gate.lock()=true,
+   _=>{}
+  }
+  let result=after_copyout_commit(&owner,&mut gate,token);
+  if kind==4 {assert_eq!(result,Ok(()));assert!(gate.owns(42));assert_eq!(gate.token_for(42),token);}
+  else {assert_eq!(result,Err(if kind==2{-5}else if kind==3{-19}else{-16}));
+   assert_eq!(gate.state,sle_management::FREE);assert!(!gate.owns(42));assert_eq!(gate.token_for(42),0);
+   assert_eq!(gate.prepare(sle_management::MANAGED).unwrap(),token); // no counter consumed
+  }
+ }
+}
 fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,transport_done:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
@@ -56,7 +86,7 @@ fn operation()->Operation {Operation{request_id:1,cookie:1,
  error:-125,status:0,opcode:0,step:0,count:4,power_step:0,selected_power:None,
  completed_boottime_ns:0}}
 fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
- let owner=Owner{host:Lock(RefCell::new(h))};let mut gate=sle_management::Management::new();
+ let owner=Owner{host:Lock(RefCell::new(h)),schedule_gate:BoolLock(RefCell::new(false))};let mut gate=sle_management::Management::new();
  assert_eq!(gate.authorize(42,mode),Err(sle_management::Failure::Permission));
  let token=gate.prepare(mode).unwrap();gate.commit(42,mode,token);
  assert_eq!(gate.authorize(42,mode),Ok(()));
