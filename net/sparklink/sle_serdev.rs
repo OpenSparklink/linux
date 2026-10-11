@@ -43,7 +43,7 @@ use super::sle_dli::{
     ControllerEventRing, SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode,
 };
 use super::sle_transport::{SleAttachInfo, SleProtoId};
-use super::sle_uart::{UartFrame, UartParser, MAX_PAYLOAD_LEN};
+use super::sle_uart::{UartFrame, UartParser};
 use super::sle_usb::{event_to_sle, DliUsbEvent};
 
 // =========================================================================
