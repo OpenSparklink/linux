@@ -4,24 +4,24 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
-pub enum State { Queued = 1, OnWire = 2, AwaitingOutcome = 3, Succeeded = 4, Failed = 5, Cancelled = 6, Faulted = 7 }
+pub(crate) enum State { Queued = 1, OnWire = 2, AwaitingOutcome = 3, Succeeded = 4, Failed = 5, Cancelled = 6, Faulted = 7 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Intent { Create { address_type: u8, address: [u8; 6] }, Disconnect { handle: u16 } }
+pub(crate) enum Intent { Create { address_type: u8, address: [u8; 6] }, Disconnect { handle: u16 } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome { Connected { status: u8, handle: u16, address_type: u8, address: [u8; 6] }, Disconnected { status: u8, handle: u16 } }
+pub(crate) enum Outcome { Connected { status: u8, handle: u16, address_type: u8, address: [u8; 6] }, Disconnected { status: u8, handle: u16 } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error { Invalid, Busy, Duplicate, Mismatch }
+pub(crate) enum Error { Invalid, Busy, Duplicate, Mismatch }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Operation {
-    pub id: u64, pub cookie: u64, pub intent: Intent, pub state: State,
-    pub error: i32, pub command_status: Option<u8>, pub outcome_status: Option<u8>,
-    pub fault_error: i32, pub handle: Option<u16>,
+pub(crate) struct Operation {
+    pub(crate) id: u64, pub(crate) cookie: u64, pub(crate) intent: Intent, pub(crate) state: State,
+    pub(crate) error: i32, pub(crate) command_status: Option<u8>, pub(crate) outcome_status: Option<u8>,
+    pub(crate) fault_error: i32, pub(crate) handle: Option<u16>,
     deadline: u64, sent: bool, out_complete: bool, accepted: bool,
     outcome: Option<Outcome>,
 }
 
-pub struct Session {
+pub(crate) struct Session {
     generation: u64,
     operation: Option<Operation>,
     // Single outstanding procedure is a Host admission policy, not a claim
@@ -32,16 +32,16 @@ pub struct Session {
 
 impl Session {
     #[cfg(test)]
-    pub fn new(generation: u64) -> Result<Self, Error> {
+    pub(crate) fn new(generation: u64) -> Result<Self, Error> {
         if generation == 0 { return Err(Error::Invalid); }
         Ok(Self { generation, operation: None, outstanding: false, uncertain: false })
     }
     #[cfg(test)]
-    pub fn query(&self, generation: u64, id: u64) -> Result<Option<Operation>, Error> {
+    pub(crate) fn query(&self, generation: u64, id: u64) -> Result<Option<Operation>, Error> {
         if generation != self.generation { return Err(Error::Mismatch); }
         Ok(self.operation.filter(|o| o.id == id))
     }
-    pub fn reserve(&mut self, generation: u64, id: u64, cookie: u64, intent: Intent,
+    pub(crate) fn reserve(&mut self, generation: u64, id: u64, cookie: u64, intent: Intent,
                    now: u64, deadline: u64) -> Result<(), Error> {
         if generation != self.generation { return Err(Error::Mismatch); }
         if id == 0 || cookie == 0 || deadline <= now { return Err(Error::Invalid); }
@@ -53,12 +53,12 @@ impl Session {
         self.outstanding = true;
         Ok(())
     }
-    pub fn sent(&mut self, cookie: u64) -> Result<(), Error> {
+    pub(crate) fn sent(&mut self, cookie: u64) -> Result<(), Error> {
         let o = self.operation.as_mut().ok_or(Error::Invalid)?;
         if o.cookie != cookie || o.state != State::Queued { return Err(Error::Mismatch); }
         o.sent = true; o.state = State::OnWire; Ok(())
     }
-    pub fn out_complete(&mut self, cookie: u64, result: Result<(), i32>) -> Result<(), Error> {
+    pub(crate) fn out_complete(&mut self, cookie: u64, result: Result<(), i32>) -> Result<(), Error> {
         let o = self.operation.as_mut().ok_or(Error::Invalid)?;
         if o.cookie != cookie || !o.sent { return Err(Error::Mismatch); }
         if let Err(error) = result {
@@ -67,13 +67,13 @@ impl Session {
         }
         o.out_complete = true; self.settle(); Ok(())
     }
-    pub fn status(&mut self, cookie: u64, status: u8) -> Result<(), Error> {
+    pub(crate) fn status(&mut self, cookie: u64, status: u8) -> Result<(), Error> {
         let o = self.operation.as_mut().ok_or(Error::Invalid)?;
         if o.cookie != cookie || !o.sent || o.accepted || o.command_status.is_some() { return Err(Error::Mismatch); }
         o.command_status = Some(status); o.accepted = status == 0;
         self.settle(); Ok(())
     }
-    pub fn outcome(&mut self, generation: u64, value: Outcome) -> Result<(), Error> {
+    pub(crate) fn outcome(&mut self, generation: u64, value: Outcome) -> Result<(), Error> {
         if generation != self.generation { return Err(Error::Mismatch); }
         let o = self.operation.as_mut().ok_or(Error::Invalid)?;
         if !o.sent || !self.outstanding || o.outcome.is_some() { return Err(Error::Mismatch); }
@@ -116,7 +116,7 @@ impl Session {
             o.error = if status == 0 { 0 } else { -121 };
         }
     }
-    pub fn cancel(&mut self, id: u64) -> Result<(), Error> {
+    pub(crate) fn cancel(&mut self, id: u64) -> Result<(), Error> {
         let o = self.operation.as_mut().ok_or(Error::Invalid)?;
         if o.id != id || !self.outstanding { return Err(Error::Mismatch); }
         o.state = State::Cancelled; o.error = -125;
@@ -126,14 +126,14 @@ impl Session {
         // late real link using its independently observed physical state.
         Ok(())
     }
-    pub fn expire(&mut self, now: u64) {
+    pub(crate) fn expire(&mut self, now: u64) {
         let Some(o) = self.operation.as_mut() else { return };
         if !self.outstanding || self.uncertain || now < o.deadline { return; }
         o.fault_error = -110;
         if o.state != State::Cancelled { o.error = -110; o.state = if o.sent { State::Faulted } else { State::Failed }; }
         if o.sent { self.uncertain = true; } else { self.outstanding = false; }
     }
-    pub fn reservation_clear(&self) -> bool { !self.outstanding && !self.uncertain }
+    pub(crate) fn reservation_clear(&self) -> bool { !self.outstanding && !self.uncertain }
 }
 
 /// Fixed-size result retention is independent of physical links. Evicting an

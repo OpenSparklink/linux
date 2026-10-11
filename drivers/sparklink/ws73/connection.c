@@ -13,7 +13,7 @@
 #endif
 #include "connection.h"
 
-static unsigned int u16(const unsigned char *p)
+static unsigned int conn_get16(const unsigned char *p)
 {
     return p[0] | (unsigned int)p[1] << 8;
 }
@@ -75,10 +75,10 @@ int ws73_connection_validate(unsigned int operation, unsigned int opcode,
     struct sparklink_connection_parameters parameters = {
         .filter = p[0], .own_address_type = p[1], .peer_address_type = p[2],
         .gt_negotiate = p[9], .frame = p[10],
-        .scan_interval = u16(p + 11), .scan_window = u16(p + 13),
-        .interval_min = u16(p + 15), .interval_max = u16(p + 17),
-        .latency = u16(p + 19), .supervision_timeout = u16(p + 21),
-        .event_min = u16(p + 23), .event_max = u16(p + 25),
+        .scan_interval = conn_get16(p + 11), .scan_window = conn_get16(p + 13),
+        .interval_min = conn_get16(p + 15), .interval_max = conn_get16(p + 17),
+        .latency = conn_get16(p + 19), .supervision_timeout = conn_get16(p + 21),
+        .event_min = conn_get16(p + 23), .event_max = conn_get16(p + 25),
     };
     unsigned char candidate[27];
     memcpy(parameters.peer_address, p + 3, 6);
