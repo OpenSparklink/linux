@@ -31,6 +31,7 @@ mod sle_fw;
 mod sle_host;
 mod sle_irq_lock;
 mod sle_mgmt;
+mod sle_link_observation;
 mod sle_native;
 mod sle_netlink;
 mod sle_pdu;
@@ -2919,6 +2920,12 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
         {
             let mut host = owner.host.lock();
             if let Some(error) = host.controller_status().2 { return Err(error); }
+            // Connection teardown is not yet admitted by this Native profile.
+            // An observed/uncertain physical link cannot be silently omitted
+            // from cleanup and mistaken for a Free reusable controller.
+            if !host.links_clear_for_management() {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
             let (adv, scan, _) = host.discovery_radio();
             // The native raw whitelist contains queries only. A quiet diagnostic
             // reader has not changed radio policy. Managed can also release an
@@ -3014,7 +3021,10 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
         if !owner.transport_open.load(core::sync::atomic::Ordering::Acquire) { return Err(EAGAIN); }
         if let Some(error) = owner.host.lock().controller_status().2 { return Err(error); }
         let token = gate.prepare(request.mode).map_err(management_error)?;
-        if !owner.host.lock().quiet() { return Err(EBUSY); }
+        {
+            let host = owner.host.lock();
+            if !host.quiet() || !host.links_clear_for_management() { return Err(EBUSY); }
+        }
         request.lease = token;
         // No command has been admitted. EFAULT leaves ownership and counter
         // unchanged; commit cannot fail while the management mutex is held.

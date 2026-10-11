@@ -368,6 +368,11 @@ static void link_event_tests(void)
 {
 	unsigned char data[284] = { 0xa2 }, before[284];
 	const unsigned int codes[] = { 0x0015, 0x1401, 0x0005, 0x1405 };
+	struct ws73_link_outcome outcome, saved;
+	memset(&outcome, 0xaa, sizeof(outcome)); saved = outcome;
+	CHECK(ws73_dli_link_outcome(NULL, 0, &outcome) == -EINVAL);
+	CHECK(!memcmp(&outcome, &saved, sizeof(outcome)));
+	CHECK(ws73_dli_link_outcome(data, sizeof(data), NULL) == -EINVAL);
 
 	CHECK(ws73_dli_validate_link_event(NULL, 0) == -EINVAL);
 	for (unsigned int kind = 0; kind < 4; kind++) {
@@ -378,6 +383,21 @@ static void link_event_tests(void)
 			memcpy(before, data, sizeof(data));
 			CHECK(ws73_dli_validate_link_event(data, 5 + n) ==
 			      ((kind < 2 ? n >= 11 : n == 4) ? 0 : -EPROTO));
+			int normalized = ws73_dli_link_outcome(data, 5 + n, &outcome);
+			CHECK(normalized == ((kind < 2 ? n >= 11 : n == 4) ? 0 : -EPROTO));
+			if (!normalized) {
+				CHECK(outcome.kind == (kind < 2 ? 1U : 2U));
+				CHECK(outcome.status == data[5] && outcome.handle == u16(data + 6));
+				CHECK(outcome.reserved[0] == 0 && outcome.reserved[1] == 0);
+				if (kind < 2) {
+					CHECK(outcome.role == data[8] && outcome.address_type == data[9]);
+					CHECK(!memcmp(outcome.address, data + 10, 6));
+				} else {
+					CHECK(!outcome.role && !outcome.address_type);
+					CHECK(!memcmp(outcome.address, (unsigned char[6]){0}, 6));
+				}
+			} else CHECK(!memcmp(&outcome, &saved, sizeof(outcome)));
+			outcome = saved;
 			CHECK(!memcmp(before, data, sizeof(data)));
 			CHECK(ws73_dli_validate_link_event(data, 4 + n) == -EPROTO);
 			CHECK(ws73_dli_validate_link_event(data, 6 + n) == -EPROTO);
@@ -389,6 +409,8 @@ static void link_event_tests(void)
 	CHECK(ws73_dli_validate_link_event(data, 5) == -ENOMSG);
 	put16(data + 1, 2); /* management Complete is never a link outcome */
 	CHECK(ws73_dli_validate_link_event(data, 9) == -ENOMSG);
+	CHECK(ws73_dli_link_outcome(data, 9, &outcome) == -ENOMSG);
+	CHECK(!memcmp(&outcome, &saved, sizeof(outcome)));
 	data[0] = 0xa1;
 	put16(data + 1, 0x1401);
 	CHECK(ws73_dli_validate_link_event(data, 16) == -ENOMSG);

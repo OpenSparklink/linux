@@ -9,6 +9,8 @@
 #include <uapi/linux/sparklink_ioctl.h>
 
 static_assert(sizeof(struct sparklink_native_info) == 32);
+static_assert(sizeof(struct sparklink_native_link_evidence) == 28);
+static_assert(offsetof(struct sparklink_native_link_evidence, address) == 20);
 static_assert(offsetof(struct sparklink_native_info, features) == 9);
 static_assert(offsetof(struct sparklink_native_info, address) == 19);
 static_assert(offsetof(struct sparklink_native_info, acb_length) == 26);
@@ -176,6 +178,15 @@ int sparklink_native_event(u16 id, u64 generation, u32 profile, u16 event_code,
 	return sparklink_native_event_rust(id, generation, profile, event_code, params, length);
 }
 EXPORT_SYMBOL_GPL(sparklink_native_event);
+
+int sparklink_native_link_event(u16 id, u64 generation, u32 profile, u16 event_code,
+    const u8 *params, size_t length,
+    const struct sparklink_native_link_evidence *evidence)
+{
+    return sparklink_native_link_event_rust(id, generation, profile,
+        event_code, params, length, evidence);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_link_event);
 
 void sparklink_native_snoop_rx(u16 id, u64 generation, const u8 *data, size_t length)
 {

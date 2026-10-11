@@ -71,6 +71,31 @@ int ws73_dli_validate_link_event(const unsigned char *data, size_t size)
 	return params >= 11 ? 0 : -EPROTO;
 }
 
+int ws73_dli_link_outcome(const unsigned char *data, size_t size,
+                         struct ws73_link_outcome *out)
+{
+    struct ws73_link_outcome candidate = {0};
+    unsigned int event;
+    int ret;
+
+    if (!out)
+        return -EINVAL;
+    ret = ws73_dli_validate_link_event(data, size);
+    if (ret)
+        return ret;
+    event = dli_u16(data + 1);
+    candidate.kind = event == 0x0015 || event == 0x1401 ? 1 : 2;
+    candidate.status = data[5];
+    candidate.handle = dli_u16(data + 6);
+    if (candidate.kind == 1) {
+        candidate.role = data[8];
+        candidate.address_type = data[9];
+        memcpy(candidate.address, data + 10, sizeof(candidate.address));
+    }
+    *out = candidate;
+    return 0;
+}
+
 int ws73_dli_validate_reply(const unsigned char *data, size_t size)
 {
 	unsigned int event, opcode, expected;

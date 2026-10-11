@@ -463,6 +463,28 @@ pub(crate) unsafe extern "C" fn sparklink_native_snoop_tx_rust(id:u16, generatio
 pub(crate) unsafe extern "C" fn sparklink_native_event_rust(
     id: u16, generation: u64, profile: u32, event_code: u16, params: *const u8, length: usize,
 ) -> i32 {
+    // SAFETY: preserves the driver's original live buffer contract.
+    unsafe { publish_native_event(id, generation, profile, event_code, params, length, None) }
+}
+
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_link_event_rust(
+    id: u16, generation: u64, profile: u32, event_code: u16,
+    params: *const u8, length: usize,
+    evidence: *const super::sle_link_observation::LinkEvidence,
+) -> i32 {
+    if evidence.is_null() { return EINVAL.to_errno(); }
+    // SAFETY: the driver retains an aligned initialized evidence value and
+    // immutable original parameter bytes throughout this callback. Copy now.
+    let evidence = unsafe { *evidence };
+    unsafe { publish_native_event(id, generation, profile, event_code, params, length, Some(evidence)) }
+}
+
+unsafe fn publish_native_event(
+    id: u16, generation: u64, profile: u32, event_code: u16,
+    params: *const u8, length: usize,
+    evidence: Option<super::sle_link_observation::LinkEvidence>,
+) -> i32 {
     if params.is_null() { return EINVAL.to_errno(); }
     if length > super::sle_uapi::CONTROLLER_EVENT_PAYLOAD_MAX { return -(kernel::bindings::EMSGSIZE as i32); }
     let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
@@ -473,10 +495,16 @@ pub(crate) unsafe extern "C" fn sparklink_native_event_rust(
     if event_code <= 2 { return PROTOCOL_ERROR; }
     // SAFETY: driver retains a validated live parameter buffer for this call.
     let bytes = unsafe { core::slice::from_raw_parts(params, length) };
+    // Host -> scheduling gate is the admission lock order. Never hold the
+    // scheduling gate while waiting for Host: management/TX may hold Host.
+    let mut host = owner.host.lock();
     let gate = owner.schedule_gate.lock();
     if *gate { return ENODEV.to_errno(); }
+    if let Some(evidence) = evidence { host.observe_link(&evidence); }
+    // A log overflow/error must not undo a real physical cleanup obligation.
     let result = owner.controller_events.lock().publish(owner.identity, profile, event_code, bytes);
     drop(gate);
+    drop(host);
     if result.is_ok() { owner.controller_event_poll.notify_all(); }
     NativeController::result_to_errno(result)
 }

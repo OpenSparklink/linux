@@ -87,6 +87,22 @@ int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t leng
 int sparklink_native_event(u16 id, u64 generation, u32 profile, u16 event_code,
 			   const u8 *params, size_t length);
 
+/* Driver-normalized physical link facts, not a userspace ABI. The original
+ * event body is retained without projection. kind1 is a connection outcome,
+ * kind2 a disconnection outcome. Failed status never establishes/removes a
+ * link. All fields are explicit; extensions remain in the original body.
+ * A driver delivering physical link outcomes must use this atomic ingress,
+ * rather than log-only sparklink_native_event. No mutation command permission
+ * or command-accepted -> connected inference follows from either function.
+ */
+struct sparklink_native_link_evidence {
+    u32 kind, status, handle, role, address_type;
+    u8 address[6], reserved[2];
+};
+int sparklink_native_link_event(u16 id, u64 generation, u32 profile, u16 event_code,
+    const u8 *params, size_t length,
+    const struct sparklink_native_link_evidence *evidence);
+
 /* Optional observational hooks. No allocation, I/O or protocol admission;
  * errors/drops must never alter transport behavior. Buffers are copied now.
  * RX is one HCC-validated WS73 DLI slot, before DLI schema/domain decoding.

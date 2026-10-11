@@ -12,7 +12,7 @@ import tempfile
 
 
 def function(text, name):
-    match = re.search(r'(?m)^(?:    )?(?:pub(?:\(crate\))? )?fn '+name+r'\(', text)
+    match = re.search(r'(?m)^(?:    )?(?:pub(?:\(crate\))? )?(?:unsafe )?fn '+name+r'\(', text)
     if match is None:
         match = re.search(r'(?m)^int '+name+r'\([^;{]*\)\s*\{', text)
     if match is None:

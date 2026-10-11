@@ -8,6 +8,7 @@
 #[allow(dead_code)]
 #[path="sle_discovery_operation.rs"] mod sle_discovery_operation;
 #[path="sle_management.rs"] mod sle_management;
+#[path="sle_link_observation.rs"] mod sle_link_observation;
 use std::cell::{RefCell,RefMut};
 use sle_command_queue::{CmdRequestQueue,CmdRequest};
 use sle_command_plan::{DiscoveryIntent,RecipeTag,RecipeProgress,RecipePart};
@@ -16,7 +17,9 @@ mod under_test {
 use super::*;
 type Error=i32;
 type Result<T=()>=std::result::Result<T,Error>;
-mod kernel {pub mod bindings {pub const ECANCELED:u32=125;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
+mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EOPNOTSUPP:u32=95;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
+use kernel::bindings;
+fn error_from_errno(value:i32)->i32 {value}
 const EINVAL:i32=-22;const ETIMEDOUT:i32=-110;const EOVERFLOW:i32=-75;
 trait Errno {fn to_errno(self)->i32;}
 impl Errno for i32 {fn to_errno(self)->i32{self}}
@@ -33,7 +36,7 @@ enum SleOpcode {
 struct Lock(RefCell<Host>);
 impl Lock {fn lock(&self)->RefMut<'_,Host>{self.0.borrow_mut()}}
 struct Owner {host:Lock}
-struct Host {requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
+struct Host {links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
  operations:Operations,selected_policy_domains:u8,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
 impl Host {
@@ -43,7 +46,7 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
  // @@CORE_DECISION@@
  Err(-999) // actual controller preparation/cleanup would follow this point
 }
-fn host()->Host {Host{requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
+fn host()->Host {Host{links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),
  selected_policy_domains:0,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,transport_done:false}}
@@ -61,6 +64,41 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
  gate.release(42,token).unwrap();
  assert_eq!(gate.authorize(42,mode),Err(sle_management::Failure::Busy));
  let result=candidate(&owner,&mut gate,mode);(owner,gate,result)
+}
+#[test] fn observed_link_blocks_both_managed_and_diagnostic_fast_release(){
+ for mode in [sle_management::MANAGED,sle_management::DIAGNOSTIC] {
+  let mut h=host();h.operations.initialized=true;h.operations.advertising=1;h.operations.scanning=1;
+  h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address:[1;6],reserved:[0;2]});
+  assert!(h.quiet());assert!(!h.links_clear_for_management());
+  let(o,g,r)=released(h,mode);assert_eq!(r,Err(-95));assert_eq!(g.state,sle_management::REVOKING);
+  // Actual outer revoke_management settles this failure as Faulted, not Free.
+  let h=o.host.lock();assert_eq!(h.discovery_radio(),(1,1,None));assert!(h.controller_status().1);
+ }
+}
+#[test] fn failed_or_wrong_disconnect_does_not_permit_handoff(){
+ let mut h=host();h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address:[1;6],reserved:[0;2]});
+ for (status,handle) in [(1,7),(0,8)] {
+  h.observe_link(&sle_link_observation::LinkEvidence{kind:2,status,handle,role:0,address_type:0,address:[0;6],reserved:[0;2]});
+  assert!(!h.links_clear_for_management());
+ }
+ h.observe_link(&sle_link_observation::LinkEvidence{kind:2,status:0,handle:7,role:0,address_type:0,address:[0;6],reserved:[0;2]});
+ assert!(h.links_clear_for_management());let(_,g,r)=released(h,sle_management::MANAGED);
+ assert_eq!(r,Ok(()));assert_eq!(g.state,sle_management::FREE);
+}
+#[test] fn uncertain_handle_reuse_cannot_be_cleared_by_disconnect(){
+ let mut h=host();for address in [[1;6],[2;6]] {
+  h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address,reserved:[0;2]});
+ }
+ h.observe_link(&sle_link_observation::LinkEvidence{kind:2,status:0,handle:7,role:0,address_type:0,address:[0;6],reserved:[0;2]});
+ assert!(!h.links_clear_for_management());let(_,g,r)=released(h,sle_management::MANAGED);
+ assert_eq!(r,Err(-95));assert_eq!(g.state,sle_management::REVOKING);
+}
+#[test] fn link_ingress_during_radio_cleanup_cannot_settle_free(){
+ let mut h=host();h.revoking=true;h.revoke_done=3;
+ assert_eq!(h.revocation_result(),Some(Ok(())));
+ h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address:[1;6],reserved:[0;2]});
+ assert_eq!(h.revocation_result(),Some(Err(-95)));
+ assert_eq!(h.begin_revoke(&[],&[]),Err(-95));
 }
 #[test] fn selected_advertising_does_not_stop_untouched_unknown_scanning(){
  let mut h=host();h.selected_policy_domains=1;h.operations.advertising=1;h.credits=0;

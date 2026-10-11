@@ -38,6 +38,7 @@ pub(crate) struct HostReply {
 /// command; nonzero sequences refer to that owner's raw DLI pending entries.
 pub(crate) struct CommandHost {
     requests: CmdRequestQueue,
+    links: super::sle_link_observation::LinkObservation,
     credits: u8,
     active: Option<InFlight>,
     reply: Option<(SleEvent, u64)>,
@@ -63,6 +64,7 @@ impl CommandHost {
         KBox::init(
             init!(Self {
                 requests <- CmdRequestQueue::new_in_place(),
+                links: super::sle_link_observation::LinkObservation::new(),
                 credits,
                 active: None,
                 reply: None,
@@ -186,6 +188,9 @@ impl CommandHost {
     /// Caller drains raw pending entries before providing driver-prepared stops.
     pub(crate) fn begin_revoke(&mut self, adv: &[RecipePart<'_>], scan: &[RecipePart<'_>]) -> Result {
         if let Some(error) = self.fault { return Err(error); }
+        if !self.links_clear_for_management() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         self.operations.cancel_domain(DiscoveryIntent::Advertising(false), -(kernel::bindings::ECANCELED as i32));
         self.operations.cancel_domain(DiscoveryIntent::Scanning(false), -(kernel::bindings::ECANCELED as i32));
         let required = super::sle_command_plan::revocation_required_domains(
@@ -206,6 +211,13 @@ impl CommandHost {
             .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
         Ok(())
     }
+    pub(crate) fn observe_link(&mut self, evidence: &super::sle_link_observation::LinkEvidence) {
+        self.links.observe(evidence);
+    }
+    pub(crate) fn links_clear_for_management(&self) -> bool {
+        self.links.clear_for_management()
+    }
+
     pub(crate) fn quiet(&self) -> bool {
         self.active.is_none() && self.reply.is_none() && self.requests.is_empty()
     }
@@ -266,7 +278,10 @@ impl CommandHost {
     }
     pub(crate) fn revocation_result(&self) -> Option<Result> {
         if let Some(error) = self.fault { return Some(Err(error)); }
-        if self.revoking && self.revoke_done == 3 && self.quiet() { Some(Ok(())) } else { None }
+        if self.revoking && self.revoke_done == 3 && self.quiet() {
+            if self.links_clear_for_management() { Some(Ok(())) }
+            else { Some(Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))) }
+        } else { None }
     }
 
     pub(crate) fn controller_status(&self) -> (u8, bool, Option<Error>) {

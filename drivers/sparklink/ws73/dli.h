@@ -21,8 +21,8 @@ struct ws73_dli_result {
 	unsigned int hardware_error; /* raw Hardware Error byte; 0x100 = absent */
 };
 
-/* Runtime support policy: metadata queries only until the discovery Host
- * transaction and report route are implemented. No I/O or state mutation.
+/* Raw admission stays metadata-query only. Typed discovery has its separate
+ * validated Host path; no native raw mutation permission is inferred here.
  */
 int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
 			      size_t size);
@@ -41,6 +41,17 @@ int ws73_dli_validate_reply(const unsigned char *data, size_t size);
  * Returns -ENOMSG for another event kind, -EPROTO for a malformed outcome.
  */
 int ws73_dli_validate_link_event(const unsigned char *data, size_t size);
+
+/* Driver-owned dialect normalization. Does not interpret successful command
+ * Status as a physical link. Errors leave output intact. Connection extension
+ * bytes are not projected; the caller retains/logs the complete original body.
+ */
+struct ws73_link_outcome {
+    unsigned int kind, status, handle, role, address_type;
+    unsigned char address[6], reserved[2];
+};
+int ws73_dli_link_outcome(const unsigned char *data, size_t size,
+                         struct ws73_link_outcome *out);
 
 /* Fresh BSLE-open instance only. The caller provides its initial probe
  * window (one); every subsequent grant is an absolute controller credit.

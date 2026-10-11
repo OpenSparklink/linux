@@ -653,16 +653,26 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 			      const unsigned char *data, size_t size)
 {
 	struct ws73_usb *ws = context;
+	struct ws73_link_outcome link;
 	int ret;
 
 	if (service != WS73_WIRE_SLE_SERVICE || queue != WS73_WIRE_SLE_QUEUE)
 		return 0;
 	sparklink_native_snoop_rx(ws->native_id, ws->native_generation, data, size);
-	ret = ws73_dli_validate_link_event(data, size);
-	if (!ret)
-		return sparklink_native_event(ws->native_id, ws->native_generation,
-					      SPARKLINK_NATIVE_WS73_HCC,
-					      get_unaligned_le16(data + 1), data + 5, size - 5);
+	ret = ws73_dli_link_outcome(data, size, &link);
+	if (!ret) {
+		struct sparklink_native_link_evidence evidence = {0};
+		u16 event = get_unaligned_le16(data + 1);
+
+		evidence.kind = link.kind;
+		evidence.status = link.status;
+		evidence.handle = link.handle;
+		evidence.role = link.role;
+		evidence.address_type = link.address_type;
+		memcpy(evidence.address, link.address, sizeof(evidence.address));
+		return sparklink_native_link_event(ws->native_id, ws->native_generation,
+			SPARKLINK_NATIVE_WS73_HCC, event, data + 5, size - 5, &evidence);
+	}
 	if (ret != -ENOMSG)
 		return ret;
 	if (size >= 3 && data[0] == 0xa2 &&
