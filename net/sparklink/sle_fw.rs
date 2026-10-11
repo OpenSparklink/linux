@@ -76,7 +76,7 @@ pub(crate) fn load_usb_firmware(
     let fw = match Firmware::request(fw_name, dev) {
         Ok(fw) => fw,
         Err(e) => {
-            pr_info!("sparklink-fw: firmware request failed: {}\n", e);
+            pr_info!("sparklink-fw: firmware request failed: {}\n", e.to_errno());
             return Err(e);
         }
     };
