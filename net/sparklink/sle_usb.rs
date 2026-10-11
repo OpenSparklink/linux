@@ -1486,7 +1486,7 @@ fn prepare_usb_controller(
         return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });
     }
     if addr == [0; 6] || addr == [0xff; 6] {
-        return Err(EPROTO);
+        return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
     }
     // SAFETY: the mandatory successful bootstrap populated this binding.
     let fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(dev_id)) };

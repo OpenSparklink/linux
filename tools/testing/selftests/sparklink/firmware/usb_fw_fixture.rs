@@ -36,6 +36,9 @@ macro_rules! c_str {
         std::ffi::CStr::from_bytes_with_nul(concat!($s, "\0").as_bytes()).unwrap()
     };
 }
+pub mod bindings {
+    pub const EPROTO: u32 = 71;
+}
 pub mod str {
     pub use std::ffi::CStr;
 }
