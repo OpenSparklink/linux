@@ -566,6 +566,9 @@ impl CommandHost {
                 }
                 _ => { self.fail(Error::from_errno(-(kernel::bindings::EPROTO as i32))); }
             }
+            if let Some(error) = self.connections.fault_reason() {
+                self.fail(Error::from_errno(error));
+            }
         }
         let current_intent = if let Some(tag) = active.recipe {
             self.current_recipe(tag)

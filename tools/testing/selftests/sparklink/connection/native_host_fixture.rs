@@ -110,4 +110,13 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert_eq!(h.credits,1);assert_eq!(h.next_cookie,1);assert!(h.requests.is_empty());assert!(h.connection_result(42,1).is_none());
 }
 
+#[test] fn contradictory_controller_evidence_faults_with_protocol_reason_not_later_timeout(){
+ clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();up(&mut h,[1;6]);
+ h.transport_complete(r.cookie);h.receive(status(0x1401,1));h.take_reply();
+ assert_eq!(h.fault,Some(-71));let o=h.connection_result(42,1).unwrap();
+ assert_eq!((o.state,o.error,o.fault_error),(sle_connection_operation::State::Faulted,-71,-71));
+ assert_eq!((o.command_status,o.outcome_status,o.handle),(Some(1),Some(0),Some(7)));
+ clock(1000);h.fail(-110);let o=h.connection_result(42,1).unwrap();assert_eq!((o.error,o.fault_error),(-71,-71));assert!(!h.links_clear_for_management());
+}
+
 }

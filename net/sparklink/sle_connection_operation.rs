@@ -202,6 +202,9 @@ impl Connections {
         self.cancel(self.file, self.request).ok().flatten()
     }
     pub(crate) fn clear(&self) -> bool { self.session.reservation_clear() }
+    pub(crate) fn fault_reason(&self) -> Option<i32> {
+        self.session.operation.filter(|_| self.session.uncertain).map(|o| o.fault_error).filter(|error| *error != 0)
+    }
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         self.session.operation.filter(|_| self.session.outstanding && !self.session.uncertain).map(|o| o.deadline)
     }
@@ -213,8 +216,8 @@ impl Connections {
     pub(crate) fn fault(&mut self, error: i32) {
         let Some(o) = self.session.operation.as_mut() else { return };
         if !self.session.outstanding { return; }
-        o.fault_error = error;
-        if o.state != State::Cancelled { o.state = State::Faulted; o.error = error; }
+        if o.fault_error == 0 { o.fault_error = error; }
+        if !matches!(o.state, State::Cancelled | State::Faulted) { o.state = State::Faulted; o.error = o.fault_error; }
         if o.sent { self.session.uncertain = true; } else { self.session.outstanding = false; }
     }
 }
@@ -312,7 +315,8 @@ mod tests {
         c.reserve(42,3,30,create(),0,100).unwrap();assert_eq!(c.expire(100),Some(30));assert!(c.clear());
         c.reserve(42,4,40,create(),0,100).unwrap();c.sent(40).unwrap();c.fault(-5);
         c.expire(1000);c.outcome(up(0));c.out_complete(40);assert!(!c.clear());
-        assert_eq!(c.query(42,4).unwrap().fault_error,-5);
+        c.fault(-110);assert_eq!(c.query(42,4).unwrap().fault_error,-5);
+        assert_eq!(c.fault_reason(),Some(-5));
         let o=c.query(42,4).unwrap();assert_eq!((o.state,o.error,o.handle),(State::Faulted,-5,Some(7)));
     }
 
