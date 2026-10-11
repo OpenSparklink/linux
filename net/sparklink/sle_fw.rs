@@ -109,13 +109,13 @@ pub(crate) fn load_usb_firmware(
         )
     };
 
-    if ret < 0 {
+    if ret != 0 {
         pr_err!(
             "sparklink-fw: download failed for dev_id={}: {}\n",
             dev_id,
             ret
         );
-        return Err(Error::from_errno(ret));
+        return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });
     }
 
     Ok(size)

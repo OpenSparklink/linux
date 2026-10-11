@@ -802,8 +802,12 @@ static int sle_usb_send_cmd_sync(struct sle_usb_dev *d, u16 opcode,
 	pipe_in = usb_rcvbulkpipe(d->udev, d->ep_bulk_in);
 	ret = usb_bulk_msg(d->udev, pipe_in, rbuf, resp_size,
 			   resp_len, SLE_INIT_TIMEOUT_MS);
-	if (!ret && *resp_len > 0)
-		memcpy(resp, rbuf, *resp_len);
+	if (!ret) {
+		if (*resp_len < 0 || *resp_len > resp_size)
+			ret = -EPROTO;
+		else if (*resp_len > 0)
+			memcpy(resp, rbuf, *resp_len);
+	}
 	kfree(rbuf);
 	return ret;
 }
@@ -968,7 +972,8 @@ int sle_usb_dev_get_mac(int dev_id, u8 *mac)
 #define SLE_FW_CHUNK_HDR     7     /* marker + offset(4) + len(2) */
 #define SLE_OP_FW_DL_START   0xF810
 #define SLE_OP_FW_DL_DONE    0xF811
-#define SLE_FW_DEFAULT_CHUNK 240   /* safe for full-speed USB (64B MTU) */
+#define SLE_FW_DEFAULT_CHUNK 240   /* legacy fallback, not a device capability */
+#define SLE_FW_MAX_SIZE     (4 * 1024 * 1024) /* matches Rust loader budget */
 #define SLE_FW_DL_TIMEOUT_MS 10000
 
 /**
@@ -992,21 +997,30 @@ int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 	int pkt_size;
 	u8 start_params[4];
 	u8 resp[32];
-	int resp_len;
+	int resp_len = 0;
 
 	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
 		return -EINVAL;
 	if (!data || size <= 0)
+		return -EINVAL;
+	if (size > SLE_FW_MAX_SIZE)
+		return -EFBIG;
+	if (chunk_size < 0)
 		return -EINVAL;
 
 	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev)
 		return -ENODEV;
 
-	if (chunk_size <= 0)
+	if (!chunk_size)
 		chunk_size = d->ep_bulk_in_size > SLE_FW_CHUNK_HDR ?
 			     d->ep_bulk_in_size - SLE_FW_CHUNK_HDR :
 			     SLE_FW_DEFAULT_CHUNK;
+	/* The chunk header has a 16-bit length. This also bounds pkt_size
+	 * before integer addition and allocation, including explicit sizes.
+	 */
+	if (chunk_size <= 0 || chunk_size > 0xffff)
+		return -EMSGSIZE;
 
 	pkt_size = SLE_FW_CHUNK_HDR + chunk_size;
 	pkt = kmalloc(pkt_size, GFP_KERNEL);
@@ -1049,6 +1063,12 @@ int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 			       offset, ret);
 			goto out;
 		}
+		if (actual_len != total) {
+			ret = -EIO;
+			pr_err("sparklink-usb: short fw chunk at offset %d: %d/%d\n",
+			       offset, actual_len, total);
+			goto out;
+		}
 
 		offset += chunk;
 	}
@@ -1056,6 +1076,8 @@ int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 	/* Step 3: Send FW_DOWNLOAD_DONE and wait for ACK */
 	ret = sle_usb_send_cmd_sync(d, SLE_OP_FW_DL_DONE,
 				    resp, sizeof(resp), &resp_len);
+	if (!ret)
+		ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_FW_DL_DONE, 0);
 	if (ret)
 		pr_err("sparklink-usb: fw download done cmd failed: %d\n", ret);
 	else

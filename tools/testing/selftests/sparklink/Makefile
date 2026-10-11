@@ -16,6 +16,7 @@ TEST_PROGS += run_event_copy.py
 TEST_PROGS += run_phy_model.py
 TEST_PROGS += run_diagnostic_result.py
 TEST_PROGS += run_management_release.py
+TEST_PROGS += run_usb_firmware.py
 
 include ../lib.mk
 

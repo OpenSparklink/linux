@@ -1460,19 +1460,58 @@ pub(crate) struct SleUsbDriver {
     dev_id: u16,
 }
 
-/// Prepare a binding in process context; failed preparation is not a device.
+/// Require bootstrap and optional firmware before reading publishable identity.
+fn prepare_usb_controller(
+    dev_id: u16,
+    dev: &kernel::device::Device,
+) -> Result<([u8; 6], u32)> {
+    // Bootstrap must establish a real controller before optional firmware.
+    initialize_usb_controller(dev_id)?;
+    let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
+    match super::sle_fw::load_usb_firmware(dev_id, fw_name, dev) {
+        Ok(size) => {
+            pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", size);
+            // Cached identity predates the download. Require fresh successful
+            // Reset/version/MAC replies before publishing this binding.
+            initialize_usb_controller(dev_id)?;
+        }
+        Err(ENOENT) => pr_debug!("sparklink-usb: optional firmware absent\n"),
+        Err(error) => return Err(error),
+    }
+
+    let mut addr = [0u8; 6];
+    // SAFETY: probe owns a live registered binding; addr has six bytes.
+    let ret = unsafe { sle_usb_dev_get_mac(i32::from(dev_id), addr.as_mut_ptr()) };
+    if ret != 0 {
+        return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });
+    }
+    if addr == [0; 6] || addr == [0xff; 6] {
+        return Err(EPROTO);
+    }
+    // SAFETY: the mandatory successful bootstrap populated this binding.
+    let fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(dev_id)) };
+    Ok((addr, fw_version))
+}
+
+fn initialize_usb_controller(dev_id: u16) -> Result {
+    // SAFETY: probe owns the live registered interface throughout this call.
+    let ret = unsafe { sle_usb_dev_init_controller(i32::from(dev_id)) };
+    if ret != 0 {
+        return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });
+    }
+    Ok(())
+}
+
+/// Publish only the freshly prepared identity; failures join and detach.
 fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<u16> {
     pr_info!("sparklink-usb: SLE controller discovered\n");
 
-    // Build attach info for the transport framework.
-    // In a real driver this would read the MAC address and firmware
-    // version from the device via control transfers.
+    // Temporary attach identity is never published as a usable USB backend.
     let count = USB_DEV_COUNT.load(Ordering::Relaxed) + 1;
-    let mut addr = [0x5E, 0x00, 0x00, 0x00, 0x01, count as u8];
+    let addr = [0x5E, 0x00, 0x00, 0x00, 0x01, count as u8];
     let attach = SleAttachInfo::new(SleProtoId::UsbBulk, addr);
 
     let dev_id = super::sle_attach_device(&attach)?;
-    let mut fw_version: u32 = 0;
     let result = (|| -> Result {
         pr_info!("sparklink-usb: attached as sle{}\n", dev_id);
 
@@ -1489,46 +1528,11 @@ fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<u16> {
             .ok_or(ENODEV)?
             .generation;
         let reg_ret = unsafe { sle_usb_dev_register(i32::from(dev_id), intf_ptr, generation) };
-        if reg_ret < 0 {
-            return Err(Error::from_errno(reg_ret));
-        } else {
-            // Run the init sequence: Reset → ReadLocalVersion → ReadMacAddr.
-            // Require matching successful replies; a failed bootstrap
-            // cannot publish a usable placeholder Runtime.
-            // SAFETY: dev_id is valid; init sequence is idempotent.
-            let init_ret = unsafe { sle_usb_dev_init_controller(i32::from(dev_id)) };
-            if init_ret < 0 {
-                return Err(Error::from_errno(init_ret));
-            }
-            if init_ret == 0 {
-                // Read back real MAC address and firmware version
-                // from the C device table and update the device info.
-                let mut real_mac = [0u8; 6];
-                // SAFETY: dev_id is valid, real_mac buffer is 6 bytes.
-                let mac_ret =
-                    unsafe { sle_usb_dev_get_mac(i32::from(dev_id), real_mac.as_mut_ptr()) };
-                if mac_ret == 0 && real_mac != [0u8; 6] {
-                    // Use real MAC from controller
-                    addr = real_mac;
-                }
-                // SAFETY: dev_id is valid.
-                fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(dev_id)) };
-                pr_info!(
-                        "sparklink-usb: init OK fw=0x{:08x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                        fw_version,
-                        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
-                    );
-
-                // Attempt firmware download (non-fatal if firmware
-                // blob is absent or already programmed).
-                let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
-                let kern_dev: &kernel::device::Device<kernel::device::Core> = interface.as_ref();
-                match super::sle_fw::load_usb_firmware(dev_id, fw_name, kern_dev) {
-                    Ok(size) => pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", size),
-                    Err(_) => pr_debug!("sparklink-usb: firmware load skipped\n"),
-                }
-            }
+        if reg_ret != 0 {
+            return Err(if reg_ret < 0 { Error::from_errno(reg_ret) } else { EIO });
         }
+        let kern_dev: &kernel::device::Device<kernel::device::Core> = interface.as_ref();
+        let (addr, fw_version) = prepare_usb_controller(dev_id, kern_dev)?;
 
         // Switch the subsystem controller backend to USB and sync
         // the device registry with real hardware info.
