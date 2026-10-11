@@ -173,7 +173,6 @@ fn raw_fifo_all_ring_positions() {
             check_raw(&mut queue, seq + cycle * 64);
         }
         assert!(queue.is_empty());
-        assert_eq!(queue.first_deadline(), None);
         assert!(queue.pop().is_none());
         // Advance by one to exercise every head/tail position.
         raw(&mut queue, 999);
@@ -240,10 +239,10 @@ fn invalid_last_step_never_cancels_old_recipe() {
             Err(QueueError::Invalid)
         );
         assert_eq!(queue.len(), 4);
-        assert_eq!(queue.first_deadline(), Some(123));
         for step in 0..4 {
             let request = queue.pop().unwrap();
             assert_eq!(request.cookie, 1);
+            assert_eq!(request.deadline, 123);
             assert_eq!(request.recipe.unwrap().step, step);
         }
     }

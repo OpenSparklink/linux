@@ -143,12 +143,6 @@ impl CmdRequestQueue {
         self.count == 0
     }
 
-    pub(crate) fn first_deadline(&self) -> Option<u64> {
-        self.entries[self.head]
-            .as_ref()
-            .map(|request| request.deadline)
-    }
-
     /// Remove a queued diagnostic only; preserve other requests/order and the
     /// independent Host on-wire reservation. Sequence zero is internal work.
     pub(crate) fn remove_seq(&mut self, seq: u32) {
