@@ -193,7 +193,9 @@ static int genl_request(int fd, unsigned short family, unsigned char cmd,
 	for (;;) {
 		int count = recv(fd, reply, capacity, 0);
 		if (count < 0) return -errno;
-		for (struct nlmsghdr *h = (void *)reply; NLMSG_OK(h, count); h = NLMSG_NEXT(h, count)) {
+		if (!count) return -EPROTO;
+		unsigned remaining = (unsigned)count;
+		for (struct nlmsghdr *h = (void *)reply; NLMSG_OK(h, remaining); h = NLMSG_NEXT(h, remaining)) {
 			if (h->nlmsg_seq != sequence) continue;
 			if (h->nlmsg_type == NLMSG_ERROR) {
 				if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return -EPROTO;
