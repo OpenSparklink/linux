@@ -334,3 +334,24 @@ this is an explicit synthetic model of the observed111 failure, not RF proof.
 The companion support runner enables it and exercises passive initializer6.
 Keep failures in lease cleanup/writer probes visible; older synthetic receipts
 with unconditional OFF success do not cover these preconditions.
+
+### Actual host frame selector for later initialization steps
+
+The explicit development QMP selectors `test-runtime-in-skip-one` and
+`test-runtime-in-skip-two` configure at most two successful nonempty bulk IN81
+frames to deliver through the normal callback before retaining the next original
+frame. All selectors default disabled. Three read-only counters expose requested,
+remaining and skipped counts. Each skipped frame logs the original length and
+SHA256 with host status zero; no buffer, status or DLI event is fabricated.
+
+Configuration requires an idle attached WS73 and all reset/detach/enumeration
+experiments disabled. It is rejected during hold/error injection. Wrong endpoint,
+failed/empty/non-bulk or cancelled callbacks do not consume this budget. Close
+clears the selector before aborting transfers. The existing two-second bounded
+hold remains, and kernel operation deadlines are never extended.
+
+`check-usb-host-runtime-hold.py` covers the actual selector/callback/setter code
+with counted dependency fixtures and can run ASan/UBSan. Those tests and QMP
+qualification do not establish real USB, scheduler, radio or automatic recovery
+acceptance. Later physical gates must match every skipped and retained frame
+hash/length to the actual capture and retain independent Ready peer activity.

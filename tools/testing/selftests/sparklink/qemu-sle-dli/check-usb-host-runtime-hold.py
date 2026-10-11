@@ -21,12 +21,18 @@ def check(args):
     source = args.source.read_text()
     close = boundary.body(source, 'usb_host_close')
     assert close.index('s->test_runtime_hold_once = false;') < close.index('usb_host_abort_xfers(s);')
+    for field in ['requested','remaining']:
+        assert close.index('s->test_runtime_skip_'+field+' = 0;') < close.index('usb_host_abort_xfers(s);')
+    assert close.index('s->test_runtime_skipped = 0;') < close.index('usb_host_abort_xfers(s);')
     assert close.index('usb_host_abort_xfers(s);') < close.index('libusb_close(s->dh);')
     names = ['usb_host_test_clear_hold', 'usb_host_test_release_hold', 'usb_host_test_hold_timeout',
              'usb_host_req_complete_data', 'usb_host_req_abort', 'usb_host_cancel_packet',
              'usb_host_get_test_runtime_hold', 'usb_host_get_test_runtime_held',
              'usb_host_set_test_runtime_hold', 'usb_host_get_test_runtime_release',
-             'usb_host_set_test_runtime_release', 'usb_host_set_test_runtime_in_error']
+             'usb_host_set_test_runtime_release', 'usb_host_set_test_runtime_in_error',
+             'usb_host_set_test_runtime_skip','usb_host_get_test_runtime_skip_one',
+             'usb_host_set_test_runtime_skip_one','usb_host_get_test_runtime_skip_two',
+             'usb_host_set_test_runtime_skip_two']
     production = '\n\n'.join(boundary.body(source, name) for name in names)
     (args.output/'production.h').write_text(production+'\n')
     mocks = r'''
@@ -59,6 +65,7 @@ typedef struct USBHostDevice {
     QEMUTimer *test_runtime_hold_timer;
     uint64_t test_runtime_in_errors, test_runtime_holds, test_runtime_releases;
     uint64_t test_runtime_bounded_releases, test_runtime_hold_drops;
+    uint64_t test_runtime_skip_requested, test_runtime_skip_remaining, test_runtime_skipped;
     void *dh;
     struct { unsigned idVendor, idProduct; } ddesc;
     int bus_num, addr;
@@ -202,6 +209,54 @@ int main(void) {
     assert(s.test_runtime_hold_once&&!s.test_runtime_in_error_once);
     usb_host_set_test_runtime_hold(&s,false,&e);
     assert(allocated==freed&&timers==timer_frees&&digests==s.test_runtime_holds&&!nodev);
+
+    /* Actual selector functions; timers/digest remain counted substitutes. */
+    for(unsigned count=1;count<=2;count++) {
+        USBHostDevice selected={.attached=true,.dh=(void *)1,.ddesc={0xffff,0x3733}};
+        USBHostDevice peer={.attached=true,.dh=(void *)1,.ddesc={0xffff,0x3733}};
+        if(count==1)usb_host_set_test_runtime_skip_one(&selected,true,&e);
+        else usb_host_set_test_runtime_skip_two(&selected,true,&e);
+        assert(selected.test_runtime_skip_requested==count&&!selected.test_runtime_skip_remaining&&!selected.test_runtime_skipped);
+        assert(usb_host_get_test_runtime_skip_one(&selected,&e)==(count==1));
+        assert(usb_host_get_test_runtime_skip_two(&selected,&e)==(count==2));
+        arm(&selected,&e);assert(selected.test_runtime_skip_remaining==count);
+        int errors=error.calls;usb_host_set_test_runtime_skip(&selected,0,&e);
+        assert(error.calls==errors+1&&selected.test_runtime_skip_remaining==count);
+        for(unsigned i=0;i<6;i++) {
+            p=(USBPacket){.state=USB_PACKET_ASYNC};r=make(&selected,&p);
+            if(i==0)r->xfer->endpoint=0x82;
+            if(i==1)r->xfer->type=3;
+            if(i==2)r->xfer->status=1;
+            if(i==3)r->xfer->actual_length=0;
+            if(i==4)r->in=false;
+            if(i==5)r->p=NULL;
+            usb_host_req_complete_data(r->xfer);
+            assert(selected.test_runtime_hold_once&&!selected.test_runtime_held);
+            assert(selected.test_runtime_skip_remaining==count&&!selected.test_runtime_skipped);
+        }
+        for(unsigned i=0;i<count;i++) {
+            unsigned c=copied,d=completed,f=freed,t=timers;
+            p=(USBPacket){.state=USB_PACKET_ASYNC};r=make(&selected,&p);
+            usb_host_req_complete_data(r->xfer);
+            assert(copied==c+4&&completed==d+1&&freed==f+1&&timers==t);
+            assert(!memcmp(p.data,"\1\2\3\4",4)&&p.status==0);
+            assert(selected.test_runtime_hold_once&&!selected.test_runtime_held);
+            assert(selected.test_runtime_skip_remaining==count-i-1&&selected.test_runtime_skipped==i+1);
+            assert(!peer.test_runtime_skip_requested&&!peer.test_runtime_skipped&&!peer.test_runtime_holds);
+        }
+        unsigned c=copied,d=completed,f=freed;
+        p=(USBPacket){.state=USB_PACKET_ASYNC};r=make(&selected,&p);usb_host_req_complete_data(r->xfer);
+        assert(selected.test_runtime_held==r&&copied==c&&completed==d&&freed==f);
+        errors=error.calls;usb_host_set_test_runtime_skip(&selected,2,&e);assert(error.calls==errors+1);
+        usb_host_set_test_runtime_release(&selected,true,&e);
+        assert(copied==c+4&&completed==d+1&&freed==f+1&&!memcmp(p.data,"\1\2\3\4",4));
+        usb_host_set_test_runtime_skip(&selected,0,&e);assert(!selected.test_runtime_skip_requested&&!selected.test_runtime_skipped);
+        errors=error.calls;usb_host_set_test_runtime_skip(&selected,3,&e);assert(error.calls==errors+1&&!selected.test_runtime_skip_requested);
+        bool *invalid[]={&selected.allow_host_reset,&selected.allow_kernel_driver_detach,&selected.allow_one_guest_reset,&selected.allow_all_guest_resets,&selected.test_enum_reset_once,&selected.test_runtime_in_error_once};
+        for(unsigned i=0;i<6;i++){*invalid[i]=true;errors=error.calls;usb_host_set_test_runtime_skip(&selected,1,&e);assert(error.calls==errors+1&&!selected.test_runtime_skip_requested);*invalid[i]=false;}
+        selected.dh=NULL;errors=error.calls;usb_host_set_test_runtime_skip(&selected,1,&e);assert(error.calls==errors+1&&!selected.test_runtime_skip_requested);
+    }
+    assert(allocated==freed&&timers==timer_frees);
     puts("RUNTIME_HOLD_DEPENDENCY_BOUNDARIES_PASS: default/guards/qualified pulse/explicit+bounded delivery/cancel+abort+combined cleanup");
 }
 '''

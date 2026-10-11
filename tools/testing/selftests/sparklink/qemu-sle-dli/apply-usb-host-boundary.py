@@ -14,7 +14,8 @@ def apply(source):
     names = ['usb-host-boundary.patch', 'usb-host-retry.patch',
              'usb-host-reenumeration.patch', 'usb-host-autoscan.patch',
              'usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch',
-             'usb-host-enumeration-once.patch']
+             'usb-host-enumeration-once.patch',
+             'usb-host-runtime-selector.patch']
     patches = [Path(__file__).with_name(name).resolve() for name in names]
     host = source / 'hw/usb/host-libusb.c'
     original = host.read_bytes()

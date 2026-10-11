@@ -79,10 +79,13 @@ def qmp_properties(args):
                 else:
                     raise AssertionError('unattached fault pulse accepted')
                 assert monitor.execute('qom-get',{'path':path,'property':'test-runtime-in-error-once'}) is False
-                for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release']:
+                for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release',
+                             'test-runtime-in-skip-one','test-runtime-in-skip-two']:
                     assert monitor.execute('qom-get',{'path':path,'property':name}) is False
                 for name in ['test-runtime-in-holds','test-runtime-in-releases',
-                             'test-runtime-in-bounded-releases','test-runtime-in-hold-drops']:
+                             'test-runtime-in-bounded-releases','test-runtime-in-hold-drops',
+                             'test-runtime-in-skip-requested','test-runtime-in-skip-remaining',
+                             'test-runtime-in-skipped']:
                     assert monitor.execute('qom-get',{'path':path,'property':name}) == 0
                     try:
                         monitor.execute('qom-set',{'path':path,'property':name,'value':1})
@@ -90,7 +93,8 @@ def qmp_properties(args):
                         pass
                     else:
                         raise AssertionError('read-only hold counter accepted a write')
-                for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release']:
+                for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release',
+                             'test-runtime-in-skip-one','test-runtime-in-skip-two']:
                     try:
                         monitor.execute('qom-set',{'path':path,'property':name,'value':True})
                     except ValueError:
@@ -264,7 +268,7 @@ int main(void)
     patches = [Path(__file__).with_name(name).resolve() for name in
                ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
                 'usb-host-autoscan.patch','usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch',
-                'usb-host-enumeration-once.patch']]
+                'usb-host-enumeration-once.patch','usb-host-runtime-selector.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
