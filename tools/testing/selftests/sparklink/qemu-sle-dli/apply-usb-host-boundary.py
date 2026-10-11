@@ -13,7 +13,8 @@ def apply(source):
     # before changing the caller's file. A partial/context drift never mutates it.
     names = ['usb-host-boundary.patch', 'usb-host-retry.patch',
              'usb-host-reenumeration.patch', 'usb-host-autoscan.patch',
-             'usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch']
+             'usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch',
+             'usb-host-enumeration-once.patch']
     patches = [Path(__file__).with_name(name).resolve() for name in names]
     host = source / 'hw/usb/host-libusb.c'
     original = host.read_bytes()

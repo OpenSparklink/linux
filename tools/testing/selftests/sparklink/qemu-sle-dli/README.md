@@ -157,7 +157,7 @@ python3 check-usb-host-runtime-error.py \
 
 该检查编译实际callback/setter，使用计数mock验证默认行为、单次注入、
 禁止arm条件及取消。autoscan检查还验证关闭一只设备只清除该设备的脉冲。
-补丁应用工具先在临时树验证完整链，可升级零至六补丁的完整前缀；所有上下文
+补丁应用工具先在临时树验证完整链，可升级零至七补丁的完整前缀；所有上下文
 漂移检查完成前不修改调用者源码。暂停QMP检查拒绝对未attached对象arm。
 
 `usb-host-runtime-hold.patch`提供单对象、默认关闭的成功接收暂留：显式设置
@@ -185,6 +185,16 @@ python3 check-usb-host-runtime-hold.py \
 完整close drain、多设备并发、线上取消/迟到回复/期限仍须独立VM真实设备门禁。
 暂停QMP只验证默认/只读/拒绝arm与release，无USB匹配或guest运行。
 这种暂留属于故障测试，不是自然故障根因或自主恢复验收。
+
+`usb-host-enumeration-once.patch`增加默认关闭的 VM 实验属性
+`test-enumeration-reset-once`。仅明确匹配 WS73 固定 hostbus/hostport，且原有
+四个 reset/detach 开关全部关闭时可启用。只在 guest 地址为零且实际 handle
+存在时，最多调用一次 libusb reset；调用前消费预算，失败也不补充。
+只读 `test-enumeration-reset-used` 跨同一对象的关闭和重新枚举保持；不得删除
+并重建对象来补预算。旧快照预算未知时禁止再复位；这不构成 live migration
+资格。开启此实验时禁止 arm runtime error/hold，正式在途测试使用默认对象。
+源码计数 fixture 和暂停 QMP 验证预算、默认值、只读及配置拒绝；真实复位次数、
+描述符、固件上传和 Ready 必须另留 VM USB 证据。该开关不接入生产恢复。
 
 完整开发门禁可由固定上游归档复现：
 

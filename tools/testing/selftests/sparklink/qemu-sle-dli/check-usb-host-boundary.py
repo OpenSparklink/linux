@@ -100,6 +100,31 @@ def qmp_properties(args):
                     assert monitor.execute('qom-get',{'path':path,'property':name}) is False
                 monitor.execute('qom-set',{'path':path,'property':'test-runtime-in-hold-once','value':False})
                 monitor.execute('qom-set',{'path':path,'property':'test-runtime-in-release','value':False})
+                for name in ['test-enumeration-reset-once','test-enumeration-reset-used']:
+                    assert monitor.execute('qom-get',{'path':path,'property':name}) is False
+                try:
+                    monitor.execute('qom-set',{'path':path,'property':'test-enumeration-reset-used','value':True})
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('read-only enumeration budget accepted a write')
+                once = dict(base,id='enumeration_once',port='3',
+                            **{'kernel-driver-detach':False,'host-reset':False,
+                               'guest-reset':False,'guest-resets-all':False,
+                               'test-enumeration-reset-once':True})
+                monitor.execute('device_add',once)
+                assert monitor.execute('qom-get',{'path':'/machine/peripheral/enumeration_once','property':'test-enumeration-reset-once'}) is True
+                for name in ['attached','test-enumeration-reset-used']:
+                    assert monitor.execute('qom-get',{'path':'/machine/peripheral/enumeration_once','property':name}) is False
+                for option in ['kernel-driver-detach','host-reset','guest-reset','guest-resets-all']:
+                    invalid = dict(once,id='invalid_once',port='4')
+                    invalid[option] = True
+                    try:
+                        monitor.execute('device_add',invalid)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError('incompatible enumeration reset opt-in accepted')
                 assert monitor.execute('query-status')['status']=='prelaunch'
                 monitor.execute('quit');assert process.wait(timeout=10)==0
             finally:
@@ -238,7 +263,8 @@ int main(void)
     print(result,end='')
     patches = [Path(__file__).with_name(name).resolve() for name in
                ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
-                'usb-host-autoscan.patch','usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch']]
+                'usb-host-autoscan.patch','usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch',
+                'usb-host-enumeration-once.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -271,6 +297,7 @@ int main(void)
             ('timer_mod(s->test_runtime_hold_timer,',
              'timer_mod(s->test_runtime_hold_timer_drift,'),
             ('s->test_runtime_hold_once = value;', 's->test_runtime_hold_once = !value;'),
+            ('s->test_enum_reset_used = true;', 's->test_enum_reset_used = false;'),
         ]:
             assert source.count(before)==1
             copy.write_text(source.replace(before, after, 1))
@@ -298,9 +325,10 @@ int main(void)
         assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
              'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'reenumeration_cases':6,
-             'host_lifecycle_sites':3,'patch_cases':18,
+             'host_lifecycle_sites':3,'patch_cases':20,
              'supported_patch_prefixes':list(range(len(patches)+1)),
              'hold_source_drift_cases':3,
+             'enumeration_budget_source_drift_cases':1,
              'source_sha256':hashlib.sha256(host.read_bytes()).hexdigest(),
              'production_sha256':hashlib.sha256(production.encode()).hexdigest()}
     if args.qemu:

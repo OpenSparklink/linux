@@ -45,12 +45,16 @@ def check(args):
         subprocess.run([sys.executable, str(helpers / f'check-usb-host-runtime-{name}.py'),
                         '--source', str(source / 'hw/usb/host-libusb.c'),
                         '--output', str(args.output / name), '--cc', args.cc, '--sanitize'], check=True)
+    subprocess.run([sys.executable, str(helpers / 'check-usb-host-enumeration-once.py'),
+                    '--source', str(source / 'hw/usb/host-libusb.c'),
+                    '--output', str(args.output / 'enumeration-once'), '--cc', args.cc], check=True)
     record = {'status': 'PASS_PINNED_QEMU_DEPENDENCY_BOUNDARIES',
               'archive_sha256': digest, 'upstream_version': '9.2.0',
               'source_sha256': hashlib.sha256((source / 'hw/usb/host-libusb.c').read_bytes()).hexdigest(),
               'chain': json.loads((args.output / 'chain/result.json').read_text()),
               'error': json.loads((args.output / 'error/manifest.json').read_text()),
               'hold': json.loads((args.output / 'hold/manifest.json').read_text()),
+              'enumeration_once': json.loads((args.output / 'enumeration-once/manifest.json').read_text()),
               'live_usb_acceptance': False, 'live_on_wire_cancel_acceptance': False,
               'qemu_scheduler_acceptance': False, 'natural_fault_root_cause_closed': False}
     (args.output / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')

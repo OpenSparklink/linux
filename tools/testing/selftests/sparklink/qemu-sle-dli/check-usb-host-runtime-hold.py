@@ -53,7 +53,7 @@ typedef struct QEMUTimer { void (*cb)(void *); void *opaque; int64_t deadline; b
 typedef struct USBHostRequest USBHostRequest;
 typedef struct USBHostDevice {
     bool attached, allow_host_reset, allow_kernel_driver_detach;
-    bool allow_one_guest_reset, allow_all_guest_resets;
+    bool allow_one_guest_reset, allow_all_guest_resets, test_enum_reset_once;
     bool test_runtime_in_error_once, test_runtime_hold_once;
     USBHostRequest *test_runtime_held;
     QEMUTimer *test_runtime_hold_timer;
@@ -195,8 +195,8 @@ int main(void) {
     s.ddesc.idProduct=1;usb_host_set_test_runtime_hold(&s,true,&e);assert(!s.test_runtime_hold_once);s.ddesc.idProduct=0x3733;
     s.dh=NULL;usb_host_set_test_runtime_hold(&s,true,&e);assert(!s.test_runtime_hold_once);s.dh=(void *)1;
     s.attached=false;usb_host_set_test_runtime_hold(&s,true,&e);assert(!s.test_runtime_hold_once);s.attached=true;
-    bool *opts[]={&s.allow_host_reset,&s.allow_kernel_driver_detach,&s.allow_one_guest_reset,&s.allow_all_guest_resets};
-    for(unsigned i=0;i<4;i++){*opts[i]=true;usb_host_set_test_runtime_hold(&s,true,&e);assert(!s.test_runtime_hold_once);*opts[i]=false;}
+    bool *opts[]={&s.allow_host_reset,&s.allow_kernel_driver_detach,&s.allow_one_guest_reset,&s.allow_all_guest_resets,&s.test_enum_reset_once};
+    for(unsigned i=0;i<5;i++){*opts[i]=true;usb_host_set_test_runtime_hold(&s,true,&e);assert(!s.test_runtime_hold_once);*opts[i]=false;}
     s.test_runtime_in_error_once=true;usb_host_set_test_runtime_hold(&s,true,&e);assert(!s.test_runtime_hold_once);s.test_runtime_in_error_once=false;
     arm(&s,&e);usb_host_set_test_runtime_in_error(&s,true,&e);
     assert(s.test_runtime_hold_once&&!s.test_runtime_in_error_once);
