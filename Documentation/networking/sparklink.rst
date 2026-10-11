@@ -1960,6 +1960,16 @@ bit one identifies an actual failure reply with raw status/opcode. First faults
 remain stable after later timer work. The current fault recovery is replug with
 new generation, not an unverified native Reset. Other registrations are isolated.
 
+Revocation keeps registration-local history of actual typed TX selection,
+including cancelled operations and evicted results. An untouched Unknown
+radio domain receives no stop for an unconfigured handle; skipping that domain
+never confirms Off or sets Ready. Only selected domains or domains with known
+radio state require a stop/retained matching Off barrier. A successor must still
+initialize an Unknown domain. The active reservation and original deadline
+remain intact; real refusal in a required domain remains Faulted. This fixes
+the actual advertising-first partial case whose unnecessary scan STOP returned
+0x0b. Source boundary tests pass; new physical-image validation is still pending.
+
 ``run_runtime_lifecycle.py --native-ws73 --native-ws73-management`` tests actual
 syscalls, competing descriptions, modes/identity, copyout rollback, inherited
 owner credentials, duplicate last-close, confirmed cleanup, raw failure details,

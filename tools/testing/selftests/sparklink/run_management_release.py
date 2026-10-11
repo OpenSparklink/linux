@@ -33,7 +33,8 @@ def run(output):
                         ['quiet', 'policy_untouched', 'policy_unsubmitted',
                          'cancel_unsubmitted_policy', 'controller_status', 'discovery_radio',
                          'current_recipe', 'can_send', 'retained_revocation',
-                         'retained_revocation_ready', 'next'])
+                         'retained_revocation_ready', 'next', 'cancel_recipe_progress', 'enqueue_recipe',
+                         'begin_revoke', 'revocation_result', 'fail'])
     fixture = (here/'diagnostic/management_release_fixture.rs').read_text()
     fixture = fixture.replace('// @@HOST_METHODS@@', methods).replace('// @@CORE_DECISION@@', decision)
     host = inputs['sle_host.rs'].decode()
@@ -53,8 +54,8 @@ def run(output):
                         '-D', 'warnings', str(tmp/'fixture.rs'), '-o', str(tmp/'test')], check=True)
         subprocess.run([str(tmp/'test'), '--test-threads=1'], check=True)
     assert all((net/n).read_bytes() == b for n, b in inputs.items())
-    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 21,
-              'scope': 'actual Host predicates/TX selection/InFlight and core fast-release block; source queue/operation/lease modules and opcode/timeout constants; locks, clock scaling and surrounding transport dependencies are fixtures',
+    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 24,
+              'scope': 'actual Host predicates/TX selection/InFlight/domain revocation and core fast-release block; source queue/operation/lease modules and opcode/timeout constants; locks, clock scaling, dependency error adapters and surrounding transport dependencies are fixtures',
               'live_ioctl_acceptance': False, 'fd_close_acceptance': False,
               'automatic_fault_recovery_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(b).hexdigest() for n, b in inputs.items()}}

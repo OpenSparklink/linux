@@ -47,6 +47,8 @@ pub(crate) struct CommandHost {
     scan_cookie: u64,
     recipe: Option<(RecipeTag, RecipeProgress)>,
     operations: Operations,
+    // Actual typed selection, never cleared by cancellation/result eviction.
+    selected_policy_domains: u8,
     revoking: bool,
     revoke_cookies: [u64; 2],
     revoke_done: u8,
@@ -71,6 +73,7 @@ impl CommandHost {
             recipe: None,
                 revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
                 revoke_status: 0, revoke_opcode: 0, revoke_reply: false,
+                selected_policy_domains: 0,
                 operations <- init!(Operations {
                     entries <- pin_init::init_array_from_fn(|_| None),
                     initialized: false,
@@ -185,13 +188,18 @@ impl CommandHost {
         if let Some(error) = self.fault { return Err(error); }
         self.operations.cancel_domain(DiscoveryIntent::Advertising(false), -(kernel::bindings::ECANCELED as i32));
         self.operations.cancel_domain(DiscoveryIntent::Scanning(false), -(kernel::bindings::ECANCELED as i32));
-        self.revoke_cookies[0] = self.next_cookie;
-        self.enqueue_recipe(DiscoveryIntent::Advertising(false), adv)?;
-        self.revoke_cookies[1] = self.next_cookie;
-        if let Err(error) = self.enqueue_recipe(DiscoveryIntent::Scanning(false), scan) {
-            self.fail(error); return Err(error);
+        let required = super::sle_command_plan::revocation_required_domains(
+            self.selected_policy_domains, [self.operations.advertising, self.operations.scanning]);
+        self.revoke_cookies = [0; 2];
+        for (domain, intent, parts) in [(0, DiscoveryIntent::Advertising(false), adv),
+                                       (1, DiscoveryIntent::Scanning(false), scan)] {
+            if required & (1 << domain) == 0 { continue; }
+            self.revoke_cookies[domain] = self.next_cookie;
+            if let Err(error) = self.enqueue_recipe(intent, parts) {
+                let _ = self.fail(error); return Err(error);
+            }
         }
-        self.revoking = true; self.revoke_done = 0;
+        self.revoking = true; self.revoke_done = !required & 3;
         self.revoke_status = 0; self.revoke_opcode = 0; self.revoke_reply = false;
         // SAFETY: reading the kernel clock has no pointer preconditions.
         self.revoke_deadline = unsafe { kernel::bindings::jiffies_64 }
@@ -207,7 +215,7 @@ impl CommandHost {
     /// Settling a lease here does not establish Off or make the radio Ready.
     pub(crate) fn policy_untouched(&self) -> bool {
         self.quiet() && self.fault.is_none() && !self.revoking
-            && self.recipe.is_none() && self.broadcast_cookie == 0 && self.scan_cookie == 0
+            && self.recipe.is_none() && self.selected_policy_domains == 0 && self.broadcast_cookie == 0 && self.scan_cookie == 0
             && !self.operations.initialized
             && self.operations.advertising == 0 && self.operations.scanning == 0
             && self.operations.entries.iter().all(Option::is_none)
@@ -220,7 +228,7 @@ impl CommandHost {
     pub(crate) fn policy_unsubmitted(&self) -> bool {
         if self.policy_untouched() { return true; }
         self.active.is_none() && self.reply.is_none() && self.fault.is_none()
-            && !self.revoking && self.recipe.is_none() && !self.operations.initialized
+            && !self.revoking && self.recipe.is_none() && self.selected_policy_domains == 0 && !self.operations.initialized
             && self.operations.advertising == 0 && self.operations.scanning == 0
             && self.operations.entries.iter().flatten().all(|op| {
                 ((op.state == State::Queued && op.error == 0)
@@ -321,7 +329,9 @@ impl CommandHost {
                     // uncertain/cancelled enables remain unknown and cannot
                     // take this path. Both domains must settle before reuse.
                     self.revoke_done |= 1 << domain;
-                    if self.revoke_done == 3 { self.operations.initialized = true; }
+                    if self.revoke_done == 3 {
+                        self.operations.initialized = self.operations.advertising == 1 && self.operations.scanning == 1;
+                    }
                     continue;
                 }
                 if tag.step == 0 {
@@ -339,7 +349,13 @@ impl CommandHost {
             // A cancelled/expired queued transaction never reaches the wire.
         };
         self.credits -= 1;
-        if request.recipe.is_some() { self.operations.sent(request.cookie, request.recipe.unwrap().step, request.opcode); }
+        if let Some(tag) = request.recipe {
+            self.selected_policy_domains |= match tag.intent {
+                DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => 1,
+                DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => 2,
+            };
+            self.operations.sent(request.cookie, tag.step, request.opcode);
+        }
         self.active = Some(InFlight {
             opcode: request.opcode,
             seq: request.seq,
@@ -496,7 +512,9 @@ impl CommandHost {
                             self.revoke_done |= 1 << i;
                             if i == 0 { self.operations.advertising = 1; }
                             else { self.operations.scanning = 1; }
-                            if self.revoke_done == 3 { self.operations.initialized = true; }
+                            if self.revoke_done == 3 {
+                                self.operations.initialized = self.operations.advertising == 1 && self.operations.scanning == 1;
+                            }
                         }
                         RecipeReply::Failed => {
                             self.revoke_status = match &event {

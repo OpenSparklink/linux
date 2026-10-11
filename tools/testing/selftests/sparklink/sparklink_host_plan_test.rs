@@ -503,3 +503,15 @@ fn queued_raw_deadline_does_not_hide_recipe_deadline_or_fake_wire_fault() {
     assert_eq!(q.first_recipe_deadline(), Some(123));
     q.remove_seq(1); assert_eq!(q.first_recipe_deadline(), Some(123));
 }
+
+#[test]
+fn revocation_domain_mask_preserves_unknown_and_requires_every_selected_domain() {
+    // Registration/selection/known-radio cases, including conservative invalid history.
+    for (selected, radio, required) in [
+        (0, [0, 0], 0), (1, [0, 0], 1), (2, [0, 0], 2), (3, [0, 0], 3),
+        (0, [1, 0], 1), (0, [0, 2], 2), (1, [0, 1], 3), (2, [1, 0], 3),
+        (255, [0, 0], 3),
+    ] {
+        assert_eq!(sle_command_plan::revocation_required_domains(selected, radio), required);
+    }
+}

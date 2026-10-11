@@ -10,14 +10,18 @@
 #[path="sle_management.rs"] mod sle_management;
 use std::cell::{RefCell,RefMut};
 use sle_command_queue::{CmdRequestQueue,CmdRequest};
-use sle_command_plan::{DiscoveryIntent,RecipeTag,RecipeProgress};
+use sle_command_plan::{DiscoveryIntent,RecipeTag,RecipeProgress,RecipePart};
 use sle_discovery_operation::{Operations,Operation,State};
 mod under_test {
 use super::*;
 type Error=i32;
 type Result<T=()>=std::result::Result<T,Error>;
 mod kernel {pub mod bindings {pub const ECANCELED:u32=125;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
-const EINVAL:i32=-22;const ETIMEDOUT:i32=-110;
+const EINVAL:i32=-22;const ETIMEDOUT:i32=-110;const EOVERFLOW:i32=-75;
+trait Errno {fn to_errno(self)->i32;}
+impl Errno for i32 {fn to_errno(self)->i32{self}}
+// Kernel Error dependency fixture; queue/policy functions are actual source.
+impl From<sle_command_queue::QueueError> for i32 {fn from(error:sle_command_queue::QueueError)->i32 {match error {sle_command_queue::QueueError::Invalid=>-22,sle_command_queue::QueueError::Full=>-16}}}
 fn msecs_to_jiffies(ms:u32)->u64 {ms as u64}
 // @@TIMEOUT@@
 #[allow(dead_code)]
@@ -31,7 +35,7 @@ impl Lock {fn lock(&self)->RefMut<'_,Host>{self.0.borrow_mut()}}
 struct Owner {host:Lock}
 struct Host {requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
- operations:Operations,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2]}
+ operations:Operations,selected_policy_domains:u8,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
 impl Host {
  // @@HOST_METHODS@@
 }
@@ -41,7 +45,7 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
 }
 fn host()->Host {Host{requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),
- revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2]}}
+ selected_policy_domains:0,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,transport_done:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
@@ -57,6 +61,28 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
  gate.release(42,token).unwrap();
  assert_eq!(gate.authorize(42,mode),Err(sle_management::Failure::Busy));
  let result=candidate(&owner,&mut gate,mode);(owner,gate,result)
+}
+#[test] fn selected_advertising_does_not_stop_untouched_unknown_scanning(){
+ let mut h=host();h.selected_policy_domains=1;h.operations.advertising=1;h.credits=0;
+ h.begin_revoke(&[RecipePart{opcode:0x0c05,params:&[0;5]}],&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
+ assert_eq!(h.revoke_done,2);assert_eq!(h.requests.len(),1);assert_eq!(h.revoke_cookies[1],0);
+ // Actual retained-Off path consumes no new wire slot or credit.
+ assert!(h.next(|_|false).unwrap().is_none());assert_eq!(h.revocation_result(),Some(Ok(())));
+ assert_eq!(h.discovery_radio(),(1,0,None));assert!(!h.controller_status().1);
+}
+#[test] fn untouched_diagnostic_slot_retains_original_reservation_without_radio_stops(){
+ let mut h=host();h.active=Some(active());
+ h.begin_revoke(&[RecipePart{opcode:0x0c05,params:&[0;5]}],&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
+ assert_eq!(h.requests.len(),0);assert_eq!(h.active.as_ref().unwrap().deadline,1000);
+ assert_eq!(h.revoke_done,3);assert_eq!(h.revocation_result(),None);
+ assert_eq!(h.discovery_radio(),(0,0,None));assert!(!h.controller_status().1);
+}
+#[test] fn selection_history_survives_result_eviction_and_both_domains_still_require_stops(){
+ let mut h=queued_policy();assert!(h.next(|_|false).unwrap().is_some());assert_eq!(h.selected_policy_domains,1);
+ h.active=None;h.recipe=None;h.requests=CmdRequestQueue::new();h.operations.entries=[None;sle_discovery_operation::CAPACITY];h.broadcast_cookie=0;
+ assert!(!h.policy_untouched());assert!(!h.policy_unsubmitted());
+ h.selected_policy_domains|=2;h.begin_revoke(&[RecipePart{opcode:0x0c05,params:&[0;5]}],&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
+ assert_eq!(h.revoke_done,0);assert_eq!(h.requests.len(),2);assert_ne!(h.revoke_cookies[0],0);assert_ne!(h.revoke_cookies[1],0);
 }
 #[test] fn untouched_managed_release_is_free_and_stays_unknown_not_ready(){
  let (owner,gate,r)=released(host(),sle_management::MANAGED);assert_eq!(r,Ok(()));
