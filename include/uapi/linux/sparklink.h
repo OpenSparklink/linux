@@ -5,7 +5,7 @@
  * Family: "sparklink"
  * Version: 1
  *
- * This header defines the stable userspace ABI for the SparkLink
+ * This header defines the unpublished userspace ABI for the SparkLink
  * Generic Netlink interface. It parallels the ioctl interface on
  * /dev/sparklink and provides structured attribute-based messaging.
  *
@@ -32,11 +32,10 @@ enum {
 	/* Device management */
 	SPARKLINK_CMD_UNSPEC,
 	SPARKLINK_CMD_GET_DEV_INFO,	/* Get device information */
-	SPARKLINK_CMD_DEV_REGISTER,	/* Register virtual device */
-	SPARKLINK_CMD_DEV_UNREGISTER,	/* Unregister virtual device */
+	/* 2/3: removed unimplemented registration commands; not reused. */
 
 	/* Advertising / scanning */
-	SPARKLINK_CMD_START_ADV,	/* Start advertising */
+	SPARKLINK_CMD_START_ADV = 4,	/* Start advertising */
 	SPARKLINK_CMD_STOP_ADV,		/* Stop advertising */
 	SPARKLINK_CMD_START_SCAN,	/* Start scanning */
 	SPARKLINK_CMD_STOP_SCAN,	/* Stop scanning */

@@ -775,8 +775,7 @@ struct sle_event_stats {
 
 /* --- Device management -------------------------------------------------- */
 
-#define SL_IOCTL_DEV_REGISTER		_IO(SL_MAGIC, 0x01)
-#define SL_IOCTL_DEV_UNREGISTER		_IOW(SL_MAGIC, 0x02, __u16)
+/* 0x01/0x02: removed unpublished no-op registration commands; not reused. */
 #define SL_IOCTL_DEV_COUNT		_IOR(SL_MAGIC, 0x03, __u32)
 #define SL_IOCTL_DEV_INFO		_IOR(SL_MAGIC, 0x04, struct sci_dev_info)
 #define SL_IOCTL_DEV_SWITCH		_IOW(SL_MAGIC, 0x05, __u16)

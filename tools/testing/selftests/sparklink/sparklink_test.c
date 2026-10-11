@@ -4,7 +4,7 @@
  *
  * Exercises the SparkLink SCI control interface ioctl commands:
  *   - DEV_COUNT: query registered device count
- *   - DEV_REGISTER / DEV_UNREGISTER: stub registration
+ *   - Retired registration commands: reject instead of reporting fake success
  *   - START_ADV / STOP_ADV: advertising lifecycle
  *   - START_SCAN / STOP_SCAN: scanning lifecycle
  *
@@ -194,15 +194,19 @@ static void test_dev_info(int fd)
 	}
 }
 
-static void test_dev_register(int fd)
+static void test_retired_registration(int fd)
 {
-	test_header("DEV_REGISTER / DEV_UNREGISTER");
-	int ret = ioctl(fd, SL_IOCTL_DEV_REGISTER, NULL);
-
-	check("DEV_REGISTER", ret);
-
-	ret = ioctl(fd, SL_IOCTL_DEV_UNREGISTER, NULL);
-	check("DEV_UNREGISTER", ret);
+	test_header("Retired no-op registration commands");
+	/* Literal historical wire numbers, not a second exported interface. */
+	const unsigned long commands[] = { 0x00005301, 0x40025302, 0x40045302 };
+	for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+		errno = 0;
+		int ret = ioctl(fd, commands[i], (void *)1);
+		if (ret != -1 || errno != ENOTTY)
+			test_fail("  FAIL: retired cmd 0x%lx ret=%d errno=%d\n", commands[i], ret, errno);
+		else
+			printf("  OK:   retired cmd 0x%lx ENOTTY\n", commands[i]);
+	}
 }
 
 static void disconnect_all(int fd)
@@ -12321,7 +12325,6 @@ static void test_ioctl_fuzz(int fd)
 	 */
 	static const unsigned long cmds[] = {
 		/* Device management */
-		SL_IOCTL_DEV_REGISTER,  SL_IOCTL_DEV_UNREGISTER,
 		SL_IOCTL_DEV_COUNT,     SL_IOCTL_DEV_INFO,
 		SL_IOCTL_DEV_SWITCH,    SL_IOCTL_DEV_LIST,
 		/* Advertising */
@@ -12683,7 +12686,7 @@ static void test_genetlink(void)
 #define SPARKLINK_TEST_CASES(X) \
 	X(test_dev_count, fd) \
 	X(test_dev_info, fd) \
-	X(test_dev_register, fd) \
+	X(test_retired_registration, fd) \
 	X(test_role_management, fd) \
 	X(test_advertising, fd) \
 	X(test_scanning, fd) \

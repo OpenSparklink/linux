@@ -64,9 +64,7 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_CONN_RECV
         | SL_IOCTL_CONN_SEND
         | SL_IOCTL_CONN_UPDATE_PARAMS
-        | SL_IOCTL_DEV_REGISTER
         | SL_IOCTL_DEV_SWITCH
-        | SL_IOCTL_DEV_UNREGISTER
         | SL_IOCTL_DISCONNECT
         | SL_IOCTL_DISCOVERY_SUBMIT
         | SL_IOCTL_DLI_POLL_EVENT

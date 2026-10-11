@@ -26,6 +26,7 @@ static const unsigned long protected[] = {
     /* Capability-requiring passive trace, without Managed writer ownership. */
     SL_IOCTL_SNOOP_GET,
     SL_IOCTL_DIAGNOSTIC_RESULT,
+    SL_IOCTL_DIAGNOSTIC_SUBMIT,
     SL_IOCTL_MANAGEMENT_ACQUIRE, SL_IOCTL_MANAGEMENT_RELEASE,
 	SL_IOCTL_AFH_CLASSIFY,
 	SL_IOCTL_AFH_HOP_NEXT,
@@ -40,9 +41,7 @@ static const unsigned long protected[] = {
 	SL_IOCTL_CONN_RECV,
 	SL_IOCTL_CONN_SEND,
 	SL_IOCTL_CONN_UPDATE_PARAMS,
-	SL_IOCTL_DEV_REGISTER,
 	SL_IOCTL_DEV_SWITCH,
-	SL_IOCTL_DEV_UNREGISTER,
 	SL_IOCTL_DISCONNECT,
 	SL_IOCTL_DISCOVERY_SUBMIT,
 	SL_IOCTL_DLI_POLL_EVENT,
@@ -277,6 +276,14 @@ static int child(int fd, int config[5], uid_t uid, gid_t gid, int id, __u64 gene
 	errno = 0;
 	if (ioctl(fd, _IO('S', 0xff), NULL) != -1 || errno != ENOTTY)
 		return failure("unknown ABI command must be ENOTTY");
+	/* Removed no-op C and historical Rust write_int encodings are unknown,
+	 * before capability, selection or user-memory access. */
+	const unsigned long retired[] = { 0x00005301, 0x40025302, 0x40045302 };
+	for (unsigned i = 0; i < COUNT(retired); ++i) {
+		errno = 0;
+		if (ioctl(fd, retired[i], (void *)1) != -1 || errno != ENOTTY)
+			return failure("retired registration ABI must be ENOTTY");
+	}
 	for (unsigned i = 0; i < COUNT(attrs); ++i) {
 		errno = 0;
 		if (write(config[i], "0", 1) != -1 || errno != EPERM)

@@ -87,11 +87,7 @@ pub(crate) const DLI_PARAM_MAX: usize = 240;
 
 pub(crate) const SL_MAGIC: u32 = 'S' as u32;
 
-/// Register a new SCI device (for testing).
-pub(crate) const SL_IOCTL_DEV_REGISTER: u32 = _IO(SL_MAGIC, 0x01);
-
-/// Unregister a SCI device by index.
-pub(crate) const SL_IOCTL_DEV_UNREGISTER: u32 = _IOW::<u16>(SL_MAGIC, 0x02);
+// Removed unpublished no-op registration commands; 0x01/0x02 are not reused.
 
 /// Get the number of registered SCI devices.
 pub(crate) const SL_IOCTL_DEV_COUNT: u32 = _IOR::<u32>(SL_MAGIC, 0x03);

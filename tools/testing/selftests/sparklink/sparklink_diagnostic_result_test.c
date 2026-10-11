@@ -419,6 +419,59 @@ static void cancel_held(int fd, uint64_t generation, const unsigned char *addres
 	hex(&active, sizeof(active)); putchar(','); hex(&final, sizeof(final)); putchar(','); hex(&queued, sizeof(queued));
 	putchar(']'); counters(held, after); puts("}"); fflush(stdout);
 }
+/* Removed commands remain literal only in rejection tests. No compatibility
+ * binding or production injection is retained. stderr keeps this separate from
+ * the historical diagnostic result/admission formats. */
+static void retired_registration(int fd, uint64_t generation)
+{
+	const unsigned long commands[] = { 0x00005301, 0x40025302, 0x40045302 };
+	struct __user_cap_header_struct h = { .version = _LINUX_CAPABILITY_VERSION_3 };
+	struct __user_cap_data_struct c[2] = { 0 };
+	struct sle_controller_snapshot before = { .version = 1, .generation = generation };
+	struct sle_controller_snapshot after = before;
+	struct sle_mgmt_stats stats_before = stats(fd);
+	__u16 mask_before = 0, mask_after = 0;
+	int count_before = ioctl(fd, SL_IOCTL_DEV_COUNT, NULL);
+	require(count_before > 0 && !ioctl(fd, SL_IOCTL_DEV_LIST, &mask_before) &&
+		!ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &before) &&
+		!syscall(SYS_capget, &h, c), "retired ABI observation before");
+	uint64_t start = now(CLOCK_REALTIME);
+	for (unsigned i = 0; i < sizeof(commands)/sizeof(commands[0]); ++i) {
+		for (unsigned j = 0; j < 3; ++j) {
+			unsigned char sentinel[8], reference[8];
+			memset(sentinel, 0xa5, sizeof(sentinel)); memcpy(reference, sentinel, sizeof(reference));
+			void *argument = j == 0 ? NULL : j == 1 ? (void *)1 : sentinel;
+			errno = 0;
+			int result = ioctl(fd, commands[i], argument);
+			require(result == -1 && errno == ENOTTY &&
+				!memcmp(sentinel, reference, sizeof(sentinel)), "retired registration rejected before usercopy");
+		}
+	}
+	uint64_t end = now(CLOCK_REALTIME);
+	struct sle_mgmt_stats stats_after = stats(fd);
+	require(ioctl(fd, SL_IOCTL_DEV_COUNT, NULL) == count_before &&
+		!ioctl(fd, SL_IOCTL_DEV_LIST, &mask_after) && mask_after == mask_before &&
+		!ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &after) &&
+		!memcmp(&before, &after, sizeof(before)) &&
+		!memcmp(&stats_before, &stats_after, sizeof(stats_before)), "retired registration changes no state");
+	fprintf(stderr, "RETIRED_REGISTRATION_PASS {\"uid\":%u,\"euid\":%u,\"cap_eff\":%llu,\"cap_prm\":%llu,\"generation\":%llu,\"cases\":9,\"errno\":%d,\"unchanged\":true,\"start_wall_ns\":%llu,\"end_wall_ns\":%llu}\n",
+		getuid(), geteuid(), (unsigned long long)c[0].effective | (unsigned long long)c[1].effective << 32,
+		(unsigned long long)c[0].permitted | (unsigned long long)c[1].permitted << 32,
+		(unsigned long long)generation, ENOTTY, (unsigned long long)start, (unsigned long long)end);
+	fflush(stderr);
+}
+static void retired_registration_root_cap0(int fd, uint64_t generation)
+{
+	pid_t child = fork(); require(child >= 0, "root capability-drop fork");
+	if (!child) {
+		struct __user_cap_header_struct h = { .version = _LINUX_CAPABILITY_VERSION_3 };
+		struct __user_cap_data_struct c[2] = { 0 };
+		require(!setgroups(0, NULL) && !syscall(SYS_capset, &h, c), "root zero capability set");
+		retired_registration(fd, generation); _exit(0);
+	}
+	int status;
+	require(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status), "root capability-drop exit");
+}
 static void caps_zero(int fd, uint64_t generation, uint32_t seq)
 {
 	fflush(stdout); pid_t pid = fork(); require(pid >= 0, "fork");
@@ -430,6 +483,7 @@ static void caps_zero(int fd, uint64_t generation, uint32_t seq)
 		require(!syscall(SYS_capset, &h, c) && !syscall(SYS_capget, &h, c), "child caps");
 		require(!c[0].effective && !c[1].effective && !c[0].permitted && !c[1].permitted,
 			"actual child capabilities zero");
+		retired_registration(fd, generation);
 		printf("{\"identity\":\"inherited_fd_child\",\"uid\":%u,\"euid\":%u,\"cap_eff\":0,\"cap_prm\":0}\n", getuid(), geteuid());
 		rejected(fd, "inherited_fd_cap0", request(generation, seq), EPERM); _exit(0);
 	}
@@ -487,6 +541,8 @@ int main(int argc, char **argv)
 	unsigned char expected[] = { snapshot.acb_length & 0xff, snapshot.acb_length >> 8, snapshot.acb_count,
 		snapshot.icb_length & 0xff, snapshot.icb_length >> 8, snapshot.icb_count };
 	require(!memcmp(buffers.data, expected, sizeof(expected)), "metadata buffers");
+	retired_registration(fd, generation);
+	retired_registration_root_cap0(fd, generation);
 	caps_zero(fd, generation, mac.seq);
 	copy_fault(fd, "read_only_output", &mac, 0); copy_fault(fd, "partial_output", &mac, 1);
 	struct sle_diagnostic_result bad = request(generation, mac.seq);

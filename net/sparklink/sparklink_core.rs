@@ -1401,13 +1401,11 @@ fn ioctl_dispatch_adv(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32
         | SL_IOCTL_STOP_SCAN
         | SL_IOCTL_DEV_COUNT
         | SL_IOCTL_DEV_INFO
-        | SL_IOCTL_DEV_REGISTER
-        | SL_IOCTL_DEV_UNREGISTER
         | SL_IOCTL_DEV_SWITCH
         | SL_IOCTL_DEV_LIST
         | SL_IOCTL_SCAN_RESULT_COUNT
         | SL_IOCTL_SET_SCAN_FILTER
-        | SL_IOCTL_CLEAR_SCAN_FILTER => ioctl_dispatch_adv_basic(context, me, cmd, arg),
+        | SL_IOCTL_CLEAR_SCAN_FILTER => ioctl_dispatch_adv_basic(context, cmd, arg),
         SL_IOCTL_EXT_ADV_CONFIGURE
         | SL_IOCTL_EXT_ADV_SET_DATA
         | SL_IOCTL_EXT_ADV_SET_SCAN_RSP
@@ -1479,7 +1477,7 @@ fn ioctl_dev_get_active(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
 
 /// Basic adv/scan/dev ioctl sub-dispatcher.
 #[inline(never)]
-fn ioctl_dispatch_adv_basic(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
+fn ioctl_dispatch_adv_basic(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
         SL_IOCTL_START_ADV => {
             let uparams: SleAdvParams = read_user_struct(arg)?;
@@ -1517,20 +1515,6 @@ fn ioctl_dispatch_adv_basic(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cm
                 else { SciState::Idle as u8 };
             drop(ss);
             write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_DEV_REGISTER => {
-            dev_info!(
-                me.dev,
-                "sparklink: DEV_REGISTER via ioctl (use module init for real registration)\n"
-            );
-            Ok(0)
-        }
-        SL_IOCTL_DEV_UNREGISTER => {
-            dev_info!(
-                me.dev,
-                "sparklink: DEV_UNREGISTER via ioctl (use module unload for real unregistration)\n"
-            );
             Ok(0)
         }
         SL_IOCTL_DEV_SWITCH => ioctl_dev_switch(arg),
@@ -3841,14 +3825,13 @@ impl MiscDevice for SparkLinkCtl {
             _ => {}
         }
 
-        let registration_only = matches!(cmd,
-            SL_IOCTL_DEV_COUNT | SL_IOCTL_DEV_LIST | SL_IOCTL_DEV_REGISTER |
-            SL_IOCTL_DEV_UNREGISTER | SL_IOCTL_DEV_SWITCH
+        let registry_operation = matches!(cmd,
+            SL_IOCTL_DEV_COUNT | SL_IOCTL_DEV_LIST | SL_IOCTL_DEV_SWITCH
         );
         // Release the fd binding lock before taking the registry lock. read/poll
         // uses registry -> binding order; retaining this guard would invert it.
         let target = me.target.lock().clone();
-        let context = if registration_only {
+        let context = if registry_operation {
             RuntimeContext { owner: None }
         } else {
             match target {
@@ -3868,7 +3851,7 @@ impl MiscDevice for SparkLinkCtl {
         }
         // Admission serialization lasts through dispatch. Workers do not take
         // this mutex under the protocol mutex; revocation completion is in Host.
-        let mut management_guard = if access == sle_authorization::Access::Protected && !registration_only {
+        let mut management_guard = if access == sle_authorization::Access::Protected && !registry_operation {
             context.owner.as_ref().filter(|owner| owner.protocol_profile != 0).map(|owner| owner.management.lock())
         } else { None };
         if let Some(gate) = management_guard.as_mut() {
@@ -3879,7 +3862,7 @@ impl MiscDevice for SparkLinkCtl {
             gate.authorize(me.file_id, required_mode).map_err(management_error)?;
         }
         // Observation never applies global policy or modifies Runtime state.
-        if !registration_only && access == sle_authorization::Access::Protected {
+        if !registry_operation && access == sle_authorization::Access::Protected {
             Self::sync_power_mode(context)?;
         }
 
@@ -3891,9 +3874,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_STOP_SCAN
             | SL_IOCTL_DEV_COUNT
             | SL_IOCTL_DEV_INFO
-            | SL_IOCTL_DEV_REGISTER
-            | SL_IOCTL_DEV_UNREGISTER
-            | SL_IOCTL_DEV_SWITCH
+                | SL_IOCTL_DEV_SWITCH
             | SL_IOCTL_DEV_LIST
             | SL_IOCTL_EXT_ADV_CONFIGURE
             | SL_IOCTL_EXT_ADV_SET_DATA
