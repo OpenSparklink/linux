@@ -47,7 +47,7 @@ pub(crate) struct CommandHost {
     scan_cookie: u64,
     recipe: Option<(RecipeTag, RecipeProgress)>,
     operations: Operations,
-    // Actual typed selection, never cleared by cancellation/result eviction.
+    // Adv / scan params / scan control selection; never cleared by eviction.
     selected_policy_domains: u8,
     revoking: bool,
     revoke_cookies: [u64; 2],
@@ -352,7 +352,12 @@ impl CommandHost {
         if let Some(tag) = request.recipe {
             self.selected_policy_domains |= match tag.intent {
                 DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => 1,
-                DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => 2,
+                DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby => {
+                    // Parameters do not enable a scanner. Preserve Unknown on
+                    // parameter-only cancellation; any other selected scan
+                    // command is conservatively a control barrier obligation.
+                    if request.opcode == SleOpcode::SetScanParam as u16 { 2 } else { 6 }
+                }
             };
             self.operations.sent(request.cookie, tag.step, request.opcode);
         }

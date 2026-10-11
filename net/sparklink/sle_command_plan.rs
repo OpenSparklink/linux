@@ -74,12 +74,15 @@ pub(crate) fn retained_revocation_off(
         && tag.cookie == cookies[domain] && radio[domain] == 1).then_some(domain)
 }
 
-/// Revocation retires only domains selected by this Runtime or with known
-/// radio state. Skipping untouched Unknown is not an Off receipt or Ready.
-/// Native raw admission is query-only; selection history outlives results.
+/// History bits: advertising selection, scan parameter selection, scan control
+/// selection. Scan parameters alone cannot start scanning. Retire advertising
+/// handles and selected scan control or known radio state; a parameter-only
+/// Unknown scan remains Unknown, never an Off receipt or Ready. Native raw
+/// admission is query-only; this history outlives cancellation/result eviction.
 pub(crate) fn revocation_required_domains(selected: u8, radio: [u32; 2]) -> u8 {
-    if selected & !3 != 0 { return 3; }
-    selected | u8::from(radio[0] != 0) | (u8::from(radio[1] != 0) << 1)
+    if selected & !7 != 0 { return 3; }
+    (selected & 1) | ((selected & 4) >> 1)
+        | u8::from(radio[0] != 0) | (u8::from(radio[1] != 0) << 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

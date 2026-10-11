@@ -81,8 +81,25 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
  let mut h=queued_policy();assert!(h.next(|_|false).unwrap().is_some());assert_eq!(h.selected_policy_domains,1);
  h.active=None;h.recipe=None;h.requests=CmdRequestQueue::new();h.operations.entries=[None;sle_discovery_operation::CAPACITY];h.broadcast_cookie=0;
  assert!(!h.policy_untouched());assert!(!h.policy_unsubmitted());
- h.selected_policy_domains|=2;h.begin_revoke(&[RecipePart{opcode:0x0c05,params:&[0;5]}],&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
+ h.selected_policy_domains|=6;h.begin_revoke(&[RecipePart{opcode:0x0c05,params:&[0;5]}],&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
  assert_eq!(h.revoke_done,0);assert_eq!(h.requests.len(),2);assert_ne!(h.revoke_cookies[0],0);assert_ne!(h.revoke_cookies[1],0);
+}
+#[test] fn actual_scan_parameter_selection_keeps_unknown_but_control_selection_requires_stop(){
+ for control in [false,true] {
+  let mut h=host();h.operations.advertising=1;h.scan_cookie=1;
+  let params=[RecipePart{opcode:0x1001,params:&[0;8]},RecipePart{opcode:0x1002,params:&[1,0]},RecipePart{opcode:0x1002,params:&[0;2]}];
+  let stop=[RecipePart{opcode:0x1002,params:&[0;2]}];
+  h.requests.push_recipe(if control{&stop}else{&params},1,
+   if control{DiscoveryIntent::Scanning(false)}else{DiscoveryIntent::ScanningStandby},1000).unwrap();
+  let request=h.next(|_|false).unwrap().unwrap();assert_eq!(request.opcode,if control{0x1002}else{0x1001});
+  assert_eq!(h.selected_policy_domains,if control{6}else{2});assert!(!h.policy_unsubmitted());
+  // Core drains never-selected steps before begin_revoke, retaining active.
+  h.requests=CmdRequestQueue::new();h.next_cookie=2;
+  h.begin_revoke(&[RecipePart{opcode:0x0c05,params:&[0;5]}],&stop).unwrap();
+  assert_eq!(h.active.as_ref().unwrap().deadline,1000);assert_eq!(h.revocation_result(),None);
+  assert_eq!(h.requests.len(),if control{2}else{1});assert_eq!(h.revoke_done,if control{0}else{2});
+  assert_eq!(h.discovery_radio(),(1,0,None));assert!(!h.controller_status().1);
+ }
 }
 #[test] fn untouched_managed_release_is_free_and_stays_unknown_not_ready(){
  let (owner,gate,r)=released(host(),sle_management::MANAGED);assert_eq!(r,Ok(()));

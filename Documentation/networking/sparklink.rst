@@ -1962,13 +1962,22 @@ new generation, not an unverified native Reset. Other registrations are isolated
 
 Revocation keeps registration-local history of actual typed TX selection,
 including cancelled operations and evicted results. An untouched Unknown
-radio domain receives no stop for an unconfigured handle; skipping that domain
-never confirms Off or sets Ready. Only selected domains or domains with known
-radio state require a stop/retained matching Off barrier. A successor must still
+radio domain receives no stop for an unconfigured handle. Scan parameter
+selection is recorded separately from actual scan control: if only parameters
+were selected on an Unknown scanner, cancellation drains the original reply
+and never selects its remaining START. Scanning remains Unknown; skipping a
+STOP never confirms Off or sets Ready. Advertising selection, selected scan
+control or known radio state require a stop/retained matching Off barrier. This
+history is monotonic within the Runtime, even after successful earlier STOPs.
+A successor must still
 initialize an Unknown domain. The active reservation and original deadline
 remain intact; real refusal in a required domain remains Faulted. This fixes
 the actual advertising-first partial case whose unnecessary scan STOP returned
-0x0b. Source boundary tests pass; new physical-image validation is still pending.
+0x0b. That change passed real advertising release/last-fd/dup and each RF20+2
+regression in a VM. Real scan parameter-only cancellation still returned 0x0b
+from an unnecessary STOP; the distinct parameter/control history fix has source
+coverage, but its new physical-image validation remains pending. Original
+failures remain preserved, and no complete Managed/recovery issue is closed.
 
 ``run_runtime_lifecycle.py --native-ws73 --native-ws73-management`` tests actual
 syscalls, competing descriptions, modes/identity, copyout rollback, inherited

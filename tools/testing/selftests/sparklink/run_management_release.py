@@ -41,7 +41,7 @@ def run(output):
     start = host.index('struct InFlight {')
     end = host.index('\n}', start)+2
     fixture = fixture.replace('// @@IN_FLIGHT@@', host[start:end])
-    variants = '\n'.join(re.search(r'(?m)^    '+name+r' = 0x[0-9A-F]+,', inputs['sle_dli.rs'].decode()).group() for name in ['EnableBroadcast', 'EnableScan', 'CreateConnection'])
+    variants = '\n'.join(re.search(r'(?m)^    '+name+r' = 0x[0-9A-F]+,', inputs['sle_dli.rs'].decode()).group() for name in ['EnableBroadcast', 'EnableScan', 'SetScanParam', 'CreateConnection'])
     fixture = fixture.replace('// @@OPCODES@@', variants)
     timeout = re.search(r'(?m)^pub\(crate\) const CMD_TIMEOUT_MS: u32 = [0-9_]+;', inputs['sle_mgmt.rs'].decode()).group()
     fixture = fixture.replace('// @@TIMEOUT@@', timeout)
@@ -54,7 +54,7 @@ def run(output):
                         '-D', 'warnings', str(tmp/'fixture.rs'), '-o', str(tmp/'test')], check=True)
         subprocess.run([str(tmp/'test'), '--test-threads=1'], check=True)
     assert all((net/n).read_bytes() == b for n, b in inputs.items())
-    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 24,
+    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 25,
               'scope': 'actual Host predicates/TX selection/InFlight/domain revocation and core fast-release block; source queue/operation/lease modules and opcode/timeout constants; locks, clock scaling, dependency error adapters and surrounding transport dependencies are fixtures',
               'live_ioctl_acceptance': False, 'fd_close_acceptance': False,
               'automatic_fault_recovery_acceptance': False, 'physical_acceptance': False,
