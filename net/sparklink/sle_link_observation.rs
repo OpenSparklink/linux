@@ -42,6 +42,10 @@ impl LinkObservation {
         !self.uncertain && self.links.iter().all(Option::is_none)
     }
 
+    pub(crate) fn contains(&self, handle: u16) -> bool {
+        !self.uncertain && self.links.iter().flatten().any(|link| link.handle == handle)
+    }
+
     /// Failed outcomes never establish/remove links. Wire schema and opcode
     /// aliases belong to the driver, not the generic Host cleanup domain.
     pub(crate) fn observe(&mut self, evidence: &LinkEvidence) {
@@ -100,9 +104,10 @@ mod tests {
         let mut failure=connected(1,[1;6]);failure.status=0x1c;
         a.observe(&failure);assert!(a.clear_for_management());
         a.observe(&connected(1,[1;6]));b.observe(&connected(2,[2;6]));
+        assert!(a.contains(1));assert!(!a.contains(2));assert!(b.contains(2));
         let mut failed=disconnected(1);failed.status=1;
         a.observe(&failed);assert!(!a.clear_for_management());
-        a.observe(&disconnected(1));assert!(a.clear_for_management());
+        a.observe(&disconnected(1));assert!(a.clear_for_management());assert!(!a.contains(1));
         assert!(!b.clear_for_management());
     }
     #[test]
@@ -121,6 +126,7 @@ mod tests {
                 _=>for h in 2..=17 { state.observe(&connected(h,[2;6])); },
             }
             state.observe(&extra);
+            assert!(!state.contains(1));
             for h in 1..=17 {state.observe(&disconnected(h));}
             assert!(!state.clear_for_management());
         }

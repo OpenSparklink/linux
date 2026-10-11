@@ -11,6 +11,7 @@ pub(crate) struct CmdRequest {
     pub(crate) seq: u32,
     pub(crate) cookie: u64,
     pub(crate) recipe: Option<RecipeTag>,
+    pub(crate) connection: Option<u32>,
     pub(crate) deadline: u64,
     pub(crate) opcode: u16,
     pub(crate) params: [u8; RECIPE_PARAMS_MAX],
@@ -72,6 +73,7 @@ impl CmdRequestQueue {
             seq,
             cookie,
             recipe,
+            connection: None,
             deadline,
             opcode,
             params: [0; RECIPE_PARAMS_MAX],
@@ -82,6 +84,25 @@ impl CmdRequestQueue {
         self.tail = (self.tail + 1) % CMD_REQ_QUEUE_DEPTH;
         self.count += 1;
         Ok(())
+    }
+
+    pub(crate) fn push_connection(&mut self, opcode: u16, params: &[u8], cookie: u64,
+        operation: u32, deadline: u64) -> Result<(), QueueError> {
+        if cookie == 0 || !(1..=2).contains(&operation) { return Err(QueueError::Invalid); }
+        self.push_tagged(opcode, params, 0, cookie, None, deadline)?;
+        let index = (self.tail + CMD_REQ_QUEUE_DEPTH - 1) % CMD_REQ_QUEUE_DEPTH;
+        if let Some(request) = self.entries[index].as_mut() { request.connection = Some(operation); }
+        Ok(())
+    }
+    pub(crate) fn remove_cookie(&mut self, cookie: u64) {
+        let count = self.count;
+        for _ in 0..count {
+            let Some(request) = self.pop() else { break };
+            if request.cookie == cookie { continue; }
+            self.entries[self.tail] = Some(request);
+            self.tail = (self.tail + 1) % CMD_REQ_QUEUE_DEPTH;
+            self.count += 1;
+        }
     }
 
     /// Capacity and every parameter are checked before cancellation/insertion.

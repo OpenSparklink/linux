@@ -22,6 +22,7 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_DEV_COUNT
         | SL_IOCTL_DEV_INFO
         | SL_IOCTL_DEV_LIST
+        | SL_IOCTL_CONNECTION_RESULT
         | SL_IOCTL_DISCOVERY_RESULT
         | SL_IOCTL_DISCOVERY_TIMING
         | SL_IOCTL_DLI_INFO
@@ -66,6 +67,7 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_CONN_UPDATE_PARAMS
         | SL_IOCTL_DEV_SWITCH
         | SL_IOCTL_DISCONNECT
+        | SL_IOCTL_CONNECTION_SUBMIT
         | SL_IOCTL_DISCOVERY_SUBMIT
         | SL_IOCTL_DLI_POLL_EVENT
         | SL_IOCTL_DLI_RESET

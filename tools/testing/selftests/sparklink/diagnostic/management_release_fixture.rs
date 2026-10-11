@@ -9,6 +9,8 @@
 #[path="sle_discovery_operation.rs"] mod sle_discovery_operation;
 #[path="sle_management.rs"] mod sle_management;
 #[path="sle_link_observation.rs"] mod sle_link_observation;
+#[allow(dead_code)]
+#[path="sle_connection_operation.rs"] mod sle_connection_operation;
 use std::cell::{RefCell,RefMut};
 use sle_command_queue::{CmdRequestQueue,CmdRequest};
 use sle_command_plan::{DiscoveryIntent,RecipeTag,RecipeProgress,RecipePart};
@@ -39,7 +41,7 @@ impl Lock {fn lock(&self)->RefMut<'_,Host>{self.0.borrow_mut()}}
 struct BoolLock(RefCell<bool>);
 impl BoolLock {fn lock(&self)->RefMut<'_,bool>{self.0.borrow_mut()}}
 struct Owner {host:Lock,schedule_gate:BoolLock}
-struct Host {links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
+struct Host {connections:sle_connection_operation::Connections,links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
  operations:Operations,selected_policy_domains:u8,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
 impl Host {
@@ -49,7 +51,7 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
  // @@CORE_DECISION@@
  Err(-999) // actual controller preparation/cleanup would follow this point
 }
-fn host()->Host {Host{links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
+fn host()->Host {Host{connections:sle_connection_operation::Connections::new(),links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),
  selected_policy_domains:0,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 struct Caller {file_id:u64}
@@ -79,7 +81,7 @@ fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:
   }
  }
 }
-fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,transport_done:false}}
+fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,connection:None,transport_done:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
  intent:sle_command_plan::DiscoveryIntent::AdvertisingStandby,state:State::Cancelled,

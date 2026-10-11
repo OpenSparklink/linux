@@ -5,15 +5,17 @@
 #[path="sle_command_plan.rs"] mod sle_command_plan;
 #[allow(dead_code)]
 #[path="sle_command_queue.rs"] mod sle_command_queue;
+#[allow(dead_code)]
+#[path="sle_connection_operation.rs"] mod sle_connection_operation;
 use sle_command_plan::{DiscoveryIntent, RecipePart};
 use sle_command_queue::CmdRequestQueue;
 struct Active { deadline:u64, transport_done:bool }
-struct Host { fault:Option<u8>, revoking:bool, revoke_done:u8, revoke_deadline:u64,
+struct Host { connections:sle_connection_operation::Connections, fault:Option<u8>, revoking:bool, revoke_done:u8, revoke_deadline:u64,
  active:Option<Active>, reply:Option<()>, requests:CmdRequestQueue }
 impl Host {
  // @@HOST_DEADLINE@@
 }
-fn host()->Host {Host{fault:None,revoking:false,revoke_done:0,revoke_deadline:5000,
+fn host()->Host {Host{connections:sle_connection_operation::Connections::new(),fault:None,revoking:false,revoke_done:0,revoke_deadline:5000,
  active:None,reply:None,requests:CmdRequestQueue::new()}}
 #[test] fn empty_and_faulted_have_no_rearm_deadline(){
  let mut h=host();assert_eq!(h.next_deadline(),None);

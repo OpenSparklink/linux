@@ -22,6 +22,7 @@
 #include "bsle.h"
 #include "dli.h"
 #include "discovery.h"
+#include "connection.h"
 #include "recovery.h"
 
 #define WS73_VID		0xffff
@@ -807,6 +808,19 @@ static int ws73_native_validate_step(void *context, unsigned int operation,
 	return ws73_discovery_validate_step(operation, step, count, opcode, params, length);
 }
 
+static int ws73_native_prepare_connection(void *context,
+    const struct sparklink_connection_request *request,
+    struct sparklink_connection_plan *plan)
+{
+    return ws73_connection_prepare(request, plan);
+}
+
+static int ws73_native_validate_connection(void *context, unsigned int operation,
+    u16 opcode, const u8 *params, size_t length)
+{
+    return ws73_connection_validate(operation, opcode, params, length);
+}
+
 static int ws73_native_command(void *context, u16 opcode, const u8 *params, size_t length)
 {
 	struct ws73_usb *ws = context;
@@ -843,6 +857,8 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.validate_command = ws73_native_validate,
 	.prepare_discovery = ws73_native_prepare,
 	.validate_discovery_step = ws73_native_validate_step,
+    .prepare_connection = ws73_native_prepare_connection,
+    .validate_connection = ws73_native_validate_connection,
 	.send_command = ws73_native_command,
 };
 

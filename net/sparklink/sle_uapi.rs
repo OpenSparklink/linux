@@ -3207,3 +3207,43 @@ unsafe impl FromBytes for SleDiagnosticSubmit {}
 impl_check_reserved!(SleDiagnosticSubmit, [reserved]);
 const _: () = assert!(core::mem::size_of::<SleDiagnosticSubmit>() == 40);
 pub(crate) const SL_IOCTL_DIAGNOSTIC_SUBMIT: u32 = _IOWR::<SleDiagnosticSubmit>(SL_MAGIC, 0xd1);
+
+pub(crate) const SL_IOCTL_CONNECTION_SUBMIT: u32 = _IOW::<SleConnectionSubmit>(SL_MAGIC, 0x9c);
+pub(crate) const SL_IOCTL_CONNECTION_RESULT: u32 = _IOWR::<SleConnectionResult>(SL_MAGIC, 0x9d);
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct SleConnectionParameters {
+    pub filter: u32, pub own_address_type: u32, pub peer_address_type: u32,
+    pub peer_address: [u8; 6], pub reserved: [u8; 2],
+    pub gt_negotiate: u32, pub frame: u32,
+    pub scan_interval: u32, pub scan_window: u32, pub interval_min: u32, pub interval_max: u32,
+    pub latency: u32, pub supervision_timeout: u32, pub event_min: u32, pub event_max: u32,
+}
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleConnectionSubmit {
+    pub version: u32, pub profile: u32, pub operation: u32, pub flags: u32,
+    pub generation: u64, pub request_id: u64,
+    pub timeout_ms: u32, pub handle: u32, pub reason: u32, pub reserved: u32,
+    pub parameters: SleConnectionParameters, pub reserved_tail: u32,
+}
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleConnectionResult {
+    pub version: u32, pub profile: u32, pub state: u32, pub operation: u32,
+    pub generation: u64, pub request_id: u64, pub error: i32, pub fault_error: i32,
+    pub command_status: u32, pub outcome_status: u32, pub handle: u32, pub flags: u32,
+    pub dev_index: u16, pub reserved: [u8; 6],
+}
+impl_check_reserved!(SleConnectionSubmit, [reserved, reserved_tail]);
+impl_check_reserved!(SleConnectionResult);
+const _: () = assert!(core::mem::size_of::<SleConnectionParameters>() == 60);
+const _: () = assert!(core::mem::size_of::<SleConnectionSubmit>() == 112);
+const _: () = assert!(core::mem::size_of::<SleConnectionResult>() == 64);
+
+// SAFETY: padding-free repr(C) integers and byte arrays accept all bit patterns.
+unsafe impl FromBytes for SleConnectionParameters {}
+// SAFETY: integer-only repr(C) request; reserved input is validated separately.
+unsafe impl FromBytes for SleConnectionSubmit {}
+// SAFETY: integer-only repr(C) result with initialized output bytes.
+unsafe impl FromBytes for SleConnectionResult {}

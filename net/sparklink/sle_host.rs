@@ -21,6 +21,7 @@ struct InFlight {
     peer_addr: Option<[u8; 6]>,
     deadline: u64,
     recipe: Option<RecipeTag>,
+    connection: Option<u32>,
     transport_done: bool,
 }
 
@@ -39,6 +40,7 @@ pub(crate) struct HostReply {
 pub(crate) struct CommandHost {
     requests: CmdRequestQueue,
     links: super::sle_link_observation::LinkObservation,
+    connections: super::sle_connection_operation::Connections,
     credits: u8,
     active: Option<InFlight>,
     reply: Option<(SleEvent, u64)>,
@@ -65,6 +67,7 @@ impl CommandHost {
             init!(Self {
                 requests <- CmdRequestQueue::new_in_place(),
                 links: super::sle_link_observation::LinkObservation::new(),
+                connections <- super::sle_connection_operation::Connections::new_in_place(),
                 credits,
                 active: None,
                 reply: None,
@@ -184,6 +187,51 @@ impl CommandHost {
         Ok(())
     }
 
+    pub(crate) fn submit_connection(&mut self, file: u64, request: u64,
+        intent: super::sle_connection_operation::Intent, operation: u32,
+        opcode: u16, params: &[u8], timeout_ms: u32) -> Result {
+        use super::sle_connection_operation::{Error as Admission, Intent};
+        if let Some(error) = self.fault { return Err(error); }
+        if self.revoking { return Err(EBUSY); }
+        if !matches!((operation, intent), (1, Intent::Create { .. }) | (2, Intent::Disconnect { .. })) { return Err(EINVAL); }
+        if matches!(intent, Intent::Create { .. }) && !self.operations.initialized { return Err(EAGAIN); }
+        self.connections.preflight(file, request).map_err(|e| match e {
+            Admission::Invalid => EINVAL, Admission::Duplicate => EEXIST,
+            Admission::Busy => EBUSY, Admission::Mismatch => EINVAL,
+        })?;
+        match intent {
+            Intent::Create { .. } => {
+                if !self.links.clear_for_management() { return Err(EBUSY); }
+            }
+            Intent::Disconnect { handle } => {
+                if !self.links.contains(handle) { return Err(Error::from_errno(-(kernel::bindings::ENOTCONN as i32))); }
+            }
+        }
+        if !(1..=10000).contains(&timeout_ms) { return Err(EINVAL); }
+        let cookie = self.next_cookie;
+        let next = cookie.checked_add(1).ok_or(EOVERFLOW)?;
+        // SAFETY: clock read has no pointer preconditions.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        let deadline = now.checked_add(msecs_to_jiffies(timeout_ms) as u64).ok_or(EOVERFLOW)?;
+        self.requests.push_connection(opcode, params, cookie, operation, deadline).map_err(Error::from)?;
+        if self.connections.reserve(file, request, cookie, intent, now, deadline).is_err() {
+            self.requests.remove_cookie(cookie); return Err(EINVAL);
+        }
+        self.next_cookie = next;
+        Ok(())
+    }
+    pub(crate) fn connection_result(&self, file: u64, request: u64) -> Option<super::sle_connection_operation::Operation> {
+        self.connections.query(file, request)
+    }
+    pub(crate) fn cancel_connection(&mut self, file: u64, request: u64) -> Result {
+        let cookie = self.connections.cancel(file, request).map_err(|_| ENOENT)?;
+        if let Some(cookie) = cookie { self.requests.remove_cookie(cookie); }
+        Ok(())
+    }
+    pub(crate) fn revoke_connections(&mut self) {
+        if let Some(cookie) = self.connections.revoke() { self.requests.remove_cookie(cookie); }
+    }
+
     /// Retain any active wire slot, but prevent queued enables from escaping.
     /// Caller drains raw pending entries before providing driver-prepared stops.
     pub(crate) fn begin_revoke(&mut self, adv: &[RecipePart<'_>], scan: &[RecipePart<'_>]) -> Result {
@@ -213,9 +261,24 @@ impl CommandHost {
     }
     pub(crate) fn observe_link(&mut self, evidence: &super::sle_link_observation::LinkEvidence) {
         self.links.observe(evidence);
+        // SAFETY: reads only the registration-local deadline clock.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
+        // Independent physical obligations are updated even for unmatched,
+        // cancelled, failed or evicted author results. Never infer a link from Status.
+        if evidence.reserved != [0; 2] || evidence.status > 255 || evidence.handle > 65535 { return; }
+        use super::sle_connection_operation::Outcome;
+        match evidence.kind {
+            1 if evidence.address_type <= 255 && evidence.role <= 1 => {
+                self.connections.outcome(Outcome::Connected { status: evidence.status as u8,
+                    handle: evidence.handle as u16, address_type: evidence.address_type as u8, address: evidence.address });
+            }
+            2 => self.connections.outcome(Outcome::Disconnected { status: evidence.status as u8, handle: evidence.handle as u16 }),
+            _ => {}
+        }
     }
     pub(crate) fn links_clear_for_management(&self) -> bool {
-        self.links.clear_for_management()
+        self.links.clear_for_management() && self.connections.clear()
     }
 
     pub(crate) fn quiet(&self) -> bool {
@@ -324,6 +387,9 @@ impl CommandHost {
     }
 
     pub(crate) fn next(&mut self, valid_raw: impl Fn(u32) -> bool) -> Result<Option<CmdRequest>> {
+        // SAFETY: read only the clock under this owner's Host lock.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         if !self.can_send() {
             return Ok(None);
         }
@@ -363,6 +429,9 @@ impl CommandHost {
             }
             // A cancelled/expired queued transaction never reaches the wire.
         };
+        if request.connection.is_some() {
+            self.connections.sent(request.cookie).map_err(|_| EINVAL)?;
+        }
         self.credits -= 1;
         if let Some(tag) = request.recipe {
             self.selected_policy_domains |= match tag.intent {
@@ -403,6 +472,7 @@ impl CommandHost {
                 .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64)
                 .min(request.deadline),
             recipe: request.recipe,
+            connection: request.connection,
             transport_done: false,
         });
         Ok(Some(request))
@@ -441,7 +511,8 @@ impl CommandHost {
                 self.credits = *command_credits;
                 // Native query Status only acknowledges acceptance. Keep the
                 // active slot/deadline until matching Complete or failure.
-                if !complete && *status == 0 {
+                if !complete && *status == 0
+                    && !self.active.as_ref().is_some_and(|active| active.opcode == *opcode && active.connection.is_some()) {
                     return Some(event);
                 }
                 *opcode
@@ -468,9 +539,13 @@ impl CommandHost {
     /// it, but do not publish terminal success until the transfer succeeded.
     pub(crate) fn transport_complete(&mut self, cookie: u64) -> bool {
         if self.fault.is_some() { return false; }
+        // SAFETY: absolute admission deadline, not a new USB completion budget.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         let Some(active) = self.active.as_mut() else { return false; };
         if active.cookie != cookie { return false; }
         active.transport_done = true;
+        if active.connection.is_some() { self.connections.out_complete(cookie); }
         self.reply.is_some()
     }
 
@@ -480,6 +555,18 @@ impl CommandHost {
         if !self.active.as_ref().is_some_and(|active| active.transport_done) { return None; }
         let (event, received) = self.reply.take()?;
         let active = self.active.take()?;
+        if active.connection.is_some() {
+            // SAFETY: final Host processing remains in the whole-operation budget.
+            self.connections.expire(unsafe { kernel::bindings::jiffies_64 });
+            match &event {
+                SleEvent::NativeCommandReply { complete: false, status, .. } => {
+                    if self.connections.status(active.cookie, *status).is_err() {
+                        self.fail(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
+                    }
+                }
+                _ => { self.fail(Error::from_errno(-(kernel::bindings::EPROTO as i32))); }
+            }
+        }
         let current_intent = if let Some(tag) = active.recipe {
             self.current_recipe(tag)
         } else if active.opcode == SleOpcode::EnableBroadcast as u16 {
@@ -568,14 +655,16 @@ impl CommandHost {
         let active = self.active.as_ref()
             .filter(|active| !active.transport_done || self.reply.is_none())
             .map(|active| active.deadline);
-        [revoke, active, self.requests.first_recipe_deadline()]
+        [revoke, active, self.requests.first_recipe_deadline(), self.connections.next_deadline()]
             .into_iter().flatten().min()
     }
 
-    pub(crate) fn timed_out(&self) -> bool {
+    pub(crate) fn timed_out(&mut self) -> bool {
         // SAFETY: reading jiffies is safe in process/IRQ context.
         let now = unsafe { kernel::bindings::jiffies_64 };
-        self.next_deadline().is_some_and(|deadline| now >= deadline)
+        if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
+        !self.connections.clear() && self.connections.next_deadline().is_none()
+            || self.next_deadline().is_some_and(|deadline| now >= deadline)
     }
 
     /// Latch a fault; never invent credits after uncertain transport outcome.
@@ -586,6 +675,7 @@ impl CommandHost {
         }
         let error = *self.fault.get_or_insert(error);
         self.operations.fault(error.to_errno());
+        self.connections.fault(error.to_errno());
         self.credits = 0;
         self.reply = None;
         if let Some((_, progress)) = &mut self.recipe { progress.cancel(); }

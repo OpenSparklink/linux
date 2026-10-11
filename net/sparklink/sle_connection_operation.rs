@@ -3,7 +3,8 @@
 //! kernel until Native typed submission, transport and revoke callers use it.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State { Queued, OnWire, AwaitingOutcome, Succeeded, Failed, Cancelled, Faulted }
+#[repr(u32)]
+pub enum State { Queued = 1, OnWire = 2, AwaitingOutcome = 3, Succeeded = 4, Failed = 5, Cancelled = 6, Faulted = 7 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent { Create { address_type: u8, address: [u8; 6] }, Disconnect { handle: u16 } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,10 +31,12 @@ pub struct Session {
 }
 
 impl Session {
+    #[cfg(test)]
     pub fn new(generation: u64) -> Result<Self, Error> {
         if generation == 0 { return Err(Error::Invalid); }
         Ok(Self { generation, operation: None, outstanding: false, uncertain: false })
     }
+    #[cfg(test)]
     pub fn query(&self, generation: u64, id: u64) -> Result<Option<Operation>, Error> {
         if generation != self.generation { return Err(Error::Mismatch); }
         Ok(self.operation.filter(|o| o.id == id))
@@ -80,7 +83,10 @@ impl Session {
             _ => false,
         };
         if !matches { return Err(Error::Mismatch); }
-        o.outcome = Some(value); self.settle(); Ok(())
+        o.outcome = Some(value);
+        let (status, handle) = match value { Outcome::Connected { status, handle, .. } | Outcome::Disconnected { status, handle } => (status, handle) };
+        o.outcome_status = Some(status); o.handle = Some(handle);
+        self.settle(); Ok(())
     }
     fn settle(&mut self) {
         let Some(o) = self.operation.as_mut() else { return };
@@ -122,12 +128,95 @@ impl Session {
     }
     pub fn expire(&mut self, now: u64) {
         let Some(o) = self.operation.as_mut() else { return };
-        if !self.outstanding || now < o.deadline { return; }
+        if !self.outstanding || self.uncertain || now < o.deadline { return; }
         o.fault_error = -110;
         if o.state != State::Cancelled { o.error = -110; o.state = if o.sent { State::Faulted } else { State::Failed }; }
         if o.sent { self.uncertain = true; } else { self.outstanding = false; }
     }
     pub fn reservation_clear(&self) -> bool { !self.outstanding && !self.uncertain }
+}
+
+/// Fixed-size result retention is independent of physical links. Evicting an
+/// author result never clears uncertainty, a wire reservation or LinkObservation.
+#[derive(Clone, Copy)]
+struct Record { file: u64, request: u64, operation: Operation }
+const HISTORY: usize = 32;
+pub(crate) struct Connections {
+    session: Session,
+    file: u64,
+    request: u64,
+    history: [Option<Record>; HISTORY],
+    cursor: usize,
+}
+impl Connections {
+    #[cfg(test)]
+    pub(crate) const fn new() -> Self {
+        Self { session: Session { generation: 1, operation: None, outstanding: false, uncertain: false },
+            file: 0, request: 0, history: [None; HISTORY], cursor: 0 }
+    }
+    #[cfg(not(test))]
+    pub(crate) fn new_in_place() -> impl pin_init::Init<Self> {
+        use kernel::prelude::*;
+        init!(Self {
+            session: Session { generation: 1, operation: None, outstanding: false, uncertain: false },
+            file: 0, request: 0, cursor: 0,
+            history <- pin_init::init_array_from_fn(|_| None),
+        })
+    }
+    pub(crate) fn query(&self, file: u64, request: u64) -> Option<Operation> {
+        if self.file == file && self.request == request { return self.session.operation; }
+        self.history.iter().flatten().find(|r| r.file == file && r.request == request).map(|r| r.operation)
+    }
+    pub(crate) fn preflight(&self, file: u64, request: u64) -> Result<(), Error> {
+        if file == 0 || request == 0 { return Err(Error::Invalid); }
+        if self.query(file, request).is_some() { return Err(Error::Duplicate); }
+        if !self.session.reservation_clear() { return Err(Error::Busy); }
+        Ok(())
+    }
+    pub(crate) fn reserve(&mut self, file: u64, request: u64, cookie: u64, intent: Intent,
+                         now: u64, deadline: u64) -> Result<(), Error> {
+        self.preflight(file, request)?;
+        if cookie == 0 || deadline <= now { return Err(Error::Invalid); }
+        let old = self.session.operation;
+        self.session.reserve(1, cookie, cookie, intent, now, deadline)?;
+        if let Some(operation) = old {
+            self.history[self.cursor] = Some(Record { file: self.file, request: self.request, operation });
+            self.cursor = (self.cursor + 1) % HISTORY;
+        }
+        self.file = file; self.request = request;
+        Ok(())
+    }
+    pub(crate) fn sent(&mut self, cookie: u64) -> Result<(), Error> { self.session.sent(cookie) }
+    pub(crate) fn out_complete(&mut self, cookie: u64) { let _ = self.session.out_complete(cookie, Ok(())); }
+    pub(crate) fn status(&mut self, cookie: u64, status: u8) -> Result<(), Error> { self.session.status(cookie, status) }
+    pub(crate) fn outcome(&mut self, value: Outcome) { let _ = self.session.outcome(1, value); }
+    pub(crate) fn cancel(&mut self, file: u64, request: u64) -> Result<Option<u64>, Error> {
+        if file != self.file || request != self.request { return Err(Error::Mismatch); }
+        let o = self.session.operation.ok_or(Error::Mismatch)?;
+        if !self.session.outstanding { return Ok(None); }
+        self.session.cancel(o.id)?;
+        Ok((!o.sent).then_some(o.cookie))
+    }
+    pub(crate) fn revoke(&mut self) -> Option<u64> {
+        if !self.session.outstanding { return None; }
+        self.cancel(self.file, self.request).ok().flatten()
+    }
+    pub(crate) fn clear(&self) -> bool { self.session.reservation_clear() }
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        self.session.operation.filter(|_| self.session.outstanding && !self.session.uncertain).map(|o| o.deadline)
+    }
+    pub(crate) fn expire(&mut self, now: u64) -> Option<u64> {
+        let old = self.session.operation;
+        self.session.expire(now);
+        old.filter(|o| !o.sent && now >= o.deadline && !self.session.outstanding).map(|o| o.cookie)
+    }
+    pub(crate) fn fault(&mut self, error: i32) {
+        let Some(o) = self.session.operation.as_mut() else { return };
+        if !self.session.outstanding { return; }
+        o.fault_error = error;
+        if o.state != State::Cancelled { o.state = State::Faulted; o.error = error; }
+        if o.sent { self.session.uncertain = true; } else { self.session.outstanding = false; }
+    }
 }
 
 #[cfg(test)]
@@ -199,4 +288,32 @@ mod tests {
         let mut s=session();s.status(20,0).unwrap();s.out_complete(20,Ok(())).unwrap();s.outcome(1,up(0x1c)).unwrap();
         let o=s.query(1,10).unwrap().unwrap();assert_eq!((o.state,o.command_status,o.outcome_status,o.error),(State::Failed,Some(0),Some(0x1c),-121));
     }
+    #[test] fn bounded_history_preserves_authors_and_cannot_revive_evicted_results() {
+        let mut c=Connections::new();
+        for id in 1..=40 {
+            c.reserve(42,id,id,create(),id*100,id*100+50).unwrap();
+            assert_eq!(c.cancel(43,id),Err(Error::Mismatch));
+            assert_eq!(c.cancel(42,id),Ok(Some(id)));
+            assert!(c.clear());
+        }
+        assert!(c.query(42,7).is_none());
+        assert_eq!(c.query(42,8).unwrap().state,State::Cancelled);
+        assert_eq!(c.query(42,40).unwrap().state,State::Cancelled);
+        assert!(c.query(43,40).is_none());
+        assert_eq!(c.preflight(42,40),Err(Error::Duplicate));
+    }
+    #[test] fn storage_revoke_deadline_and_fault_do_not_forget_physical_reservations() {
+        let mut c=Connections::new();c.reserve(42,1,10,create(),0,100).unwrap();
+        assert_eq!(c.next_deadline(),Some(100));assert_eq!(c.revoke(),Some(10));assert!(c.clear());
+        c.reserve(42,2,20,create(),0,100).unwrap();c.sent(20).unwrap();
+        assert_eq!(c.revoke(),None);assert!(!c.clear());
+        c.outcome(up(0));c.status(20,0).unwrap();c.out_complete(20);
+        assert_eq!(c.query(42,2).unwrap().state,State::Cancelled);assert!(c.clear());
+        c.reserve(42,3,30,create(),0,100).unwrap();assert_eq!(c.expire(100),Some(30));assert!(c.clear());
+        c.reserve(42,4,40,create(),0,100).unwrap();c.sent(40).unwrap();c.fault(-5);
+        c.expire(1000);c.outcome(up(0));c.out_complete(40);assert!(!c.clear());
+        assert_eq!(c.query(42,4).unwrap().fault_error,-5);
+        let o=c.query(42,4).unwrap();assert_eq!((o.state,o.error,o.handle),(State::Faulted,-5,Some(7)));
+    }
+
 }

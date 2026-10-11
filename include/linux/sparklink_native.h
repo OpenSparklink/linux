@@ -4,6 +4,7 @@
 
 #include <linux/types.h>
 #include <linux/sparklink_discovery.h>
+#include <linux/sparklink_connection.h>
 
 struct module;
 
@@ -59,6 +60,13 @@ struct sparklink_native_ops {
 	int (*validate_discovery_step)(void *context, unsigned int operation,
 		unsigned int step, unsigned int count, u16 opcode,
 		const u8 *params, size_t length);
+    /* Optional paired callbacks. Missing callbacks reject typed connection.
+     * The internal tag never grants raw DLI mutation permission. */
+    int (*prepare_connection)(void *context,
+        const struct sparklink_connection_request *request,
+        struct sparklink_connection_plan *plan);
+    int (*validate_connection)(void *context, unsigned int operation,
+        u16 opcode, const u8 *params, size_t length);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
 };
 

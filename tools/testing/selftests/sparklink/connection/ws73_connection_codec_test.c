@@ -4,12 +4,25 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include "ws73_connection_codec.h"
+#include "connection.h"
 int main(void)
 {
-    struct ws73_connection_parameters p = {.peer_address={0,1,9,0x32,0x54,0xf9},
+    struct sparklink_connection_parameters p = {.peer_address={0,1,9,0x32,0x54,0xf9},
         .gt_negotiate=1,.frame=1,.scan_interval=32,.scan_window=32,
         .interval_min=12,.interval_max=12,.supervision_timeout=508};
+    struct sparklink_connection_request request = {.operation=1,.parameters=p};
+    struct sparklink_connection_plan plan, unchanged;
+    memset(&plan,0xaa,sizeof(plan));unchanged=plan;
+    request.parameters.reserved[0]=1;
+    assert(ws73_connection_prepare(&request,&plan)==-EINVAL);assert(!memcmp(&plan,&unchanged,sizeof(plan)));
+    request.parameters.reserved[0]=0;
+    assert(ws73_connection_prepare(&request,&plan)==0);assert(plan.operation==1&&plan.opcode==0x1401&&plan.length==27);
+    assert(ws73_connection_validate(plan.operation,plan.opcode,plan.params,plan.length)==0);
+    request.operation=2;memset(&request.parameters,0,sizeof(request.parameters));request.handle=0xffff;request.reason=0x13;
+    assert(ws73_connection_prepare(&request,&plan)==0);assert(plan.operation==2&&plan.opcode==0x1403&&plan.length==3);
+    assert(plan.params[0]==255&&plan.params[1]==255&&plan.params[2]==0x13);
+    unchanged=plan;request.operation=3;
+    assert(ws73_connection_prepare(&request,&plan)==-EOPNOTSUPP);assert(!memcmp(&plan,&unchanged,sizeof(plan)));
     const unsigned char expected[27]={0,0,0,0,1,9,0x32,0x54,0xf9,1,1,32,0,32,0,12,0,12,0,0,0,0xfc,1,0,0,0,0};
     unsigned char out[32], before[32]; memset(out,0xaa,sizeof(out));memcpy(before,out,sizeof(out));
     for (size_t n=0;n<27;n++) {assert(ws73_connection_create(out,n,&p)==-ENOSPC);assert(!memcmp(out,before,32));}
@@ -19,7 +32,7 @@ int main(void)
     assert(ws73_connection_validate(1,0x1401,out,31)==-EINVAL);
     assert(ws73_connection_validate(1,0x1403,out,27)==-EINVAL);
     for (unsigned int kind=0;kind<8;kind++) {
-        struct ws73_connection_parameters bad=p;
+        struct sparklink_connection_parameters bad=p;
         switch(kind){case 0:bad.scan_window=33;break;case 1:bad.interval_min=13;break;
         case 2:bad.supervision_timeout=0;break;case 3:bad.frame=2;break;case 4:bad.gt_negotiate=4;break;
         case 5:bad.peer_address_type=256;break;case 6:bad.event_min=1;break;default:memset(bad.peer_address,0,6);}
@@ -34,5 +47,5 @@ int main(void)
     assert(ws73_connection_disconnect(out,32,7,256)==-EINVAL);
     assert(ws73_connection_validate(3,0x1402,NULL,0)==-EOPNOTSUPP); // cancel not qualified on v111
     assert(ws73_connection_validate(1,0x1401,NULL,27)==-EINVAL);
-    puts("WS73_CONNECTION_CODEC_STAGING: PASS; not production or RF");return 0;
+    puts("WS73_CONNECTION_PRODUCTION_CODEC: PASS; not running kernel or RF");return 0;
 }

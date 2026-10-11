@@ -708,8 +708,8 @@ impl WorkItem<1> for ControllerRuntime {
                         // Own the transport independently. RPC snapshots and
                         // RX processing must not wait for a blocking USB OUT.
                         drop(guard);
-                        match transport.send(request.opcode,
-                            &request.params[..request.param_len as usize], request.recipe) {
+                        match transport.send_typed(request.opcode,
+                            &request.params[..request.param_len as usize], request.recipe, request.connection) {
                             Ok(()) => {
                                 if this.host.lock().transport_complete(request.cookie) {
                                     this.schedule_rx(0);

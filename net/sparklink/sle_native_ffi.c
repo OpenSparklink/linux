@@ -20,6 +20,12 @@ static_assert(sizeof(struct sle_controller_event_query) == 360);
 static_assert(offsetof(struct sle_controller_event_query, event) == 24);
 
 static_assert(sizeof(struct sle_controller_snapshot) == 64);
+static_assert(sizeof(struct sle_connection_parameters) == 60);
+static_assert(sizeof(struct sparklink_connection_parameters) == 60);
+static_assert(sizeof(struct sle_connection_submit) == 112);
+static_assert(sizeof(struct sle_connection_result) == 64);
+static_assert(sizeof(struct sparklink_connection_plan) == 40);
+static_assert(sizeof(struct sparklink_connection_request) == 72);
 static_assert(sizeof(struct sle_discovery_submit) == 704);
 static_assert(sizeof(struct sle_discovery_result) == 64);
 static_assert(sizeof(struct sparklink_discovery_plan) == 1052);
@@ -78,7 +84,8 @@ int sparklink_native_register(const struct sparklink_native_info *info,
 
 	if (!info || !ops || !context || !identity || !ops->get || !ops->put ||
 	    !ops->open || !ops->close || !ops->validate_command || !ops->send_command ||
-	    !!ops->prepare_discovery != !!ops->validate_discovery_step)
+	    !!ops->prepare_discovery != !!ops->validate_discovery_step ||
+        !!ops->prepare_connection != !!ops->validate_connection)
 		return -EINVAL;
 	transport = kmalloc_obj(*transport);
 	if (!transport)
@@ -146,6 +153,22 @@ int sparklink_native_transport_validate_step(struct sparklink_native_transport *
 		return -EOPNOTSUPP;
 	return transport->ops.validate_discovery_step(transport->context,
 		operation, step, count, opcode, params, length);
+}
+
+int sparklink_native_transport_prepare_connection(struct sparklink_native_transport *transport,
+    const struct sparklink_connection_request *request, struct sparklink_connection_plan *plan)
+{
+    if (!transport->ops.prepare_connection)
+        return -EOPNOTSUPP;
+    return transport->ops.prepare_connection(transport->context, request, plan);
+}
+
+int sparklink_native_transport_validate_connection(struct sparklink_native_transport *transport,
+    unsigned int operation, u16 opcode, const u8 *params, size_t length)
+{
+    if (!transport->ops.validate_connection)
+        return -EOPNOTSUPP;
+    return transport->ops.validate_connection(transport->context, operation, opcode, params, length);
 }
 
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,

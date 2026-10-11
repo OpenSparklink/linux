@@ -2,11 +2,16 @@
 /* Independent field implementation from DLI/reference protocol facts.
  * WS73 v111 has a 27-byte frame-1 create body, not standard V2's additional
  * connection PHY/frame quartet. No reference implementation is incorporated.
- * This staging codec grants no raw mutation, credit or connection success.
+ * Preparation grants no raw mutation, credit or connection success.
  */
+#ifdef __KERNEL__
+#include <linux/errno.h>
+#include <linux/string.h>
+#else
 #include <errno.h>
 #include <string.h>
-#include "ws73_connection_codec.h"
+#endif
+#include "connection.h"
 
 static unsigned int u16(const unsigned char *p)
 {
@@ -17,14 +22,14 @@ static void put16(unsigned char *p, unsigned int value)
     p[0] = value; p[1] = value >> 8;
 }
 int ws73_connection_create(unsigned char *out, size_t capacity,
-                           const struct ws73_connection_parameters *p)
+                           const struct sparklink_connection_parameters *p)
 {
     unsigned char candidate[27] = {0};
     if (!out || !p)
         return -EINVAL;
     if (capacity < sizeof(candidate))
         return -ENOSPC;
-    if (p->filter > 1 || p->own_address_type > 255 || p->peer_address_type > 255 ||
+    if (p->reserved[0] || p->reserved[1] || p->filter > 1 || p->own_address_type > 255 || p->peer_address_type > 255 ||
         p->gt_negotiate > 3 || p->frame != 1 || !p->scan_interval ||
         p->scan_interval > 65535 || !p->scan_window || p->scan_window > p->scan_interval ||
         !p->interval_min || p->interval_min > p->interval_max || p->interval_max > 65535 ||
@@ -67,7 +72,7 @@ int ws73_connection_validate(unsigned int operation, unsigned int opcode,
         return -EOPNOTSUPP;
     if (opcode != 0x1401 || size != 27)
         return -EINVAL;
-    struct ws73_connection_parameters parameters = {
+    struct sparklink_connection_parameters parameters = {
         .filter = p[0], .own_address_type = p[1], .peer_address_type = p[2],
         .gt_negotiate = p[9], .frame = p[10],
         .scan_interval = u16(p + 11), .scan_window = u16(p + 13),
@@ -78,4 +83,33 @@ int ws73_connection_validate(unsigned int operation, unsigned int opcode,
     unsigned char candidate[27];
     memcpy(parameters.peer_address, p + 3, 6);
     return ws73_connection_create(candidate, sizeof(candidate), &parameters) < 0 ? -EINVAL : 0;
+}
+
+int ws73_connection_prepare(const struct sparklink_connection_request *request,
+                            struct sparklink_connection_plan *out)
+{
+    struct sparklink_connection_plan candidate = {0};
+    int size;
+
+    if (!request || !out)
+        return -EINVAL;
+    candidate.operation = request->operation;
+    if (request->operation == 1) {
+        if (request->handle || request->reason)
+            return -EINVAL;
+        candidate.opcode = 0x1401;
+        size = ws73_connection_create(candidate.params, sizeof(candidate.params), &request->parameters);
+    } else if (request->operation == 2) {
+        if (memcmp(&request->parameters, &(struct sparklink_connection_parameters){0}, sizeof(request->parameters)))
+            return -EINVAL;
+        candidate.opcode = 0x1403;
+        size = ws73_connection_disconnect(candidate.params, sizeof(candidate.params), request->handle, request->reason);
+    } else {
+        return -EOPNOTSUPP;
+    }
+    if (size < 0)
+        return size;
+    candidate.length = size;
+    memcpy(out, &candidate, sizeof(candidate));
+    return 0;
 }

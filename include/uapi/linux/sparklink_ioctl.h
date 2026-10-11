@@ -1277,4 +1277,51 @@ struct sle_diagnostic_submit {
 };
 #define SL_IOCTL_DIAGNOSTIC_SUBMIT _IOWR(SL_MAGIC, 0xd1, struct sle_diagnostic_submit)
 
+
+/* Unpublished Native typed connection ABI. File-local nonzero request IDs
+ * increase monotonically. Submit has no copyout; retry/query never repeats I/O.
+ * Cancellation cancels the author only, not the physical controller procedure.
+ * Success requires real OUT, CommandStatus acceptance and matching outcome.
+ * Timeout is an absolute whole-operation budget in milliseconds (1..10000).
+ * Status validity is explicit, so raw status zero is not an absent result.
+ */
+#define SLE_CONNECTION_VERSION 1U
+#define SLE_CONNECTION_CREATE 1U
+#define SLE_CONNECTION_DISCONNECT 2U
+#define SLE_CONNECTION_CANCEL_AUTHOR 3U
+#define SLE_CONNECTION_QUEUED 1U
+#define SLE_CONNECTION_ON_WIRE 2U
+#define SLE_CONNECTION_AWAITING_OUTCOME 3U
+#define SLE_CONNECTION_SUCCEEDED 4U
+#define SLE_CONNECTION_FAILED 5U
+#define SLE_CONNECTION_CANCELLED 6U
+#define SLE_CONNECTION_FAULTED 7U
+#define SLE_CONNECTION_COMMAND_STATUS_VALID 1U
+#define SLE_CONNECTION_OUTCOME_STATUS_VALID 2U
+#define SLE_CONNECTION_HANDLE_VALID 4U
+struct sle_connection_parameters {
+    __u32 filter, own_address_type, peer_address_type;
+    __u8 peer_address[6], reserved[2];
+    __u32 gt_negotiate, frame;
+    __u32 scan_interval, scan_window, interval_min, interval_max;
+    __u32 latency, supervision_timeout, event_min, event_max;
+};
+struct sle_connection_submit {
+    __u32 version, profile, operation, flags;
+    __aligned_u64 generation, request_id;
+    __u32 timeout_ms, handle, reason, reserved;
+    struct sle_connection_parameters parameters;
+    __u32 reserved_tail;
+};
+struct sle_connection_result {
+    __u32 version, profile, state, operation;
+    __aligned_u64 generation, request_id;
+    __s32 error, fault_error;
+    __u32 command_status, outcome_status, handle, flags;
+    __u16 dev_index;
+    __u8 reserved[6];
+};
+#define SL_IOCTL_CONNECTION_SUBMIT _IOW(SL_MAGIC, 0x9c, struct sle_connection_submit)
+#define SL_IOCTL_CONNECTION_RESULT _IOWR(SL_MAGIC, 0x9d, struct sle_connection_result)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

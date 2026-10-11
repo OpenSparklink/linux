@@ -21,6 +21,7 @@ mod sle_configfs;
 mod sle_conn;
 mod sle_command_plan;
 mod sle_discovery_operation;
+mod sle_connection_operation;
 mod sle_command_queue;
 mod sle_controller_event;
 mod sle_crypto;
@@ -1362,6 +1363,8 @@ struct SparkLinkCtl {
     /// Per-open monotonic watermark survives bounded result eviction/selection.
     #[pin]
     diagnostic_request_id: Mutex<u64>,
+    #[pin]
+    connection_request_id: Mutex<u64>,
     #[pin]
     operation: Mutex<()>,
     #[pin]
@@ -2920,6 +2923,10 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
         {
             let mut host = owner.host.lock();
             if let Some(error) = host.controller_status().2 { return Err(error); }
+            // Cancel only never-selected author work; preserve an accepted or
+            // on-wire physical procedure. Until typed teardown is integrated,
+            // unresolved connection obligations fail closed rather than Free.
+            host.revoke_connections();
             // Connection teardown is not yet admitted by this Native profile.
             // An observed/uncertain physical link cannot be silently omitted
             // from cleanup and mistaken for a Free reusable controller.
@@ -3114,6 +3121,86 @@ fn ioctl_controller_snapshot(
     }
     drop(guard);
     write_user_struct(arg, &out)?;
+    Ok(0)
+}
+
+/// Typed native connection, all driver field validation before Host mutation.
+/// Dispatch already holds file operation and Managed lease locks throughout admission.
+#[inline(never)]
+fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let request: SleConnectionSubmit = read_user_struct(arg)?;
+    if request.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if request.flags != 0 || request.generation == 0 || request.request_id == 0
+        || request.parameters.reserved != [0; 2] { return Err(EINVAL); }
+    let owner = discovery_owner(context, me)?;
+    if request.generation != owner.identity.generation { return Err(ENODEV); }
+    if request.profile != owner.protocol_profile { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    // SAFETY: exact padding-free integer/byte ABI, initialized by copyin.
+    let parameters_zero = unsafe { core::slice::from_raw_parts(core::ptr::from_ref(&request.parameters).cast::<u8>(), 60) }.iter().all(|b| *b == 0);
+    if request.operation == 3 {
+        if request.timeout_ms != 0 || request.handle != 0 || request.reason != 0 || !parameters_zero { return Err(EINVAL); }
+        let state_guard = context.lock()?;
+        let mut host = owner.host.lock();
+        let gate = owner.schedule_gate.lock();
+        if *gate { return Err(ENODEV); }
+        host.cancel_connection(me.file_id, request.request_id)?;
+        drop(gate); drop(host); drop(state_guard);
+        owner.kick_commands(); owner.schedule_rx(0);
+        return Ok(0);
+    }
+    if !(1..=10000).contains(&request.timeout_ms) || request.handle > 65535 || request.reason > 255 { return Err(EINVAL); }
+    let intent = match request.operation {
+        1 if request.handle == 0 && request.reason == 0 => sle_connection_operation::Intent::Create {
+            address_type: u8::try_from(request.parameters.peer_address_type).map_err(|_| EINVAL)?,
+            address: request.parameters.peer_address },
+        2 if parameters_zero => sle_connection_operation::Intent::Disconnect { handle: request.handle as u16 },
+        _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+    };
+    if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
+    let state_guard = context.lock()?;
+    let state = state_guard.as_ref().ok_or(ENODEV)?;
+    let plan = match &state.controller {
+        sle_dli::ControllerBackend::Ws73(controller) => controller.prepare_connection(&request)?,
+        _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+    };
+    let mut watermark = me.connection_request_id.lock();
+    if request.request_id <= *watermark { return Err(Error::from_errno(-(bindings::ESTALE as i32))); }
+    // Same Host -> scheduling gate order as atomic physical link ingress.
+    let mut host = owner.host.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return Err(ENODEV); }
+    host.submit_connection(me.file_id, request.request_id, intent, plan.operation,
+        plan.opcode, &plan.params[..plan.length as usize], request.timeout_ms)?;
+    *watermark = request.request_id;
+    drop(gate); drop(host); drop(watermark); drop(state_guard);
+    owner.kick_commands(); owner.schedule_rx(0);
+    Ok(0)
+}
+
+/// Author-only non-destructive history, available after cancellation/release/fault.
+#[inline(never)]
+fn ioctl_connection_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let input: SleConnectionResult = read_user_struct(arg)?;
+    if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if input.flags != 0 || input.request_id == 0 || input.generation == 0 { return Err(EINVAL); }
+    let owner = discovery_owner(context, me)?;
+    if input.generation != owner.identity.generation { return Err(ENODEV); }
+    let host = owner.host.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return Err(ENODEV); }
+    let record = host.connection_result(me.file_id, input.request_id).ok_or(ENOENT)?;
+    // SAFETY: all integer/byte fields, initialize every output byte.
+    let mut output: SleConnectionResult = unsafe { core::mem::zeroed() };
+    output.version = 1; output.profile = owner.protocol_profile;
+    output.generation = owner.identity.generation; output.request_id = input.request_id;
+    output.dev_index = owner.identity.id; output.state = record.state as u32;
+    output.error = record.error; output.fault_error = record.fault_error;
+    output.operation = match record.intent { sle_connection_operation::Intent::Create { .. } => 1, sle_connection_operation::Intent::Disconnect { .. } => 2 };
+    if let Some(status) = record.command_status { output.flags |= 1; output.command_status = status as u32; }
+    if let Some(status) = record.outcome_status { output.flags |= 2; output.outcome_status = status as u32; }
+    if let Some(handle) = record.handle { output.flags |= 4; output.handle = handle as u32; }
+    drop(gate); drop(host);
+    write_user_struct(arg, &output)?;
     Ok(0)
 }
 
@@ -3425,6 +3512,8 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
         SL_IOCTL_DIAGNOSTIC_RESULT => ioctl_diagnostic_result(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
+        SL_IOCTL_CONNECTION_SUBMIT => ioctl_connection_submit(context, me, arg),
+        SL_IOCTL_CONNECTION_RESULT => ioctl_connection_result(context, me, arg),
         SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
         SL_IOCTL_DISCOVERY_TIMING => ioctl_discovery_timing(context, me, arg),
@@ -3771,6 +3860,7 @@ impl MiscDevice for SparkLinkCtl {
                 SparkLinkCtl {
                     file_id,
                     diagnostic_request_id <- new_mutex!(0),
+                    connection_request_id <- new_mutex!(0),
                     operation <- new_mutex!(()),
                     owned_target <- new_mutex!(None),
                     events <- new_mutex!(EventQueue::new()),
@@ -3993,6 +4083,8 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_DIAGNOSTIC_RESULT
             | SL_IOCTL_SNOOP_GET
             | SL_IOCTL_CONTROLLER_SNAPSHOT
+            | SL_IOCTL_CONNECTION_SUBMIT
+            | SL_IOCTL_CONNECTION_RESULT
             | SL_IOCTL_DISCOVERY_SUBMIT
             | SL_IOCTL_DISCOVERY_RESULT
             | SL_IOCTL_DISCOVERY_TIMING
