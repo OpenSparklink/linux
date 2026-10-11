@@ -29,9 +29,7 @@ use kernel::usb;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::sle_dli::{
-    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleFeature, SleOpcode,
-    SleStatus, SLE_MEAS_PATH_LOSS, SLE_MEAS_RSSI, SLE_SEC_AES_CCM, SLE_SEC_ECDH_P256, SLE_SEC_SC,
-    SLE_TRANSPORT_FRAGMENTED, SLE_TRANSPORT_RELIABLE, SLE_TRANSPORT_UNRELIABLE,
+    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode, SleStatus,
 };
 use super::sle_transport::{SleAttachInfo, SleProtoId};
 
@@ -1275,7 +1273,6 @@ fn raw_to_status(raw: u8) -> SleStatus {
 /// per-device table mapping `dev_id` to `usb_device` and URB contexts.
 pub struct UsbController {
     addr: [u8; 6],
-    opened: bool,
     /// Device ID in the sle_dev registry. Used to index the C-side
     /// USB device table for actual I/O.
     dev_id: u16,
@@ -1286,12 +1283,11 @@ impl UsbController {
     /// Create a new USB controller handle.
     ///
     /// `addr` is the 6-byte SLE MAC address read from the controller
-    /// during probe via the ReadLocalAddr (0x0404) command.
+    /// during probe via the ReadMacAddr (0x0406) command.
     /// `dev_id` is the device ID returned by `sle_attach_device`.
     pub fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
         Self {
             addr,
-            opened: false,
             dev_id: identity.id,
             identity,
         }
@@ -1325,21 +1321,11 @@ impl SleController for UsbController {
         info.name[..name.len()].copy_from_slice(name);
         info.bus = SleBus::Usb;
         info.addr = self.addr;
-        info.fw_version = 0; // read from device during open
-        info.features = (SleFeature::Encryption as u64)
-            | (SleFeature::DataLenUpdate as u64)
-            | (SleFeature::Mcs4 as u64)
-            | (SleFeature::Bw2m as u64)
-            | (SleFeature::Pilot8to1 as u64)
-            | (SleFeature::Crc32 as u64);
-        info.max_pdu_payload = 255;
-        info.max_connections = 8;
-        info.max_mtu = 512;
-        info.max_mps = 255;
-        info.transport_modes =
-            SLE_TRANSPORT_UNRELIABLE | SLE_TRANSPORT_RELIABLE | SLE_TRANSPORT_FRAGMENTED;
-        info.measurement_cap = SLE_MEAS_RSSI | SLE_MEAS_PATH_LOSS;
-        info.security_cap = SLE_SEC_AES_CCM | SLE_SEC_ECDH_P256 | SLE_SEC_SC;
+        // SAFETY: this controller retains the registered probe binding.
+        info.fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(self.dev_id)) };
+        // Bootstrap queried identity only. Defaults advertise no unqueried
+        // features, connection/data limits, transport or crypto capabilities.
+
         info
     }
 

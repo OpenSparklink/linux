@@ -40,9 +40,7 @@
 use kernel::prelude::*;
 
 use super::sle_dli::{
-    ControllerEventRing, SleBus, SleController, SleControllerInfo, SleEvent, SleFeature, SleOpcode,
-    SLE_MEAS_RSSI, SLE_SEC_AES_CCM, SLE_SEC_ECDH_P256, SLE_TRANSPORT_RELIABLE,
-    SLE_TRANSPORT_UNRELIABLE,
+    ControllerEventRing, SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode,
 };
 use super::sle_transport::{SleAttachInfo, SleProtoId};
 use super::sle_uart::{UartFrame, UartParser, MAX_PAYLOAD_LEN};
@@ -261,18 +259,9 @@ impl SleController for SerdevController {
         info.addr = self.addr;
         // SAFETY: dev_id is valid.
         info.fw_version = unsafe { sle_serdev_dev_get_fw_version(i32::from(self.dev_id)) };
-        info.features = (SleFeature::Encryption as u64)
-            | (SleFeature::Mcs4 as u64)
-            | (SleFeature::Pilot8to1 as u64)
-            | (SleFeature::Crc32 as u64)
-            | (SleFeature::DataLenUpdate as u64);
-        info.max_pdu_payload = MAX_PAYLOAD_LEN as u16;
-        info.max_connections = 4;
-        info.max_mtu = 512;
-        info.max_mps = MAX_PAYLOAD_LEN as u16;
-        info.transport_modes = SLE_TRANSPORT_UNRELIABLE | SLE_TRANSPORT_RELIABLE;
-        info.measurement_cap = SLE_MEAS_RSSI;
-        info.security_cap = SLE_SEC_AES_CCM | SLE_SEC_ECDH_P256;
+        // This path has not queried controller features or data capabilities.
+        // Codec buffer sizes and reference limits are not hardware support.
+
         info
     }
 

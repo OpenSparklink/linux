@@ -712,10 +712,9 @@ pub(crate) fn sle_attach_device(info: &sle_transport::SleAttachInfo) -> Result<u
     let mut ss = SUBSYSTEM.lock();
     let ss = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
 
-    // Look up the protocol to get bus type and defaults.
+    // Protocol framing limits do not establish controller capabilities.
     let proto = ss.proto_registry.get(info.proto_id).ok_or(EINVAL)?;
     let bus = proto.bus;
-    let default_pdu = proto.max_pdu;
 
     // Build a SleControllerInfo for device registration.
     let proto_name = proto.name;
@@ -731,16 +730,8 @@ pub(crate) fn sle_attach_device(info: &sle_transport::SleAttachInfo) -> Result<u
         fw_version: info.fw_version,
         features: info.features,
         features_ext: info.features_ext,
-        max_pdu_payload: if info.max_pdu > 0 {
-            info.max_pdu
-        } else {
-            default_pdu
-        },
-        max_connections: if info.max_connections > 0 {
-            info.max_connections
-        } else {
-            8
-        },
+        max_pdu_payload: info.max_pdu,
+        max_connections: info.max_connections,
         ..Default::default()
     };
 

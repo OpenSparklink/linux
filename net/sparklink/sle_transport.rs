@@ -187,9 +187,9 @@ pub(crate) struct SleAttachInfo {
     pub features: u64,
     /// Extended feature bits 64-72.
     pub features_ext: u16,
-    /// Maximum PDU payload size (0 = use protocol default).
+    /// Queried maximum PDU payload size (0 = unknown/unavailable).
     pub max_pdu: u16,
-    /// Maximum concurrent connections (0 = use protocol default).
+    /// Queried connection limit (0 = unknown/unavailable, not unlimited).
     pub max_connections: u8,
 }
 

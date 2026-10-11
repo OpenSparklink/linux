@@ -366,17 +366,6 @@ int sle_usb_sync_bulk_in(struct usb_device *udev, u8 ep,
 #define DLI_PKT_COMMAND    0xA1
 #define DLI_PKT_ASYNC_DATA 0xA3
 
-/* Endpoint addresses (host perspective, T/XS 10003-2025 Table 3) */
-#define SLE_EP_EVENT_IN   0x91
-#define SLE_EP_DATA_IN    0x92
-#define SLE_EP_CMD_OUT    0x12
-
-/* Transfer buffer sizes */
-#define SLE_CMD_BUF_SIZE  260  /* 4-byte header + 255 params + 1 spare */
-#define SLE_DATA_BUF_SIZE 520  /* 5-byte header + 511 payload + 4 spare */
-#define SLE_EVENT_BUF_SIZE 64
-#define SLE_RX_BUF_SIZE   520
-
 /* Timeout for synchronous command transfers (ms) */
 #define SLE_CMD_TIMEOUT_MS 5000
 
@@ -413,7 +402,6 @@ struct sle_usb_dev {
 	u16 ep_bulk_in_size;          /* wMaxPacketSize */
 	u16 ep_intr_in_size;
 	u8 ep_intr_in_interval;       /* bInterval */
-	bool endpoints_valid;
 	/* Read-back from controller during init */
 	u8 mac_addr[6];
 	u32 fw_version;
@@ -436,6 +424,7 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
 	struct sle_usb_dev *d;
 	struct usb_interface *intf;
 	struct usb_endpoint_descriptor *bulk_in, *bulk_out, *int_in;
+	struct sle_urb_ctx *evt_urb, *rx_urb;
 	int ret;
 
 	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !intf_ptr || !generation)
@@ -447,50 +436,39 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
 
 	intf = (struct usb_interface *)intf_ptr;
 
+	/* A missing descriptor is not a test controller. Discover and allocate
+	 * privately; publish the table entry only after preparation succeeds.
+	 */
+	ret = usb_find_common_endpoints(intf->cur_altsetting,
+					&bulk_in, &bulk_out, &int_in, NULL);
+	if (ret)
+		return ret;
+	if (!usb_endpoint_maxp(bulk_in) || !usb_endpoint_maxp(bulk_out) ||
+	    !usb_endpoint_maxp(int_in) || !int_in->bInterval)
+		return -EPROTO;
+
+	evt_urb = sle_usb_alloc_ctx(usb_endpoint_maxp(int_in));
+	if (!evt_urb)
+		return -ENOMEM;
+	rx_urb = sle_usb_alloc_ctx(usb_endpoint_maxp(bulk_in));
+	if (!rx_urb) {
+		sle_usb_free_ctx(evt_urb);
+		return -ENOMEM;
+	}
+
 	spin_lock_init(&d->lock);
 	d->intf = intf;
 	d->udev = interface_to_usbdev(intf);
-
-	/* Discover endpoints from the interface descriptor */
-	ret = usb_find_common_endpoints(intf->cur_altsetting,
-					&bulk_in, &bulk_out, &int_in, NULL);
-	if (ret) {
-		/* Endpoints not found — use hard-coded defaults (test mode) */
-		d->ep_bulk_in  = SLE_EP_DATA_IN;
-		d->ep_bulk_out = SLE_EP_CMD_OUT;
-		d->ep_intr_in  = SLE_EP_EVENT_IN;
-		d->ep_bulk_in_size  = 64;
-		d->ep_intr_in_size  = SLE_EVENT_BUF_SIZE;
-		d->ep_intr_in_interval = 4;
-		d->endpoints_valid = false;
-		pr_warn("sparklink-usb: endpoints not found in descriptors, using defaults\n");
-	} else {
-		d->ep_bulk_in  = bulk_in->bEndpointAddress;
-		d->ep_bulk_out = bulk_out->bEndpointAddress;
-		d->ep_intr_in  = int_in->bEndpointAddress;
-		d->ep_bulk_in_size  = usb_endpoint_maxp(bulk_in);
-		d->ep_intr_in_size  = usb_endpoint_maxp(int_in);
-		d->ep_intr_in_interval = int_in->bInterval;
-		d->endpoints_valid = true;
-		pr_info("sparklink-usb: endpoints: bulk_in=0x%02x(%d) "
-			"bulk_out=0x%02x int_in=0x%02x(%d,ivl=%d)\n",
-			d->ep_bulk_in, d->ep_bulk_in_size,
-			d->ep_bulk_out,
-			d->ep_intr_in, d->ep_intr_in_size,
-			d->ep_intr_in_interval);
-	}
-
-	d->evt_urb = sle_usb_alloc_ctx(SLE_EVENT_BUF_SIZE);
-	if (!d->evt_urb)
-		return -ENOMEM;
-
-	d->rx_urb = sle_usb_alloc_ctx(d->ep_bulk_in_size > 0 ?
-				       d->ep_bulk_in_size : SLE_RX_BUF_SIZE);
-	if (!d->rx_urb) {
-		sle_usb_free_ctx(d->evt_urb);
-		d->evt_urb = NULL;
-		return -ENOMEM;
-	}
+	d->ep_bulk_in = bulk_in->bEndpointAddress;
+	d->ep_bulk_out = bulk_out->bEndpointAddress;
+	d->ep_intr_in = int_in->bEndpointAddress;
+	d->ep_bulk_in_size = usb_endpoint_maxp(bulk_in);
+	d->ep_intr_in_size = usb_endpoint_maxp(int_in);
+	d->ep_intr_in_interval = int_in->bInterval;
+	d->evt_urb = evt_urb;
+	d->rx_urb = rx_urb;
+	d->suspended = false;
+	d->command_credits = 0;
 
 	memset(d->mac_addr, 0, 6);
 	d->fw_version = 0;

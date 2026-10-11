@@ -303,7 +303,7 @@ pub struct SleControllerInfo {
     pub features_ext: u16,
     /// Maximum PDU payload size in bytes.
     pub max_pdu_payload: u16,
-    /// Maximum number of concurrent connections (0 = unlimited).
+    /// Queried connection limit; 0 means unknown/unavailable, never unlimited.
     pub max_connections: u8,
     /// Maximum MTU (SSAP message size) the controller supports.
     pub max_mtu: u16,
@@ -344,11 +344,11 @@ impl Default for SleControllerInfo {
             fw_version: 0,
             features: 0,
             features_ext: 0,
-            max_pdu_payload: 255,
-            max_connections: 1,
-            max_mtu: 247,
-            max_mps: 247,
-            transport_modes: SLE_TRANSPORT_UNRELIABLE,
+            max_pdu_payload: 0,
+            max_connections: 0,
+            max_mtu: 0,
+            max_mps: 0,
+            transport_modes: 0,
             measurement_cap: 0,
             security_cap: 0,
         }
