@@ -10,6 +10,7 @@
 #include "hw/usb.h"
 #include "hw/usb/desc.h"
 #include "qom/object.h"
+#include "qapi/error.h"
 
 #define TYPE_USB_WS73_TEST "usb-ws73-test"
 OBJECT_DECLARE_SIMPLE_TYPE(USBWs73Test, USB_WS73_TEST)
@@ -44,6 +45,13 @@ struct USBWs73Test {
     bool timeout_enable;
     bool reports_emitted;
     bool bsp, pm, custom, opened, failed_once;
+    /* Test model only: retain the next terminal frame at the queue head.
+     * This is not a successful host/libusb IN transfer or real RF evidence.
+     * One budget per object, including reset; all controls default disabled.
+     */
+    QEMUTimer *model_hold_timer;
+    bool model_hold_once, model_held;
+    uint64_t model_holds, model_releases, model_bounded_releases, model_drops;
 };
 
 static unsigned int instances;
@@ -413,6 +421,9 @@ static bool outgoing(USBWs73Test *s, const uint8_t *p, size_t n)
 static void reset(USBDevice *dev)
 {
     USBWs73Test *s = USB_WS73_TEST(dev);
+    if (s->model_hold_timer) { timer_del(s->model_hold_timer); }
+    if (s->model_held) { s->model_drops++; }
+    s->model_hold_once = s->model_held = false;
     s->head = s->count = s->sequence = s->commands = 0;
     s->advertising = s->scanning = s->fail_stop = s->timeout_enable = false;
     s->advertiser_created = false;
@@ -477,12 +488,99 @@ static void wakeup(void *opaque)
     usb_wakeup(usb_ep_get(&s->parent_obj, USB_TOKEN_IN, 1), 0);
 }
 
+static void model_release(USBWs73Test *s, bool bounded)
+{
+    g_assert(s->model_held && s->count);
+    char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+                                               s->packets[s->head],
+                                               s->packet_size[s->head]);
+    timer_del(s->model_hold_timer);
+    s->model_held = false;
+    if (bounded) { s->model_bounded_releases++; }
+    else { s->model_releases++; }
+    fprintf(stderr, "WS73_MODEL_TERMINAL_RELEASE: serial=%u bytes=%u bounded=%u sha256=%s\n",
+            s->serial, s->packet_size[s->head], bounded, digest);
+    g_free(digest);
+    usb_wakeup(usb_ep_get(&s->parent_obj, USB_TOKEN_IN, 1), 0);
+}
+
+static void model_bounded_release(void *opaque)
+{
+    USBWs73Test *s = opaque;
+    if (s->model_held) { model_release(s, true); }
+}
+
+static bool model_arm_get(Object *obj, Error **errp)
+{
+    return USB_WS73_TEST(obj)->model_hold_once;
+}
+
+static void model_arm_set(Object *obj, bool value, Error **errp)
+{
+    USBWs73Test *s = USB_WS73_TEST(obj);
+    if (!value) { s->model_hold_once = false; return; }
+    if (!s->opened || !s->runtime_discovery || s->count || s->in_flight
+        || s->model_hold_once || s->model_held || s->model_holds) {
+        error_setg(errp, "model hold requires idle opened discovery fixture and unused object budget");
+        return;
+    }
+    s->model_hold_once = true;
+}
+
+static bool model_held_get(Object *obj, Error **errp)
+{
+    return USB_WS73_TEST(obj)->model_held;
+}
+
+static bool model_armable_get(Object *obj, Error **errp)
+{
+    USBWs73Test *s = USB_WS73_TEST(obj);
+    return s->opened && s->runtime_discovery && !s->count && !s->in_flight
+        && !s->model_hold_once && !s->model_held && !s->model_holds;
+}
+
+static bool model_release_get(Object *obj, Error **errp)
+{
+    return false; /* pulse, never a stored success */
+}
+
+static void model_release_set(Object *obj, bool value, Error **errp)
+{
+    USBWs73Test *s = USB_WS73_TEST(obj);
+    if (!value) { return; }
+    if (!s->model_held || !s->count) {
+        error_setg(errp, "no actual model terminal frame retained");
+        return;
+    }
+    model_release(s, false);
+}
+
+static bool model_retain_terminal(USBWs73Test *s)
+{
+    if (s->model_held) { return true; }
+    uint8_t *frame = s->packets[s->head];
+    if (!s->model_hold_once || s->packet_size[s->head] < 105
+        || frame[96] != 0xa2 || le16(frame + 97) != 2 || !le16(frame + 101)) {
+        return false;
+    }
+    g_assert(s->model_holds == 0);
+    s->model_hold_once = false; s->model_held = true; s->model_holds++;
+    char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, frame,
+                                               s->packet_size[s->head]);
+    fprintf(stderr, "WS73_MODEL_TERMINAL_HOLD: serial=%u bytes=%u sha256=%s\n",
+            s->serial, s->packet_size[s->head], digest);
+    g_free(digest);
+    timer_mod(s->model_hold_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+    return true;
+}
+
 static void realize(USBDevice *dev, Error **errp)
 {
     USBWs73Test *s = USB_WS73_TEST(dev);
     usb_desc_create_serial(dev); usb_desc_init(dev);
     s->wake = timer_new_ms(QEMU_CLOCK_VIRTUAL, wakeup, s);
     s->out_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, out_complete, s);
+    s->model_hold_timer = timer_new_ms(QEMU_CLOCK_REALTIME, model_bounded_release, s);
     s->serial = ++instances;
     g_assert(s->serial < 255);
     g_assert(s->runtime_reports <= 40);
@@ -531,6 +629,7 @@ static void transfer(USBDevice *dev, USBPacket *p)
         if (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) < s->ready_at[s->head]) {
             timer_mod(s->wake, s->ready_at[s->head]); p->status = USB_RET_NAK; return;
         }
+        if (model_retain_terminal(s)) { p->status = USB_RET_NAK; return; }
         if (s->packet_size[s->head] >= 105 && s->packets[s->head][96] == 0xa2 && le16(s->packets[s->head] + 97) == 2
             && le16(s->packets[s->head] + 101)) { s->in_flight = false; }
         if (s->out_packet && s->packet_size[s->head] >= 105 &&
@@ -588,6 +687,9 @@ static void unrealize(USBDevice *dev)
     timer_free(s->wake); s->wake = NULL;
     g_assert(!s->out_packet);
     timer_free(s->out_timer); s->out_timer = NULL;
+    if (s->model_held) { s->model_drops++; }
+    s->model_hold_once = s->model_held = false;
+    timer_free(s->model_hold_timer); s->model_hold_timer = NULL;
 }
 
 static void class_init(ObjectClass *klass, void *data)
@@ -599,12 +701,25 @@ static void class_init(ObjectClass *klass, void *data)
     uc->cancel_packet = cancel_packet;
     object_class_property_add_bool(klass, "runtime-out-pending", out_pending, NULL);
     object_class_property_add_bool(klass, "runtime-out-replied", out_replied, NULL);
+    object_class_property_add_bool(klass, "model-terminal-hold-once", model_arm_get, model_arm_set);
+    object_class_property_add_bool(klass, "model-terminal-held", model_held_get, NULL);
+    object_class_property_add_bool(klass, "model-terminal-armable", model_armable_get, NULL);
+    object_class_property_add_bool(klass, "model-terminal-release", model_release_get, model_release_set);
     device_class_set_props(DEVICE_CLASS(klass), properties);
+}
+
+static void instance_init(Object *obj)
+{
+    USBWs73Test *s = USB_WS73_TEST(obj);
+    object_property_add_uint64_ptr(obj, "model-terminal-holds", &s->model_holds, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "model-terminal-releases", &s->model_releases, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "model-terminal-bounded-releases", &s->model_bounded_releases, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "model-terminal-drops", &s->model_drops, OBJ_PROP_FLAG_READ);
 }
 
 static const TypeInfo type = {
     .name = TYPE_USB_WS73_TEST, .parent = TYPE_USB_DEVICE,
-    .instance_size = sizeof(USBWs73Test), .class_init = class_init,
+    .instance_size = sizeof(USBWs73Test), .class_init = class_init, .instance_init = instance_init,
 };
 
 static void register_type(void) { type_register_static(&type); }

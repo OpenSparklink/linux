@@ -5,6 +5,24 @@ QEMU 虚拟 SparkLink SLE DLI USB 控制器，用于在没有真实硬件的环�
 
 ## 设计定位
 
+`usb-ws73-test` 是另一个专用 runtime-only 测试设备，所有回复均为模拟。
+`model-terminal-hold-once` 默认关闭，显式 arm 后保留队首下一份 DLI 终结帧；
+Status、credit、其他帧不消费预算。`model-terminal-release` 交还原队首数据，
+只读 held/holds/releases/bounded-releases/drops 记录状态；两秒 REALTIME timer
+提供有界释放（实际调度并非硬实时）。预算跨 reset 保持，reset/drop/unrealize
+清理 timer。它不保留真实 libusb transfer，不是 `usb-host` 的实际 IN81 hold，
+也不是自然故障或 RF 证据。用于同一生产内核的 fd/迟到回复清理开发支撑，
+真实设备验收必须仍使用上面的实际 usb-host hold 门禁。
+
+```sh
+python3 check-ws73-model-hold.py --cc clang --sanitize \
+  --output /absolute/private/fresh-model-hold-check
+```
+
+该检查编译实际 retain/arm/release/reset 函数，计数依赖替代 timer/wakeup/digest，
+验证默认值、过滤、队列字节保持、跨对象拒绝、显式/有界释放及 reset 不补预算。
+它不验证 QEMU 调度、内核 fd 或真实 USB；这些须另跑相应 VM 门禁。
+
 这不是一个完整的 SparkLink 射频仿真器。它的目标是：
 
 - 对 guest 呈现符合 T/XS 10003-2025 的 USB DLI 控制器描述符
