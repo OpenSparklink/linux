@@ -92,6 +92,14 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  h.resume_management().unwrap();assert!(!h.operations.initialized);assert_eq!(h.discovery_radio(),(0,0,None));assert_eq!(h.credits,0);
  assert_eq!(h.submit_connection(42,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100),Err(EAGAIN));
 }
+#[test] fn canonical_snapshot_never_calls_faulted_or_uncertain_absence_known(){
+ clock(1);let mut a=host();let b=host();assert!(a.link_snapshot().1);
+ up(&mut a,[1;6]);assert_eq!(a.link_snapshot().0,1);assert_eq!(a.link_snapshot().2[0].unwrap().lifetime,1);
+ a.fail(-5);assert!(!a.link_snapshot().1);assert_eq!(a.link_snapshot().2[0].unwrap().handle,7);
+ assert!(b.link_snapshot().1);assert_eq!(b.link_snapshot().0,0);
+ let mut c=host();create(&mut c,1);c.next(|_|true).unwrap().unwrap();c.connections.fault(-5);
+ assert!(c.fault.is_none());assert!(!c.link_snapshot().1);
+}
 #[test] fn cancelled_inflight_author_keeps_reservation_and_late_handle_without_fake_free(){
  clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();h.cancel_connection(42,1).unwrap();
  assert!(!h.links_clear_for_management());assert!(h.next(|_|true).unwrap().is_none());

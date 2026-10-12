@@ -254,7 +254,10 @@ impl CommandHost {
         self.connections.query(file, request)
     }
     pub(crate) fn link_snapshot(&self) -> (u64, bool, [Option<super::sle_link_observation::Link>; super::sle_link_observation::CAPACITY]) {
-        self.links.snapshot()
+        let (revision, known, links) = self.links.snapshot();
+        // A failed transport or uncertain procedure can have lost physical
+        // facts. Do not expose its observed absence as a known empty table.
+        (revision, known && self.fault.is_none() && self.connections.fault_reason().is_none(), links)
     }
     pub(crate) fn cancel_connection(&mut self, file: u64, request: u64) -> Result {
         let cookie = self.connections.cancel(file, request).map_err(|_| ENOENT)?;
