@@ -12,11 +12,19 @@
 static int empty_registry(int fd)
 {
 	unsigned short mask = 0xffff;
+	unsigned short active = 0;
+	short selected = 0;
 	struct sle_controller_snapshot snapshot = { .version = 1 };
 	if (ioctl(fd, SL_IOCTL_DEV_LIST, &mask) || mask)
 		return -1;
+	if (ioctl(fd, SL_IOCTL_DEV_GET_ACTIVE, &active) || active != 0xffff)
+		return -1;
 	errno = 0;
-	if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &snapshot) != -1 || errno != ENODEV)
+	if (ioctl(fd, SL_IOCTL_DEV_SELECT, &selected) != -1 || errno != ENODEV)
+		return -1;
+	errno = 0;
+	/* No per-fd affinity is an invalid request, distinct from a retired id. */
+	if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &snapshot) != -1 || errno != EINVAL)
 		return -1;
 	return 0;
 }
@@ -49,6 +57,6 @@ int main(void)
 		if (strcmp(label, "none\n") || empty_registry(fd)) return 1;
 	}
 	close(fd);
-	puts("SPARKLINK_NO_GHOST_BACKEND_PASS selectors=9 registered=0 snapshot=ENODEV");
+	puts("SPARKLINK_NO_GHOST_BACKEND_PASS selectors=9 registered=0 select=ENODEV unbound_snapshot=EINVAL");
 	return 0;
 }
