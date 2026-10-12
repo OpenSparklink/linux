@@ -6,6 +6,7 @@
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/sparklink_native.h>
+#include <linux/sparklink_channel.h>
 #include <uapi/linux/sparklink_ioctl.h>
 
 static_assert(sizeof(struct sparklink_native_info) == 32);
@@ -266,3 +267,24 @@ void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
 	sparklink_native_snoop_tx_rust(id, generation, opcode, params, length, status);
 }
 EXPORT_SYMBOL_GPL(sparklink_native_snoop_tx);
+
+extern void *sparklink_native_session_get_rust(u16 id, u64 generation, u64 lifetime, u16 handle, int *error);
+extern int sparklink_native_session_status_rust(u16 id, u64 generation, u64 lifetime, u16 handle);
+void *sparklink_native_session_get(u16 id, u64 generation, u64 lifetime, u16 handle, int *error)
+{
+    return sparklink_native_session_get_rust(id, generation, lifetime, handle, error);
+}
+int sparklink_native_session_status(u16 id, u64 generation, u64 lifetime, u16 handle)
+{
+    return sparklink_native_session_status_rust(id, generation, lifetime, handle);
+}
+
+extern int sparklink_native_acb_send_guarded_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+    const u8 *data, size_t length,
+    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
+int sparklink_native_acb_send_guarded(u16 id, u64 generation, u64 lifetime, u16 handle,
+    const u8 *data, size_t length,
+    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope)
+{
+    return sparklink_native_acb_send_guarded_rust(id, generation, lifetime, handle, data, length, consent, scope);
+}

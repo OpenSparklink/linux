@@ -82,14 +82,14 @@ int main(void) {
     reset();assert(exercise(0)==0);assert(submit_calls==1 && callback_calls==1 && kill_calls==0);
     reset();allocation_fails=true;assert(exercise(0)==-ENOMEM);assert(submit_calls==0);
     reset();deadline=0;assert(exercise(0)==-ETIMEDOUT);assert(submit_calls==0);
-    for(unsigned int i=0;i<3;i++) {
-        const int denied[]={-EAGAIN,-ESTALE,-EACCES};reset();assert(exercise(denied[i])==denied[i]);
+    for(unsigned int i=0;i<4;i++) {
+        const int denied[]={-EAGAIN,-ESTALE,-EACCES,-ECANCELED};reset();assert(exercise(denied[i])==denied[i]);
         assert(submit_calls==0 && callback_calls==0 && failures==0);
     }
     reset();submit_error=-ENODEV;assert(exercise(0)==-ENODEV);assert(callback_calls==0 && kill_calls==0);
     reset();completion_error=-EPIPE;assert(exercise(0)==-EPIPE);assert(callback_calls==1 && failures==1);
     reset();shortened=1;assert(exercise(0)==-EREMOTEIO);assert(callback_calls==1 && failures==1);
     reset();no_completion=true;assert(exercise(0)==-ETIMEDOUT);assert(kill_calls==1 && callback_calls==1 && failures==1);
-    puts("WS73_ACTUAL_TICKET_DRIVER_FAULTS_PASS cases=10; dependency fixtures, not RF");
+    puts("WS73_ACTUAL_TICKET_DRIVER_FAULTS_PASS cases=11; dependency fixtures, not RF");
     return 0;
 }

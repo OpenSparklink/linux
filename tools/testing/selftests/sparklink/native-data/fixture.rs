@@ -14,9 +14,9 @@ pub type Result<T=()> = std::result::Result<T, Error>;
 pub const EINVAL:Error=Error(-22);pub const ENODEV:Error=Error(-19);pub const EAGAIN:Error=Error(-11);
 pub const EMSGSIZE:Error=Error(-90);pub const EIO:Error=Error(-5);pub const ENOBUFS:Error=Error(-105);
 pub const ENOMEM:Error=Error(-12);pub const EOVERFLOW:Error=Error(-75);pub const GFP_ATOMIC:()=();
-pub mod bindings {pub const EPROTO:i32=71;pub const EALREADY:i32=114;pub const EACCES:i32=13;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
+pub mod bindings {pub const EPROTO:i32=71;pub const EALREADY:i32=114;pub const ECONNRESET:i32=104;pub const EACCES:i32=13;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
 pub unsafe fn ktime_get_boottime()->i64{super::NOW.with(|n|*n.borrow() as i64)}}
-pub mod prelude {pub use crate::{Error,Result,KVec,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO,ENOMEM,GFP_ATOMIC};}
+pub mod prelude {pub use crate::{Error,Result,KVec,ENODEV,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO,ENOMEM,GFP_ATOMIC};}
 #[derive(Debug)] pub struct KVec<T>(Vec<T>);
 impl<T> KVec<T> {
  fn new()->Self{Self(Vec::new())}
@@ -30,13 +30,16 @@ impl<T:Clone> KVec<T> {fn extend_from_slice(&mut self,v:&[T],_:())->Result{self.
 #[path="sle_link_observation.rs"] mod sle_link_observation;
 #[path="sle_data_credit.rs"] mod sle_data_credit;
 #[path="sle_native_data.rs"] mod sle_native_data;
+#[path="sle_sessions.rs"] mod sle_sessions;
 use sle_link_observation::{LinkEvidence,LinkObservation};
 const PROTOCOL_ERROR:i32=-71;const UNSUPPORTED:i32=-95;
-#[derive(Clone,Copy,PartialEq)] struct DeviceIdentity{id:u16,generation:u64}
+#[derive(Clone,Copy,PartialEq)] pub(crate) struct DeviceIdentity{id:u16,generation:u64}
+mod sle_dev {pub(crate) use super::DeviceIdentity;}
 struct Lock<T>(RefCell<T>);
 impl<T> Lock<T>{fn new(v:T)->Self{Self(RefCell::new(v))}fn lock(&self)->RefMut<'_,T>{self.0.borrow_mut()}}
 struct Host{links:LinkObservation,data_revoked:bool,fault:Option<Error>}
-impl Host{// @@ADMITTED@@
+impl Host{fn controller_status(&self)->(u32,bool,Option<Error>){(0,true,self.fault)}
+// @@ADMITTED@@
 fn link_snapshot(&self)->(u64,bool,[Option<sle_link_observation::Link>;16]){self.links.snapshot()}}
 struct Poll;impl Poll{fn notify_all(&self){}}
 struct Dummy{transport:*mut c_void}
@@ -46,12 +49,12 @@ mod sle_dli{pub enum ControllerBackend{Ws73(super::Dummy)}}
 struct State{controller:sle_dli::ControllerBackend}
 struct Owner{
  identity:DeviceIdentity,host:Lock<Host>,data:Lock<sle_native_data::NativeData>,data_poll:Poll,
- schedule_gate:Lock<bool>,native_lifecycle:Lock<()>,state:Lock<Option<State>>,transport_open:AtomicBool,
+ sessions:Lock<[Option<sle_sessions::Session>;16]>,schedule_gate:Lock<bool>,native_lifecycle:Lock<()>,state:Lock<Option<State>>,transport_open:AtomicBool,
  commands:RefCell<Vec<SleEvent>>,
 }
 impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  identity:DeviceIdentity{id,generation},host:Lock::new(Host{links:LinkObservation::new(),data_revoked:false,fault:None}),
- data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll,schedule_gate:Lock::new(false),
+ data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll,sessions:Lock::new([const{None};16]),schedule_gate:Lock::new(false),
  native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Ws73(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
 })}}
@@ -116,6 +119,8 @@ mod under_test{use super::*;
 // @@COMMIT@@
 // @@RECEIVE@@
 // @@SEND@@
+// @@SEND_COMMON@@
+// @@GUARDED_SEND@@
 // @@TAKE@@
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
@@ -240,4 +245,67 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
  for _ in 0..5 {assert_eq!(send(0,7,1,0,b"queued once"),0);}
  assert_eq!(TX.with(|t|t.borrow().len()),5);
  assert_eq!(send(0,7,1,0,b"credit exhausted"),-11);
+}
+
+struct ConsentScope { live: bool }
+unsafe extern "C" fn consent_scope(scope:*mut c_void,submit:unsafe extern "C" fn(*mut c_void)->i32,context:*mut c_void)->i32 {
+ let scope=unsafe{&*scope.cast::<ConsentScope>()};
+ if !scope.live {-125} else {unsafe{submit(context)}}
+}
+#[test] fn actual_guarded_entry_rejects_retired_binding_without_losing_prior_debt(){
+ let(a,_)=setup();link(&a,0,1);
+ let mut scope=ConsentScope{live:true};
+ let bytes=b"guarded";
+ let send_guarded=|scope:&mut ConsentScope|unsafe{under_test::sparklink_native_acb_send_guarded_rust(
+  0,7,1,0,bytes.as_ptr(),bytes.len(),Some(consent_scope),(scope as *mut ConsentScope).cast())};
+ assert_eq!(send_guarded(&mut scope),0);
+ scope.live=false;
+ for _ in 0..32 {assert_eq!(send_guarded(&mut scope),-125);}
+ assert_eq!(TX.with(|t|t.borrow().len()),1);
+ scope.live=true;
+ for _ in 0..4 {assert_eq!(send_guarded(&mut scope),0);}
+ assert_eq!(send_guarded(&mut scope),-11);
+ assert_eq!(a.data.lock().credits.maximum(),Ok(254));
+}
+
+struct FakeSession {refs:usize, stopped:bool, id:u16, generation:u64, lifetime:u64, handle:u16}
+#[no_mangle] unsafe extern "C" fn sl_connection_session_create(id:u16,generation:u64,lifetime:u64,handle:u16,maximum:u16)->*mut c_void {
+ assert!(maximum>5);Box::into_raw(Box::new(FakeSession{refs:1,stopped:false,id,generation,lifetime,handle})).cast()
+}
+#[no_mangle] unsafe extern "C" fn sl_connection_session_get(p:*mut c_void){unsafe{(*p.cast::<FakeSession>()).refs+=1;}}
+#[no_mangle] unsafe extern "C" fn sl_connection_session_put(p:*mut c_void){unsafe{
+ let s=&mut *p.cast::<FakeSession>();assert!(s.refs>0);s.refs-=1;
+ if s.refs==0 {drop(Box::from_raw(p.cast::<FakeSession>()));}
+}}
+#[no_mangle] unsafe extern "C" fn sl_connection_session_stop(p:*mut c_void,error:i32){unsafe{
+ let s=&mut *p.cast::<FakeSession>();assert!(error<0);s.stopped=true;
+ let owner=sle_usb::ingress_owner(DeviceIdentity{id:s.id,generation:s.generation}).unwrap();
+ assert!(owner.sessions.0.try_borrow_mut().is_ok());
+ assert!(owner.host.0.try_borrow_mut().is_ok());
+ assert!(owner.native_lifecycle.0.try_borrow_mut().is_ok());
+}}
+fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut error=0;
+ let p=unsafe{sle_sessions::sparklink_native_session_get_rust(id,generation,life,handle,&mut error)};(p,error)}
+#[test] fn actual_runtime_session_get_shares_one_owner_and_preserves_lifetime(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ let(p,e)=session(0,7,1,0);assert_eq!(e,0);assert!(!p.is_null());
+ let(q,e)=session(0,7,1,0);assert_eq!(e,0);assert_eq!(p,q);
+ unsafe{assert_eq!((*p.cast::<FakeSession>()).refs,3);assert_eq!((*p.cast::<FakeSession>()).lifetime,1);assert_eq!((*p.cast::<FakeSession>()).handle,0);}
+ let(other,e)=session(1,8,1,0);assert_eq!(e,0);assert_ne!(p,other);
+ assert_eq!(session(0,7,9,0).1,-116);assert_eq!(session(0,8,1,0).1,-19);
+ link(&a,0,2);a.reconcile_sessions();
+ unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert_eq!((*p.cast::<FakeSession>()).refs,2);assert!(!(*other.cast::<FakeSession>()).stopped);}
+ link(&a,0,1);let(new,e)=session(0,7,3,0);assert_eq!(e,0);assert_ne!(p,new);
+ a.stop_sessions(-19);b.stop_sessions(-19);
+ unsafe{for pointer in [p,q,other,new]{sl_connection_session_put(pointer);}}
+}
+#[test] fn actual_session_status_and_revocation_are_per_runtime_and_join_outside_locks(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ let(p,_)=session(0,7,1,0);let(q,_)=session(1,8,1,0);
+ a.host.lock().data_revoked=true;
+ assert_eq!(unsafe{sle_sessions::sparklink_native_session_status_rust(0,7,1,0)},-13);
+ assert_eq!(session(0,7,1,0).1,-13);
+ a.reconcile_sessions();
+ unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert!(!(*q.cast::<FakeSession>()).stopped);}
+ b.stop_sessions(-19);unsafe{sl_connection_session_put(p);sl_connection_session_put(q);}
 }

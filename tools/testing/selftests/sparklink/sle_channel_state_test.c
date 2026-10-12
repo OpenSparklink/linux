@@ -39,6 +39,17 @@ static void trace(struct sl_channel_progress s, unsigned int depth)
 int main(void)
 {
 	struct sl_channel_progress s = {0};
+	struct sl_binding_progress binding = {0};
+	assert(sl_binding_attach(&binding));
+	assert(sl_binding_live(binding));
+	assert(!sl_binding_attach(&binding));
+	binding.busy = 1; /* independently owned in-flight work survives detach */
+	sl_binding_retire(&binding);
+	assert(!sl_binding_live(binding) && binding.busy == 1);
+	assert(!sl_binding_attach(&binding)); /* same-life reattach is not invented */
+	sl_binding_retire(&binding);
+	assert(binding.retired && !binding.bound);
+
 	sl_channel_start(&s, 249);
 	sl_channel_request_submitted(&s, 0);
 	sl_channel_peer_capability(&s, 249, 0);

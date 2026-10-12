@@ -20,7 +20,7 @@ TEST_PROGS += run_event_copy.py
 TEST_PROGS += run_phy_model.py
 TEST_PROGS += run_diagnostic_result.py
 TEST_PROGS += run_management_release.py run_link_observation.py
-TEST_PROGS += run_native_data.py run_native_ticket_driver.py
+TEST_PROGS += run_native_data.py run_native_ticket_driver.py run_session_dispatch.py
 TEST_PROGS += run_usb_firmware.py
 TEST_PROGS += run_usb_discovery.py
 

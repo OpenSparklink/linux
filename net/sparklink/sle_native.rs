@@ -682,6 +682,8 @@ struct NativeTxTicket {
     lifetime: u64,
     handle: u16,
     length: usize,
+    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
+    scope: *mut c_void,
     attempted: Cell<bool>,
     submitted: Cell<bool>,
 }
@@ -717,7 +719,11 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
     // SAFETY: registered Backend contract permits only an already prepared
     // atomic queue operation (WS73: usb_submit_urb(..., GFP_ATOMIC)). No wait,
     // kernel allocation with sleeping flags, protocol callback or decode here.
-    let result = unsafe { submit.unwrap()(context) };
+    let result = if let Some(consent) = ticket.consent {
+        // SAFETY: scope belongs to the live session worker; consent holds its
+        // state lock through the same prepared atomic queue operation.
+        unsafe { consent(ticket.scope, submit.unwrap(), context) }
+    } else { unsafe { submit.unwrap()(context) } };
     if result == 0 {
         ticket.submitted.set(true); // USB queued; only genuine NOCP pays debt.
     } else if data.credits.unsubmitted(ticket.lifetime, ticket.handle).is_err() {
@@ -731,6 +737,22 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
+) -> i32 {
+    // SAFETY: preserves internal caller buffer lifetime until driver joins.
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, None, core::ptr::null_mut()) }
+}
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_acb_send_guarded_rust(
+    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
+    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
+) -> i32 {
+    if consent.is_none() || scope.is_null() { return EINVAL.to_errno(); }
+    // SAFETY: session worker holds its reference and scope until this returns.
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, consent, scope) }
+}
+unsafe fn native_acb_send(
+    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
+    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
 ) -> i32 {
     if data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
     let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
@@ -760,7 +782,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
         }
     }
     let mut ticket = NativeTxTicket { owner: owner.clone(), lifetime, handle, length,
-        attempted: Cell::new(false), submitted: Cell::new(false) };
+        consent, scope, attempted: Cell::new(false), submitted: Cell::new(false) };
     // SAFETY: caller owns immutable bytes, the ticket and retained Backend
     // remain live until the blocking driver callback joins its completion.
     let result = unsafe { sparklink_native_transport_acb(transport.transport,

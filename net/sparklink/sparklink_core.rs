@@ -34,6 +34,7 @@ mod sle_irq_lock;
 mod sle_mgmt;
 mod sle_link_observation;
 mod sle_native;
+mod sle_sessions;
 mod sle_data_credit;
 mod sle_native_data;
 mod sle_pdu;
@@ -543,6 +544,8 @@ pub(crate) struct ControllerRuntime {
     #[pin]
     pub(crate) data_poll: PollCondVar,
     #[pin]
+    pub(crate) sessions: Mutex<[Option<sle_sessions::Session>; 16]>,
+    #[pin]
     pub(crate) rx_work: DelayedWork<ControllerRuntime, 0>,
     #[pin]
     pub(crate) tx_work: DelayedWork<ControllerRuntime, 1>,
@@ -589,6 +592,7 @@ impl ControllerRuntime {
             host <- new_irq_lock!(host, "sparklink_runtime_host"),
             data <- new_irq_lock!(sle_native_data::NativeData::new(data_length, data_count), "sparklink_runtime_data"),
             data_poll <- new_poll_condvar!("sparklink_native_data"),
+            sessions <- new_mutex!([const { None }; 16], "sparklink_sessions"),
             rx_work <- new_delayed_work!("sparklink_runtime_rx_work"),
             tx_work <- new_delayed_work!("sparklink_runtime_tx_work"),
             schedule_gate <- new_irq_lock!(false, "sparklink_runtime_schedule"),
@@ -613,6 +617,8 @@ impl ControllerRuntime {
         // A transaction may be faulting while copying its candidate lease.
         // Observers must not wait for that management mutex either.
         self.management.lock().settled(ENODEV.to_errno());
+        // Session workers can wait for native_lifecycle. Join BEFORE taking it.
+        self.stop_sessions(ENODEV.to_errno());
         let _lifecycle = self.native_lifecycle.lock();
         sle_usb::unpublish_runtime(self);
         self.stop_workers();
@@ -1275,7 +1281,15 @@ impl ChannelGuard {
 }
 impl Drop for ChannelGuard {
     fn drop(&mut self) {
-        // SAFETY: this guard owns the successful family registration.
+        let owners = {
+            let shared = SUBSYSTEM.lock();
+            core::array::from_fn::<_, {sle_dev::SLE_DEV_MAX}, _>(|index|
+                shared.as_ref().and_then(|s| s.runtimes[index].clone()))
+        };
+        for owner in owners.into_iter().flatten() {
+            owner.stop_sessions(ENODEV.to_errno());
+        }
+        // SAFETY: sessions/work have drained before protocol registration ends.
         unsafe { sl_channel_socket_exit() };
     }
 }

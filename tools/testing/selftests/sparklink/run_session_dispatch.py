@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Actual connection route and channel submit-consent bodies with kernel dependencies."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+
+def function(source, name):
+    m = re.search(r'^static (?:void|int) '+name+r'\([^;{]*\)\s*\{', source, re.M)
+    assert m
+    i=m.end();depth=1
+    while depth:
+        depth+=(source[i]=='{')-(source[i]=='}');i+=1
+    return source[m.start():i]
+
+
+def run(output):
+    here=Path(__file__).resolve().parent;root=here.parents[3];net=root/'net/sparklink'
+    paths=[net/'sle_channel_socket.c',net/'sle_channel_state.h',net/'sle_channel_wire.c',net/'sle_channel_wire.h',here/'session/dispatch_fixture.c']
+    inputs={p:p.read_bytes() for p in paths};source=inputs[paths[0]].decode()
+    structs=source[source.index('struct sl_basic_channel {'):source.index('struct sl_socket_binding {')]
+    # Submit scope excludes the socket binding layout.
+    structs+=re.search(r'struct sl_submit_scope \{[^;]+;[^}]+\};',source)[0]
+    defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX'])
+    bodies='\n'.join(function(source,n) for n in ['sl_session_submit','sl_route'])
+    fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
+    with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
+        tmp=Path(directory);(tmp/'test.c').write_text(fixture)
+        subprocess.run([os.environ.get('CC','clang'),'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-g','-I'+str(net),str(tmp/'test.c'),str(net/'sle_channel_wire.c'),'-o',str(tmp/'test')],check=True)
+        subprocess.run([str(tmp/'test')],check=True,env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1:abort_on_error=1',UBSAN_OPTIONS='halt_on_error=1'))
+    assert all(p.read_bytes()==b for p,b in inputs.items())
+    result={'status':'ACTUAL_SESSION_ROUTE_SUBMIT_PASS','scope':'actual single-consumer route/local TCID+PI/finite RX and atomic channel submit-consent; kernel allocation/lock/wakeup dependencies; capability reply integration separately tested','physical_acceptance':False,'whole_session_proof':False,'bodies_sha256':hashlib.sha256(bodies.encode()).hexdigest(),'sources':{str(p.relative_to(root)):hashlib.sha256(b).hexdigest() for p,b in inputs.items()}}
+    if output:output.write_text(json.dumps(result,indent=2)+'\n')
+    print(json.dumps(result,indent=2))
+
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--output',type=Path);run(parser.parse_args().output)

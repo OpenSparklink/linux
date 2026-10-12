@@ -925,7 +925,7 @@ static int ws73_native_acb(void *context, struct sparklink_native_tx_ticket *tic
 		}
 	}
 	usb_free_urb(transfer.urb);
-	if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -EACCES &&
+	if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -EACCES && ret != -ECANCELED &&
 		!READ_ONCE(ws->stopping))
 		ws73_async_failure(ws, ret);
 out:

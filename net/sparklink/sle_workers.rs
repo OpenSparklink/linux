@@ -683,6 +683,8 @@ impl WorkItem<0> for ControllerRuntime {
                 rearm_jiffies = 1;
             }
         }
+        // Session ownership follows canonical physical links/withdrawal.
+        this.reconcile_sessions();
         // An inline drain may already have taken the grant; check the owner
         // state even on an empty RX pass. Queue TX after releasing its mutex.
         let can_send = {

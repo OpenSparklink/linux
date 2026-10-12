@@ -3,8 +3,41 @@
 #define _SLE_CHANNEL_STATE_H
 /* Production pure transitions. Socket integration serializes the entire
  * structure with state_lock; a deadline flag always uses the original timer.
- * This transitional negotiation state does not solve same-lifetime reopen.
+ * ConnectionSession owns this state; fd detach does not restart negotiation.
  */
+/* Single current basic-channel binding. Retirement is local: without a
+ * qualified protocol close/drain barrier, reattach in this lifetime is refused.
+ * busy counts a dequeued, independently owned TX in the total queue budget. */
+struct sl_binding_progress { unsigned int bound, retired, busy; };
+static inline int sl_binding_live(struct sl_binding_progress s)
+{
+    return s.bound && !s.retired;
+}
+static inline int sl_binding_attach(struct sl_binding_progress *s)
+{
+    if (s->bound || s->retired) return 0;
+    s->bound = 1;
+    return 1;
+}
+static inline int sl_binding_space(struct sl_binding_progress s, unsigned int queued, unsigned int limit)
+{
+    return sl_binding_live(s) && queued < limit && s.busy < limit - queued;
+}
+static inline int sl_binding_start_tx(struct sl_binding_progress *s)
+{
+    if (!sl_binding_live(*s) || s->busy) return 0;
+    s->busy = 1;
+    return 1;
+}
+static inline void sl_binding_finish_tx(struct sl_binding_progress *s)
+{
+    s->busy = 0;
+}
+static inline void sl_binding_retire(struct sl_binding_progress *s)
+{
+    s->bound = 0;
+    s->retired = 1;
+}
 enum sl_channel_phase { SL_CH_UNBOUND, SL_CH_NEGOTIATING, SL_CH_OPEN,
 	SL_CH_FAILED, SL_CH_CLOSED };
 struct sl_channel_progress {

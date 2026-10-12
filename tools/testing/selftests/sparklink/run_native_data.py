@@ -17,7 +17,7 @@ def run(output):
     root = here.parents[3]
     net = root / 'net/sparklink'
     files = [net / n for n in ['sle_native.rs', 'sle_link_observation.rs',
-                             'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs']]
+                             'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs', 'sle_sessions.rs']]
     files.append(here / 'native-data/fixture.rs')
     originals = {p: p.read_bytes() for p in files}
     fixture = originals[files[-1]].decode()
@@ -30,6 +30,8 @@ def run(output):
     fixture = fixture.replace('// @@TICKET@@', source[start:end])
     for marker, name in [('RECEIVE', 'sparklink_native_receive_rust'),
                          ('SEND', 'sparklink_native_acb_send_rust'),
+                         ('SEND_COMMON', 'native_acb_send'),
+                         ('GUARDED_SEND', 'sparklink_native_acb_send_guarded_rust'),
                          ('COMMIT', 'sparklink_native_tx_commit_rust'),
                          ('TAKE', 'sparklink_native_acb_take_rust')]:
         fixture = fixture.replace('// @@' + marker + '@@', function(source, name))

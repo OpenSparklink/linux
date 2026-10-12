@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Lifetime-bound basic datagram channel, without reliable-delivery promises.
- * SSAP/dynamic/reliable modes are not
- * advertised. Each socket binds an immutable controller/connection lifetime.
- */
+/* Runtime-owned connection session, one basic channel, fd bindings. Dynamic
+ * TCIDs/reliable modes and same-lifetime rebinding require protocol support. */
 #include <linux/capability.h>
 #include <linux/errno.h>
+#include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/net.h>
 #include <linux/poll.h>
@@ -20,300 +19,485 @@
 #include "sle_channel_wire.h"
 #include "sle_channel_state.h"
 
-#define SL_CHANNEL_QUEUE 8
-struct sl_channel_sock {
-	struct sock sk;
-	struct sockaddr_sparklink address;
-	struct delayed_work work;
-	struct sk_buff_head tx;
-	struct list_head entry;
-	bool bound; /* registry membership, protected by sl_channel_registry */
-	spinlock_t state_lock; /* progress + deadline; never held across USB */
-	struct sl_channel_progress progress;
-	u8 response_id;
-	u32 response_mask;
-	/* response_id/mask are private to the serialized worker. */
-	unsigned long deadline;
+#define SL_CHANNEL_TX 8
+#define SL_CHANNEL_RX 16
+
+struct sl_basic_channel {
+	u8 local_tcid, remote_tcid, pi;
+	unsigned int mtu, mps;
+	struct sl_binding_progress binding;
+	struct sock *sk; /* held reference; session lock protects detach/delivery */
+	struct sk_buff_head tx, rx;
+	u64 rx_dropped;
 };
-static LIST_HEAD(sl_channel_sockets);
-static DEFINE_MUTEX(sl_channel_registry);
-static unsigned int sl_channel_count;
+struct sl_connection_session {
+	struct kref refs;
+	u16 controller, handle;
+	u64 generation, lifetime;
+	spinlock_t lock; /* state + channel; never spans blocking transport */
+	struct sl_channel_progress progress;
+	unsigned long deadline;
+	unsigned long unknown_deadline; /* worker-only bounded snapshot uncertainty */
+	struct delayed_work work;
+	struct sl_basic_channel channel;
+	u8 response_id;
+	u32 response_mask; /* only serialized session worker writes these */
+	u8 rx_buffer[2047]; /* sole connection consumer, fixed budget */
+};
+struct sl_socket_binding {
+	struct sock sk;
+	spinlock_t lock; /* publication of session reference */
+	struct sl_connection_session *session;
+};
+struct sl_submit_scope { struct sl_connection_session *session; bool application; };
 static struct proto sl_channel_proto;
 
-static struct sl_channel_sock *sl_sk(struct sock *sk)
+static struct sl_socket_binding *sl_sk(struct sock *sk)
 {
-	return container_of(sk, struct sl_channel_sock, sk);
+	return container_of(sk, struct sl_socket_binding, sk);
 }
-
-static struct sl_channel_progress sl_snapshot(struct sl_channel_sock *ss)
+static void sl_session_destroy(struct kref *refs)
 {
-	struct sl_channel_progress s;
-	spin_lock_bh(&ss->state_lock);
-	s = ss->progress;
-	spin_unlock_bh(&ss->state_lock);
+	struct sl_connection_session *s = container_of(refs, struct sl_connection_session, refs);
+
+	WARN_ON(s->channel.sk || delayed_work_pending(&s->work));
+	skb_queue_purge(&s->channel.tx);
+	skb_queue_purge(&s->channel.rx);
+	kfree(s);
+}
+void sl_connection_session_get(void *opaque)
+{
+	struct sl_connection_session *s = opaque;
+	kref_get(&s->refs);
+}
+void sl_connection_session_put(void *opaque)
+{
+	struct sl_connection_session *s = opaque;
+	kref_put(&s->refs, sl_session_destroy);
+}
+static struct sl_connection_session *sl_binding_session(struct sock *sk)
+{
+	struct sl_socket_binding *binding = sl_sk(sk);
+	struct sl_connection_session *s;
+
+	spin_lock_bh(&binding->lock);
+	s = binding->session;
+	if (s)
+		sl_connection_session_get(s);
+	spin_unlock_bh(&binding->lock);
 	return s;
 }
-
-static void sl_schedule(struct sl_channel_sock *ss)
+static struct sl_channel_progress sl_snapshot(struct sl_connection_session *s)
 {
-	/* Close and scheduling serialize before cancel_delayed_work_sync. No
-	 * work reference can be newly queued after the CLOSED transition. */
-	spin_lock_bh(&ss->state_lock);
-	if (sl_channel_active(ss->progress)) {
-		sock_hold(&ss->sk);
-		if (!queue_delayed_work(system_unbound_wq, &ss->work, msecs_to_jiffies(10)))
-			sock_put(&ss->sk);
+	unsigned long flags;
+	struct sl_channel_progress view;
+	spin_lock_irqsave(&s->lock, flags);
+	view = s->progress;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return view;
+}
+static void sl_schedule(struct sl_connection_session *s)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&s->lock, flags);
+	if (sl_channel_active(s->progress)) {
+		sl_connection_session_get(s);
+		if (!queue_delayed_work(system_unbound_wq, &s->work, msecs_to_jiffies(10)))
+			sl_connection_session_put(s);
 	}
-	spin_unlock_bh(&ss->state_lock);
+	spin_unlock_irqrestore(&s->lock, flags);
 }
-
-static void sl_fault(struct sl_channel_sock *ss, int error)
+static void sl_socket_fault(struct sock *sk, int error)
 {
-	spin_lock_bh(&ss->state_lock);
-	sl_channel_fail(&ss->progress);
-	spin_unlock_bh(&ss->state_lock);
-	WRITE_ONCE(ss->sk.sk_err, -error);
-	WRITE_ONCE(ss->sk.sk_shutdown, SHUTDOWN_MASK);
-	WRITE_ONCE(ss->sk.sk_state, TCP_CLOSE);
-	ss->sk.sk_error_report(&ss->sk);
-	ss->sk.sk_state_change(&ss->sk);
+	WRITE_ONCE(sk->sk_err, -error);
+	WRITE_ONCE(sk->sk_shutdown, SHUTDOWN_MASK);
+	WRITE_ONCE(sk->sk_state, TCP_CLOSE);
+	sk->sk_error_report(sk);
+	sk->sk_state_change(sk);
 }
-
-static void sl_progress_event(struct sl_channel_sock *ss, unsigned int event, unsigned int mtu)
+static void sl_wake(struct sl_connection_session *s)
 {
-	struct sl_channel_progress s;
-	enum sl_channel_phase before;
+	unsigned long flags;
+	struct sock *sk;
+	spin_lock_irqsave(&s->lock, flags);
+	sk = s->channel.sk;
+	if (sk)
+		sock_hold(sk);
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (sk) {
+		sk->sk_write_space(sk);
+		sk->sk_data_ready(sk);
+		sock_put(sk);
+	}
+}
+static void sl_fault(struct sl_connection_session *s, int error)
+{
+	unsigned long flags;
+	struct sock *sk;
+	spin_lock_irqsave(&s->lock, flags);
+	sl_channel_fail(&s->progress);
+	sk = s->channel.sk;
+	if (sk)
+		sock_hold(sk);
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (sk) {
+		sl_socket_fault(sk, error);
+		sock_put(sk);
+	}
+}
+static void sl_progress_event(struct sl_connection_session *s, unsigned int event, unsigned int mtu)
+{
+	unsigned long flags;
+	enum sl_channel_phase before, after;
 	int expired;
 
-	spin_lock_bh(&ss->state_lock);
-	before = ss->progress.phase;
-	expired = time_after_eq(jiffies, ss->deadline);
+	spin_lock_irqsave(&s->lock, flags);
+	before = s->progress.phase;
+	expired = time_after_eq(jiffies, s->deadline);
 	switch (event) {
-	case 1: sl_channel_request_submitted(&ss->progress, expired); break;
-	case 2: sl_channel_peer_capability(&ss->progress, mtu, expired); break;
-	case 3: sl_channel_response_submitted(&ss->progress, expired); break;
-	default: sl_channel_tick(&ss->progress, expired); break;
+	case 1: sl_channel_request_submitted(&s->progress, expired); break;
+	case 2: sl_channel_peer_capability(&s->progress, mtu, expired); break;
+	case 3: sl_channel_response_submitted(&s->progress, expired); break;
+	default: sl_channel_tick(&s->progress, expired); break;
 	}
-	s = ss->progress;
-	spin_unlock_bh(&ss->state_lock);
-	if (before == SL_CH_NEGOTIATING && s.phase == SL_CH_FAILED)
-		sl_fault(ss, -ETIMEDOUT);
-	else if (before != SL_CH_OPEN && s.phase == SL_CH_OPEN)
-		ss->sk.sk_write_space(&ss->sk);
+	after = s->progress.phase;
+	if (after == SL_CH_OPEN) {
+		s->channel.mtu = s->progress.mtu;
+		s->channel.mps = s->progress.mtu;
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (before == SL_CH_NEGOTIATING && after == SL_CH_FAILED)
+		sl_fault(s, -ETIMEDOUT);
+	else if (before != SL_CH_OPEN && after == SL_CH_OPEN)
+		sl_wake(s);
 }
 
-static int sl_wait_ready(struct sl_channel_sock *ss)
+/* Invoked inside actual Runtime Host/data/gate commit. Order is those locks
+ * then session lock. No caller holds session lock over any Runtime API/wait.
+ * Last-fd detach and actual USB queueing therefore have one linearization. */
+static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 {
-	struct sl_channel_progress s = sl_snapshot(ss);
-	return !sl_channel_active(s) ||
-		(s.phase == SL_CH_OPEN && skb_queue_len(&ss->tx) < SL_CHANNEL_QUEUE);
+	struct sl_submit_scope *permission = scope;
+	struct sl_connection_session *s = permission->session;
+	int ret;
+
+	spin_lock(&s->lock); /* Runtime commit has IRQs disabled */
+	if (!sl_channel_active(s->progress) ||
+	    (permission->application && !sl_binding_live(s->channel.binding)))
+		ret = -ECANCELED;
+	else
+		ret = submit(context); /* atomic queue only; no wait or protocol reentry */
+	spin_unlock(&s->lock);
+	return ret;
+}
+static int sl_send(struct sl_connection_session *s, bool application, const u8 *data, size_t length)
+{
+	struct sl_submit_scope permission = { s, application };
+
+	return sparklink_native_acb_send_guarded(s->controller, s->generation, s->lifetime,
+		s->handle, data, length, sl_session_submit, &permission);
 }
 
-static int sl_send(struct sl_channel_sock *ss, const u8 *data, size_t length)
+/* Exactly one session worker consumes the connection's ACB queue. Decode once,
+ * route CMTC to session state, then route DTAP by local TCID/PI to channel RX. */
+static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t length)
 {
-	if (!sl_channel_active(sl_snapshot(ss)))
-		return -ECANCELED;
-	return sparklink_native_acb_send(ss->address.controller, ss->address.generation,
-		ss->address.lifetime, ss->address.handle, data, length);
-}
-
-static void sl_work(struct work_struct *work)
-{
-	struct sl_channel_sock *ss = container_of(to_delayed_work(work), struct sl_channel_sock, work);
+	unsigned long flags;
 	struct sl_channel_frame frame;
 	struct sl_channel_cap cap;
 	struct sk_buff *skb;
-	u8 signal[16], wire[24], *rx;
+	struct sock *sk = NULL;
 	unsigned int code, identifier, mask;
+	int ret;
+
+	ret = sl_channel_frame_decode(bytes, length, &frame);
+	if (ret)
+		return;
+	if (frame.tcid == SL_CHANNEL_CMTC) {
+		if (sl_channel_cap_decode(frame.data, frame.length, &code, &identifier, &mask, &cap))
+			return;
+		if (code == 1) {
+			if (s->response_id && s->response_id != identifier) {
+				sl_fault(s, -EPROTO);
+				return;
+			}
+			s->response_id = identifier;
+			s->response_mask = mask;
+		} else if (identifier == 1 && sl_snapshot(s).request_submitted) {
+			struct sl_channel_progress view = sl_snapshot(s);
+			sl_progress_event(s, 2, min_t(unsigned int, view.maximum, min(cap.mtu, cap.mps)));
+		}
+		return;
+	}
+	skb = alloc_skb(frame.length, GFP_KERNEL);
+	if (!skb)
+		return;
+	memcpy(skb_put(skb, frame.length), frame.data, frame.length);
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(s->channel.binding) &&
+	    frame.tcid == s->channel.local_tcid && frame.pi == s->channel.pi &&
+	    frame.length <= s->channel.mtu) {
+		spin_lock(&s->channel.rx.lock);
+		if (s->channel.rx.qlen < SL_CHANNEL_RX &&
+            atomic_read(&s->channel.sk->sk_rmem_alloc) < READ_ONCE(s->channel.sk->sk_rcvbuf) &&
+            sk_rmem_schedule(s->channel.sk, skb, skb->truesize)) {
+            skb_set_owner_r(skb, s->channel.sk);
+			__skb_queue_tail(&s->channel.rx, skb);
+			skb = NULL;
+			sk = s->channel.sk;
+			sock_hold(sk);
+		}
+		spin_unlock(&s->channel.rx.lock);
+	}
+	if (skb)
+		s->channel.rx_dropped++;
+	spin_unlock_irqrestore(&s->lock, flags);
+	kfree_skb(skb);
+	if (sk) {
+		sk->sk_data_ready(sk);
+		sock_put(sk);
+	}
+}
+static void sl_work(struct work_struct *work)
+{
+	unsigned long flags;
+	struct sl_connection_session *s = container_of(to_delayed_work(work), struct sl_connection_session, work);
+	struct sk_buff *skb;
+	u8 signal[16], wire[24];
 	size_t size;
 	int ret, n, i;
 
-	if (!sl_channel_active(sl_snapshot(ss)))
+	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
-	sl_progress_event(ss, 0, 0);
-	if (!sl_channel_active(sl_snapshot(ss)))
+	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle);
+	if (ret == -EAGAIN) {
+		/* Unknown physical state is bounded independently of CMTC deadline. */
+		sl_progress_event(s, 0, 0);
+		if (!s->unknown_deadline)
+			s->unknown_deadline = jiffies + msecs_to_jiffies(5000);
+		if (time_after_eq(jiffies, s->unknown_deadline))
+			sl_fault(s, -ETIMEDOUT);
+		goto again;
+	}
+	s->unknown_deadline = 0;
+	if (ret) { sl_fault(s, ret); goto put; }
+	sl_progress_event(s, 0, 0);
+	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
-	if (!sl_snapshot(ss).request_submitted) {
+	if (!sl_snapshot(s).request_submitted) {
 		n = sl_channel_cap_request(signal, sizeof(signal), 1);
-		n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
-		ret = sl_send(ss, wire, n);
+		if (n >= 0)
+			n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
+		if (n < 0) { sl_fault(s, n); goto put; }
+		ret = sl_send(s, false, wire, n);
 		if (ret == -EAGAIN)
 			goto again;
-		if (ret) { sl_fault(ss, ret); goto put; }
-		sl_progress_event(ss, 1, 0);
-		if (!sl_channel_active(sl_snapshot(ss)))
-			goto put;
+		if (ret) { sl_fault(s, ret); goto put; }
+		sl_progress_event(s, 1, 0);
 	}
-	rx = kmalloc(2047, GFP_KERNEL);
-	if (!rx) { sl_fault(ss, -ENOMEM); goto put; }
-	for (i = 0; i < 16; i++) {
-		ret = sparklink_native_acb_take(ss->address.controller, ss->address.generation,
-			ss->address.lifetime, ss->address.handle, rx, 2047, &size);
+	for (i = 0; i < 16 && sl_channel_active(sl_snapshot(s)); i++) {
+		ret = sparklink_native_acb_take(s->controller, s->generation, s->lifetime,
+			s->handle, s->rx_buffer, sizeof(s->rx_buffer), &size);
 		if (ret == -EAGAIN)
 			break;
-		if (ret) { sl_fault(ss, ret); break; }
-		ret = sl_channel_frame_decode(rx, size, &frame);
-		if (ret)
-			continue; /* malformed/unsupported input never becomes successful data */
-		if (frame.tcid == SL_CHANNEL_CMTC) {
-			ret = sl_channel_cap_decode(frame.data, frame.length, &code, &identifier, &mask, &cap);
-			if (ret)
-				continue;
-			if (code == 1) {
-				ss->response_id = identifier;
-				ss->response_mask = mask;
-			} else if (identifier == 1 && sl_snapshot(ss).request_submitted) {
-				struct sl_channel_progress view = sl_snapshot(ss);
-				sl_progress_event(ss, 2, min_t(unsigned int, view.maximum, min(cap.mtu, cap.mps)));
-			}
-		} else if (sl_snapshot(ss).phase == SL_CH_OPEN && frame.tcid == ss->address.local_tcid && frame.pi == ss->address.pi) {
-			if (frame.length > sl_snapshot(ss).mtu)
-				continue;
-			skb = alloc_skb(frame.length, GFP_KERNEL);
-			if (!skb)
-				continue;
-			memcpy(skb_put(skb, frame.length), frame.data, frame.length);
-			if (sock_queue_rcv_skb(&ss->sk, skb))
-				kfree_skb(skb);
-		}
+		if (ret) { sl_fault(s, ret); break; }
+		sl_route(s, s->rx_buffer, size);
 	}
-	kfree(rx);
-	if (!sl_channel_active(sl_snapshot(ss)))
+	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
-	if (ss->response_id) {
-		n = sl_channel_cap_response(signal, sizeof(signal), ss->response_id, ss->response_mask, sl_snapshot(ss).maximum);
-		n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
-		ret = sl_send(ss, wire, n);
+	if (s->response_id) {
+		n = sl_channel_cap_response(signal, sizeof(signal), s->response_id, s->response_mask, sl_snapshot(s).maximum);
+		if (n >= 0)
+			n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
+		if (n < 0) { sl_fault(s, n); goto put; }
+		ret = sl_send(s, false, wire, n);
 		if (ret == -EAGAIN)
 			goto again;
-		if (ret) { sl_fault(ss, ret); goto put; }
-		ss->response_id = 0;
-		sl_progress_event(ss, 3, 0);
+		if (ret) { sl_fault(s, ret); goto put; }
+		s->response_id = 0;
+		sl_progress_event(s, 3, 0);
 	}
-	if (sl_snapshot(ss).phase == SL_CH_OPEN) {
-		skb = skb_peek(&ss->tx);
-		if (skb) {
-			ret = sl_send(ss, skb->data, skb->len);
-			if (ret == -EAGAIN)
-				goto again;
-			if (ret) { sl_fault(ss, ret); goto put; }
-			skb = skb_dequeue(&ss->tx);
-			kfree_skb(skb);
-			ss->sk.sk_write_space(&ss->sk);
+	skb = NULL;
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(s->channel.binding) && !s->channel.binding.busy) {
+		skb = skb_dequeue(&s->channel.tx);
+		if (skb)
+			sl_binding_start_tx(&s->channel.binding);
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (skb) {
+		ret = sl_send(s, true, skb->data, skb->len);
+		spin_lock_irqsave(&s->lock, flags);
+		sl_binding_finish_tx(&s->channel.binding);
+		if (ret == -EAGAIN && sl_binding_live(s->channel.binding)) {
+			skb_queue_head(&s->channel.tx, skb);
+			skb = NULL;
+		}
+		spin_unlock_irqrestore(&s->lock, flags);
+		kfree_skb(skb);
+		sl_wake(s);
+		if (ret && ret != -EAGAIN && ret != -ECANCELED) {
+			sl_fault(s, ret);
+			goto put;
 		}
 	}
 again:
-	sl_progress_event(ss, 0, 0);
-	if (sl_channel_active(sl_snapshot(ss)))
-		sl_schedule(ss);
+	sl_progress_event(s, 0, 0);
+	if (sl_channel_active(sl_snapshot(s)))
+		sl_schedule(s);
 put:
-	sock_put(&ss->sk);
+	sl_connection_session_put(s);
 }
+void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime, u16 handle, u16 maximum)
+{
+	struct sl_connection_session *s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return NULL;
+	kref_init(&s->refs);
+	s->controller = controller; s->generation = generation; s->lifetime = lifetime; s->handle = handle;
+	spin_lock_init(&s->lock);
+	INIT_DELAYED_WORK(&s->work, sl_work);
+	skb_queue_head_init(&s->channel.tx);
+	skb_queue_head_init(&s->channel.rx);
+	s->channel.local_tcid = SL_CHANNEL_CUTC;
+	s->channel.remote_tcid = SL_CHANNEL_CUTC;
+	s->channel.pi = SPARKLINK_SOCKET_USER_PI;
+	sl_channel_start(&s->progress, min_t(unsigned int, maximum - 5, 2042));
+	s->deadline = jiffies + msecs_to_jiffies(5000);
+	return s;
+}
+void sl_connection_session_stop(void *opaque, int error)
+{
+	unsigned long flags;
+	struct sl_connection_session *s = opaque;
+	struct sock *sk;
 
+	spin_lock_irqsave(&s->lock, flags);
+	sl_channel_close(&s->progress);
+	sl_binding_retire(&s->channel.binding);
+	sk = s->channel.sk;
+	s->channel.sk = NULL;
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (sk) {
+		sl_socket_fault(sk, error);
+		sock_put(sk); /* session's binding reference */
+	}
+	if (cancel_delayed_work_sync(&s->work))
+		sl_connection_session_put(s); /* queued work owned one reference */
+	skb_queue_purge(&s->channel.tx);
+	skb_queue_purge(&s->channel.rx);
+}
 static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int length)
 {
-	struct sl_channel_sock *ss = sl_sk(sock->sk), *other;
+	unsigned long flags;
+	struct sl_socket_binding *binding = sl_sk(sock->sk);
 	struct sockaddr_sparklink *input = (void *)address;
-	u16 maximum;
-	int ret;
+	struct sl_connection_session *s;
+	int ret = 0;
 
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 	if (length != sizeof(*input) || input->family != AF_SPARKLINK || input->version != 1 ||
 	    input->flags || memchr_inv(input->reserved, 0, sizeof(input->reserved)))
 		return -EINVAL;
-	if (input->local_tcid != SL_CHANNEL_CUTC || input->remote_tcid != SL_CHANNEL_CUTC ||
-	    input->pi != SPARKLINK_SOCKET_USER_PI)
+	if (input->local_tcid != SL_CHANNEL_CUTC || input->remote_tcid != SL_CHANNEL_CUTC || input->pi != SPARKLINK_SOCKET_USER_PI)
 		return -EOPNOTSUPP;
-	ret = sparklink_native_acb_limits(input->controller, input->generation, input->lifetime, input->handle, &maximum);
-	if (ret)
+	s = sparklink_native_session_get(input->controller, input->generation, input->lifetime, input->handle, &ret);
+	if (!s)
 		return ret;
-	if (maximum <= 5)
-		return -EOPNOTSUPP;
-	mutex_lock(&sl_channel_registry);
-	if (ss->bound) { ret = -EINVAL; goto out; }
-	if (sl_channel_count >= 64) { ret = -ENOBUFS; goto out; }
-	list_for_each_entry(other, &sl_channel_sockets, entry) {
-		if (other->address.controller == input->controller && other->address.generation == input->generation &&
-		    other->address.lifetime == input->lifetime) { ret = -EADDRINUSE; goto out; }
+	spin_lock_bh(&binding->lock);
+	spin_lock_irqsave(&s->lock, flags);
+	if (binding->session)
+		ret = -EINVAL;
+	else if (!sl_channel_active(s->progress))
+		ret = -ECONNRESET;
+	else if (s->channel.binding.retired)
+		ret = -EOPNOTSUPP; /* no qualified same-life CUTC close/rebind barrier */
+	else if (s->channel.binding.bound)
+		ret = -EADDRINUSE;
+	else {
+		sl_binding_attach(&s->channel.binding);
+		s->channel.sk = sock->sk;
+		sock_hold(sock->sk);
+		binding->session = s; /* transfer caller's session reference */
+		sock->state = SS_CONNECTED;
+		WRITE_ONCE(sock->sk->sk_state, TCP_ESTABLISHED);
 	}
-	ss->address = *input;
-	spin_lock_bh(&ss->state_lock);
-	sl_channel_start(&ss->progress, min_t(unsigned int, maximum - 5, 2042));
-	ss->deadline = jiffies + msecs_to_jiffies(5000);
-	spin_unlock_bh(&ss->state_lock);
-	ss->bound = true;
-	list_add(&ss->entry, &sl_channel_sockets);
-	sl_channel_count++;
-	sock->state = SS_CONNECTED;
-	WRITE_ONCE(sock->sk->sk_state, TCP_ESTABLISHED);
-	sl_schedule(ss);
-	ret = 0;
-out:
-	mutex_unlock(&sl_channel_registry);
+	spin_unlock_irqrestore(&s->lock, flags);
+	spin_unlock_bh(&binding->lock);
+	if (ret)
+		sl_connection_session_put(s);
+	else
+		sl_schedule(s);
 	return ret;
 }
-
+static int sl_can_write(struct sl_connection_session *s)
+{
+	unsigned long flags;
+	int ready;
+	spin_lock_irqsave(&s->lock, flags);
+	ready = !sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding) ||
+		(s->progress.phase == SL_CH_OPEN && sl_binding_space(s->channel.binding, skb_queue_len(&s->channel.tx), SL_CHANNEL_TX));
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ready;
+}
 static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 {
-	struct sl_channel_sock *ss = sl_sk(sock->sk);
-	struct sk_buff *skb;
+	unsigned long flags;
+	struct sl_connection_session *s = sl_binding_session(sock->sk);
+	struct sk_buff *skb = NULL;
 	u8 *p;
 	int ret;
 	long timeout = sock_sndtimeo(sock->sk, msg->msg_flags & MSG_DONTWAIT);
 
-	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL))
-		return -EOPNOTSUPP;
-	if (sl_snapshot(ss).phase == SL_CH_UNBOUND)
+	if (!s)
 		return -ENOTCONN;
-	if (length > sl_snapshot(ss).mtu)
-		return -EMSGSIZE;
-	while (!sl_wait_ready(ss)) {
-		if (!timeout)
-			return -EAGAIN;
-		timeout = wait_event_interruptible_timeout(*sk_sleep(sock->sk), sl_wait_ready(ss), timeout);
-		if (timeout < 0)
-			return timeout;
+	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
+	if (length > sl_snapshot(s).mtu) { ret = -EMSGSIZE; goto put; }
+	while (!sl_can_write(s)) {
+		if (!timeout) { ret = -EAGAIN; goto put; }
+		timeout = wait_event_interruptible_timeout(*sk_sleep(sock->sk), sl_can_write(s), timeout);
+		if (timeout < 0) { ret = timeout; goto put; }
 	}
-
 	skb = alloc_skb(length + 5, GFP_KERNEL);
-	if (!skb)
-		return -ENOMEM;
+	if (!skb) { ret = -ENOMEM; goto put; }
 	p = skb_put(skb, length + 5);
-	p[0] = ss->address.remote_tcid; p[1] = 0; p[2] = (length + 1) & 255; p[3] = (length + 1) >> 8; p[4] = ss->address.pi;
+	p[0] = s->channel.remote_tcid; p[1] = 0; p[2] = (length + 1) & 255; p[3] = (length + 1) >> 8; p[4] = s->channel.pi;
 	ret = memcpy_from_msg(p + 5, msg, length);
-	if (ret) { kfree_skb(skb); return ret; }
-	/* Software admission linearizes with CLOSED/capability changes under
-	 * state_lock -> tx.lock. Driver USB submission has a separate pending
-	 * ticket/reuse review; this lock is never held across transport I/O. */
-	spin_lock_bh(&ss->state_lock);
-	if (ss->progress.phase != SL_CH_OPEN) {
-		ret = sl_channel_active(ss->progress) ? -EAGAIN : -ENOTCONN;
-		goto reject;
+	if (ret)
+		goto put;
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(s->channel.binding))
+		ret = sl_channel_active(s->progress) && sl_binding_live(s->channel.binding) ? -EAGAIN : -ENOTCONN;
+	else if (length > s->channel.mtu)
+		ret = -EMSGSIZE;
+	else {
+		spin_lock(&s->channel.tx.lock);
+		if (!sl_binding_space(s->channel.binding, s->channel.tx.qlen, SL_CHANNEL_TX))
+			ret = -EAGAIN;
+		else {
+			__skb_queue_tail(&s->channel.tx, skb);
+			skb = NULL;
+			ret = length;
+		}
+		spin_unlock(&s->channel.tx.lock);
 	}
-	if (length > ss->progress.mtu) { ret = -EMSGSIZE; goto reject; }
-	spin_lock_bh(&ss->tx.lock);
-	if (ss->tx.qlen >= SL_CHANNEL_QUEUE) {
-		spin_unlock_bh(&ss->tx.lock); ret = -EAGAIN; goto reject;
-	}
-	__skb_queue_tail(&ss->tx, skb);
-	spin_unlock_bh(&ss->tx.lock);
-	spin_unlock_bh(&ss->state_lock);
-	return length;
-reject:
-	spin_unlock_bh(&ss->state_lock);
+	spin_unlock_irqrestore(&s->lock, flags);
+put:
 	kfree_skb(skb);
+	sl_connection_session_put(s);
 	return ret;
 }
-
 static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, int flags)
 {
+	struct sl_connection_session *s = sl_binding_session(sock->sk);
 	struct sk_buff *skb;
-	int error, copied;
+	int error, copied, offset = 0;
 
-	skb = skb_recv_datagram(sock->sk, flags, &error);
-	if (!skb)
-		return error;
+	if (!s)
+		return -ENOTCONN;
+	skb = __skb_recv_datagram(sock->sk, &s->channel.rx, flags, &offset, &error);
+	if (!skb) { copied = error; goto put; }
 	copied = min_t(size_t, length, skb->len);
 	if (copied < skb->len)
 		msg->msg_flags |= MSG_TRUNC;
@@ -321,62 +505,82 @@ static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, in
 	if (!error && flags & MSG_TRUNC)
 		copied = skb->len;
 	skb_free_datagram(sock->sk, skb);
-	return error ? error : copied;
+	if (error)
+		copied = error;
+put:
+	sl_connection_session_put(s);
+	return copied;
 }
-
 static __poll_t sl_poll(struct file *file, struct socket *sock, poll_table *wait)
 {
-	struct sl_channel_sock *ss = sl_sk(sock->sk);
-	struct sl_channel_progress state;
+	unsigned long flags;
+	struct sl_connection_session *s;
 	__poll_t mask = 0;
 
 	sock_poll_wait(file, sock, wait);
-	state = sl_snapshot(ss);
-	if (!sl_channel_active(state))
+	s = sl_binding_session(sock->sk);
+	if (!s)
 		return EPOLLERR | EPOLLHUP;
-	if (!skb_queue_empty(&sock->sk->sk_receive_queue))
-		mask |= EPOLLIN | EPOLLRDNORM;
-	if (state.phase == SL_CH_OPEN && skb_queue_len(&ss->tx) < SL_CHANNEL_QUEUE)
-		mask |= EPOLLOUT | EPOLLWRNORM;
+	spin_lock_irqsave(&s->lock, flags);
+	if (!sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding))
+		mask = EPOLLERR | EPOLLHUP;
+	else {
+		if (!skb_queue_empty(&s->channel.rx))
+			mask |= EPOLLIN | EPOLLRDNORM;
+		if (s->progress.phase == SL_CH_OPEN && sl_binding_space(s->channel.binding, skb_queue_len(&s->channel.tx), SL_CHANNEL_TX))
+			mask |= EPOLLOUT | EPOLLWRNORM;
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	sl_connection_session_put(s);
 	return mask;
 }
-
+static int sl_drained(struct sl_connection_session *s)
+{
+	unsigned long flags;
+	int drained;
+	spin_lock_irqsave(&s->lock, flags);
+	drained = !sl_channel_active(s->progress) || (skb_queue_empty(&s->channel.tx) && !s->channel.binding.busy);
+	spin_unlock_irqrestore(&s->lock, flags);
+	return drained;
+}
 static int sl_release(struct socket *sock)
 {
-	struct sock *sk = sock->sk;
-	struct sl_channel_sock *ss;
+	unsigned long flags;
+	struct sock *sk = sock->sk, *held = NULL;
+	struct sl_socket_binding *binding;
+	struct sl_connection_session *s;
 
 	if (!sk)
 		return 0;
-	ss = sl_sk(sk);
-	/* Explicit finite linger drains admitted software TX through the real
-	 * driver. It does not invent controller completion or peer delivery.
-	 * Without linger (or after its bound), close discards unsent packets.
-	 */
-	if (ss->bound && sock_flag(sk, SOCK_LINGER) && sk->sk_lingertime &&
-	    sl_channel_active(sl_snapshot(ss)))
-		wait_event_interruptible_timeout(*sk_sleep(sk),
-			!sl_channel_active(sl_snapshot(ss)) || skb_queue_empty(&ss->tx),
-			min_t(long, sk->sk_lingertime, msecs_to_jiffies(5000)));
-	mutex_lock(&sl_channel_registry);
-	spin_lock_bh(&ss->state_lock);
-	sl_channel_close(&ss->progress);
-	spin_unlock_bh(&ss->state_lock);
-	if (ss->bound) {
-		list_del(&ss->entry);
-		sl_channel_count--;
+	binding = sl_sk(sk);
+	s = sl_binding_session(sk);
+	if (s && sock_flag(sk, SOCK_LINGER) && sk->sk_lingertime)
+		wait_event_interruptible_timeout(*sk_sleep(sk), sl_drained(s), min_t(long, sk->sk_lingertime, msecs_to_jiffies(5000)));
+	spin_lock_bh(&binding->lock);
+	binding->session = NULL;
+	if (s) {
+		spin_lock_irqsave(&s->lock, flags);
+		if (s->channel.sk == sk) {
+			held = s->channel.sk;
+			s->channel.sk = NULL;
+			sl_binding_retire(&s->channel.binding);
+		}
+		spin_unlock_irqrestore(&s->lock, flags);
 	}
-	mutex_unlock(&sl_channel_registry);
-	if (cancel_delayed_work_sync(&ss->work))
-		sock_put(sk); /* pending worker owned one reference */
-	skb_queue_purge(&ss->tx); /* unsent packets never reserved controller credit */
-	skb_queue_purge(&sk->sk_receive_queue);
+	spin_unlock_bh(&binding->lock);
+	if (s) {
+		skb_queue_purge(&s->channel.tx);
+		skb_queue_purge(&s->channel.rx);
+		if (held)
+			sock_put(held);
+		sl_connection_session_put(s); /* binding ownership */
+		sl_connection_session_put(s); /* temporary operation reference */
+	}
 	sock_orphan(sk);
 	sock->sk = NULL;
 	sock_put(sk);
 	return 0;
 }
-
 static const struct proto_ops sl_channel_ops = {
 	.family = PF_SPARKLINK, .owner = THIS_MODULE, .release = sl_release,
 	.bind = sl_bind, .connect = sock_no_connect, .socketpair = sock_no_socketpair,
@@ -384,16 +588,13 @@ static const struct proto_ops sl_channel_ops = {
 	.ioctl = sock_no_ioctl, .listen = sock_no_listen, .shutdown = sock_no_shutdown,
 	.sendmsg = sl_sendmsg, .recvmsg = sl_recvmsg, .mmap = sock_no_mmap,
 };
-
 static struct proto sl_channel_proto = {
-	.name = "SPARKLINK", .owner = THIS_MODULE, .obj_size = sizeof(struct sl_channel_sock),
+	.name = "SPARKLINK", .owner = THIS_MODULE, .obj_size = sizeof(struct sl_socket_binding),
 };
-
 static int sl_create(struct net *net, struct socket *sock, int protocol, int kern)
 {
 	struct sock *sk;
-	struct sl_channel_sock *ss;
-
+	struct sl_socket_binding *binding;
 	if (!net_eq(net, &init_net))
 		return -EAFNOSUPPORT;
 	if (sock->type != SOCK_DGRAM || protocol)
@@ -403,23 +604,17 @@ static int sl_create(struct net *net, struct socket *sock, int protocol, int ker
 		return -ENOMEM;
 	sock_init_data(sock, sk);
 	sock->ops = &sl_channel_ops;
-	ss = sl_sk(sk);
-	memset((u8 *)ss + sizeof(*sk), 0, sizeof(*ss) - sizeof(*sk));
-	spin_lock_init(&ss->state_lock);
-	skb_queue_head_init(&ss->tx);
-	INIT_LIST_HEAD(&ss->entry);
-	INIT_DELAYED_WORK(&ss->work, sl_work);
+	binding = sl_sk(sk);
+	spin_lock_init(&binding->lock);
+	binding->session = NULL;
 	return 0;
 }
-
 static const struct net_proto_family sl_family = {
 	.family = PF_SPARKLINK, .create = sl_create, .owner = THIS_MODULE,
 };
-
 int sl_channel_socket_init(void)
 {
 	int ret = proto_register(&sl_channel_proto, 0);
-
 	if (ret)
 		return ret;
 	ret = sock_register(&sl_family);
@@ -427,7 +622,6 @@ int sl_channel_socket_init(void)
 		proto_unregister(&sl_channel_proto);
 	return ret;
 }
-
 void sl_channel_socket_exit(void)
 {
 	sock_unregister(PF_SPARKLINK);

@@ -46,7 +46,7 @@ def run(output):
         subprocess.run([str(tmp/'test')], check=True,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=1', UBSAN_OPTIONS='halt_on_error=1'))
     assert all(p.read_bytes() == b for p, b in inputs.items())
-    result = {'status': 'WS73_ACTUAL_TICKET_DRIVER_FAULTS_PASS', 'cases': 10,
+    result = {'status': 'WS73_ACTUAL_TICKET_DRIVER_FAULTS_PASS', 'cases': 11,
               'scope': 'actual C preparation/atomic submit/completion/finite wait/kill/join bodies + wire codec; USB/lock/time are explicit dependencies',
               'physical_acceptance': False, 'whole_ticket_proof': False,
               'production_bodies_sha256': hashlib.sha256(code.encode()).hexdigest(),
