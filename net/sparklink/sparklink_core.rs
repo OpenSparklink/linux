@@ -1099,6 +1099,7 @@ struct DebugfsHolder {
 
 #[pin_data]
 struct SparkLinkModule {
+    _channel: ChannelGuard,
     #[pin]
     _miscdev: MiscDeviceRegistration<SparkLinkCtl>,
     _debugfs_holder: Pin<KBox<DebugfsHolder>>,
@@ -1271,6 +1272,25 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
     )
 }
 
+extern "C" {
+    fn sl_channel_socket_init() -> i32;
+    fn sl_channel_socket_exit();
+}
+struct ChannelGuard;
+impl ChannelGuard {
+    fn new() -> Result<Self> {
+        // SAFETY: once-only core initialization; C owns family registration.
+        let result = unsafe { sl_channel_socket_init() };
+        if result < 0 { Err(Error::from_errno(result)) } else { Ok(Self) }
+    }
+}
+impl Drop for ChannelGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns the successful family registration.
+        unsafe { sl_channel_socket_exit() };
+    }
+}
+
 impl kernel::InPlaceModule for SparkLinkModule {
     fn init(_module: &'static ThisModule) -> impl PinInit<Self, Error> {
         pr_info!("sparklink: initialising SparkLink subsystem v0.3.0\n");
@@ -1285,6 +1305,7 @@ impl kernel::InPlaceModule for SparkLinkModule {
         let options = MiscDeviceOptions { name: c"sparklink" };
 
         try_pin_init!(Self {
+            _channel: ChannelGuard::new()?,
             _miscdev <- MiscDeviceRegistration::register(options),
             _debugfs_holder: init_debugfs()?,
             _genl: genl_bridge::GenlGuard::new()?,

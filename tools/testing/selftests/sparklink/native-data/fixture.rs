@@ -118,6 +118,7 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
  assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,0]),0);assert_eq!(send(0,7,1,0,&[7]),-11);
  assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,2]),0);assert_eq!(send(0,7,1,0,&[7]),0);
  assert!(a.commands.borrow().is_empty());assert_eq!(a.data.lock().completion_errors,1);
+ assert_eq!(a.data.lock().credits.maximum(),Ok(254));
 }
 #[test] fn actual_completion_before_usb_return_is_accounted_and_old_debt_blocks_reuse(){
  let(a,_)=setup();link(&a,0,1);EARLY_COMPLETE.with(|e|*e.borrow_mut()=true);

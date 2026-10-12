@@ -649,6 +649,31 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
 
 /// Internal channel entry point. The old handle-only trait stays unsupported.
 #[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_acb_limits_rust(
+    id: u16, generation: u64, lifetime: u64, handle: u16, maximum: *mut u16,
+) -> i32 {
+    if maximum.is_null() { return EINVAL.to_errno(); }
+    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let host = owner.host.lock();
+    let (_, known, links) = host.link_snapshot();
+    let data = owner.data.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return ENODEV.to_errno(); }
+    if !known { return EAGAIN.to_errno(); }
+    if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
+        return -(kernel::bindings::ESTALE as i32);
+    }
+    match data.credits.maximum() {
+        Ok(value) => {
+            // SAFETY: internal caller provides a writable kernel u16 for this call.
+            unsafe { *maximum = value }; 0
+        }
+        Err(error) => super::sle_native_data::error(error).to_errno(),
+    }
+}
+
+/// Internal channel entry point. The old handle-only trait stays unsupported.
+#[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
 ) -> i32 {

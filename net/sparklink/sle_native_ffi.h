@@ -18,6 +18,8 @@ int sparklink_native_acb_send_rust(u16 id, u64 generation, u64 lifetime, u16 han
 				 const u8 *data, size_t length);
 int sparklink_native_acb_take_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
 				 u8 *data, size_t capacity, size_t *length);
+int sparklink_native_acb_limits_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+				   u16 *maximum);
 int sparklink_native_event_rust(u16 id, u64 generation, u32 profile, u16 event_code,
 				const u8 *params, size_t length);
 

@@ -3,6 +3,7 @@
 TEST_GEN_PROGS := sparklink_test ws73_bsle_test ws73_dli_test ws73_discovery_test
 TEST_GEN_PROGS += ws73_recovery_test
 TEST_GEN_PROGS += ws73_acb_test
+TEST_GEN_PROGS += sle_channel_wire_test
 TEST_GEN_PROGS_EXTENDED := sparklink_runtime_test ws73_native_runtime_test sparklink_host_plan_test sparklink_discovery_operation_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_tx_fault_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_open_test
@@ -22,6 +23,9 @@ TEST_PROGS += run_usb_firmware.py
 TEST_PROGS += run_usb_discovery.py
 
 include ../lib.mk
+
+$(OUTPUT)/sle_channel_wire_test: sle_channel_wire_test.c ../../../../net/sparklink/sle_channel_wire.c ../../../../net/sparklink/sle_channel_wire.h
+	$(CC) $(CFLAGS) $< ../../../../net/sparklink/sle_channel_wire.c $(LDLIBS) -o $@
 
 $(OUTPUT)/ws73_acb_test: ws73_acb_test.c ../../../../drivers/sparklink/ws73/wire.c ../../../../drivers/sparklink/ws73/wire.h
 	$(CC) $(CFLAGS) $< ../../../../drivers/sparklink/ws73/wire.c $(LDLIBS) -o $@

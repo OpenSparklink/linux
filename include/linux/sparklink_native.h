@@ -100,6 +100,8 @@ int sparklink_native_acb_send(u16 id, u64 generation, u64 lifetime, u16 handle,
 			    const u8 *data, size_t length);
 int sparklink_native_acb_take(u16 id, u64 generation, u64 lifetime, u16 handle,
 			    u8 *data, size_t capacity, size_t *length);
+int sparklink_native_acb_limits(u16 id, u64 generation, u64 lifetime, u16 handle,
+			      u16 *maximum);
 
 /* Publish exact driver-validated native event parameters. IRQ-safe; copies
  * into the attributed owner's bounded log before returning. No pointer is

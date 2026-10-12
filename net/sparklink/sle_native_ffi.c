@@ -217,6 +217,12 @@ int sparklink_native_acb_take(u16 id, u64 generation, u64 lifetime, u16 handle,
 }
 EXPORT_SYMBOL_GPL(sparklink_native_acb_take);
 
+int sparklink_native_acb_limits(u16 id, u64 generation, u64 lifetime, u16 handle,
+			      u16 *maximum)
+{
+	return sparklink_native_acb_limits_rust(id, generation, lifetime, handle, maximum);
+}
+
 int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t length)
 {
 	return sparklink_native_receive_rust(id, generation, data, length);

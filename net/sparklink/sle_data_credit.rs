@@ -20,6 +20,11 @@ pub(crate) struct DataCredits {
 }
 
 impl DataCredits {
+    pub(crate) fn maximum(&self) -> Result<u16, CreditError> {
+        if self.uncertain { return Err(CreditError::Fault); }
+        if self.maximum == 0 || self.capacity == 0 { return Err(CreditError::Unsupported); }
+        Ok(self.maximum)
+    }
     pub(crate) const fn new(maximum: u16, capacity: u8) -> Self {
         Self { maximum, capacity, outstanding: 0, debts: [None; LINKS], uncertain: false }
     }
