@@ -11,7 +11,7 @@ int main(void)
 {
 	unsigned char out[2300], data[2048];
 	const unsigned char *payload;
-	unsigned int handle;
+	unsigned int handle, boundary;
 	size_t size, i;
 	int n;
 
@@ -38,6 +38,16 @@ int main(void)
 	handle = 0xdead; payload = data; size = 777;
 	CHECK(ws73_wire_acb_decode(out + 68, 2052, 2047, &handle, &payload, &size) == -EOPNOTSUPP);
 	CHECK(handle == 0xdead && payload == data && size == 777);
+	CHECK(ws73_wire_acb_fragment_decode(out + 68, 2052, 2047, &handle, &boundary, &payload, &size) == 0);
+	CHECK(handle == 0xfff && boundary == 1 && size == 2047);
+	out[70] = 0xaf; /* priority=1, middle, handle=0xfff */
+	CHECK(ws73_wire_acb_fragment_decode(out + 68, 2052, 2047, &handle, &boundary, &payload, &size) == 0);
+	CHECK(handle == 0xfff && boundary == 2);
+	out[70] = 0x3f;
+	CHECK(ws73_wire_acb_fragment_decode(out + 68, 2052, 2047, &handle, &boundary, &payload, &size) == 0);
+	CHECK(boundary == 3);
+	out[70] = 0x4f;
+	CHECK(ws73_wire_acb_fragment_decode(out + 68, 2052, 2047, &handle, &boundary, &payload, &size) == -EOPNOTSUPP);
 	CHECK(ws73_wire_acb(out, sizeof(out), 1, 0x1000, 254, data, 1) == -EINVAL);
 	CHECK(ws73_wire_acb(out, 127, 1, 0, 254, data, 1) == -EMSGSIZE);
 	CHECK(ws73_wire_acb(out, sizeof(out), 1, 0, 0, data, 1) == -EINVAL);

@@ -574,9 +574,15 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
     let event = u16::from_le_bytes([packet[1], packet[2]]);
     let count = u16::from_le_bytes([packet[3], packet[4]]) as usize;
     if packet[0] == 0xa3 {
-        if event & 0xf000 != 0 || count == 0 || count != length - 5 { return PROTOCOL_ERROR; }
+        if count == 0 || count != length - 5 { return PROTOCOL_ERROR; }
+        if event & 0x4000 != 0 { return UNSUPPORTED; }
+        let boundary = ((event >> 12) & 3) as u8;
+        let handle = event & 0x0fff;
+        // SAFETY: monotonic read-only kernel clock; deadline never refreshed by continuations.
+        let now = unsafe { kernel::bindings::ktime_get_boottime() } as u64;
         // Copy before acquiring IRQ-safe Host/data/gate locks.
         let mut bytes = KVec::new();
+        if boundary == 1 && bytes.reserve(super::sle_native_data::MAXIMUM, GFP_ATOMIC).is_err() { return ENOMEM.to_errno(); }
         if bytes.extend_from_slice(&packet[5..], GFP_ATOMIC).is_err() { return ENOMEM.to_errno(); }
         let host = owner.host.lock();
         let (_, known, links) = host.link_snapshot();
@@ -584,15 +590,16 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         let gate = owner.schedule_gate.lock();
         if *gate { return ENODEV.to_errno(); }
         let retired = if known { Some(data.reconcile(&links)) } else { None };
-        let link = if known { links.iter().flatten().find(|link| link.handle == event) } else { None };
+        let link = if known { links.iter().flatten().find(|link| link.handle == handle) } else { None };
         if let Some(link) = link {
-            let _ = data.push(super::sle_native_data::Packet { lifetime: link.lifetime, handle: event, bytes });
+            let _ = data.receive(super::sle_native_data::Packet { lifetime: link.lifetime, handle, bytes }, boundary, now);
         } else {
             data.dropped = data.dropped.saturating_add(1);
         }
         drop(gate); drop(data); drop(host);
         drop(retired);
         owner.data_poll.notify_all();
+        owner.schedule_rx(0);
         return 0; // bounded ingress drop is not a USB/device recovery request
     }
     if length > 260 { return PROTOCOL_ERROR; }

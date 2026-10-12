@@ -29,3 +29,11 @@ matching counts settle it; neither Down nor USB success invents a credit.
 Uncertain accounting stops data transmission for that controller generation.
 It does not change command credit or reset another controller. Hardware debt
 clearing and nonmanual recovery are unqualified; related issues remain open.
+
+SDK111 real VM142 produced a 28-byte PB-first fragment for a 62-byte SDU,
+despite queried TX capacity 254. RX now reassembles PB-first/middle/last per
+registration/lifetime/handle, up to 2047 bytes, with a five-second absolute
+deadline reclaimed by the per-controller heartbeat. First ingress reserves
+the whole buffer outside IRQ locks; continuation cannot grow beyond it.
+Expired, oversized, orphan or old-lifetime fragments never become complete
+data or return a TX credit. Valid PB/priority flags are not USB/device faults.

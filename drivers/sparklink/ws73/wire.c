@@ -156,13 +156,13 @@ int ws73_wire_acb(unsigned char *out, size_t capacity, unsigned int sequence,
 	return total;
 }
 
-int ws73_wire_acb_decode(const unsigned char *data, size_t size,
+int ws73_wire_acb_fragment_decode(const unsigned char *data, size_t size,
 			unsigned int maximum, unsigned int *handle,
-			const unsigned char **payload, size_t *payload_size)
+			unsigned int *boundary, const unsigned char **payload, size_t *payload_size)
 {
 	unsigned int length, identity;
 
-	if (!data || !handle || !payload || !payload_size ||
+	if (!data || !handle || !boundary || !payload || !payload_size ||
 	    !maximum || maximum > 2047)
 		return -EINVAL;
 	if (size < 5 || data[0] != 0xa3)
@@ -171,14 +171,37 @@ int ws73_wire_acb_decode(const unsigned char *data, size_t size,
 	identity = wire_u16(data + 1);
 	if (!length || length != size - 5 || length > maximum)
 		return -EPROTO;
-	/* Reject fragment/high-bit modes until their stateful path is connected.
-	 * Do not reinterpret an unsupported fragment as an independent SDU.
+	/* Bit 14 is reserved; PB and priority are independent of the handle.
+	 * Core reassembles PB fragments, never treats them as complete SDUs.
 	 */
-	if (identity & 0xf000)
+	if (identity & 0x4000)
 		return -EOPNOTSUPP;
-	*handle = identity;
+	*handle = identity & 0x0fff;
+	*boundary = (identity >> 12) & 3;
 	*payload = data + 5;
 	*payload_size = length;
+	return 0;
+}
+
+int ws73_wire_acb_decode(const unsigned char *data, size_t size,
+			unsigned int maximum, unsigned int *handle,
+			const unsigned char **payload, size_t *payload_size)
+{
+	unsigned int identity, boundary;
+	const unsigned char *bytes;
+	size_t count;
+	int ret;
+
+	if (!handle || !payload || !payload_size)
+		return -EINVAL;
+	ret = ws73_wire_acb_fragment_decode(data, size, maximum, &identity, &boundary, &bytes, &count);
+	if (ret)
+		return ret;
+	if (boundary)
+		return -EOPNOTSUPP;
+	*handle = identity;
+	*payload = bytes;
+	*payload_size = count;
 	return 0;
 }
 

@@ -32,7 +32,7 @@ int ws73_wire_pm(unsigned char *out, size_t capacity, unsigned int sequence,
 int ws73_wire_command(unsigned char *out, size_t capacity, unsigned int sequence,
 		      unsigned int opcode, const unsigned char *params, size_t size);
 
-/* Full ACB SDU only. Handle is a connection handle, never a TCID.
+/* TX full ACB SDU only. Handle is a connection handle, never a TCID.
  * Payload is an opaque DTAP SDU; channel framing belongs above this codec.
  * These helpers do not grant data credit or claim controller acceptance.
  */
@@ -42,6 +42,10 @@ int ws73_wire_acb(unsigned char *out, size_t capacity, unsigned int sequence,
 int ws73_wire_acb_decode(const unsigned char *data, size_t size,
 			unsigned int maximum, unsigned int *handle,
 			const unsigned char **payload, size_t *payload_size);
+int ws73_wire_acb_fragment_decode(const unsigned char *data, size_t size,
+			unsigned int maximum, unsigned int *handle,
+			unsigned int *boundary, const unsigned char **payload,
+			size_t *payload_size);
 
 typedef int (*ws73_wire_consumer)(void *context, unsigned int service,
 				 unsigned int queue, const unsigned char *payload,

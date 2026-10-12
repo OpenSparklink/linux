@@ -695,11 +695,15 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 					      report.header, size - 5);
 	}
 	if (size && data[0] == 0xa3) {
-		unsigned int handle;
+		unsigned int handle, boundary;
 		const unsigned char *payload;
 		size_t payload_size;
 
-		ret = ws73_wire_acb_decode(data, size, 2047, &handle, &payload, &payload_size);
+		ret = ws73_wire_acb_fragment_decode(data, size, 2047, &handle, &boundary, &payload, &payload_size);
+		if (ret == -EOPNOTSUPP) {
+			atomic_inc(&ws->unsupported_rx);
+			return 0; /* unsupported reserved mode is not a USB transport fault */
+		}
 		if (ret)
 			return ret;
 	}

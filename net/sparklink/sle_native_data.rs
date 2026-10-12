@@ -17,6 +17,7 @@ pub(crate) struct Packet {
 pub(crate) struct NativeData {
     pub(crate) credits: DataCredits,
     packets: [Option<Packet>; RX_PACKETS],
+    partial: [Option<(Packet, u64)>; RX_PACKETS],
     pub(crate) dropped: u64,
     pub(crate) completion_errors: u64,
 }
@@ -24,7 +25,55 @@ pub(crate) struct NativeData {
 impl NativeData {
     pub(crate) fn new(maximum: u16, capacity: u8) -> Self {
         Self { credits: DataCredits::new(maximum, capacity),
-            packets: [const { None }; RX_PACKETS], dropped: 0, completion_errors: 0 }
+            packets: [const { None }; RX_PACKETS], partial: [const { None }; RX_PACKETS],
+            dropped: 0, completion_errors: 0 }
+    }
+
+    pub(crate) fn expire(&mut self, now: u64) {
+        for partial in &mut self.partial {
+            if partial.as_ref().is_some_and(|(_, deadline)| now >= *deadline) {
+                *partial = None;
+                self.dropped = self.dropped.saturating_add(1);
+            }
+        }
+    }
+
+    /// First fragments reserve the entire bounded buffer before IRQ locks.
+    /// Continuations can only copy into already allocated spare capacity.
+    pub(crate) fn receive(&mut self, packet: Packet, boundary: u8, now: u64) -> Result {
+        self.expire(now);
+        let existing = self.partial.iter().position(|p| p.as_ref().is_some_and(|(p, _)|
+            p.handle == packet.handle && p.lifetime == packet.lifetime));
+        if boundary <= 1 {
+            if let Some(index) = existing {
+                self.partial[index] = None;
+                self.dropped = self.dropped.saturating_add(1);
+            }
+            if boundary == 0 { return self.push(packet); }
+            if packet.bytes.capacity() < MAXIMUM { return Err(EINVAL); }
+            let Some(index) = self.partial.iter().position(Option::is_none) else {
+                self.dropped = self.dropped.saturating_add(1);
+                return Err(Error::from_errno(-(kernel::bindings::ENOBUFS as i32)));
+            };
+            self.partial[index] = Some((packet, now.saturating_add(5_000_000_000)));
+            return Ok(());
+        }
+        let Some(index) = existing else {
+            self.dropped = self.dropped.saturating_add(1); return Err(EINVAL);
+        };
+        let current = self.partial[index].as_mut().unwrap();
+        if current.0.bytes.len() + packet.bytes.len() > MAXIMUM {
+            self.partial[index] = None;
+            self.dropped = self.dropped.saturating_add(1);
+            return Err(Error::from_errno(-(kernel::bindings::EMSGSIZE as i32)));
+        }
+        // Capacity was reserved at first-fragment ingress, so this cannot allocate.
+        if current.0.bytes.extend_from_slice(&packet.bytes, GFP_ATOMIC).is_err() { return Err(ENOMEM); }
+        if boundary == 3 {
+            let (complete, _) = self.partial[index].take().unwrap();
+            self.push(complete)?;
+        }
+        Ok(())
     }
 
     /// Already copied outside IRQ-safe locks; packet/byte limits are fixed.
@@ -58,6 +107,13 @@ impl NativeData {
     /// Return retired buffers so their allocations are freed after IRQ locks.
     /// Keep queue order; the latest canonical table is the only lifetime source.
     pub(crate) fn reconcile(&mut self, links: &[Option<super::sle_link_observation::Link>; 16]) -> [Option<Packet>; RX_PACKETS] {
+        for partial in &mut self.partial {
+            if partial.as_ref().is_some_and(|(packet, _)| !links.iter().flatten().any(|link|
+                link.handle == packet.handle && link.lifetime == packet.lifetime)) {
+                // kfree is IRQ-safe; no allocation or I/O on link retirement.
+                *partial = None;
+            }
+        }
         let mut retired = [const { None }; RX_PACKETS];
         let mut kept = 0;
         let mut removed = 0;

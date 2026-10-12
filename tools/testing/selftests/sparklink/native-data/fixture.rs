@@ -12,14 +12,18 @@ pub type Result<T=()> = std::result::Result<T, Error>;
 pub const EINVAL:Error=Error(-22);pub const ENODEV:Error=Error(-19);pub const EAGAIN:Error=Error(-11);
 pub const EMSGSIZE:Error=Error(-90);pub const EIO:Error=Error(-5);pub const ENOBUFS:Error=Error(-105);
 pub const ENOMEM:Error=Error(-12);pub const EOVERFLOW:Error=Error(-75);pub const GFP_ATOMIC:()=();
-pub mod bindings {pub const EPROTO:i32=71;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;}
-pub mod prelude {pub use crate::{Error,Result,KVec,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO};}
+pub mod bindings {pub const EPROTO:i32=71;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
+pub unsafe fn ktime_get_boottime()->i64{super::NOW.with(|n|*n.borrow() as i64)}}
+pub mod prelude {pub use crate::{Error,Result,KVec,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO,ENOMEM,GFP_ATOMIC};}
 #[derive(Debug)] pub struct KVec<T>(Vec<T>);
 impl<T> KVec<T> {
  fn new()->Self{Self(Vec::new())}
  fn len(&self)->usize{self.0.len()}
  fn as_ptr(&self)->*const T{self.0.as_ptr()}
+ fn capacity(&self)->usize{self.0.capacity()}
+ fn reserve(&mut self,n:usize,_:())->Result{self.0.reserve(n);Ok(())}
 }
+impl<T> std::ops::Deref for KVec<T>{type Target=[T];fn deref(&self)->&[T]{&self.0}}
 impl<T:Clone> KVec<T> {fn extend_from_slice(&mut self,v:&[T],_:())->Result{self.0.extend_from_slice(v);Ok(())}}
 #[path="sle_link_observation.rs"] mod sle_link_observation;
 #[path="sle_data_credit.rs"] mod sle_data_credit;
@@ -48,6 +52,7 @@ impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Ws73(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
 })}}
+impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
 #[derive(Debug)] enum SleEvent{
  CommandCredits{credits:u8},
  NativeCommandReply{opcode:u16,command_credits:u8,status:u8,complete:bool,data:KVec<u8>},
@@ -58,6 +63,7 @@ thread_local!{
  static TX:RefCell<Vec<(usize,u16,Vec<u8>)>>=const{RefCell::new(Vec::new())};
  static TX_RESULT:RefCell<i32>=const{RefCell::new(0)};
  static EARLY_COMPLETE:RefCell<bool>=const{RefCell::new(false)};
+ static NOW:RefCell<u64>=const{RefCell::new(1)};
 }
 mod sle_usb{use super::*;
  pub fn ingress_owner(id:DeviceIdentity)->Option<Rc<Owner>>{OWNERS.with(|o|o.borrow().iter().find(|o|o.identity==id).cloned())}
@@ -78,7 +84,7 @@ mod under_test{use super::*;
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
  OWNERS.with(|o|*o.borrow_mut()=vec![a.clone(),b.clone()]);TX.with(|t|t.borrow_mut().clear());
- TX_RESULT.with(|r|*r.borrow_mut()=0);EARLY_COMPLETE.with(|e|*e.borrow_mut()=false);(a,b)}
+ TX_RESULT.with(|r|*r.borrow_mut()=0);EARLY_COMPLETE.with(|e|*e.borrow_mut()=false);NOW.with(|n|*n.borrow_mut()=1);(a,b)}
 fn link(owner:&Owner,handle:u16,kind:u32){owner.host.lock().links.observe(&LinkEvidence{kind,status:0,handle:handle as u32,role:1,address_type:0,address:[1;6],reserved:[0;2]});}
 fn receive(id:u16,g:u64,bytes:&[u8])->i32{unsafe{under_test::sparklink_native_receive_rust(id,g,bytes.as_ptr(),bytes.len())}}
 fn send(id:u16,g:u64,life:u64,handle:u16,bytes:&[u8])->i32{unsafe{under_test::sparklink_native_acb_send_rust(id,g,life,handle,bytes.as_ptr(),bytes.len())}}
@@ -122,13 +128,37 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
 }
 #[test] fn malformed_or_uncertain_data_never_refills_or_becomes_success(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
- for p in [vec![0xa3,0,0,2,0,1],vec![0xa3,0,0x10,1,0,1],vec![0xa2,9,0,2,0,0,0]]{assert_eq!(receive(0,7,&p),-71)}
+ for p in [vec![0xa3,0,0,2,0,1],vec![0xa2,9,0,2,0,0,0]]{assert_eq!(receive(0,7,&p),-71)}
+ assert_eq!(receive(0,7,&[0xa3,0,0x40,1,0,1]),-95);
  assert_eq!(send(0,7,1,0,&[1]),0);assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,2]),0);
  assert_eq!(send(0,7,1,0,&[1]),-5);assert_eq!(send(1,8,1,0,&[1]),0);
  let(a,_)=setup();link(&a,0,1);TX_RESULT.with(|r|*r.borrow_mut()=-110);
  assert_eq!(send(0,7,1,0,&[1]),-110);TX_RESULT.with(|r|*r.borrow_mut()=0);
  assert_eq!(send(0,7,1,0,&[1]),-5);
  *a.schedule_gate.lock()=true;assert_eq!(send(0,7,1,0,&[1]),-19);
+}
+#[test] fn actual_fragments_reassemble_without_crossing_controllers(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ assert_eq!(receive(0,7,&acb(0x1000,b"first")),0);
+ assert_eq!(receive(1,8,&acb(0x1000,b"other")),0);
+ assert_eq!(take(0,7,1,0,20).0,-11);
+ assert_eq!(receive(0,7,&acb(0x2000,b"middle")),0);
+ assert_eq!(receive(1,8,&acb(0x3000,b"last")),0);
+ assert_eq!(receive(0,7,&acb(0x3000,b"last")),0);
+ assert_eq!(take(0,7,1,0,20),(0,b"firstmiddlelast".to_vec()));
+ assert_eq!(take(1,8,1,0,20),(0,b"otherlast".to_vec()));
+ assert!(a.commands.borrow().is_empty());
+}
+#[test] fn stale_expired_oversized_and_orphan_fragments_do_not_deliver_or_refill(){
+ let(a,_)=setup();link(&a,0,1);
+ assert_eq!(receive(0,7,&acb(0x3000,b"orphan")),0);assert_eq!(take(0,7,1,0,20).0,-11);
+ receive(0,7,&acb(0x1000,b"old"));link(&a,0,2);link(&a,0,1);
+ receive(0,7,&acb(0x3000,b"wrong life"));assert_eq!(take(0,7,3,0,20).0,-11);
+ receive(0,7,&acb(0x1000,b"timeout"));NOW.with(|n|*n.borrow_mut()=5_000_000_002);
+ receive(0,7,&acb(0x3000,b"late"));assert_eq!(take(0,7,3,0,20).0,-11);
+ receive(0,7,&acb(0x1000,&[1;2040]));receive(0,7,&acb(0x3000,&[1;8]));
+ assert_eq!(take(0,7,3,0,2047).0,-11);
+ assert_eq!(send(0,7,3,0,b"still live"),0);
 }
 #[test] fn existing_management_frames_still_delegate_without_data_credit(){
  let(a,_)=setup();

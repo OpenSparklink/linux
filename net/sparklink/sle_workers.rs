@@ -577,6 +577,9 @@ impl WorkItem<0> for ControllerRuntime {
             return;
         }
         let mut pumped = 0u32;
+        // Reclaim incomplete native SDUs even when no later USB data arrives.
+        // SAFETY: read-only monotonic clock; buffer destruction is IRQ-safe.
+        this.data.lock().expire(unsafe { kernel::bindings::ktime_get_boottime() } as u64);
         let mut rearm_jiffies = msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS) as u64;
         let mut batch = new_event_batch().ok();
         let drops = sle_usb::take_dropped_stats(&this);
