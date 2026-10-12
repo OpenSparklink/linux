@@ -22,6 +22,8 @@ static bool irq_disabled;
 #define spin_lock_irqsave(l,f) do{(f)=irq_disabled;irq_disabled=true;assert(!(l)->held);(l)->held=true;}while(0)
 #define spin_unlock_irqrestore(l,f) do{assert((l)->held);(l)->held=false;irq_disabled=(f);}while(0)
 static void spin_lock(spinlock_t *l){assert(irq_disabled&&!l->held);l->held=true;}
+static void spin_lock_bh(spinlock_t *l){assert(irq_disabled&&!l->held);l->held=true;}
+static void spin_unlock_bh(spinlock_t *l){assert(l->held);l->held=false;}
 static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 #define min(a,b) ((a)<(b)?(a):(b))
 #define min_t(t,a,b) ((t)min(a,b))
@@ -31,7 +33,7 @@ static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 struct sock;
 struct sk_buff {struct sock *owner;struct sk_buff *next;unsigned int len,truesize,users;u8 data[2047];};
 struct sk_buff_head {spinlock_t lock;unsigned int qlen;struct sk_buff *head,*tail,*prev;};
-struct sock {unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err;void (*sk_data_ready)(struct sock *);};
+struct sock {unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state;void (*sk_data_ready)(struct sock *);};
 struct kref {unsigned int refs;};
 struct delayed_work {int unused;};
 static unsigned int allocations,submitted;
@@ -52,7 +54,10 @@ static struct sl_channel_progress sl_snapshot(struct sl_connection_session *s){r
 static void sl_progress_event(struct sl_connection_session *s,unsigned int event,unsigned int mtu){(void)s;(void)event;(void)mtu;assert(!"capability-reply integration covered separately");}
 static void sl_fault(struct sl_connection_session *s,int error){assert(error<0);sl_channel_fail(&s->progress);}
 
-struct socket {struct sock *sk;};
+struct socket {struct sock *sk;int state;};
+#define SS_CONNECTED 1
+#define TCP_ESTABLISHED 1
+#define WRITE_ONCE(x,v) ((x)=(v))
 struct msghdr {int msg_flags;u8 bytes[2047];};
 typedef u32 __poll_t;typedef int poll_table;struct file {int unused;};
 static void sock_poll_wait(struct file *file,struct socket *sock,poll_table *wait){(void)file;(void)sock;(void)wait;}
@@ -115,7 +120,7 @@ static void init_receive(struct sl_connection_session *s,struct sock *sk){
  s->channel.rx.prev=(struct sk_buff *)&s->channel.rx;current_session=s;authority=true;copy_fault=false;receive_timeout=5;wait_calls=0;status_error=0;
 }
 static void receive_tests(void){
- struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={sk};struct msghdr msg={0};
+ struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={.sk=sk};struct msghdr msg={0};
  init_receive(&s,sk);assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EAGAIN&&wait_calls==0);
  route(&s,31,241,"peek");assert(sl_recvmsg(&sock,&msg,2,MSG_PEEK)==2&&s.channel.rx.qlen==1&&(msg.msg_flags&MSG_TRUNC));
  assert(sl_recvmsg(&sock,&msg,2,MSG_TRUNC)==4&&s.channel.rx.qlen==0);
@@ -139,7 +144,7 @@ static void receive_tests(void){
  assert(allocations==0&sk->sk_rmem_alloc==0);
 }
 static void direction_tests(void){
- struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={sk};struct msghdr msg={0};
+ struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={.sk=sk};struct msghdr msg={0};
  init_receive(&s,sk);init_grant(&s,sk,SL_GRANT_TX);
  assert(sl_poll(NULL,&sock,NULL)==(EPOLLOUT|EPOLLWRNORM));
  route(&s,31,241,"forbidden RX");assert(s.channel.rx.qlen==0&&s.channel.rx_dropped==1);
@@ -162,6 +167,20 @@ static void direction_tests(void){
  init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);socket_binding.grant.security=1;
  assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);
  assert(allocations==0&&sk->sk_rmem_alloc==0);
+}
+static void publication_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct socket sock={.sk=&b.sk};
+ init_receive(&s,&b.sk);s.channel.sk=NULL;s.channel.binding=(struct sl_binding_progress){0};
+ struct sl_bind_admission admission={.sock=&sock,.binding=&b,.session=&s,.grant=b.grant};
+ struct sl_channel_grant before=b.grant;authority=false;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EACCES);
+ assert(!b.session&&!s.channel.binding.bound&&b.sk.refs==1&&b.grant.directions==before.directions);
+ authority=true;assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==0);
+ assert(b.session==&s&&s.channel.sk==&b.sk&&s.channel.binding.bound&&b.sk.refs==2&&sock.state==SS_CONNECTED);
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EINVAL);
+ b.session=NULL;s.channel.binding.bound=0;s.channel.binding.retired=1;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EOPNOTSUPP);
+ s.channel.sk=NULL;sock_put(&b.sk);
 }
 int main(void){
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
@@ -197,6 +216,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channel.rx.qlen==SL_CHANNEL_RX&&s.channel.rx_dropped==4);
  while(s.channel.rx.head){struct sk_buff *skb=s.channel.rx.head;s.channel.rx.head=skb->next;kfree_skb(skb);}
  while(s.channel.tx.head){struct sk_buff *skb=s.channel.tx.head;s.channel.tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- receive_tests();direction_tests();
+ receive_tests();direction_tests();publication_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

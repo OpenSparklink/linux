@@ -404,9 +404,47 @@ void sl_connection_session_stop(void *opaque, int error)
 	skb_queue_purge(&s->channel.tx);
 	skb_queue_purge(&s->channel.rx);
 }
+struct sl_bind_admission {
+	struct socket *sock;
+	struct sl_socket_binding *binding;
+	struct sl_connection_session *session;
+	struct sl_channel_grant grant;
+};
+/* Final publication takes Host/data/gate -> Binding -> Session. No sleeping
+ * allocation/lookup spans any of these locks. Revoked first cannot mint. */
+static int sl_publish_binding(void *context)
+{
+	struct sl_bind_admission *admission = context;
+	struct socket *sock = admission->sock;
+	struct sl_socket_binding *binding = admission->binding;
+	struct sl_connection_session *s = admission->session;
+	unsigned long flags;
+	int ret = 0;
+	spin_lock_bh(&binding->lock);
+	spin_lock_irqsave(&s->lock, flags);
+	if (binding->session)
+		ret = -EINVAL;
+	else if (!sl_channel_active(s->progress))
+		ret = -ECONNRESET;
+	else if (s->channel.binding.retired)
+		ret = -EOPNOTSUPP; /* no qualified same-life CUTC close/rebind barrier */
+	else if (s->channel.binding.bound)
+		ret = -EADDRINUSE;
+	else {
+		binding->grant = admission->grant;
+		sl_binding_attach(&s->channel.binding);
+		s->channel.sk = sock->sk;
+		sock_hold(sock->sk);
+		binding->session = s; /* transfer caller's session reference */
+		sock->state = SS_CONNECTED;
+		WRITE_ONCE(sock->sk->sk_state, TCP_ESTABLISHED);
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	spin_unlock_bh(&binding->lock);
+	return ret;
+}
 static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int length)
 {
-	unsigned long flags;
 	struct sl_socket_binding *binding = sl_sk(sock->sk);
 	struct sockaddr_sparklink *input = (void *)address;
 	struct sl_connection_session *s;
@@ -434,27 +472,11 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 	s = sparklink_native_session_get(input->controller, input->generation, input->lifetime, input->handle, input->lease, &ret);
 	if (!s)
 		return ret;
-	spin_lock_bh(&binding->lock);
-	spin_lock_irqsave(&s->lock, flags);
-	if (binding->session)
-		ret = -EINVAL;
-	else if (!sl_channel_active(s->progress))
-		ret = -ECONNRESET;
-	else if (s->channel.binding.retired)
-		ret = -EOPNOTSUPP; /* no qualified same-life CUTC close/rebind barrier */
-	else if (s->channel.binding.bound)
-		ret = -EADDRINUSE;
-	else {
-		binding->grant = grant;
-		sl_binding_attach(&s->channel.binding);
-		s->channel.sk = sock->sk;
-		sock_hold(sock->sk);
-		binding->session = s; /* transfer caller's session reference */
-		sock->state = SS_CONNECTED;
-		WRITE_ONCE(sock->sk->sk_state, TCP_ESTABLISHED);
+	{
+		struct sl_bind_admission admission = { sock, binding, s, grant };
+		ret = sparklink_native_session_admit(input->controller, input->generation,
+			input->lifetime, input->handle, input->lease, sl_publish_binding, &admission);
 	}
-	spin_unlock_irqrestore(&s->lock, flags);
-	spin_unlock_bh(&binding->lock);
 	if (ret)
 		sl_connection_session_put(s);
 	else
