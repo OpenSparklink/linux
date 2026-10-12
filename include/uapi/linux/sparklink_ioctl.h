@@ -1312,6 +1312,10 @@ struct sle_connection_submit {
     __u32 timeout_ms, handle, reason, reserved;
     struct sle_connection_parameters parameters;
     __u32 reserved_tail;
+    /* Unpublished v2: required for Disconnect, zero for Create/author cancel.
+     * Kernel rechecks this physical reference at admission AND selection. */
+    __aligned_u64 expected_lifetime;
+    __u8 expected_address[6], expected_address_type, expected_role;
 };
 struct sle_connection_result {
     __u32 version, profile, state, operation;

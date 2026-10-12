@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Staging connection-operation contract. Not linked into the production
-//! kernel until Native typed submission, transport and revoke callers use it.
+//! Native author history and three-evidence connection procedure. Physical
+//! link obligations and per-lifetime identity remain separate from results.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -13,10 +13,22 @@ pub(crate) enum Outcome { Connected { status: u8, handle: u16, address_type: u8,
 pub(crate) enum Error { Invalid, Busy, Duplicate, Mismatch }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpectedLink {
+    pub(crate) lifetime: u64, pub(crate) handle: u16, pub(crate) role: u8,
+    pub(crate) address_type: u8, pub(crate) address: [u8; 6],
+}
+impl ExpectedLink {
+    pub(crate) fn valid(&self) -> bool {
+        self.lifetime != 0 && self.role <= 1 && self.address != [0;6] && self.address != [255;6]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Operation {
     pub(crate) id: u64, pub(crate) cookie: u64, pub(crate) intent: Intent, pub(crate) state: State,
     pub(crate) error: i32, pub(crate) command_status: Option<u8>, pub(crate) outcome_status: Option<u8>,
     pub(crate) fault_error: i32, pub(crate) handle: Option<u16>,
+    pub(crate) reference: Option<ExpectedLink>,
     deadline: u64, sent: bool, out_complete: bool, accepted: bool,
     outcome: Option<Outcome>,
 }
@@ -52,7 +64,7 @@ impl Session {
         if self.outstanding || self.uncertain { return Err(Error::Busy); }
         self.operation = Some(Operation { id, cookie, intent, state: State::Queued, error: 0,
             command_status: None, outcome_status: None, fault_error: 0, handle: None, deadline, sent: false, out_complete: false,
-            accepted: false, outcome: None });
+            accepted: false, outcome: None, reference: None });
         self.outstanding = true;
         Ok(())
     }
@@ -178,11 +190,15 @@ impl Connections {
         Ok(())
     }
     pub(crate) fn reserve(&mut self, file: u64, request: u64, cookie: u64, intent: Intent,
-                         now: u64, deadline: u64) -> Result<(), Error> {
+                         now: u64, deadline: u64, reference: Option<ExpectedLink>) -> Result<(), Error> {
         self.preflight(file, request)?;
         if cookie == 0 || deadline <= now { return Err(Error::Invalid); }
+        if let Some(reference) = reference {
+            if !reference.valid() || intent != (Intent::Disconnect { handle: reference.handle }) { return Err(Error::Invalid); }
+        }
         let old = self.session.operation;
         self.session.reserve(1, cookie, cookie, intent, now, deadline)?;
+        if let Some(operation) = self.session.operation.as_mut() { operation.reference = reference; }
         if let Some(operation) = old {
             self.history[self.cursor] = Some(Record { file: self.file, request: self.request, operation });
             self.cursor = (self.cursor + 1) % HISTORY;
@@ -196,6 +212,17 @@ impl Connections {
     }
     pub(crate) fn sent(&mut self, cookie: u64) -> Result<(), Error> {
         self.matching_session(cookie).ok_or(Error::Mismatch)?.sent(cookie)
+    }
+    pub(crate) fn reference(&self, cookie: u64) -> Option<ExpectedLink> {
+        self.session.operation.filter(|o| o.cookie == cookie).and_then(|o| o.reference)
+    }
+    pub(crate) fn reject_before_send(&mut self, cookie: u64, error: i32) -> Result<(), Error> {
+        let session = self.matching_session(cookie).ok_or(Error::Mismatch)?;
+        let operation = session.operation.as_mut().ok_or(Error::Mismatch)?;
+        if operation.sent || operation.state != State::Queued { return Err(Error::Mismatch); }
+        operation.state = State::Failed; operation.error = error;
+        session.outstanding = false;
+        Ok(())
     }
     pub(crate) fn out_complete(&mut self, cookie: u64) {
         if let Some(session) = self.matching_session(cookie) { let _ = session.out_complete(cookie, Ok(())); }
@@ -266,6 +293,17 @@ mod tests {
     fn create()->Intent {Intent::Create {address_type:0,address:[1;6]}}
     fn up(status:u8)->Outcome {Outcome::Connected {status,handle:7,address_type:0,address:[1;6]}}
     fn session()->Session {let mut s=Session::new(1).unwrap();s.reserve(1,10,20,create(),0,30).unwrap();s.sent(20).unwrap();s}
+    #[test]
+    fn queued_reference_rejection_has_no_fabricated_wire_facts() {
+        let reference=ExpectedLink {lifetime:1,handle:7,role:0,address_type:0,address:[1;6]};
+        let mut c=Connections::new();
+        c.reserve(42,1,10,Intent::Disconnect{handle:7},0,100,Some(reference)).unwrap();
+        assert_eq!(c.reference(10),Some(reference));c.reject_before_send(10,-116).unwrap();
+        let o=c.query(42,1).unwrap();assert_eq!((o.state,o.error,o.fault_error),(State::Failed,-116,0));
+        assert_eq!((o.command_status,o.outcome_status,o.handle),(None,None,None));assert!(c.clear());
+        c.reserve(42,2,20,create(),0,100,None).unwrap();c.sent(20).unwrap();
+        assert_eq!(c.reject_before_send(20,-116),Err(Error::Mismatch));
+    }
     #[test] fn status_is_acceptance_and_all_three_evidences_are_required() {
         for order in [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
             let mut s=session();
@@ -332,7 +370,7 @@ mod tests {
     #[test] fn bounded_history_preserves_authors_and_cannot_revive_evicted_results() {
         let mut c=Connections::new();
         for id in 1..=40 {
-            c.reserve(42,id,id,create(),id*100,id*100+50).unwrap();
+            c.reserve(42,id,id,create(),id*100,id*100+50,None).unwrap();
             assert_eq!(c.cancel(43,id),Err(Error::Mismatch));
             assert_eq!(c.cancel(42,id),Ok(Some(id)));
             assert!(c.clear());
@@ -344,14 +382,14 @@ mod tests {
         assert_eq!(c.preflight(42,40),Err(Error::Duplicate));
     }
     #[test] fn storage_revoke_deadline_and_fault_do_not_forget_physical_reservations() {
-        let mut c=Connections::new();c.reserve(42,1,10,create(),0,100).unwrap();
+        let mut c=Connections::new();c.reserve(42,1,10,create(),0,100,None).unwrap();
         assert_eq!(c.next_deadline(),Some(100));assert_eq!(c.revoke(),Some(10));assert!(c.clear());
-        c.reserve(42,2,20,create(),0,100).unwrap();c.sent(20).unwrap();
+        c.reserve(42,2,20,create(),0,100,None).unwrap();c.sent(20).unwrap();
         assert_eq!(c.revoke(),None);assert!(!c.clear());
         c.outcome(up(0));c.status(20,0).unwrap();c.out_complete(20);
         assert_eq!(c.query(42,2).unwrap().state,State::Cancelled);assert!(c.clear());
-        c.reserve(42,3,30,create(),0,100).unwrap();assert_eq!(c.expire(100),Some(30));assert!(c.clear());
-        c.reserve(42,4,40,create(),0,100).unwrap();c.sent(40).unwrap();c.fault(-5);
+        c.reserve(42,3,30,create(),0,100,None).unwrap();assert_eq!(c.expire(100),Some(30));assert!(c.clear());
+        c.reserve(42,4,40,create(),0,100,None).unwrap();c.sent(40).unwrap();c.fault(-5);
         c.expire(1000);c.outcome(up(0));c.out_complete(40);assert!(!c.clear());
         c.fault(-110);assert_eq!(c.query(42,4).unwrap().fault_error,-5);
         assert_eq!(c.fault_reason(),Some(-5));
@@ -359,7 +397,7 @@ mod tests {
     }
 
     #[test] fn internal_cleanup_keeps_author_record_and_requires_exact_real_outcome() {
-        let mut c=Connections::new();c.reserve(42,1,10,create(),0,100).unwrap();c.cancel(42,1).unwrap();
+        let mut c=Connections::new();c.reserve(42,1,10,create(),0,100,None).unwrap();c.cancel(42,1).unwrap();
         c.reserve_cleanup(20,7,1,100).unwrap();assert!(!c.clear());c.sent(20).unwrap();c.status(20,0).unwrap();c.out_complete(20);
         c.outcome(Outcome::Disconnected{status:0,handle:8});assert!(!c.clear());
         c.outcome(Outcome::Disconnected{status:0,handle:7});assert!(c.clear());

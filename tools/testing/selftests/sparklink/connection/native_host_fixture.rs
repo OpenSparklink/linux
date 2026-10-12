@@ -17,7 +17,7 @@ type Error=i32; type Result<T=()>=std::result::Result<T,Error>;
 const EAGAIN:i32=-11;const EINVAL:i32=-22;const EBUSY:i32=-16;const EEXIST:i32=-17;const ENOENT:i32=-2;
 const EOVERFLOW:i32=-75;const ETIMEDOUT:i32=-110;const EIO:i32=-5;
 mod kernel {pub mod bindings {
- pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;
+ pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;
  #[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;
  pub unsafe fn ktime_get_boottime()->i64 {unsafe{jiffies_64 as i64 * 1000000}}
 }}
@@ -47,7 +47,30 @@ fn host()->CommandHost {let mut operations=Operations::new();operations.initiali
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
  revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){unsafe{kernel::bindings::jiffies_64=now}}
-fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100).unwrap()}
+fn reference(handle:u16)->sle_connection_operation::ExpectedLink { sle_connection_operation::ExpectedLink { lifetime:1,handle,role:0,address_type:0,address:[1;6] } }
+fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None).unwrap()}
+#[test] fn stale_peer_reference_rejects_before_admission_without_mutation(){
+ clock(1);let mut h=host();up(&mut h,[1;6]);let cookie=h.next_cookie;
+ for changed in [sle_connection_operation::ExpectedLink{lifetime:2,..reference(7)},
+  sle_connection_operation::ExpectedLink{role:1,..reference(7)},
+  sle_connection_operation::ExpectedLink{address_type:1,..reference(7)},
+  sle_connection_operation::ExpectedLink{address:[2;6],..reference(7)}] {
+  assert_eq!(h.submit_connection(42,1,sle_connection_operation::Intent::Disconnect{handle:7},2,0x1403,&[7,0,19],100,Some(changed)),Err(-116));
+  assert_eq!(h.next_cookie,cookie);assert!(h.connection_result(42,1).is_none());assert_eq!(h.credits,1);
+ }
+ assert!(h.next(|_|true).unwrap().is_none());assert!(h.links.contains(7));
+}
+#[test] fn queued_disconnect_cannot_target_a_reused_handle_even_for_same_peer(){
+ for address in [[1;6],[2;6]] {
+  clock(1);let mut h=host();up(&mut h,[1;6]);h.credits=0;
+  h.submit_connection(42,1,sle_connection_operation::Intent::Disconnect{handle:7},2,0x1403,&[7,0,19],100,Some(reference(7))).unwrap();
+  h.observe_link(&sle_link_observation::LinkEvidence{kind:2,status:0,handle:7,role:0,address_type:0,address:[0;6],reserved:[0;2]});
+  up(&mut h,address);h.credits=1;assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.credits,1);
+  let o=h.connection_result(42,1).unwrap();assert_eq!((o.state,o.error,o.fault_error),(sle_connection_operation::State::Failed,-116,0));
+  assert_eq!((o.command_status,o.outcome_status,o.handle),(None,None,None));assert!(h.fault.is_none());
+  let (_,known,links)=h.link_snapshot();assert!(known);assert_eq!(links[0].unwrap().lifetime,3);assert_eq!(links[0].unwrap().address,address);
+ }
+}
 fn status(opcode:u16,status:u8)->SleEvent {SleEvent::NativeCommandReply{opcode,command_credits:1,status,complete:false,data:vec![]}}
 fn up(h:&mut CommandHost,address:[u8;6]){h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address,reserved:[0;2]})}
 fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{kind:2,status:0,handle:7,role:0,address_type:0,address:[0;6],reserved:[0;2]})}
@@ -57,8 +80,8 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert!(h.transport_complete(r.cookie));assert!(h.take_reply().is_some());
  assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::AwaitingOutcome);
  up(&mut h,[1;6]);assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::Succeeded);
- assert!(!h.links_clear_for_management());assert!(h.submit_connection(42,2,sle_connection_operation::Intent::Disconnect{handle:8},2,0x1403,&[8,0,19],100).is_err());
- h.submit_connection(42,2,sle_connection_operation::Intent::Disconnect{handle:7},2,0x1403,&[7,0,19],100).unwrap();
+ assert!(!h.links_clear_for_management());assert!(h.submit_connection(42,2,sle_connection_operation::Intent::Disconnect{handle:8},2,0x1403,&[8,0,19],100,Some(reference(8))).is_err());
+ h.submit_connection(42,2,sle_connection_operation::Intent::Disconnect{handle:7},2,0x1403,&[7,0,19],100,Some(reference(7))).unwrap();
  let r=h.next(|_|true).unwrap().unwrap();h.transport_complete(r.cookie);h.receive(status(0x1403,0));h.take_reply();
  assert!(!h.links_clear_for_management());down(&mut h);assert!(h.links_clear_for_management());
  assert_eq!(h.connection_result(42,2).unwrap().state,sle_connection_operation::State::Succeeded);
@@ -73,11 +96,11 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  clock(1);let mut h=host();h.operations.advertising=1;h.operations.scanning=1;
  h.advertising_set=sle_command_plan::AdvertisingSet::Configured([0;49]);create(&mut h,1);h.revoke_connections();
  revoke(&mut h).unwrap();assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.revocation_result(),Some(Ok(())));
- assert_eq!(h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100),Err(EBUSY));
+ assert_eq!(h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None),Err(EBUSY));
  let credits=h.credits;h.resume_management().unwrap();assert!(!h.revoking);assert_eq!(h.credits,credits);
  assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
  assert!(h.operations.initialized);assert_eq!(h.discovery_radio(),(1,1,None));
- h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100).unwrap();
+ h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None).unwrap();
  assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
 }
 #[test] fn resume_rejects_pending_reply_physical_obligation_and_fault_without_reset(){
@@ -90,7 +113,7 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
 #[test] fn untouched_setup_resume_never_invents_ready_off_or_credits(){
  let mut h=host();h.operations.initialized=false;h.operations.advertising=0;h.operations.scanning=0;h.credits=0;
  h.resume_management().unwrap();assert!(!h.operations.initialized);assert_eq!(h.discovery_radio(),(0,0,None));assert_eq!(h.credits,0);
- assert_eq!(h.submit_connection(42,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100),Err(EAGAIN));
+ assert_eq!(h.submit_connection(42,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None),Err(EAGAIN));
 }
 #[test] fn canonical_snapshot_never_calls_faulted_or_uncertain_absence_known(){
  clock(1);let mut a=host();let b=host();assert!(a.link_snapshot().1);
@@ -137,8 +160,8 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
 #[test] fn setup_or_inconsistent_internal_tag_is_rejected_before_queue_cookie_and_credit(){
  clock(1);let mut h=host();h.operations.initialized=false;
  let intent=sle_connection_operation::Intent::Create{address_type:0,address:[1;6]};
- assert_eq!(h.submit_connection(42,1,intent,1,0x1401,&[1;27],100),Err(EAGAIN));
- h.operations.initialized=true;assert_eq!(h.submit_connection(42,1,intent,2,0x1401,&[1;27],100),Err(EINVAL));
+ assert_eq!(h.submit_connection(42,1,intent,1,0x1401,&[1;27],100,None),Err(EAGAIN));
+ h.operations.initialized=true;assert_eq!(h.submit_connection(42,1,intent,2,0x1401,&[1;27],100,None),Err(EINVAL));
  assert_eq!(h.credits,1);assert_eq!(h.next_cookie,1);assert!(h.requests.is_empty());assert!(h.connection_result(42,1).is_none());
 }
 

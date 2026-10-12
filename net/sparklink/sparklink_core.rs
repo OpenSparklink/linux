@@ -3128,7 +3128,7 @@ fn ioctl_controller_snapshot(
 #[inline(never)]
 fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     let request: SleConnectionSubmit = read_user_struct(arg)?;
-    if request.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if request.version != 2 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if request.flags != 0 || request.generation == 0 || request.request_id == 0
         || request.parameters.reserved != [0; 2] { return Err(EINVAL); }
     let owner = discovery_owner(context, me)?;
@@ -3136,8 +3136,10 @@ fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if request.profile != owner.protocol_profile { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     // SAFETY: exact padding-free integer/byte ABI, initialized by copyin.
     let parameters_zero = unsafe { core::slice::from_raw_parts(core::ptr::from_ref(&request.parameters).cast::<u8>(), 60) }.iter().all(|b| *b == 0);
+    let reference_zero = request.expected_lifetime == 0 && request.expected_address == [0;6]
+        && request.expected_address_type == 0 && request.expected_role == 0;
     if request.operation == 3 {
-        if request.timeout_ms != 0 || request.handle != 0 || request.reason != 0 || !parameters_zero { return Err(EINVAL); }
+        if request.timeout_ms != 0 || request.handle != 0 || request.reason != 0 || !parameters_zero || !reference_zero { return Err(EINVAL); }
         let state_guard = context.lock()?;
         let mut host = owner.host.lock();
         let gate = owner.schedule_gate.lock();
@@ -3149,12 +3151,19 @@ fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     }
     if !(1..=10000).contains(&request.timeout_ms) || request.handle > 65535 || request.reason > 255 { return Err(EINVAL); }
     let intent = match request.operation {
-        1 if request.handle == 0 && request.reason == 0 => sle_connection_operation::Intent::Create {
+        1 if request.handle == 0 && request.reason == 0 && reference_zero => sle_connection_operation::Intent::Create {
             address_type: u8::try_from(request.parameters.peer_address_type).map_err(|_| EINVAL)?,
             address: request.parameters.peer_address },
         2 if parameters_zero => sle_connection_operation::Intent::Disconnect { handle: request.handle as u16 },
         _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
     };
+    let reference = if request.operation == 2 {
+        let reference = sle_connection_operation::ExpectedLink { lifetime: request.expected_lifetime,
+            handle: request.handle as u16, role: request.expected_role,
+            address_type: request.expected_address_type, address: request.expected_address };
+        if !reference.valid() { return Err(EINVAL); }
+        Some(reference)
+    } else { None };
     if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
@@ -3169,7 +3178,7 @@ fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     let gate = owner.schedule_gate.lock();
     if *gate { return Err(ENODEV); }
     host.submit_connection(me.file_id, request.request_id, intent, plan.operation,
-        plan.opcode, &plan.params[..plan.length as usize], request.timeout_ms)?;
+        plan.opcode, &plan.params[..plan.length as usize], request.timeout_ms, reference)?;
     *watermark = request.request_id;
     drop(gate); drop(host); drop(watermark); drop(state_guard);
     owner.kick_commands(); owner.schedule_rx(0);

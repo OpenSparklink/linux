@@ -49,6 +49,11 @@ impl LinkObservation {
     }
 
     pub(crate) fn known(&self) -> bool { !self.uncertain }
+    pub(crate) fn matches(&self, lifetime: u64, handle: u16, role: u8, address_type: u8, address: [u8;6]) -> bool {
+        self.known() && lifetime != 0 && self.links.iter().flatten().any(|link|
+            link.handle == handle && link.lifetime == lifetime
+                && link.role == role && link.address_type == address_type && link.address == address)
+    }
     /// Caller holds the registration Host lock. This is observed physical
     /// state, not command history or a synthetic controller list response.
     pub(crate) fn snapshot(&self) -> (u64, bool, [Option<Link>; CAPACITY]) {
@@ -116,12 +121,15 @@ mod tests {
         let mut state=LinkObservation::new();assert_eq!(state.snapshot().0,0);
         state.observe(&connected(7,[1;6]));let (revision,known,links)=state.snapshot();
         assert!(known);assert_eq!(revision,1);assert_eq!(links[0].unwrap().lifetime,1);
+        assert!(state.matches(1,7,0,0,[1;6]));assert!(!state.matches(1,7,1,0,[1;6]));
+        assert!(!state.matches(1,7,0,1,[1;6]));assert!(!state.matches(1,7,0,0,[2;6]));
         state.observe(&connected(7,[1;6]));assert_eq!(state.snapshot().0,1);
         state.observe(&disconnected(8));assert_eq!(state.snapshot().0,1);
         state.observe(&disconnected(7));assert_eq!(state.snapshot().0,2);
         state.observe(&connected(7,[2;6]));let (revision,known,links)=state.snapshot();
         assert!(known);assert_eq!(revision,3);assert_eq!(links[0].unwrap().lifetime,3);
         assert_eq!(links[0].unwrap().address,[2;6]);
+        assert!(!state.matches(1,7,0,0,[1;6]));assert!(state.matches(3,7,0,0,[2;6]));
     }
     #[test]
     fn lifetime_exhaustion_never_reuses_a_token_or_hides_an_obligation() {

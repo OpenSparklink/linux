@@ -3226,6 +3226,8 @@ pub(crate) struct SleConnectionSubmit {
     pub generation: u64, pub request_id: u64,
     pub timeout_ms: u32, pub handle: u32, pub reason: u32, pub reserved: u32,
     pub parameters: SleConnectionParameters, pub reserved_tail: u32,
+    pub expected_lifetime: u64, pub expected_address: [u8; 6],
+    pub expected_address_type: u8, pub expected_role: u8,
 }
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
@@ -3238,7 +3240,7 @@ pub(crate) struct SleConnectionResult {
 impl_check_reserved!(SleConnectionSubmit, [reserved, reserved_tail]);
 impl_check_reserved!(SleConnectionResult);
 const _: () = assert!(core::mem::size_of::<SleConnectionParameters>() == 60);
-const _: () = assert!(core::mem::size_of::<SleConnectionSubmit>() == 112);
+const _: () = assert!(core::mem::size_of::<SleConnectionSubmit>() == 128);
 const _: () = assert!(core::mem::size_of::<SleConnectionResult>() == 64);
 
 // SAFETY: padding-free repr(C) integers and byte arrays accept all bit patterns.

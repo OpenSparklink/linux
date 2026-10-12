@@ -219,7 +219,8 @@ impl CommandHost {
 
     pub(crate) fn submit_connection(&mut self, file: u64, request: u64,
         intent: super::sle_connection_operation::Intent, operation: u32,
-        opcode: u16, params: &[u8], timeout_ms: u32) -> Result {
+        opcode: u16, params: &[u8], timeout_ms: u32,
+        reference: Option<super::sle_connection_operation::ExpectedLink>) -> Result {
         use super::sle_connection_operation::{Error as Admission, Intent};
         if let Some(error) = self.fault { return Err(error); }
         if self.revoking { return Err(EBUSY); }
@@ -231,10 +232,14 @@ impl CommandHost {
         })?;
         match intent {
             Intent::Create { .. } => {
+                if reference.is_some() { return Err(EINVAL); }
                 if !self.links.clear_for_management() { return Err(EBUSY); }
             }
             Intent::Disconnect { handle } => {
-                if !self.links.contains(handle) { return Err(Error::from_errno(-(kernel::bindings::ENOTCONN as i32))); }
+                let reference = reference.ok_or(EINVAL)?;
+                if reference.handle != handle || !reference.valid() { return Err(EINVAL); }
+                if !self.links.matches(reference.lifetime, reference.handle, reference.role,
+                    reference.address_type, reference.address) { return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32))); }
             }
         }
         if !(1..=10000).contains(&timeout_ms) { return Err(EINVAL); }
@@ -244,7 +249,7 @@ impl CommandHost {
         let now = unsafe { kernel::bindings::jiffies_64 };
         let deadline = now.checked_add(msecs_to_jiffies(timeout_ms) as u64).ok_or(EOVERFLOW)?;
         self.requests.push_connection(opcode, params, cookie, operation, deadline).map_err(Error::from)?;
-        if self.connections.reserve(file, request, cookie, intent, now, deadline).is_err() {
+        if self.connections.reserve(file, request, cookie, intent, now, deadline, reference).is_err() {
             self.requests.remove_cookie(cookie); return Err(EINVAL);
         }
         self.next_cookie = next;
@@ -479,6 +484,16 @@ impl CommandHost {
             // Disconnect at the queue front when an exact handle is available.
             if self.revoking && self.requests.first_recipe().is_some() && !self.links_clear_for_management() { return Ok(None); }
             let Some(request) = self.requests.pop() else { return Ok(None) };
+            if request.connection.is_some() {
+                if let Some(reference) = self.connections.reference(request.cookie) {
+                    if !self.links.matches(reference.lifetime, reference.handle, reference.role,
+                        reference.address_type, reference.address) {
+                        self.connections.reject_before_send(request.cookie,
+                            -(kernel::bindings::ESTALE as i32)).map_err(|_| EINVAL)?;
+                        continue; // no OUT, credit, status or physical mutation
+                    }
+                }
+            }
             if let Some(tag) = request.recipe {
                 if tag.intent.has_enable() && !self.current_recipe(tag) { continue; }
                 // SAFETY: only reads the kernel clock.
