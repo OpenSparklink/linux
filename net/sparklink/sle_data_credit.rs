@@ -101,6 +101,21 @@ mod tests {
         assert_eq!(c.debts.iter().flatten().find(|d| d.handle == 0).unwrap().lifetime, 3);
     }
     #[test]
+    fn wire_duplicate_after_reuse_is_indistinguishable_without_barrier() {
+        // Reproduce the NOCPReuse TLC counterexample using the actual ledger.
+        // This documents an OPEN attribution risk, not a safety qualification
+        // or evidence that the firmware actually emits duplicate completions.
+        let mut c = DataCredits::new(254, 5);
+        c.reserve(1, 0, 4).unwrap();
+        c.complete(0, 1).unwrap(); // genuine old completion: old debt is paid
+        c.reserve(3, 0, 4).unwrap(); // current policy now permits reuse
+        assert_eq!(c.debts[0].unwrap().lifetime, 3);
+        // Wire handle/count alone cannot distinguish a duplicate old event.
+        assert_eq!(c.complete(0, 1), Ok(()));
+        assert_eq!(c.outstanding, 0);
+        assert!(c.debts[0].is_none());
+    }
+    #[test]
     fn over_completion_and_uncertain_usb_never_invent_capacity() {
         let mut c = DataCredits::new(254, 5);
         c.reserve(1, 0, 4).unwrap();
