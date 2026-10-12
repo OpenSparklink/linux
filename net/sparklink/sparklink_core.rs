@@ -36,7 +36,6 @@ mod sle_link_observation;
 mod sle_native;
 mod sle_data_credit;
 mod sle_native_data;
-mod sle_netlink;
 mod sle_pdu;
 mod sle_phy;
 mod sle_power;
@@ -1109,12 +1108,12 @@ fn init_version_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_build_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security power event dli usb netlink\nlanguage: Rust"))
+    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security power event dli usb genl-C\nlanguage: Rust"))
 }
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_usb: USB transport\nsle_netlink: Generic Netlink protocol"))
+    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_usb: USB transport\nsparklink_genl: C Generic Netlink bridge"))
 }
 
 #[inline(never)]
