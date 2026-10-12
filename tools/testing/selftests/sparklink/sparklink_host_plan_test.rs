@@ -516,3 +516,36 @@ fn revocation_mask_preserves_parameter_only_unknown_and_requires_scan_control() 
         assert_eq!(sle_command_plan::revocation_required_domains(selected, radio), required);
     }
 }
+
+#[test]
+fn native_connection_cancellation_preserves_mixed_queue_and_wraparound_order() {
+    for rotation in 0..80 {
+        let mut q = CmdRequestQueue::new();
+        for _ in 0..rotation {
+            q.push_tagged(0x0403, &[], 1, 1, None, 100).unwrap();
+            q.pop().unwrap();
+        }
+        q.push_tagged(0x0403, &[7], 9, 50, None, 100).unwrap();
+        q.push_connection(0x1401, &[1; 27], 51, 1, 115).unwrap();
+        q.push_recipe(&parts(), 52, Intent::Advertising(false), 120).unwrap();
+        q.push_tagged(0x0406, &[8], 10, 53, None, 130).unwrap();
+        let conn = q.entries.iter().flatten().find(|r| r.cookie == 51).unwrap();
+        assert_eq!((conn.connection, conn.seq, conn.deadline, conn.param_len), (Some(1), 0, 115, 27));
+        assert_eq!(conn.params[..27], [1; 27]);
+        let length = q.len();
+        assert_eq!(q.push_connection(0x1401, &[], 54, 3, 150), Err(QueueError::Invalid));
+        assert_eq!(q.len(), length);
+        q.remove_cookie(51);
+        let first = q.pop().unwrap();
+        assert_eq!((first.cookie, first.seq, first.connection, first.params[0]), (50, 9, None, 7));
+        for step in 0..4 {
+            let request = q.pop().unwrap();
+            assert_eq!(request.cookie, 52);
+            assert_eq!(request.recipe.unwrap().step, step);
+            assert_eq!(request.connection, None);
+        }
+        let last = q.pop().unwrap();
+        assert_eq!((last.cookie, last.seq, last.connection, last.params[0]), (53, 10, None, 8));
+        assert!(q.is_empty());
+    }
+}
