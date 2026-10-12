@@ -3040,11 +3040,12 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
             // and commit succeed; an ioctl error never grants it authority.
             // Native ingress may update physical links while copyout sleeps.
             // Hold Host through commit, then gate, matching ingress lock order.
-            let host = owner.host.lock();
+            let mut host = owner.host.lock();
             let stopping = owner.schedule_gate.lock();
             if *stopping { return Err(ENODEV); }
             if let Some(error) = host.controller_status().2 { return Err(error); }
             if !host.quiet() || !host.links_clear_for_management() { return Err(EBUSY); }
+            host.resume_management()?;
             gate.commit(me.file_id, request.mode, token);
         }
         *me.owned_target.lock() = Some(owner.clone());

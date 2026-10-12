@@ -36,7 +36,7 @@ def run(output):
         depth += (acquire[end]=='{')-(acquire[end]=='}'); end += 1
     commit = acquire[start:end]
     methods = '\n'.join(function(inputs['sle_host.rs'].decode(), n) for n in
-                        ['validate_connection_cleanup','revoke_connections','observe_link','links_clear_for_management','quiet', 'policy_untouched', 'policy_unsubmitted',
+                        ['validate_connection_cleanup','revoke_connections','observe_link','links_clear_for_management','quiet', 'resume_management', 'policy_untouched', 'policy_unsubmitted',
                          'cancel_unsubmitted_policy', 'controller_status', 'discovery_radio',
                          'current_recipe', 'can_send', 'retained_revocation',
                          'retained_revocation_ready', 'next', 'cancel_recipe_progress', 'enqueue_recipe_until', 'enqueue_recipe',
@@ -60,7 +60,7 @@ def run(output):
                         '-D', 'warnings', str(tmp/'fixture.rs'), '-o', str(tmp/'test')], check=True)
         subprocess.run([str(tmp/'test'), '--test-threads=1'], check=True)
     assert all((net/n).read_bytes() == b for n, b in inputs.items())
-    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 47,
+    record = {'status': 'MANAGEMENT_RELEASE_SOURCE_BOUNDARIES_PASS', 'rust_tests': 48,
               'scope': 'actual Host predicates/TX selection/InFlight/domain revocation and core fast-release block; source queue/operation/lease modules and opcode/timeout constants; locks, clock scaling, dependency error adapters and surrounding transport dependencies are fixtures',
               'live_ioctl_acceptance': False, 'fd_close_acceptance': False,
               'automatic_fault_recovery_acceptance': False, 'physical_acceptance': False,

@@ -69,6 +69,28 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert!(a.links_clear_for_management());assert_eq!(a.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
  assert!(b.next(|_|true).unwrap().is_some());assert!(!b.links_clear_for_management());
 }
+#[test] fn settled_revoke_new_lease_accepts_create_without_losing_history_or_credits(){
+ clock(1);let mut h=host();h.operations.advertising=1;h.operations.scanning=1;create(&mut h,1);h.revoke_connections();
+ revoke(&mut h).unwrap();assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.revocation_result(),Some(Ok(())));
+ assert_eq!(h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100),Err(EBUSY));
+ let credits=h.credits;h.resume_management().unwrap();assert!(!h.revoking);assert_eq!(h.credits,credits);
+ assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
+ assert!(h.operations.initialized);assert_eq!(h.discovery_radio(),(1,1,None));
+ h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100).unwrap();
+ assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
+}
+#[test] fn resume_rejects_pending_reply_physical_obligation_and_fault_without_reset(){
+ clock(1);let mut h=host();create(&mut h,1);let wire=h.next(|_|true).unwrap().unwrap();
+ h.revoke_connections();h.begin_revoke(&[],&[]).unwrap();assert_eq!(h.resume_management(),Err(EBUSY));assert!(h.revoking);
+ h.receive(status(0x1401,0));h.transport_complete(wire.cookie);assert_eq!(h.resume_management(),Err(EBUSY));
+ h.take_reply();up(&mut h,[1;6]);assert_eq!(h.resume_management(),Err(EBUSY));assert!(h.links.contains(7));
+ h.fail(-5);assert_eq!(h.resume_management(),Err(-5));assert!(h.revoking);assert!(h.links.contains(7));
+}
+#[test] fn untouched_setup_resume_never_invents_ready_off_or_credits(){
+ let mut h=host();h.operations.initialized=false;h.operations.advertising=0;h.operations.scanning=0;h.credits=0;
+ h.resume_management().unwrap();assert!(!h.operations.initialized);assert_eq!(h.discovery_radio(),(0,0,None));assert_eq!(h.credits,0);
+ assert_eq!(h.submit_connection(42,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100),Err(EAGAIN));
+}
 #[test] fn cancelled_inflight_author_keeps_reservation_and_late_handle_without_fake_free(){
  clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();h.cancel_connection(42,1).unwrap();
  assert!(!h.links_clear_for_management());assert!(h.next(|_|true).unwrap().is_none());

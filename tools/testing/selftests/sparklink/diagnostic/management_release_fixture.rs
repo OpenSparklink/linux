@@ -81,6 +81,18 @@ fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:
   }
  }
 }
+#[test] fn new_lease_commit_retires_only_settled_old_revocation(){
+ for complete in [false,true] {
+  let mut h=host();h.revoking=true;h.revoke_done=if complete{3}else{0};h.selected_policy_domains=3;
+  h.operations.advertising=1;h.operations.scanning=1;h.operations.initialized=true;
+  let owner=Owner{host:Lock(RefCell::new(h)),schedule_gate:BoolLock(RefCell::new(false))};
+  let mut gate=sle_management::Management::new();let token=gate.prepare(sle_management::MANAGED).unwrap();
+  let result=after_copyout_commit(&owner,&mut gate,token);
+  let h=owner.host.lock();assert_eq!(h.credits,1);assert!(h.operations.initialized);
+  if complete {assert_eq!(result,Ok(()));assert!(!h.revoking);assert_eq!(h.selected_policy_domains,0);assert!(gate.owns(42));}
+  else {assert_eq!(result,Err(-16));assert!(h.revoking);assert_eq!(h.selected_policy_domains,3);assert_eq!(gate.state,sle_management::FREE);}
+ }
+}
 fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,enable:None,peer_addr:None,deadline:1000,recipe:None,connection:None,transport_done:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,

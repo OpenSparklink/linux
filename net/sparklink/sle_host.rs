@@ -310,6 +310,21 @@ impl CommandHost {
     pub(crate) fn quiet(&self) -> bool {
         self.active.is_none() && self.reply.is_none() && self.requests.is_empty()
     }
+    /// Called only at an atomically checked new management lease commit.
+    /// Keep physical state, author history and genuine credits; retire only
+    /// the previous lease's already-settled cleanup bookkeeping.
+    pub(crate) fn resume_management(&mut self) -> Result {
+        if let Some(error) = self.fault { return Err(error); }
+        if !self.quiet() || !self.links_clear_for_management()
+            || (self.revoking && !self.revocation_result().is_some_and(|result| result.is_ok())) {
+            return Err(EBUSY);
+        }
+        self.revoking = false;
+        self.revoke_cookies = [0; 2]; self.revoke_done = 0; self.revoke_deadline = 0;
+        self.revoke_status = 0; self.revoke_opcode = 0; self.revoke_reply = false;
+        self.selected_policy_domains = 0; self.recipe = None;
+        Ok(())
+    }
     /// An unconfigured controller has no advertising handle to stop. Derive
     /// this exception from the same Host state that records policy admission;
     /// unknown after any recipe, cancellation or fault is not untouched.
