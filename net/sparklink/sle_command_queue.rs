@@ -94,6 +94,17 @@ impl CmdRequestQueue {
         if let Some(request) = self.entries[index].as_mut() { request.connection = Some(operation); }
         Ok(())
     }
+    /// Revoke-only work precedes queued radio stops after the original wire
+    /// slot completes. Existing entries keep their byte/cookie/order identity.
+    pub(crate) fn push_cleanup(&mut self, opcode: u16, params: &[u8], cookie: u64, deadline: u64) -> Result<(), QueueError> {
+        self.push_connection(opcode, params, cookie, 2, deadline)?;
+        let last = (self.tail + CMD_REQ_QUEUE_DEPTH - 1) % CMD_REQ_QUEUE_DEPTH;
+        let request = self.entries[last].take();
+        self.tail = last;
+        self.head = (self.head + CMD_REQ_QUEUE_DEPTH - 1) % CMD_REQ_QUEUE_DEPTH;
+        self.entries[self.head] = request;
+        Ok(())
+    }
     pub(crate) fn remove_cookie(&mut self, cookie: u64) {
         let count = self.count;
         for _ in 0..count {

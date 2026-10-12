@@ -536,6 +536,9 @@ unsafe fn publish_native_event(
     let result = owner.controller_events.lock().publish(owner.identity, profile, event_code, bytes);
     drop(gate);
     drop(host);
+    // Physical outcomes must progress teardown even when event-log publication
+    // failed. Queue work only after releasing both IRQ-safe guards.
+    if evidence.is_some() { owner.schedule_rx(0); }
     if result.is_ok() { owner.controller_event_poll.notify_all(); }
     NativeController::result_to_errno(result)
 }

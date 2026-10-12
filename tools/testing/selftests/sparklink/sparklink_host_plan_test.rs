@@ -549,3 +549,21 @@ fn native_connection_cancellation_preserves_mixed_queue_and_wraparound_order() {
         assert!(q.is_empty());
     }
 }
+
+#[test]
+fn revoke_disconnect_priority_preserves_existing_queue_and_capacity_across_wraparound() {
+    for rotation in 0..80 {
+        let mut q=CmdRequestQueue::new();
+        for _ in 0..rotation {q.push_tagged(0x0403,&[],1,1,None,100).unwrap();q.pop().unwrap();}
+        q.push_recipe(&parts(),10,Intent::Advertising(false),200).unwrap();
+        q.push_tagged(0x0406,&[9],11,11,None,210).unwrap();
+        q.push_cleanup(0x1403,&[7,0,0x13],12,220).unwrap();
+        let cleanup=q.pop().unwrap();assert_eq!((cleanup.cookie,cleanup.connection,cleanup.deadline),(12,Some(2),220));
+        assert_eq!(&cleanup.params[..3],&[7,0,0x13]);
+        for step in 0..4 {let r=q.pop().unwrap();assert_eq!(r.recipe.unwrap().step,step);assert_eq!(r.cookie,10);}
+        let raw=q.pop().unwrap();assert_eq!((raw.cookie,raw.seq,raw.params[0]),(11,11,9));assert!(q.is_empty());
+        for seq in 1..=CMD_REQ_QUEUE_DEPTH as u32 {q.push_tagged(0x0403,&[],seq,seq as u64,None,100).unwrap();}
+        assert_eq!(q.push_cleanup(0x1403,&[7,0,0x13],100,220),Err(QueueError::Full));
+        for seq in 1..=CMD_REQ_QUEUE_DEPTH as u32 {assert_eq!(q.pop().unwrap().seq,seq);}
+    }
+}

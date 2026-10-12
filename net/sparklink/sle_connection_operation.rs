@@ -31,6 +31,9 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    const fn empty() -> Self {
+        Self { generation: 1, operation: None, outstanding: false, uncertain: false }
+    }
     #[cfg(test)]
     pub(crate) fn new(generation: u64) -> Result<Self, Error> {
         if generation == 0 { return Err(Error::Invalid); }
@@ -147,19 +150,20 @@ pub(crate) struct Connections {
     request: u64,
     history: [Option<Record>; HISTORY],
     cursor: usize,
+    cleanup: Option<Session>,
 }
 impl Connections {
     #[cfg(test)]
     pub(crate) const fn new() -> Self {
-        Self { session: Session { generation: 1, operation: None, outstanding: false, uncertain: false },
-            file: 0, request: 0, history: [None; HISTORY], cursor: 0 }
+        Self { session: Session::empty(),
+            file: 0, request: 0, history: [None; HISTORY], cursor: 0, cleanup: None }
     }
     #[cfg(not(test))]
     pub(crate) fn new_in_place() -> impl pin_init::Init<Self> {
         use kernel::prelude::*;
         init!(Self {
-            session: Session { generation: 1, operation: None, outstanding: false, uncertain: false },
-            file: 0, request: 0, cursor: 0,
+            session: Session::empty(),
+            file: 0, request: 0, cursor: 0, cleanup: None,
             history <- pin_init::init_array_from_fn(|_| None),
         })
     }
@@ -170,7 +174,7 @@ impl Connections {
     pub(crate) fn preflight(&self, file: u64, request: u64) -> Result<(), Error> {
         if file == 0 || request == 0 { return Err(Error::Invalid); }
         if self.query(file, request).is_some() { return Err(Error::Duplicate); }
-        if !self.session.reservation_clear() { return Err(Error::Busy); }
+        if !self.clear() { return Err(Error::Busy); }
         Ok(())
     }
     pub(crate) fn reserve(&mut self, file: u64, request: u64, cookie: u64, intent: Intent,
@@ -186,10 +190,32 @@ impl Connections {
         self.file = file; self.request = request;
         Ok(())
     }
-    pub(crate) fn sent(&mut self, cookie: u64) -> Result<(), Error> { self.session.sent(cookie) }
-    pub(crate) fn out_complete(&mut self, cookie: u64) { let _ = self.session.out_complete(cookie, Ok(())); }
-    pub(crate) fn status(&mut self, cookie: u64, status: u8) -> Result<(), Error> { self.session.status(cookie, status) }
-    pub(crate) fn outcome(&mut self, value: Outcome) { let _ = self.session.outcome(1, value); }
+    fn matching_session(&mut self, cookie: u64) -> Option<&mut Session> {
+        if self.session.operation.is_some_and(|o| o.cookie == cookie) { return Some(&mut self.session); }
+        self.cleanup.as_mut().filter(|s| s.operation.is_some_and(|o| o.cookie == cookie))
+    }
+    pub(crate) fn sent(&mut self, cookie: u64) -> Result<(), Error> {
+        self.matching_session(cookie).ok_or(Error::Mismatch)?.sent(cookie)
+    }
+    pub(crate) fn out_complete(&mut self, cookie: u64) {
+        if let Some(session) = self.matching_session(cookie) { let _ = session.out_complete(cookie, Ok(())); }
+    }
+    pub(crate) fn status(&mut self, cookie: u64, status: u8) -> Result<(), Error> {
+        self.matching_session(cookie).ok_or(Error::Mismatch)?.status(cookie, status)
+    }
+    pub(crate) fn outcome(&mut self, value: Outcome) {
+        let _ = self.session.outcome(1, value);
+        if let Some(cleanup) = self.cleanup.as_mut() { let _ = cleanup.outcome(1, value); }
+    }
+    /// Internal cleanup reuses the same three-evidence procedure, without
+    /// replacing/evicting the cancelled author's public record or watermark.
+    pub(crate) fn reserve_cleanup(&mut self, cookie: u64, handle: u16, now: u64, deadline: u64) -> Result<(), Error> {
+        if !self.clear() { return Err(Error::Busy); }
+        let mut session = Session::empty();
+        session.reserve(1, cookie, cookie, Intent::Disconnect { handle }, now, deadline)?;
+        self.cleanup = Some(session);
+        Ok(())
+    }
     pub(crate) fn cancel(&mut self, file: u64, request: u64) -> Result<Option<u64>, Error> {
         if file != self.file || request != self.request { return Err(Error::Mismatch); }
         let o = self.session.operation.ok_or(Error::Mismatch)?;
@@ -201,25 +227,37 @@ impl Connections {
         if !self.session.outstanding { return None; }
         self.cancel(self.file, self.request).ok().flatten()
     }
-    pub(crate) fn clear(&self) -> bool { self.session.reservation_clear() }
+    pub(crate) fn clear(&self) -> bool {
+        self.session.reservation_clear() && self.cleanup.as_ref().is_none_or(Session::reservation_clear)
+    }
     pub(crate) fn fault_reason(&self) -> Option<i32> {
-        self.session.operation.filter(|_| self.session.uncertain).map(|o| o.fault_error).filter(|error| *error != 0)
+        let author = self.session.operation.filter(|_| self.session.uncertain).map(|o| o.fault_error).filter(|error| *error != 0);
+        author.or_else(|| self.cleanup.as_ref().and_then(|s| s.operation).and_then(|o| {
+            if matches!(o.state, State::Failed | State::Faulted) { Some(if o.fault_error != 0 { o.fault_error } else { o.error }) } else { None }
+        }))
     }
     pub(crate) fn next_deadline(&self) -> Option<u64> {
-        self.session.operation.filter(|_| self.session.outstanding && !self.session.uncertain).map(|o| o.deadline)
+        let deadline = |s: &Session| s.operation.filter(|_| s.outstanding && !s.uncertain).map(|o| o.deadline);
+        [deadline(&self.session), self.cleanup.as_ref().and_then(deadline)].into_iter().flatten().min()
     }
     pub(crate) fn expire(&mut self, now: u64) -> Option<u64> {
         let old = self.session.operation;
         self.session.expire(now);
+        if let Some(cleanup) = self.cleanup.as_mut() { cleanup.expire(now); }
         old.filter(|o| !o.sent && now >= o.deadline && !self.session.outstanding).map(|o| o.cookie)
     }
     pub(crate) fn fault(&mut self, error: i32) {
-        let Some(o) = self.session.operation.as_mut() else { return };
-        if !self.session.outstanding { return; }
-        if o.fault_error == 0 { o.fault_error = error; }
-        if !matches!(o.state, State::Cancelled | State::Faulted) { o.state = State::Faulted; o.error = o.fault_error; }
-        if o.sent { self.session.uncertain = true; } else { self.session.outstanding = false; }
+        fn latch(session: &mut Session, error: i32) {
+            let Some(o) = session.operation.as_mut() else { return };
+            if !session.outstanding { return; }
+            if o.fault_error == 0 { o.fault_error = error; }
+            if !matches!(o.state, State::Cancelled | State::Faulted) { o.state = State::Faulted; o.error = o.fault_error; }
+            if o.sent { session.uncertain = true; } else { session.outstanding = false; }
+        }
+        latch(&mut self.session, error);
+        if let Some(cleanup) = self.cleanup.as_mut() { latch(cleanup, error); }
     }
+
 }
 
 #[cfg(test)]
@@ -318,6 +356,14 @@ mod tests {
         c.fault(-110);assert_eq!(c.query(42,4).unwrap().fault_error,-5);
         assert_eq!(c.fault_reason(),Some(-5));
         let o=c.query(42,4).unwrap();assert_eq!((o.state,o.error,o.handle),(State::Faulted,-5,Some(7)));
+    }
+
+    #[test] fn internal_cleanup_keeps_author_record_and_requires_exact_real_outcome() {
+        let mut c=Connections::new();c.reserve(42,1,10,create(),0,100).unwrap();c.cancel(42,1).unwrap();
+        c.reserve_cleanup(20,7,1,100).unwrap();assert!(!c.clear());c.sent(20).unwrap();c.status(20,0).unwrap();c.out_complete(20);
+        c.outcome(Outcome::Disconnected{status:0,handle:8});assert!(!c.clear());
+        c.outcome(Outcome::Disconnected{status:0,handle:7});assert!(c.clear());
+        assert_eq!((c.query(42,1).unwrap().state,c.query(42,1).unwrap().error),(State::Cancelled,-125));
     }
 
 }

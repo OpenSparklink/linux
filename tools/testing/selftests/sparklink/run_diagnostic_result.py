@@ -16,7 +16,7 @@ def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
     inputs = {name: (net / name).read_bytes() for name in
-              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs']}
+              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']}
     uapi = inputs['sle_uapi.rs'].decode()
     declaration = uapi[uapi.index('/// Owner-private bounded diagnostic result;'):
                        uapi.index('unsafe impl FromBytes for SleDiagnosticResult')]
@@ -54,16 +54,16 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     with tempfile.TemporaryDirectory(prefix='sparklink-host-deadline-') as tmp:
         tmp = Path(tmp)
-        for name in ['sle_command_queue.rs', 'sle_command_plan.rs', 'sle_connection_operation.rs']:
+        for name in ['sle_command_queue.rs', 'sle_command_plan.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']:
             (tmp / name).write_bytes(inputs[name])
         fixture = (here / 'diagnostic/host_deadline_fixture.rs').read_text()
-        fixture = fixture.replace('// @@HOST_DEADLINE@@', function(inputs['sle_host.rs'].decode(), 'next_deadline'))
+        fixture = fixture.replace('// @@HOST_DEADLINE@@', function(inputs['sle_host.rs'].decode(), 'next_deadline')+'\n'+function(inputs['sle_host.rs'].decode(),'links_clear_for_management'))
         (tmp / 'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 42, 'result_tests': 14, 'admission_tests': 12, 'host_deadline_tests': 6, 'connection_dependency_tests': 10,
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 48, 'result_tests': 14, 'admission_tests': 12, 'host_deadline_tests': 6, 'connection_dependency_tests': 11, 'link_dependency_tests': 5,
               'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},

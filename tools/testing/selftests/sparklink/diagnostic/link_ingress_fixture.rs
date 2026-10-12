@@ -30,7 +30,8 @@ impl Log {fn publish(&mut self,id:DeviceIdentity,profile:u32,event:u16,body:&[u8
 struct Poll;
 impl Poll {fn notify_all(&self){trace("notify".into());}}
 struct Owner {identity:DeviceIdentity,protocol_profile:u32,host:Lock<Host>,schedule_gate:Lock<bool>,controller_events:Lock<Log>,controller_event_poll:Poll}
-impl Owner {fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{identity:DeviceIdentity{id,generation},protocol_profile:1,
+impl Owner {fn schedule_rx(&self,delay:u64){assert_eq!(delay,0);trace("rx".into());}
+fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{identity:DeviceIdentity{id,generation},protocol_profile:1,
  host:Lock::new("host",Host{links:LinkObservation::new()}),schedule_gate:Lock::new("gate",false),controller_events:Lock::new("log",Log{records:vec![],fail:false}),controller_event_poll:Poll})}}
 thread_local! {static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(vec![])};static TRACE:RefCell<Vec<String>>=const{RefCell::new(vec![])};}
 fn trace(v:String){TRACE.with(|t|t.borrow_mut().push(v));}
@@ -49,7 +50,7 @@ fn up()->LinkEvidence{LinkEvidence{kind:1,status:0,handle:7,role:1,address_type:
 fn publish(id:u16,g:u64,p:u32,code:u16,body:&[u8],e:Option<LinkEvidence>)->i32{unsafe{under_test::invoke(id,g,p,code,body.as_ptr(),body.len(),e)}}
 #[test] fn actual_publisher_keeps_raw_body_and_obligation_and_reverse_unlocks(){
  let(a,b)=setup();let body=[0xaa;32];assert_eq!(publish(0,7,1,0x1401,&body,Some(up())),0);
- let order=TRACE.with(|t|t.borrow().clone());assert_eq!(order,["host+","gate+","log+","log-","gate-","host-","notify"]);
+ let order=TRACE.with(|t|t.borrow().clone());assert_eq!(order,["host+","gate+","log+","log-","gate-","host-","rx","notify"]);
  assert!(!a.host.lock().links.clear_for_management());assert!(b.host.lock().links.clear_for_management());
  assert_eq!(a.controller_events.lock().records,[Record{id:0,generation:7,profile:1,event:0x1401,body:body.to_vec()}]);
 }
@@ -57,6 +58,7 @@ fn publish(id:u16,g:u64,p:u32,code:u16,body:&[u8],e:Option<LinkEvidence>)->i32{u
  let(a,_)=setup();a.controller_events.lock().fail=true;
  assert_eq!(publish(0,7,1,0x15,&[0;11],Some(up())),-75);assert!(!a.host.lock().links.clear_for_management());
  assert!(a.controller_events.lock().records.is_empty());assert!(!TRACE.with(|t|t.borrow().iter().any(|x|x=="notify")));
+ assert_eq!(TRACE.with(|t|t.borrow().iter().filter(|x|x.as_str()=="rx").count()),1);
 }
 #[test] fn management_events_profile_retirement_and_oversize_cannot_mutate_owner(){
  for (id,g,p,code,n,expected) in [(0,7,1,1,11,-71),(0,7,1,2,11,-71),(0,6,1,0x15,11,-19),(0,7,2,0x15,11,-71),(0,7,0,0x15,11,-71),(0,7,1,0x15,289,-90)] {

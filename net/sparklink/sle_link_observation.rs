@@ -46,6 +46,11 @@ impl LinkObservation {
         !self.uncertain && self.links.iter().flatten().any(|link| link.handle == handle)
     }
 
+    pub(crate) fn known(&self) -> bool { !self.uncertain }
+    pub(crate) fn first_handle(&self) -> Option<u16> {
+        self.known().then(|| self.links.iter().flatten().next().map(|link| link.handle)).flatten()
+    }
+
     /// Failed outcomes never establish/remove links. Wire schema and opcode
     /// aliases belong to the driver, not the generic Host cleanup domain.
     pub(crate) fn observe(&mut self, evidence: &LinkEvidence) {
@@ -94,6 +99,7 @@ mod tests {
     fn exact_handle_is_required_and_duplicate_delivery_is_harmless() {
         let mut state=LinkObservation::new();
         state.observe(&connected(7,[1;6]));state.observe(&connected(7,[1;6]));
+        assert!(state.known());assert_eq!(state.first_handle(),Some(7));
         assert!(!state.clear_for_management());
         state.observe(&disconnected(8));assert!(!state.clear_for_management());
         state.observe(&disconnected(7));assert!(state.clear_for_management());
@@ -126,7 +132,7 @@ mod tests {
                 _=>for h in 2..=17 { state.observe(&connected(h,[2;6])); },
             }
             state.observe(&extra);
-            assert!(!state.contains(1));
+            assert!(!state.contains(1));assert!(!state.known());assert_eq!(state.first_handle(),None);
             for h in 1..=17 {state.observe(&disconnected(h));}
             assert!(!state.clear_for_management());
         }

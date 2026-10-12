@@ -54,6 +54,33 @@ impl_has_delayed_work! {
 // Unified controller event processing
 // ---------------------------------------------------------------------------
 
+/// Runtime state serializes driver preparation with retirement. No IRQ-safe
+/// Host/gate guard spans callbacks, allocation or transport I/O. Candidate is
+/// rechecked under Host -> gate before reserving a new internal typed request.
+fn progress_connection_cleanup(owner: &Arc<ControllerRuntime>, state: &ControllerState) -> Result<bool> {
+    let candidate = owner.host.lock().cleanup_candidate()?;
+    let Some(handle) = candidate else { return Ok(false); };
+    let controller = match &state.controller {
+        sle_dli::ControllerBackend::Ws73(controller) => controller,
+        _ => return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
+    };
+    // Normal local management termination. This is a protocol reason, not a
+    // vendor opcode; the retained driver owns wire preparation and validation.
+    let request = SleConnectionSubmit {
+        version: 1, profile: owner.protocol_profile, operation: 2,
+        generation: owner.identity.generation, handle: handle as u32, reason: 0x13,
+        // SAFETY: integer/byte-only repr(C); no uninitialized request fields.
+        ..unsafe { core::mem::zeroed() }
+    };
+    let plan = controller.prepare_connection(&request)?;
+    let mut host = owner.host.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return Err(ENODEV); }
+    let result = host.submit_cleanup(handle, plan.opcode, &plan.params[..plan.length as usize]);
+    drop(gate); drop(host);
+    result
+}
+
 /// Consume the retained management reply under this owner's protocol mutex.
 /// Generic/discovery ingress pressure cannot steal the result or its sequence.
 fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerState) -> bool {
@@ -595,6 +622,9 @@ impl WorkItem<0> for ControllerRuntime {
                     }
                 }
                 if drained == 0 || pumped >= 256 {
+                    if let Err(error) = progress_connection_cleanup(&this, runtime) {
+                        fail_host(&this, runtime, error);
+                    }
                     if runtime.controller.uses_command_host()
                         && this.host.lock().timed_out()
                     {

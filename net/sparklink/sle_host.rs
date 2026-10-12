@@ -142,16 +142,16 @@ impl CommandHost {
     /// Each step waits for matching successful Complete, including native
     /// Status acceptance. A newer same-domain recipe removes old queued
     /// steps, while its already-on-wire command retains its reply reservation.
-    pub(crate) fn enqueue_recipe(
-        &mut self, intent: DiscoveryIntent, parts: &[RecipePart<'_>],
-    ) -> Result {
+    pub(crate) fn enqueue_recipe(&mut self, intent: DiscoveryIntent, parts: &[RecipePart<'_>]) -> Result {
+        // SAFETY: fixed whole-recipe budget, not a timeout per step.
+        let deadline = unsafe { kernel::bindings::jiffies_64 }
+            .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
+        self.enqueue_recipe_until(intent, parts, deadline)
+    }
+    fn enqueue_recipe_until(&mut self, intent: DiscoveryIntent, parts: &[RecipePart<'_>], deadline: u64) -> Result {
         if let Some(error) = self.fault { return Err(error); }
         let cookie = self.next_cookie;
         let next_cookie = cookie.checked_add(1).ok_or(EOVERFLOW)?;
-        // A bounded lifetime for the whole recipe, not four fresh timeouts.
-        // SAFETY: reading the kernel clock does not dereference user memory.
-        let deadline = unsafe { kernel::bindings::jiffies_64 }
-            .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
         self.requests.push_recipe(parts, cookie, intent, deadline)?;
         self.cancel_recipe_progress(intent);
         self.next_cookie = next_cookie;
@@ -167,6 +167,7 @@ impl CommandHost {
         parts: &[RecipePart<'_>], power_step: u8,
     ) -> Result {
         if power_step as usize > parts.len() { return Err(EINVAL); }
+        if !self.connections.clear() { return Err(EBUSY); }
         let slot = self.operations.slot(request_id).map_err(|error| match error {
             AdmissionError::Invalid => EINVAL,
             AdmissionError::Duplicate => EEXIST,
@@ -234,11 +235,18 @@ impl CommandHost {
 
     /// Retain any active wire slot, but prevent queued enables from escaping.
     /// Caller drains raw pending entries before providing driver-prepared stops.
-    pub(crate) fn begin_revoke(&mut self, adv: &[RecipePart<'_>], scan: &[RecipePart<'_>]) -> Result {
+    pub(crate) fn validate_connection_cleanup(&self) -> Result {
         if let Some(error) = self.fault { return Err(error); }
-        if !self.links_clear_for_management() {
-            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
-        }
+        if !self.links.known() { return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))); }
+        if let Some(error) = self.connections.fault_reason() { return Err(Error::from_errno(error)); }
+        Ok(())
+    }
+    pub(crate) fn begin_revoke(&mut self, adv: &[RecipePart<'_>], scan: &[RecipePart<'_>]) -> Result {
+        self.validate_connection_cleanup()?;
+        // SAFETY: read the fixed original pending budget before queuing stops.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        self.revoke_deadline = self.connections.next_deadline().unwrap_or(now).max(now)
+            .saturating_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
         self.operations.cancel_domain(DiscoveryIntent::Advertising(false), -(kernel::bindings::ECANCELED as i32));
         self.operations.cancel_domain(DiscoveryIntent::Scanning(false), -(kernel::bindings::ECANCELED as i32));
         let required = super::sle_command_plan::revocation_required_domains(
@@ -248,16 +256,33 @@ impl CommandHost {
                                        (1, DiscoveryIntent::Scanning(false), scan)] {
             if required & (1 << domain) == 0 { continue; }
             self.revoke_cookies[domain] = self.next_cookie;
-            if let Err(error) = self.enqueue_recipe(intent, parts) {
+            if let Err(error) = self.enqueue_recipe_until(intent, parts, self.revoke_deadline) {
                 let _ = self.fail(error); return Err(error);
             }
         }
         self.revoking = true; self.revoke_done = !required & 3;
         self.revoke_status = 0; self.revoke_opcode = 0; self.revoke_reply = false;
-        // SAFETY: reading the kernel clock has no pointer preconditions.
-        self.revoke_deadline = unsafe { kernel::bindings::jiffies_64 }
-            .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
         Ok(())
+    }
+    pub(crate) fn cleanup_candidate(&self) -> Result<Option<u16>> {
+        if !self.revoking { return Ok(None); }
+        self.validate_connection_cleanup()?;
+        if !self.connections.clear() { return Ok(None); }
+        Ok(self.links.first_handle())
+    }
+    pub(crate) fn submit_cleanup(&mut self, handle: u16, opcode: u16, params: &[u8]) -> Result<bool> {
+        if self.cleanup_candidate()? != Some(handle) { return Ok(false); }
+        // SAFETY: clock read; preparation occurred outside the IRQ-safe lock.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        if now >= self.revoke_deadline { return Err(ETIMEDOUT); }
+        let cookie = self.next_cookie;
+        let next = cookie.checked_add(1).ok_or(EOVERFLOW)?;
+        self.requests.push_cleanup(opcode, params, cookie, self.revoke_deadline).map_err(Error::from)?;
+        if self.connections.reserve_cleanup(cookie, handle, now, self.revoke_deadline).is_err() {
+            self.requests.remove_cookie(cookie); return Err(EBUSY);
+        }
+        self.next_cookie = next;
+        Ok(true)
     }
     pub(crate) fn observe_link(&mut self, evidence: &super::sle_link_observation::LinkEvidence) {
         self.links.observe(evidence);
@@ -276,6 +301,7 @@ impl CommandHost {
             2 => self.connections.outcome(Outcome::Disconnected { status: evidence.status as u8, handle: evidence.handle as u16 }),
             _ => {}
         }
+        if let Some(error) = self.connections.fault_reason() { self.fail(Error::from_errno(error)); }
     }
     pub(crate) fn links_clear_for_management(&self) -> bool {
         self.links.clear_for_management() && self.connections.clear()
@@ -342,8 +368,7 @@ impl CommandHost {
     pub(crate) fn revocation_result(&self) -> Option<Result> {
         if let Some(error) = self.fault { return Some(Err(error)); }
         if self.revoking && self.revoke_done == 3 && self.quiet() {
-            if self.links_clear_for_management() { Some(Ok(())) }
-            else { Some(Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))) }
+            if self.links_clear_for_management() { Some(Ok(())) } else { None }
         } else { None }
     }
 
@@ -374,6 +399,7 @@ impl CommandHost {
             && (self.credits > 0 || self.retained_revocation_ready())
             && self.active.is_none()
             && !self.requests.is_empty()
+            && (!self.revoking || self.requests.first_recipe().is_none() || self.links_clear_for_management())
     }
 
     fn retained_revocation(&self, tag: RecipeTag) -> Option<usize> {
@@ -390,6 +416,7 @@ impl CommandHost {
         // SAFETY: read only the clock under this owner's Host lock.
         let now = unsafe { kernel::bindings::jiffies_64 };
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
+        if let Some(error) = self.connections.fault_reason() { return Err(Error::from_errno(error)); }
         if !self.can_send() {
             return Ok(None);
         }
@@ -397,6 +424,10 @@ impl CommandHost {
             // Retaining an actual OFF needs no credit. A later domain that
             // needs I/O must still await the controller's genuine grant.
             if self.credits == 0 && !self.retained_revocation_ready() { return Ok(None); }
+            // Radio controls cannot interfere with a pending connection or
+            // known link during revoke. Process-context RX prioritizes a real
+            // Disconnect at the queue front when an exact handle is available.
+            if self.revoking && self.requests.first_recipe().is_some() && !self.links_clear_for_management() { return Ok(None); }
             let Some(request) = self.requests.pop() else { return Ok(None) };
             if let Some(tag) = request.recipe {
                 if tag.intent.has_enable() && !self.current_recipe(tag) { continue; }
@@ -654,7 +685,7 @@ impl CommandHost {
     /// A delivered reply releases its slot only when the worker consumes it.
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         if self.fault.is_some() { return None; }
-        let revoke = (self.revoking && self.revoke_done != 3).then_some(self.revoke_deadline);
+        let revoke = (self.revoking && (self.revoke_done != 3 || !self.links_clear_for_management())).then_some(self.revoke_deadline);
         let active = self.active.as_ref()
             .filter(|active| !active.transport_done || self.reply.is_none())
             .map(|active| active.deadline);
@@ -663,6 +694,7 @@ impl CommandHost {
     }
 
     pub(crate) fn timed_out(&mut self) -> bool {
+        if self.fault.is_some() { return false; }
         // SAFETY: reading jiffies is safe in process/IRQ context.
         let now = unsafe { kernel::bindings::jiffies_64 };
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }

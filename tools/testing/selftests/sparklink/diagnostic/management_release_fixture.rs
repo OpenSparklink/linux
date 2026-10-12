@@ -102,8 +102,9 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
   let mut h=host();h.operations.initialized=true;h.operations.advertising=1;h.operations.scanning=1;
   h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address:[1;6],reserved:[0;2]});
   assert!(h.quiet());assert!(!h.links_clear_for_management());
-  let(o,g,r)=released(h,mode);assert_eq!(r,Err(-95));assert_eq!(g.state,sle_management::REVOKING);
-  // Actual outer revoke_management settles this failure as Faulted, not Free.
+  let(o,g,r)=released(h,mode);assert_eq!(r,Err(if mode==sle_management::DIAGNOSTIC{-95}else{-999}));assert_eq!(g.state,sle_management::REVOKING);
+  // Managed proceeds to real driver preparation; Diagnostic rejects. Neither
+  // fast path settles Free merely because advertising/scanning are Off.
   let h=o.host.lock();assert_eq!(h.discovery_radio(),(1,1,None));assert!(h.controller_status().1);
  }
 }
@@ -129,8 +130,8 @@ fn released(h:Host,mode:u32)->(Owner,sle_management::Management,Result) {
  let mut h=host();h.revoking=true;h.revoke_done=3;
  assert_eq!(h.revocation_result(),Some(Ok(())));
  h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address:[1;6],reserved:[0;2]});
- assert_eq!(h.revocation_result(),Some(Err(-95)));
- assert_eq!(h.begin_revoke(&[],&[]),Err(-95));
+ assert_eq!(h.revocation_result(),None);
+ assert_eq!(h.begin_revoke(&[],&[]),Ok(()));assert_eq!(h.revocation_result(),None);
 }
 #[test] fn selected_advertising_does_not_stop_untouched_unknown_scanning(){
  let mut h=host();h.selected_policy_domains=1;h.operations.advertising=1;h.credits=0;
@@ -342,6 +343,12 @@ fn queued_policy()->Host {
  assert_eq!(r.opcode,0x0c02);assert_eq!(peer.operations.find(1).unwrap().state,State::Pending);
  assert_eq!(target.operations.find(1).unwrap().state,State::Cancelled);
  assert!(target.active.is_none());assert!(peer.active.is_some());assert_eq!(target.credits,1);
+}
+
+#[test] fn ordinary_recipe_keeps_its_original_whole_budget_after_helper_refactor(){
+ let mut h=host();
+ h.enqueue_recipe(DiscoveryIntent::Scanning(false),&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
+ let r=h.requests.pop().unwrap();assert_eq!(r.deadline,1+CMD_TIMEOUT_MS as u64);assert_eq!(r.recipe.unwrap().cookie,r.cookie);
 }
 
 }

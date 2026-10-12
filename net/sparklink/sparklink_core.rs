@@ -2923,14 +2923,12 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
         {
             let mut host = owner.host.lock();
             if let Some(error) = host.controller_status().2 { return Err(error); }
-            // Cancel only never-selected author work; preserve an accepted or
-            // on-wire physical procedure. Until typed teardown is integrated,
-            // unresolved connection obligations fail closed rather than Free.
+            // Preserve sent/accepted author procedures and physical facts.
+            // Managed cleanup will prepare real Disconnects in process context;
+            // Diagnostic cannot claim or clean another physical session.
             host.revoke_connections();
-            // Connection teardown is not yet admitted by this Native profile.
-            // An observed/uncertain physical link cannot be silently omitted
-            // from cleanup and mistaken for a Free reusable controller.
-            if !host.links_clear_for_management() {
+            if mode == sle_management::MANAGED { host.validate_connection_cleanup()?; }
+            if mode == sle_management::DIAGNOSTIC && !host.links_clear_for_management() {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
             let (adv, scan, _) = host.discovery_radio();
@@ -2939,7 +2937,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
             // untouched Setup lease without sending a stop for a nonexistent
             // advertising handle. Selected or uncertain policy still requires
             // real cleanup; neither exception confirms Off nor sets Ready.
-            if host.quiet() && (mode == sle_management::DIAGNOSTIC
+            if host.links_clear_for_management() && host.quiet() && (mode == sle_management::DIAGNOSTIC
                 || (mode == sle_management::MANAGED
                     && ((adv == 1 && scan == 1) || host.policy_untouched()))) {
                 gate.settled(0); return Ok(());
@@ -2948,7 +2946,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
             // or TX selection. Cancel never-selected typed policy without a
             // stop for a handle that has not been configured; retain Unknown
             // and cancelled operation results, rather than synthesizing Ready.
-            if mode == sle_management::MANAGED && host.cancel_unsubmitted_policy() {
+            if mode == sle_management::MANAGED && host.links_clear_for_management() && host.cancel_unsubmitted_policy() {
                 gate.settled(0); return Ok(());
             }
         }
