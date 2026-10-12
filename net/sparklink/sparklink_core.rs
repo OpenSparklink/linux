@@ -44,7 +44,6 @@ mod sle_security;
 mod sle_snoop;
 mod sle_serdev;
 mod sle_spi;
-mod sle_ssap;
 mod sle_transport;
 mod sle_uapi;
 mod sle_uart;
@@ -1909,12 +1908,6 @@ fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u3
             info.data_mps = entry.channels.data.mps;
             info.data_mode = entry.channels.data.mode as u8;
             info.svc_mtu = entry.channels.svc_mgmt.mtu;
-            if let Some(session) = &entry.ssap_session {
-                info.ssap_mtu = session.mtu;
-                info.ssap_info_exchanged = if session.info_exchanged { 1 } else { 0 };
-                info.ssap_reliable_mode = if session.reliable_mode { 1 } else { 0 };
-                info.ssap_version_major = session.version.0;
-            }
             info.smtc_tx_credits = entry.channels.svc_mgmt.tx_credits;
             info.smtc_rx_credits = entry.channels.svc_mgmt.rx_credits;
             info.dudtc_tx_credits = entry.channels.data.tx_credits;
@@ -2146,8 +2139,7 @@ fn ioctl_inject_conn_data(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
             let mut resp_buf = [0u8; 32];
             let resp_len = s
                 .conn
-                .handle_transport_signaling(handle, sig_data, &mut resp_buf)
-                .unwrap_or(0);
+                .handle_transport_signaling(handle, sig_data, &mut resp_buf)?;
             if resp_len > 0 {
                 let _ = s.controller.send_data(handle, &resp_buf[..resp_len]);
             }
@@ -2156,14 +2148,14 @@ fn ioctl_inject_conn_data(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
         {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         } else {
-            // Check if this is an SSAP PDU on the dynamic reliable channel.
+            // Unqualified dynamic reliable input has no production consumer.
             let first_byte_tcid = u16::from(raw[0]);
-            let is_ssap_reliable = raw.len() > 1
+            let is_dynamic_reliable = raw.len() > 1
                 && s.conn
-                    .ssap_reliable_tcid(handle)
+                    .dynamic_reliable_tcid(handle)
                     .map(|t| t == first_byte_tcid)
                     .unwrap_or(false);
-            if is_ssap_reliable {
+            if is_dynamic_reliable {
                 return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
             } else {
                 let payload = if !raw.is_empty()

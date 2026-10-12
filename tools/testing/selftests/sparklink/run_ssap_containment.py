@@ -15,16 +15,16 @@ from run_connection_tx import function
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
-    paths = [net / name for name in ['sle_ssap.rs', 'sparklink_core.rs', 'sle_workers.rs']]
+    paths = [here / 'ssap/legacy_staging.rs', net / 'sparklink_core.rs', net / 'sle_workers.rs']
     inputs = {p.name: p.read_bytes() for p in paths}
     fixture = here / 'ssap'
-    # Copy the entire actual production module unchanged, then append child tests.
+    # The old business model is test-only; production rejection seams are compiled verbatim.
     with tempfile.TemporaryDirectory(prefix='sparklink-ssap-') as tmp:
         tmp = Path(tmp)
-        (tmp / 'sle_ssap.rs').write_bytes(inputs['sle_ssap.rs'] + b'\n' + (fixture / 'regression.rs').read_bytes())
+        (tmp / 'sle_ssap.rs').write_bytes(inputs['legacy_staging.rs'] + b'\n' + (fixture / 'regression.rs').read_bytes())
         (tmp / 'legacy_codec.rs').write_bytes((fixture / 'legacy_codec.rs').read_bytes() + b'\n' + (fixture / 'codec_regression.rs').read_bytes())
         code = (fixture / 'kernel_fixture.rs').read_text()
-        code += '#[path="sle_ssap.rs"] mod sle_ssap;\n'
+        code += '#[path="sle_ssap.rs"] pub mod sle_ssap;\n'
         code += '#[path="legacy_codec.rs"] mod legacy_codec;\n'
         code += 'use prelude::*; struct RuntimeContext;\n'
         code += function(inputs['sparklink_core.rs'].decode(), 'ioctl_ssap_remote')
@@ -37,7 +37,7 @@ def run(output):
     for p in paths:
         assert p.read_bytes() == inputs[p.name], 'production input changed during tests'
     record = {'status': 'SSAP_LEGACY_CONTAINMENT_PASS', 'rust_tests': 10,
-              'scope': 'legacy database/session with allocation fixture; historical codec; actual local/remote rejection seams, not a wire Engine',
+              'scope': 'test-only historical staging/session and codec with allocator fixture; actual local/remote rejection seams; no production service DB or wire Engine',
               'standard_ssap_acceptance': False, 'physical_acceptance': False,
               'sources': {name: hashlib.sha256(data).hexdigest() for name, data in inputs.items()},
               'remaining': ['Userspace standard codec/fragment controls, permissions and authenticated per-peer database',

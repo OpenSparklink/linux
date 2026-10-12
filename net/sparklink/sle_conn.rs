@@ -23,7 +23,6 @@ use kernel::prelude::*;
 use kernel::time::msecs_to_jiffies;
 
 use super::sle_phy::{ChannelMap, HoppingState};
-use super::sle_ssap::SsapSession;
 
 /// Read the current kernel jiffies counter.
 pub fn jiffies_now() -> u64 {
@@ -354,7 +353,7 @@ impl TransportChannel {
 /// Fixed set of transport channels per connection.
 ///
 /// Each connection has three fixed channels (management, service management,
-/// default data) and an optional dynamic reliable channel for SSAP.
+/// default data) and an optional dynamic reliable transport channel.
 #[derive(Copy, Clone, Debug)]
 pub struct ChannelSet {
     /// SLE-CMTC management channel (TCID 0x02): reliable, small MTU.
@@ -363,8 +362,8 @@ pub struct ChannelSet {
     pub svc_mgmt: TransportChannel,
     /// SLE-DUDTC default unicast data channel (TCID 0x1F): mode from caps.
     pub data: TransportChannel,
-    /// Dynamic reliable channel for SSAP (created after ExchangeInfo negotiation).
-    pub ssap_reliable: Option<TransportChannel>,
+    /// Dynamic reliable transport metadata (not a qualified protocol Engine).
+    pub dynamic_reliable: Option<TransportChannel>,
     /// Monotonic identifier for credit grant signaling (T/XS 20002-2025 §7.3.3).
     pub credit_grant_id: u8,
     /// Monotonic identifier for transport control signaling (§7.3.3).
@@ -379,7 +378,7 @@ impl Default for ChannelSet {
             mgmt: TransportChannel::new(tcid::MANAGEMENT, TransportMode::Reliable, 48),
             svc_mgmt: TransportChannel::new(tcid::SERVICE_MGMT, TransportMode::Reliable, 247),
             data: TransportChannel::new(tcid::DEFAULT_DATA, TransportMode::Unreliable, 247),
-            ssap_reliable: None,
+            dynamic_reliable: None,
             credit_grant_id: 0,
             sig_identifier: 0,
             next_dynamic_tcid: 0x80,
@@ -411,7 +410,7 @@ impl ChannelSet {
             ch.tx_credits = 0;
             ch.rx_credits = 0;
         }
-        self.ssap_reliable = None;
+        self.dynamic_reliable = None;
     }
 
     /// Get next credit grant identifier and advance counter (wraps at 255).
@@ -439,15 +438,15 @@ impl ChannelSet {
         Some(tcid)
     }
 
-    /// Create and open the SSAP reliable transport channel with negotiated params.
-    pub fn create_ssap_reliable(&mut self, tcid: u16, cfg: &ReliableModeConfig) {
+    /// Create generic reliable transport metadata; callers must prove negotiation.
+    pub fn create_dynamic_reliable(&mut self, tcid: u16, cfg: &ReliableModeConfig) {
         let mut ch = TransportChannel::new(tcid, TransportMode::Reliable, cfg.mtu);
         ch.mps = cfg.mps;
         ch.seq.tx_window = cfg.tx_window as u16;
         ch.state = ChannelState::Open;
         ch.tx_credits = INITIAL_CREDITS;
         ch.rx_credits = INITIAL_CREDITS;
-        self.ssap_reliable = Some(ch);
+        self.dynamic_reliable = Some(ch);
     }
 
     /// Update data channel MTU/MPS based on negotiated connection parameters.
@@ -467,7 +466,7 @@ impl ChannelSet {
             self::tcid::SERVICE_MGMT => Some(&mut self.svc_mgmt),
             self::tcid::DEFAULT_DATA => Some(&mut self.data),
             _ => self
-                .ssap_reliable
+                .dynamic_reliable
                 .as_mut()
                 .filter(|ch| ch.tcid == tcid),
         }
@@ -479,7 +478,7 @@ impl ChannelSet {
             self::tcid::MANAGEMENT => Some(&self.mgmt),
             self::tcid::SERVICE_MGMT => Some(&self.svc_mgmt),
             self::tcid::DEFAULT_DATA => Some(&self.data),
-            _ => self.ssap_reliable.as_ref().filter(|ch| ch.tcid == tcid),
+            _ => self.dynamic_reliable.as_ref().filter(|ch| ch.tcid == tcid),
         }
     }
 }
@@ -1027,8 +1026,6 @@ pub struct ConnEntry {
     pub peer_cap: PeerCapability,
     /// Transport channels (management, service management, data).
     pub channels: ChannelSet,
-    /// SSAP session for service management (created on connection).
-    pub ssap_session: Option<SsapSession>,
     /// Sequence number tracker.
     pub seq: SeqTracker,
     /// Receive data queue (peer -> userspace).
@@ -1066,7 +1063,6 @@ impl ConnEntry {
             params: NegotiatedParams::default(),
             peer_cap: PeerCapability::default(),
             channels: ChannelSet::default(),
-            ssap_session: None,
             seq: SeqTracker::new_async(),
             rx_queue: DataRingBuffer::try_new()?,
             queue_max: QUEUE_DEPTH,
@@ -1388,7 +1384,6 @@ impl ConnManager {
                 entry.params = params;
                 entry.channels.negotiate(params.max_pdu_size, 512);
                 entry.channels.open_all();
-                entry.ssap_session = Some(SsapSession::new(handle));
                 entry.state = ConnState::Connected;
                 entry.last_activity = jiffies_now();
                 pr_info!(
@@ -1680,224 +1675,28 @@ impl ConnManager {
     }
 
 
-    /// Build a TCID_Connect_Req PDU for reliable-mode channel creation.
-    ///
-    /// Allocates a local dynamic TCID, encodes the signaling PDU with a
-    /// TCID 0x02 prefix for sending on the management channel, and records
-    /// the allocated TCID in the SSAP session's `reliable_tcid`.
-    ///
-    /// Returns the total wire length written to `buf` (including TCID prefix).
+    /// Legacy dynamic negotiation is unsupported until canonical Session
+    /// owns capability, local/remote TCID and transaction lifetimes.
     pub fn build_tcid_connect_req(
-        &mut self,
-        handle: u16,
-        cfg: &ReliableModeConfig,
-        buf: &mut [u8],
+        &mut self, _handle: u16, _cfg: &ReliableModeConfig, _buf: &mut [u8],
     ) -> Result<usize> {
-        let entry = self.find_mut(handle)?;
-        let local_tcid = entry
-            .channels
-            .alloc_dynamic_tcid()
-            .ok_or(ENOMEM)?;
-        let sig_id = entry.channels.next_sig_id();
-        // Wire: [TCID_prefix=0x02][signaling PDU...]
-        if buf.is_empty() {
-            return Err(ENOMEM);
-        }
-        buf[0] = tcid::MANAGEMENT as u8;
-        let sig_len = TransportSignaling::encode_connect_req(
-            sig_id,
-            local_tcid,
-            cfg,
-            &mut buf[1..],
-        )?;
-        // Record the local TCID so we can match the ConnectRsp.
-        if let Some(session) = &mut entry.ssap_session {
-            session.reliable_tcid = Some(local_tcid as u16);
-        }
-        Ok(1 + sig_len)
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
-    /// Handle an incoming transport control signaling PDU (on TCID 0x02).
-    ///
-    /// Decodes the signaling, and for ConnectReq allocates a local TCID,
-    /// creates the reliable channel, and writes a ConnectRsp to `resp_buf`.
-    /// Returns the response length (including TCID prefix), or 0 if no
-    /// response is needed (e.g. for ConnectRsp which is terminal).
+    /// Reject unqualified dynamic setup without encoding a success response.
+    /// Native CMTC/basic CUTC uses the independently validated socket path.
     pub fn handle_transport_signaling(
-        &mut self,
-        handle: u16,
-        raw: &[u8],
-        resp_buf: &mut [u8],
+        &mut self, _handle: u16, _raw: &[u8], _resp_buf: &mut [u8],
     ) -> Result<usize> {
-        let sig = TransportSignaling::decode(raw)?;
-        match sig {
-            TransportSignaling::ConnectReq {
-                identifier,
-                src_tcid,
-                config,
-            } => {
-                let entry = self.find_mut(handle)?;
-                // Allocate a local TCID for this channel.
-                let local_tcid = match entry.channels.alloc_dynamic_tcid() {
-                    Some(t) => t,
-                    None => {
-                        // No resources — send failure response.
-                        if resp_buf.len() < 9 {
-                            return Err(ENOMEM);
-                        }
-                        resp_buf[0] = tcid::MANAGEMENT as u8;
-                        let rsp_len = TransportSignaling::encode_connect_rsp(
-                            identifier,
-                            src_tcid,
-                            0,
-                            TcidConnectResult::NoResources,
-                            &mut resp_buf[1..],
-                        )?;
-                        return Ok(1 + rsp_len);
-                    }
-                };
-                // Create the reliable channel with negotiated params.
-                entry
-                    .channels
-                    .create_ssap_reliable(local_tcid as u16, &config);
-                // Record the peer's TCID so SSAP can route through it.
-                if let Some(session) = &mut entry.ssap_session {
-                    session.reliable_tcid = Some(local_tcid as u16);
-                    session.reliable_mode = true;
-                }
-                pr_info!(
-                    "sparklink: TCID_Connect_Req accepted: local={:#04x} peer={:#04x} mtu={}\n",
-                    local_tcid,
-                    src_tcid,
-                    config.mtu
-                );
-                // Send success response.
-                if resp_buf.len() < 9 {
-                    return Err(ENOMEM);
-                }
-                resp_buf[0] = tcid::MANAGEMENT as u8;
-                let rsp_len = TransportSignaling::encode_connect_rsp(
-                    identifier,
-                    src_tcid,
-                    local_tcid,
-                    TcidConnectResult::Success,
-                    &mut resp_buf[1..],
-                )?;
-                Ok(1 + rsp_len)
-            }
-            TransportSignaling::ConnectRsp {
-                src_tcid,
-                dst_tcid,
-                result,
-                ..
-            } => {
-                let entry = self.find_mut(handle)?;
-                if result == TcidConnectResult::Success {
-                    // The peer accepted — create the channel locally using
-                    // the src_tcid we proposed. The dst_tcid is the peer's
-                    // local TCID (we don't need to store it separately since
-                    // routing is done by our local TCID).
-                    let cfg = ReliableModeConfig::default();
-                    entry
-                        .channels
-                        .create_ssap_reliable(src_tcid as u16, &cfg);
-                    if let Some(session) = &mut entry.ssap_session {
-                        session.reliable_tcid = Some(src_tcid as u16);
-                        session.reliable_mode = true;
-                    }
-                    pr_info!(
-                        "sparklink: TCID_Connect_Rsp success: local={:#04x} peer={:#04x}\n",
-                        src_tcid,
-                        dst_tcid
-                    );
-                } else {
-                    pr_info!(
-                        "sparklink: TCID_Connect_Rsp failed: result={}\n",
-                        result as u8
-                    );
-                    // Clear any pending reliable TCID.
-                    if let Some(session) = &mut entry.ssap_session {
-                        session.reliable_tcid = None;
-                    }
-                }
-                Ok(0) // No further response for a ConnectRsp.
-            }
-            TransportSignaling::DisconnectReq {
-                identifier,
-                src_tcid,
-                dst_tcid,
-            } => {
-                let entry = self.find_mut(handle)?;
-                // Tear down the reliable channel if it matches.
-                if let Some(ch) = &entry.channels.ssap_reliable {
-                    if ch.tcid == dst_tcid as u16 {
-                        entry.channels.ssap_reliable = None;
-                        if let Some(session) = &mut entry.ssap_session {
-                            session.reliable_tcid = None;
-                        }
-                    }
-                }
-                // Send DisconnectRsp.
-                if resp_buf.len() < 8 {
-                    return Err(ENOMEM);
-                }
-                resp_buf[0] = tcid::MANAGEMENT as u8;
-                resp_buf[1] = sig_code::TCID_DISCONNECT_RSP;
-                resp_buf[2] = identifier;
-                let dlen: u16 = 3;
-                let dl = dlen.to_le_bytes();
-                resp_buf[3] = dl[0];
-                resp_buf[4] = dl[1];
-                resp_buf[5] = src_tcid;
-                resp_buf[6] = dst_tcid;
-                resp_buf[7] = 0; // result = success
-                Ok(8)
-            }
-            TransportSignaling::DisconnectRsp { .. } => {
-                Ok(0) // Terminal — no response.
-            }
-        }
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 
-    /// Query SSAP session state for a connection.
-    /// Returns (mtu, info_exchanged) on success.
-    pub fn ssap_session_info(&self, handle: u16) -> Option<(u16, bool)> {
-        let entry = self.find(handle).ok()?;
-        entry
-            .ssap_session
-            .as_ref()
-            .map(|s| (s.mtu, s.info_exchanged))
+    /// Generic transport metadata only; no service transaction/cache/session.
+    pub fn dynamic_reliable_tcid(&self, handle: u16) -> Option<u16> {
+        self.find(handle).ok()?.channels.dynamic_reliable.as_ref()
+            .map(|channel| channel.tcid)
     }
 
-    /// Return the SSAP reliable TCID for a connection, if one exists.
-    pub fn ssap_reliable_tcid(&self, handle: u16) -> Option<u16> {
-        let entry = self.find(handle).ok()?;
-        entry.ssap_session.as_ref()?.reliable_tcid
-    }
-
-    /// Get a mutable reference to the SSAP session for a connection.
-    pub fn get_ssap_session(
-        &mut self,
-        handle: u16,
-    ) -> Option<&mut super::sle_ssap::SsapSession> {
-        let entry = self.find_mut(handle).ok()?;
-        entry.ssap_session.as_mut()
-    }
-
-    /// Pop the first available remote event from any connected peer's SSAP session.
-    /// Returns (conn_handle, RemoteEvent) if any peer has a queued event.
-    pub fn pop_any_remote_event(
-        &mut self,
-    ) -> Option<(u16, super::sle_ssap::RemoteEvent)> {
-        for entry in self.connections.iter_mut() {
-            if let Some(session) = &mut entry.ssap_session {
-                if let Some(evt) = session.remote_db.pop_remote_event() {
-                    return Some((entry.handle, evt));
-                }
-            }
-        }
-        None
-    }
 
     /// Consume a TX credit on the specified channel before sending a PDU.
     pub fn consume_tx_credit(&mut self, handle: u16, tcid: u16) -> Result {
@@ -2217,7 +2016,6 @@ impl ConnManager {
         let peer = entry.peer_addr;
         entry.channels.close_all();
         entry.state = ConnState::Idle;
-        entry.ssap_session = None;
         pr_warn!(
             "sparklink: handle {} supervision timeout (peer {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})\n",
             handle, peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]

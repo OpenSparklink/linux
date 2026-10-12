@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! SLE Service Access Protocol (SSAP) — attribute service layer.
+//! TEST-ONLY historical local staging/session model; not a wire Engine.
 //!
-//! Legacy local service staging and connection metadata. This is NOT a
+//! Preserved legacy local staging regression model. This is NOT a
 //! qualified SSAP wire implementation; the replacement Engine is planned for
 //! slkd and is not implemented yet.
 //!
@@ -16,7 +16,6 @@
 //! Remote transactions, notifications, indications and method echo are
 //! unsupported until a standard Engine and per-connection PDU owner are ready.
 
-#![allow(dead_code, unreachable_pub)]
 
 use kernel::alloc::KVec;
 use kernel::prelude::*;
@@ -411,11 +410,7 @@ impl SsapInner {
         Ok(h)
     }
 
-    fn alloc_handles(&mut self, count: u16) -> Result<u16> {
-        let start = self.next_handle;
-        self.next_handle = start.checked_add(count).ok_or(ENOSPC)?;
-        Ok(start)
-    }
+
 
     // -----------------------------------------------------------------------
     // Service registration

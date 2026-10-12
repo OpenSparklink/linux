@@ -3,7 +3,7 @@ SSAP legacy containment / historical codec
 
 Run: python3 tools/testing/selftests/sparklink/run_ssap_containment.py
 
-The runner compiles the entire actual net/sparklink/sle_ssap.rs, appending
+The runner compiles the test-only historical ssap/legacy_staging.rs, appending
 private child tests, and the actual remote ioctl dispatcher body. KVec/allocation
 and the transport TCID constant are explicit dependency fixtures. Nine tests
 cover all opcodes and input lengths including 65535/65536, repeated full frames,
@@ -30,3 +30,6 @@ Engine needs standard codecs/fragment flags, explicit peer/generation ownership,
 request correlation/deadlines/cancellation, permission/error conformance,
 transactional queue/credit submission, memory budgets and real peer tests. Native
 PDU sockets, negotiated reliability and indication ACK semantics are still open.
+
+The staging/session model is no longer compiled by the production kernel.
+It preserves permissions/OOM/failure history and must not become a new wire Engine.

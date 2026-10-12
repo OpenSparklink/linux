@@ -310,16 +310,16 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
                 // notifications belonging to another peer.
                 return;
             } else {
-                // Check if this is an SSAP PDU on the dynamic reliable channel.
+                // Unqualified dynamic reliable input has no production consumer.
                 let first_byte_tcid = u16::from(raw[0]);
-                let is_ssap_reliable = raw.len() > 1
+                let is_dynamic_reliable = raw.len() > 1
                     && shared
                         .conn
-                        .ssap_reliable_tcid(*handle)
+                        .dynamic_reliable_tcid(*handle)
                         .map(|t| t == first_byte_tcid)
                         .unwrap_or(false);
-                if is_ssap_reliable {
-                    // Legacy SSAP reliable-channel processing is unsupported.
+                if is_dynamic_reliable {
+                    // Dynamic reliable-channel processing is not qualified.
                     return;
                 } else {
                     // User data — strip TCID prefix if present, enqueue to rx_queue.
