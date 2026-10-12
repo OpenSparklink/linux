@@ -12,7 +12,7 @@ import tempfile
 
 
 def function(source, name):
-    m = re.search(r'^static (?:void|int) '+name+r'\([^;{]*\)\s*\{', source, re.M)
+    m = re.search(r'^static (?:void|int|__poll_t) '+name+r'\([^;{]*\)\s*\{', source, re.M)
     assert m
     i=m.end();depth=1
     while depth:
@@ -22,15 +22,14 @@ def function(source, name):
 
 def run(output):
     here=Path(__file__).resolve().parent;root=here.parents[3];net=root/'net/sparklink'
-    paths=[net/'sle_channel_socket.c',net/'sle_channel_state.h',net/'sle_channel_wire.c',net/'sle_channel_wire.h',here/'session/dispatch_fixture.c']
+    paths=[net/'sle_channel_socket.c',net/'sle_channel_state.h',net/'sle_channel_grant.h',net/'sle_channel_wire.c',net/'sle_channel_wire.h',here/'session/dispatch_fixture.c']
     inputs={p:p.read_bytes() for p in paths};source=inputs[paths[0]].decode()
-    structs=source[source.index('struct sl_basic_channel {'):source.index('struct sl_socket_binding {')]
-    # Submit scope excludes the socket binding layout.
+    structs=source[source.index('struct sl_basic_channel {'):source.index('static struct proto sl_channel_proto;')]
+    # Include actual SocketBinding/grant layout; allocation/mapping remain dependencies.
     structs+=re.search(r'struct sl_receive \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sl_admission \{[^}]+\};',source)[0]
-    structs+=re.search(r'struct sl_submit_scope \{[^;]+;[^}]+\};',source)[0]
     defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX','SL_CHANNEL_TX'])
-    bodies='\n'.join(function(source,n) for n in ['sl_session_submit','sl_route','sl_admit','sl_take','sl_recvmsg'])
+    bodies='\n'.join(function(source,n) for n in ['sl_permits','sl_session_submit','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll'])
     fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
     with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
         tmp=Path(directory);(tmp/'test.c').write_text(fixture)

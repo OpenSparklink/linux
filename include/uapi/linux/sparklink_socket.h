@@ -9,7 +9,9 @@
  * lease is the current Managed token; release/owner death invalidates it.
  * A successor lease never renews the old fd. Kernel enforces admission and
  * actual USB submission; accepted physical obligations are retained.
- * Current basic mode only accepts TX|RX and security=0.
+ * directions is TX, RX, or TX|RX. Forbidden send/recv returns EACCES;
+ * poll advertises only granted readiness. CMTC belongs to Session.
+ * Current basic mode only accepts security=NONE; protected requests reject.
  * No mutation/raw DLI permission.
  */
 struct sockaddr_sparklink {
@@ -23,6 +25,9 @@ struct sockaddr_sparklink {
 #define SPARKLINK_SOCKET_VERSION 2
 #define SPARKLINK_SOCKET_TX 1
 #define SPARKLINK_SOCKET_RX 2
-/* Only unencrypted basic mode is qualified; nonzero security is unsupported. */
+#define SPARKLINK_SOCKET_SECURITY_NONE 0
+#define SPARKLINK_SOCKET_SECURITY_ENCRYPTED 1
+#define SPARKLINK_SOCKET_SECURITY_AUTHENTICATED 2
+/* Protected security requirements are defined but currently unsupported. */
 #define SPARKLINK_SOCKET_USER_PI 241
 #endif

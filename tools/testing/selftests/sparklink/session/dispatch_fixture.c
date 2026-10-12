@@ -9,10 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #define msghdr fixture_msghdr
 #define MSG_CMSG_COMPAT 0x40000000
 #include "sle_channel_wire.h"
 #include "sle_channel_state.h"
+#include "sle_channel_grant.h"
+#include <stddef.h>
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef uint64_t u64;
 typedef struct {bool held;} spinlock_t;
 static bool irq_disabled;
@@ -39,6 +42,7 @@ static void __skb_queue_tail(struct sk_buff_head *q,struct sk_buff *skb){assert(
 static void sock_hold(struct sock *s){s->refs++;}
 static void sock_put(struct sock *s){assert(s->refs>0);s->refs--;}
 /* @@STRUCTS@@ */
+static struct sl_socket_binding *sl_sk(struct sock *sk){return (struct sl_socket_binding *)((char *)sk - offsetof(struct sl_socket_binding,sk));}
 static void data_ready(struct sock *sk){sk->wakes++;}
 #define READ_ONCE(v) (v)
 static int atomic_read(int *value){return *value;}
@@ -50,6 +54,10 @@ static void sl_fault(struct sl_connection_session *s,int error){assert(error<0);
 
 struct socket {struct sock *sk;};
 struct msghdr {int msg_flags;u8 bytes[2047];};
+typedef u32 __poll_t;typedef int poll_table;struct file {int unused;};
+static void sock_poll_wait(struct file *file,struct socket *sock,poll_table *wait){(void)file;(void)sock;(void)wait;}
+static int skb_queue_empty(struct sk_buff_head *q){return !q->qlen;}
+static unsigned int skb_queue_len(struct sk_buff_head *q){return q->qlen;}
 static struct sl_connection_session *current_session;
 static bool authority=true,host_locked,copy_fault;
 static long receive_timeout;
@@ -95,15 +103,20 @@ static void skb_free_datagram(struct sock *sk,struct sk_buff *skb){assert(!host_
 /* @@FUNCTIONS@@ */
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
 static void route(struct sl_connection_session *s,unsigned int tcid,unsigned int pi,const char *message){u8 wire[300];int n=sl_channel_frame_encode(wire,sizeof(wire),tcid,pi,(const u8 *)message,strlen(message));assert(n>0);sl_route(s,wire,n);assert(!s->lock.held&&!irq_disabled);}
+static void init_grant(struct sl_connection_session *s,struct sock *sk,unsigned int directions){
+ struct sl_grant_scope scope={.controller=s->controller,.generation=s->generation,.lifetime=s->lifetime,.epoch=s->epoch,.handle=s->handle,.local_tcid=s->channel.local_tcid,.remote_tcid=s->channel.remote_tcid,.pi=s->channel.pi};
+ assert(sl_grant_init(&sl_sk(sk)->grant,scope,directions,0));
+}
 static void init_receive(struct sl_connection_session *s,struct sock *sk){
  memset(s,0,sizeof(*s));s->controller=1;s->generation=7;s->lifetime=11;s->handle=3;s->epoch=1;s->refs.refs=1;
  sl_channel_start(&s->progress,249);sl_channel_request_submitted(&s->progress,0);sl_channel_peer_capability(&s->progress,249,0);sl_channel_response_submitted(&s->progress,0);
  s->channel.local_tcid=31;s->channel.pi=241;s->channel.mtu=249;s->channel.sk=sk;assert(sl_binding_attach(&s->channel.binding));
+ init_grant(s,sk,SL_GRANT_TX|SL_GRANT_RX);
  s->channel.rx.prev=(struct sk_buff *)&s->channel.rx;current_session=s;authority=true;copy_fault=false;receive_timeout=5;wait_calls=0;status_error=0;
 }
 static void receive_tests(void){
- struct sl_connection_session s;struct sock sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready};struct socket sock={&sk};struct msghdr msg={0};
- init_receive(&s,&sk);assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EAGAIN&&wait_calls==0);
+ struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={sk};struct msghdr msg={0};
+ init_receive(&s,sk);assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EAGAIN&&wait_calls==0);
  route(&s,31,241,"peek");assert(sl_recvmsg(&sock,&msg,2,MSG_PEEK)==2&&s.channel.rx.qlen==1&&(msg.msg_flags&MSG_TRUNC));
  assert(sl_recvmsg(&sock,&msg,2,MSG_TRUNC)==4&&s.channel.rx.qlen==0);
  route(&s,31,241,"");assert(sl_recvmsg(&sock,&msg,1,MSG_PEEK)==0&&s.channel.rx.qlen==1);
@@ -112,7 +125,7 @@ static void receive_tests(void){
  assert(sl_recvmsg(&sock,&msg,1,MSG_OOB)==-EOPNOTSUPP);
  status_error=-EAGAIN;assert(sl_recvmsg(&sock,&msg,100,0)==-EAGAIN&&wait_calls==0);status_error=0;
  for(unsigned int kind=0;kind<=5;kind++){
-  init_receive(&s,&sk);wait_case=kind;
+  init_receive(&s,sk);wait_case=kind;
   int ret=sl_recvmsg(&sock,&msg,100,0);
   if(kind==0)assert(ret==-EAGAIN);
   else if(kind==1){assert(ret==-EACCES&&s.channel.rx.qlen==1);assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);}
@@ -123,14 +136,39 @@ static void receive_tests(void){
   assert(wait_calls==1&&s.refs.refs==1);
   while(s.channel.rx.head){struct sk_buff *skb=s.channel.rx.head;s.channel.rx.head=skb->next;kfree_skb(skb);}
  }
- assert(allocations==0&&sk.sk_rmem_alloc==0);
+ assert(allocations==0&sk->sk_rmem_alloc==0);
+}
+static void direction_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={sk};struct msghdr msg={0};
+ init_receive(&s,sk);init_grant(&s,sk,SL_GRANT_TX);
+ assert(sl_poll(NULL,&sock,NULL)==(EPOLLOUT|EPOLLWRNORM));
+ route(&s,31,241,"forbidden RX");assert(s.channel.rx.qlen==0&&s.channel.rx_dropped==1);
+ assert(sl_recvmsg(&sock,&msg,100,0)==-EACCES&&wait_calls==0);
+ init_grant(&s,sk,SL_GRANT_RX);
+ assert(sl_poll(NULL,&sock,NULL)==0);
+ struct sl_admission admission={&s,alloc_skb(1,0),1};assert(sl_admit(&admission)==-EACCES&&admission.skb);kfree_skb(admission.skb);
+ struct sl_submit_scope scope={&s,true};unsigned int before=submitted;irq_disabled=true;
+ assert(sl_session_submit(&scope,atomic_submit,&s)==-EACCES&&submitted==before);
+ scope.application=false;assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==before+1);irq_disabled=false;
+ route(&s,31,241,"allowed RX");assert(sl_poll(NULL,&sock,NULL)==(EPOLLIN|EPOLLRDNORM));assert(sl_recvmsg(&sock,&msg,100,0)==10);
+ for(unsigned int field=0;field<8;field++){
+  init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);struct sl_grant_scope *g=&socket_binding.grant.scope;
+  switch(field){case 0:g->controller++;break;case 1:g->generation++;break;case 2:g->lifetime++;break;case 3:g->epoch++;break;case 4:g->handle++;break;case 5:g->local_tcid++;break;case 6:g->remote_tcid++;break;default:g->pi++;break;}
+  assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);
+  assert(sl_poll(NULL,&sock,NULL)==(EPOLLERR|EPOLLHUP));
+  irq_disabled=true;scope.application=true;assert(sl_session_submit(&scope,atomic_submit,&s)==-EACCES);irq_disabled=false;
+ }
+ init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);socket_binding.grant.security=1;
+ assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);
+ assert(allocations==0&&sk->sk_rmem_alloc==0);
 }
 int main(void){
- struct sl_connection_session s={0};struct sock sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready};
+ struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
  sl_channel_start(&s.progress,249);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress,249,0);sl_channel_response_submitted(&s.progress,0);
- s.channel.local_tcid=SL_CHANNEL_CUTC;s.channel.remote_tcid=SL_CHANNEL_CUTC;s.channel.pi=241;s.channel.mtu=249;s.channel.sk=&sk;
+ s.channel.local_tcid=SL_CHANNEL_CUTC;s.channel.remote_tcid=SL_CHANNEL_CUTC;s.channel.pi=241;s.channel.mtu=249;s.channel.sk=sk;
  assert(sl_binding_attach(&s.channel.binding));
- route(&s,SL_CHANNEL_CUTC,241,"real codec");assert(s.channel.rx.qlen==1&&sk.wakes==1&&sk.refs==1);
+ init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);
+ route(&s,SL_CHANNEL_CUTC,241,"real codec");assert(s.channel.rx.qlen==1&sk->wakes==1&sk->refs==1);
  route(&s,32,241,"wrong TCID");route(&s,SL_CHANNEL_CUTC,242,"wrong PI");assert(s.channel.rx.qlen==1&&s.channel.rx_dropped==2);
  for(unsigned int i=1;i<SL_CHANNEL_RX;i++)route(&s,SL_CHANNEL_CUTC,241,"bounded");
  route(&s,SL_CHANNEL_CUTC,241,"full queue");assert(s.channel.rx.qlen==SL_CHANNEL_RX&&s.channel.rx_dropped==3);
@@ -158,6 +196,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channel.rx.qlen==SL_CHANNEL_RX&&s.channel.rx_dropped==4);
  while(s.channel.rx.head){struct sk_buff *skb=s.channel.rx.head;s.channel.rx.head=skb->next;kfree_skb(skb);}
  while(s.channel.tx.head){struct sk_buff *skb=s.channel.tx.head;s.channel.tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- receive_tests();
+ receive_tests();direction_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

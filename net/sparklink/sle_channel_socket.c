@@ -18,6 +18,9 @@
 #include <uapi/linux/sparklink_socket.h>
 #include "sle_channel_wire.h"
 #include "sle_channel_state.h"
+#include "sle_channel_grant.h"
+
+_Static_assert(SL_GRANT_TX == SPARKLINK_SOCKET_TX && SL_GRANT_RX == SPARKLINK_SOCKET_RX, "grant direction UAPI mismatch");
 
 #define SL_CHANNEL_TX 8
 #define SL_CHANNEL_RX 16
@@ -46,6 +49,7 @@ struct sl_connection_session {
 };
 struct sl_socket_binding {
 	struct sock sk;
+	struct sl_channel_grant grant; /* immutable after bind publication */
 	spinlock_t lock; /* publication of session reference */
 	struct sl_connection_session *session;
 };
@@ -55,6 +59,17 @@ static struct proto sl_channel_proto;
 static struct sl_socket_binding *sl_sk(struct sock *sk)
 {
 	return container_of(sk, struct sl_socket_binding, sk);
+}
+/* Session lock protects channel.sk's held socket reference. The grant lives
+ * in that SocketBinding, not a copied policy in Session/Channel. */
+static int sl_permits(struct sl_connection_session *s, unsigned int direction)
+{
+	struct sl_grant_scope scope = { .controller = s->controller,
+		.generation = s->generation, .lifetime = s->lifetime, .epoch = s->epoch,
+		.handle = s->handle, .local_tcid = s->channel.local_tcid,
+		.remote_tcid = s->channel.remote_tcid, .pi = s->channel.pi };
+
+	return s->channel.sk && sl_grant_permits(&sl_sk(s->channel.sk)->grant, scope, direction);
 }
 static void sl_session_destroy(struct kref *refs)
 {
@@ -185,6 +200,8 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 	if (!sl_channel_active(s->progress) ||
 	    (permission->application && !sl_binding_live(s->channel.binding)))
 		ret = -ECANCELED;
+	else if (permission->application && !sl_permits(s, SL_GRANT_TX))
+		ret = -EACCES;
 	else
 		ret = submit(context); /* atomic queue only; no wait or protocol reentry */
 	spin_unlock(&s->lock);
@@ -235,7 +252,7 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 	memcpy(skb_put(skb, frame.length), frame.data, frame.length);
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(s->channel.binding) &&
-	    frame.tcid == s->channel.local_tcid && frame.pi == s->channel.pi &&
+	    sl_permits(s, SL_GRANT_RX) && frame.tcid == s->channel.local_tcid && frame.pi == s->channel.pi &&
 	    frame.length <= s->channel.mtu) {
 		spin_lock(&s->channel.rx.lock);
 		if (s->channel.rx.qlen < SL_CHANNEL_RX &&
@@ -319,7 +336,7 @@ static void sl_work(struct work_struct *work)
 	}
 	skb = NULL;
 	spin_lock_irqsave(&s->lock, flags);
-	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(s->channel.binding) && !s->channel.binding.busy) {
+	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(s->channel.binding) && sl_permits(s, SL_GRANT_TX) && !s->channel.binding.busy) {
 		skb = skb_dequeue(&s->channel.tx);
 		if (skb)
 			sl_binding_start_tx(&s->channel.binding);
@@ -393,6 +410,8 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 	struct sl_socket_binding *binding = sl_sk(sock->sk);
 	struct sockaddr_sparklink *input = (void *)address;
 	struct sl_connection_session *s;
+	struct sl_channel_grant grant;
+	struct sl_grant_scope scope;
 	int ret = 0;
 
 	if (!capable(CAP_NET_ADMIN))
@@ -400,10 +419,18 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 	if (length != sizeof(*input) || input->family != AF_SPARKLINK || input->version != SPARKLINK_SOCKET_VERSION ||
 	    input->flags || memchr_inv(input->reserved, 0, sizeof(input->reserved)))
 		return -EINVAL;
-	if (input->directions != (SPARKLINK_SOCKET_TX | SPARKLINK_SOCKET_RX) || input->security)
+	if (!input->directions || input->directions & ~(SPARKLINK_SOCKET_TX | SPARKLINK_SOCKET_RX))
+		return -EINVAL;
+	if (input->security)
 		return -EOPNOTSUPP;
 	if (input->local_tcid != SL_CHANNEL_CUTC || input->remote_tcid != SL_CHANNEL_CUTC || input->pi != SPARKLINK_SOCKET_USER_PI)
 		return -EOPNOTSUPP;
+	scope = (struct sl_grant_scope){ .controller = input->controller,
+		.generation = input->generation, .lifetime = input->lifetime, .epoch = input->lease,
+		.handle = input->handle, .local_tcid = input->local_tcid,
+		.remote_tcid = input->remote_tcid, .pi = input->pi };
+	if (!sl_grant_init(&grant, scope, input->directions, input->security))
+		return -EINVAL;
 	s = sparklink_native_session_get(input->controller, input->generation, input->lifetime, input->handle, input->lease, &ret);
 	if (!s)
 		return ret;
@@ -418,6 +445,7 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 	else if (s->channel.binding.bound)
 		ret = -EADDRINUSE;
 	else {
+		binding->grant = grant;
 		sl_binding_attach(&s->channel.binding);
 		s->channel.sk = sock->sk;
 		sock_hold(sock->sk);
@@ -438,7 +466,7 @@ static int sl_can_write(struct sl_connection_session *s)
 	unsigned long flags;
 	int ready;
 	spin_lock_irqsave(&s->lock, flags);
-	ready = !sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding) ||
+	ready = !sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding) || !sl_permits(s, SL_GRANT_TX) ||
 		(s->progress.phase == SL_CH_OPEN && sl_binding_space(s->channel.binding, skb_queue_len(&s->channel.tx), SL_CHANNEL_TX));
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ready;
@@ -454,7 +482,9 @@ static int sl_admit(void *context)
     int ret;
 
 	spin_lock_irqsave(&s->lock, flags);
-	if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(s->channel.binding))
+	if (sl_binding_live(s->channel.binding) && !sl_permits(s, SL_GRANT_TX))
+		ret = -EACCES;
+	else if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(s->channel.binding))
 		ret = sl_channel_active(s->progress) && sl_binding_live(s->channel.binding) ? -EAGAIN : -ENOTCONN;
 	else if (length > s->channel.mtu)
 		ret = -EMSGSIZE;
@@ -538,6 +568,10 @@ static int sl_take(void *context)
 		ret = -ENOTCONN;
 		goto unlock;
 	}
+	if (!sl_permits(s, SL_GRANT_RX)) {
+		ret = -EACCES;
+		goto unlock;
+	}
 	spin_lock(&s->channel.rx.lock);
 	receive->last = s->channel.rx.prev;
 	receive->skb = skb_peek(&s->channel.rx);
@@ -619,12 +653,13 @@ static __poll_t sl_poll(struct file *file, struct socket *sock, poll_table *wait
 		return EPOLLERR | EPOLLHUP;
 	}
 	spin_lock_irqsave(&s->lock, flags);
-	if (!sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding))
+	if (!sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding) ||
+	    (!sl_permits(s, SL_GRANT_TX) && !sl_permits(s, SL_GRANT_RX)))
 		mask = EPOLLERR | EPOLLHUP;
 	else {
-		if (!skb_queue_empty(&s->channel.rx))
+		if (sl_permits(s, SL_GRANT_RX) && !skb_queue_empty(&s->channel.rx))
 			mask |= EPOLLIN | EPOLLRDNORM;
-		if (s->progress.phase == SL_CH_OPEN && sl_binding_space(s->channel.binding, skb_queue_len(&s->channel.tx), SL_CHANNEL_TX))
+		if (sl_permits(s, SL_GRANT_TX) && s->progress.phase == SL_CH_OPEN && sl_binding_space(s->channel.binding, skb_queue_len(&s->channel.tx), SL_CHANNEL_TX))
 			mask |= EPOLLOUT | EPOLLWRNORM;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
