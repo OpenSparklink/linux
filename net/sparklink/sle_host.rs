@@ -57,6 +57,7 @@ pub(crate) struct CommandHost {
     selected_policy_domains: u8,
     revoking: bool,
     data_revoked: bool,
+    pub(crate) grants: super::sle_grant::LeaseAuthority,
     revoke_cookies: [u64; 2],
     revoke_done: u8,
     revoke_deadline: u64,
@@ -80,7 +81,7 @@ impl CommandHost {
             broadcast_cookie: 0,
             scan_cookie: 0,
             recipe: None,
-                data_revoked: false, revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
+                grants: super::sle_grant::LeaseAuthority::new(), data_revoked: false, revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
                 revoke_status: 0, revoke_opcode: 0, revoke_reply: false,
                 selected_policy_domains: 0,
                 advertising_set: super::sle_command_plan::AdvertisingSet::Unknown,
@@ -276,6 +277,7 @@ impl CommandHost {
     pub(crate) fn revoke_connections(&mut self) {
         // First Host-locked withdrawal, before process-context recipe preparation.
         // Actual submit takes this same lock. Already queued URBs retain debt.
+        self.grants.revoke();
         self.data_revoked = true;
         if let Some(cookie) = self.connections.revoke() { self.requests.remove_cookie(cookie); }
     }

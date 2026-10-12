@@ -17,7 +17,7 @@ def run(output):
     root = here.parents[3]
     net = root / 'net/sparklink'
     files = [net / n for n in ['sle_native.rs', 'sle_link_observation.rs',
-                             'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs', 'sle_sessions.rs']]
+                             'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs', 'sle_sessions.rs', 'sle_grant.rs']]
     files.append(here / 'native-data/fixture.rs')
     originals = {p: p.read_bytes() for p in files}
     fixture = originals[files[-1]].decode()

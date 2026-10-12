@@ -26,9 +26,10 @@ def run(output):
     inputs={p:p.read_bytes() for p in paths};source=inputs[paths[0]].decode()
     structs=source[source.index('struct sl_basic_channel {'):source.index('struct sl_socket_binding {')]
     # Submit scope excludes the socket binding layout.
+    structs+=re.search(r'struct sl_admission \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sl_submit_scope \{[^;]+;[^}]+\};',source)[0]
-    defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX'])
-    bodies='\n'.join(function(source,n) for n in ['sl_session_submit','sl_route'])
+    defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX','SL_CHANNEL_TX'])
+    bodies='\n'.join(function(source,n) for n in ['sl_session_submit','sl_route','sl_admit'])
     fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
     with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
         tmp=Path(directory);(tmp/'test.c').write_text(fixture)

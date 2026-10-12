@@ -268,23 +268,31 @@ void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
 }
 EXPORT_SYMBOL_GPL(sparklink_native_snoop_tx);
 
-extern void *sparklink_native_session_get_rust(u16 id, u64 generation, u64 lifetime, u16 handle, int *error);
-extern int sparklink_native_session_status_rust(u16 id, u64 generation, u64 lifetime, u16 handle);
-void *sparklink_native_session_get(u16 id, u64 generation, u64 lifetime, u16 handle, int *error)
+extern void *sparklink_native_session_get_rust(u16 id, u64 generation, u64 lifetime, u16 handle, u64 epoch, int *error);
+extern int sparklink_native_session_status_rust(u16 id, u64 generation, u64 lifetime, u16 handle, u64 epoch);
+void *sparklink_native_session_get(u16 id, u64 generation, u64 lifetime, u16 handle, u64 epoch, int *error)
 {
-    return sparklink_native_session_get_rust(id, generation, lifetime, handle, error);
+    return sparklink_native_session_get_rust(id, generation, lifetime, handle, epoch, error);
 }
-int sparklink_native_session_status(u16 id, u64 generation, u64 lifetime, u16 handle)
+int sparklink_native_session_status(u16 id, u64 generation, u64 lifetime, u16 handle, u64 epoch)
 {
-    return sparklink_native_session_status_rust(id, generation, lifetime, handle);
+    return sparklink_native_session_status_rust(id, generation, lifetime, handle, epoch);
 }
 
 extern int sparklink_native_acb_send_guarded_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
-    const u8 *data, size_t length,
+    const u8 *data, size_t length, u64 epoch,
     int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
 int sparklink_native_acb_send_guarded(u16 id, u64 generation, u64 lifetime, u16 handle,
-    const u8 *data, size_t length,
+    const u8 *data, size_t length, u64 epoch,
     int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope)
 {
-    return sparklink_native_acb_send_guarded_rust(id, generation, lifetime, handle, data, length, consent, scope);
+    return sparklink_native_acb_send_guarded_rust(id, generation, lifetime, handle, data, length, epoch, consent, scope);
+}
+
+extern int sparklink_native_session_admit_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+    u64 epoch, int (*admit)(void *), void *context);
+int sparklink_native_session_admit(u16 id, u64 generation, u64 lifetime, u16 handle,
+    u64 epoch, int (*admit)(void *), void *context)
+{
+    return sparklink_native_session_admit_rust(id, generation, lifetime, handle, epoch, admit, context);
 }

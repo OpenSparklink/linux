@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#[path="sle_grant.rs"] mod sle_grant;
 // Actual Host predicates and core release decision; lock/transport dependencies
 // are fixtures. This does not prove fd-close, scheduling, hardware or RF.
 #[allow(dead_code)]
@@ -43,7 +44,7 @@ impl BoolLock {fn lock(&self)->RefMut<'_,bool>{self.0.borrow_mut()}}
 struct Owner {host:Lock,schedule_gate:BoolLock}
 struct Host {connections:sle_connection_operation::Connections,links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
- advertising_set:sle_command_plan::AdvertisingSet,operations:Operations,selected_policy_domains:u8,data_revoked:bool,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
+ advertising_set:sle_command_plan::AdvertisingSet,operations:Operations,selected_policy_domains:u8,grants:sle_grant::LeaseAuthority,data_revoked:bool,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
 impl Host {
  // @@HOST_METHODS@@
 }
@@ -53,7 +54,7 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
 }
 fn host()->Host {Host{connections:sle_connection_operation::Connections::new(),links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),advertising_set:sle_command_plan::AdvertisingSet::Unknown,
- selected_policy_domains:0,data_revoked:false,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
+ selected_policy_domains:0,grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 struct Caller {file_id:u64}
 struct Request {mode:u32}
 fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:u64)->Result {
@@ -361,6 +362,15 @@ fn queued_policy()->Host {
  let mut h=host();
  h.enqueue_recipe(DiscoveryIntent::Scanning(false),&[RecipePart{opcode:0x1002,params:&[0;2]}]).unwrap();
  let r=h.requests.pop().unwrap();assert_eq!(r.deadline,1+CMD_TIMEOUT_MS as u64);assert_eq!(r.recipe.unwrap().cookie,r.cookie);
+}
+
+
+#[test] fn rejected_epoch_does_not_resume_or_publish_management() {
+ let mut h=host();assert!(h.grants.activate(u64::MAX,true));h.grants.revoke();h.data_revoked=true;
+ let owner=Owner{host:Lock(RefCell::new(h)),schedule_gate:BoolLock(RefCell::new(false))};
+ let mut gate=sle_management::Management::new();let token=gate.prepare(sle_management::MANAGED).unwrap();
+ assert_eq!(after_copyout_commit(&owner,&mut gate,token),Err(-75));
+ assert_eq!(gate.state,sle_management::FREE);assert!(owner.host.lock().data_revoked);
 }
 
 }

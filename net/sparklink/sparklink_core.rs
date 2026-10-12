@@ -17,6 +17,7 @@
 mod sle_adv;
 mod sle_authorization;
 mod sle_management;
+mod sle_grant;
 mod sle_configfs;
 mod sle_conn;
 mod sle_command_plan;
@@ -2791,6 +2792,8 @@ fn management_error(error: sle_management::Failure) -> Error {
 /// lock spans allocation, driver preparation, copyout or transport operations.
 #[inline(never)]
 fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::Management, mode: u32) {
+    // Linearize withdrawal before waiting for process-context state/preparation.
+    owner.host.lock().revoke_connections();
     let result = (|| -> Result {
         let mut state = owner.state.lock();
         let state = Option::as_mut(&mut *state).ok_or(ENODEV)?;
@@ -2801,7 +2804,6 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
             // Preserve sent/accepted author procedures and physical facts.
             // Managed cleanup will prepare real Disconnects in process context;
             // Diagnostic cannot claim or clean another physical session.
-            host.revoke_connections();
             if mode == sle_management::MANAGED { host.validate_connection_cleanup()?; }
             if mode == sle_management::DIAGNOSTIC && !host.links_clear_for_management() {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
@@ -2920,7 +2922,9 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
             if *stopping { return Err(ENODEV); }
             if let Some(error) = host.controller_status().2 { return Err(error); }
             if !host.quiet() || !host.links_clear_for_management() { return Err(EBUSY); }
+            if !host.grants.accepts(token) { return Err(EOVERFLOW); }
             host.resume_management()?;
+            if !host.grants.activate(token, request.mode == sle_management::MANAGED) { return Err(EOVERFLOW); }
             gate.commit(me.file_id, request.mode, token);
         }
         *me.owned_target.lock() = Some(owner.clone());

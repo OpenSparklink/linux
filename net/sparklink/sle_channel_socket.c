@@ -33,7 +33,7 @@ struct sl_basic_channel {
 struct sl_connection_session {
 	struct kref refs;
 	u16 controller, handle;
-	u64 generation, lifetime;
+	u64 generation, lifetime, epoch;
 	spinlock_t lock; /* state + channel; never spans blocking transport */
 	struct sl_channel_progress progress;
 	unsigned long deadline;
@@ -195,7 +195,7 @@ static int sl_send(struct sl_connection_session *s, bool application, const u8 *
 	struct sl_submit_scope permission = { s, application };
 
 	return sparklink_native_acb_send_guarded(s->controller, s->generation, s->lifetime,
-		s->handle, data, length, sl_session_submit, &permission);
+		s->handle, data, length, s->epoch, sl_session_submit, &permission);
 }
 
 /* Exactly one session worker consumes the connection's ACB queue. Decode once,
@@ -269,7 +269,7 @@ static void sl_work(struct work_struct *work)
 
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
-	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle);
+	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
 	if (ret == -EAGAIN) {
 		/* Unknown physical state is bounded independently of CMTC deadline. */
 		sl_progress_event(s, 0, 0);
@@ -348,13 +348,13 @@ again:
 put:
 	sl_connection_session_put(s);
 }
-void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime, u16 handle, u16 maximum)
+void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch, u16 maximum)
 {
 	struct sl_connection_session *s = kzalloc(sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return NULL;
 	kref_init(&s->refs);
-	s->controller = controller; s->generation = generation; s->lifetime = lifetime; s->handle = handle;
+	s->controller = controller; s->generation = generation; s->lifetime = lifetime; s->handle = handle; s->epoch = epoch;
 	spin_lock_init(&s->lock);
 	INIT_DELAYED_WORK(&s->work, sl_work);
 	skb_queue_head_init(&s->channel.tx);
@@ -397,12 +397,14 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
-	if (length != sizeof(*input) || input->family != AF_SPARKLINK || input->version != 1 ||
+	if (length != sizeof(*input) || input->family != AF_SPARKLINK || input->version != SPARKLINK_SOCKET_VERSION ||
 	    input->flags || memchr_inv(input->reserved, 0, sizeof(input->reserved)))
 		return -EINVAL;
+	if (input->directions != (SPARKLINK_SOCKET_TX | SPARKLINK_SOCKET_RX) || input->security)
+		return -EOPNOTSUPP;
 	if (input->local_tcid != SL_CHANNEL_CUTC || input->remote_tcid != SL_CHANNEL_CUTC || input->pi != SPARKLINK_SOCKET_USER_PI)
 		return -EOPNOTSUPP;
-	s = sparklink_native_session_get(input->controller, input->generation, input->lifetime, input->handle, &ret);
+	s = sparklink_native_session_get(input->controller, input->generation, input->lifetime, input->handle, input->lease, &ret);
 	if (!s)
 		return ret;
 	spin_lock_bh(&binding->lock);
@@ -441,9 +443,37 @@ static int sl_can_write(struct sl_connection_session *s)
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ready;
 }
+struct sl_admission { struct sl_connection_session *session; struct sk_buff *skb; size_t length; };
+static int sl_admit(void *context)
+{
+    struct sl_admission *admission = context;
+    struct sl_connection_session *s = admission->session;
+    struct sk_buff *skb = admission->skb;
+    size_t length = admission->length;
+    unsigned long flags;
+    int ret;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(s->channel.binding))
+		ret = sl_channel_active(s->progress) && sl_binding_live(s->channel.binding) ? -EAGAIN : -ENOTCONN;
+	else if (length > s->channel.mtu)
+		ret = -EMSGSIZE;
+	else {
+		spin_lock(&s->channel.tx.lock);
+		if (!sl_binding_space(s->channel.binding, s->channel.tx.qlen, SL_CHANNEL_TX))
+			ret = -EAGAIN;
+		else {
+			__skb_queue_tail(&s->channel.tx, skb);
+			admission->skb = NULL;
+			ret = 0;
+		}
+		spin_unlock(&s->channel.tx.lock);
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+    return ret;
+}
 static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 {
-	unsigned long flags;
 	struct sl_connection_session *s = sl_binding_session(sock->sk);
 	struct sk_buff *skb = NULL;
 	u8 *p;
@@ -452,6 +482,9 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 
 	if (!s)
 		return -ENOTCONN;
+	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
+	if (ret)
+		goto put;
 	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
 	if (length > sl_snapshot(s).mtu) { ret = -EMSGSIZE; goto put; }
 	while (!sl_can_write(s)) {
@@ -466,23 +499,14 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 	ret = memcpy_from_msg(p + 5, msg, length);
 	if (ret)
 		goto put;
-	spin_lock_irqsave(&s->lock, flags);
-	if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(s->channel.binding))
-		ret = sl_channel_active(s->progress) && sl_binding_live(s->channel.binding) ? -EAGAIN : -ENOTCONN;
-	else if (length > s->channel.mtu)
-		ret = -EMSGSIZE;
-	else {
-		spin_lock(&s->channel.tx.lock);
-		if (!sl_binding_space(s->channel.binding, s->channel.tx.qlen, SL_CHANNEL_TX))
-			ret = -EAGAIN;
-		else {
-			__skb_queue_tail(&s->channel.tx, skb);
-			skb = NULL;
-			ret = length;
-		}
-		spin_unlock(&s->channel.tx.lock);
-	}
-	spin_unlock_irqrestore(&s->lock, flags);
+    {
+        struct sl_admission admission = { s, skb, length };
+        ret = sparklink_native_session_admit(s->controller, s->generation, s->lifetime,
+            s->handle, s->epoch, sl_admit, &admission);
+        skb = admission.skb;
+        if (!ret)
+            ret = length;
+    }
 put:
 	kfree_skb(skb);
 	sl_connection_session_put(s);
@@ -496,6 +520,8 @@ static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, in
 
 	if (!s)
 		return -ENOTCONN;
+	error = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
+	if (error) { copied = error; goto put; }
 	skb = __skb_recv_datagram(sock->sk, &s->channel.rx, flags, &offset, &error);
 	if (!skb) { copied = error; goto put; }
 	copied = min_t(size_t, length, skb->len);
@@ -521,6 +547,10 @@ static __poll_t sl_poll(struct file *file, struct socket *sock, poll_table *wait
 	s = sl_binding_session(sock->sk);
 	if (!s)
 		return EPOLLERR | EPOLLHUP;
+	if (sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch)) {
+		sl_connection_session_put(s);
+		return EPOLLERR | EPOLLHUP;
+	}
 	spin_lock_irqsave(&s->lock, flags);
 	if (!sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding))
 		mask = EPOLLERR | EPOLLHUP;

@@ -6,15 +6,23 @@
 /* Experimental/unpublished. Broker binds with CAP_NET_ADMIN and can pass the
  * SOCK_DGRAM fd to ordinary applications. Basic mode has no reliable delivery
  * promise. SOCK_SEQPACKET requires a qualified reliable mode and is rejected.
+ * lease is the current Managed token; release/owner death invalidates it.
+ * A successor lease never renews the old fd. Kernel enforces admission and
+ * actual USB submission; accepted physical obligations are retained.
+ * Current basic mode only accepts TX|RX and security=0.
  * No mutation/raw DLI permission.
  */
 struct sockaddr_sparklink {
 	__u16 family, controller;
 	__u16 version, flags;
-	__u64 generation, lifetime;
+	__u64 generation, lifetime, lease;
 	__u16 handle;
 	__u8 local_tcid, remote_tcid, pi, reserved[3];
+	__u32 directions, security;
 };
-#define SPARKLINK_SOCKET_VERSION 1
+#define SPARKLINK_SOCKET_VERSION 2
+#define SPARKLINK_SOCKET_TX 1
+#define SPARKLINK_SOCKET_RX 2
+/* Only unencrypted basic mode is qualified; nonzero security is unsupported. */
 #define SPARKLINK_SOCKET_USER_PI 241
 #endif

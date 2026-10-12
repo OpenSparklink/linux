@@ -4,6 +4,7 @@
 #[allow(dead_code)] #[path="sle_command_plan.rs"] mod sle_command_plan;
 #[allow(dead_code)] #[path="sle_command_queue.rs"] mod sle_command_queue;
 #[allow(dead_code)] #[path="sle_discovery_operation.rs"] mod sle_discovery_operation;
+#[path="sle_grant.rs"] mod sle_grant;
 #[path="sle_connection_operation.rs"] mod sle_connection_operation;
 #[path="sle_link_observation.rs"] mod sle_link_observation;
 mod sle_dli {pub(crate) use super::actual_host::SleStatus;}
@@ -45,7 +46,7 @@ impl CmdRequestQueue {
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
  connections:sle_connection_operation::Connections::new(),credits:1,active:None,reply:None,fault:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
- data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
+ grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){unsafe{kernel::bindings::jiffies_64=now}}
 fn reference(handle:u16)->sle_connection_operation::ExpectedLink { sle_connection_operation::ExpectedLink { lifetime:1,handle,role:0,address_type:0,address:[1;6] } }
 fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None).unwrap()}

@@ -58,11 +58,27 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"full queue");assert(s.channel.rx.qlen==SL_CHANNEL_RX&&s.channel.rx_dropped==3);
  struct sl_submit_scope scope={&s,true};irq_disabled=true;
  assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==1);
+
+ irq_disabled=false;
+ for(unsigned i=0;i<SL_CHANNEL_TX;i++) {
+  struct sl_admission admission={&s,alloc_skb(1,0),1};
+  assert(sl_admit(&admission)==0&&admission.skb==NULL);
+ }
+ struct sl_admission extra={&s,alloc_skb(1,0),1};
+ assert(sl_admit(&extra)==-EAGAIN&&extra.skb);kfree_skb(extra.skb);
+ struct sl_admission large={&s,alloc_skb(250,0),250};
+ assert(sl_admit(&large)==-EMSGSIZE&&large.skb);kfree_skb(large.skb);
+ irq_disabled=true;
  sl_binding_retire(&s.channel.binding);
  assert(sl_session_submit(&scope,atomic_submit,&s)==-ECANCELED&&submitted==1);
+ irq_disabled=false;
+ struct sl_admission closed={&s,alloc_skb(1,0),1};
+ assert(sl_admit(&closed)==-ENOTCONN&&closed.skb);kfree_skb(closed.skb);
+ irq_disabled=true;
  scope.application=false;assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==2);
  sl_channel_close(&s.progress);assert(sl_session_submit(&scope,atomic_submit,&s)==-ECANCELED&&submitted==2);irq_disabled=false;
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channel.rx.qlen==SL_CHANNEL_RX&&s.channel.rx_dropped==4);
- while(s.channel.rx.head){struct sk_buff *skb=s.channel.rx.head;s.channel.rx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
+ while(s.channel.rx.head){struct sk_buff *skb=s.channel.rx.head;s.channel.rx.head=skb->next;kfree_skb(skb);}
+ while(s.channel.tx.head){struct sk_buff *skb=s.channel.tx.head;s.channel.tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

@@ -682,6 +682,7 @@ struct NativeTxTicket {
     lifetime: u64,
     handle: u16,
     length: usize,
+    epoch: Option<u64>,
     consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
     scope: *mut c_void,
     attempted: Cell<bool>,
@@ -710,6 +711,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
     if *gate { return ENODEV.to_errno(); }
     if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
     if !host.admits_data() { return -(kernel::bindings::EACCES as i32); }
+    if ticket.epoch.is_some_and(|epoch| !host.grants.permits(epoch)) { return -(kernel::bindings::EACCES as i32); }
     if !links.iter().flatten().any(|link| link.handle == ticket.handle && link.lifetime == ticket.lifetime) {
         return -(kernel::bindings::ESTALE as i32);
     }
@@ -739,20 +741,20 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
 ) -> i32 {
     // SAFETY: preserves internal caller buffer lifetime until driver joins.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, None, core::ptr::null_mut()) }
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, None, None, core::ptr::null_mut()) }
 }
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_acb_send_guarded_rust(
-    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
+    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize, epoch: u64,
     consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
 ) -> i32 {
     if consent.is_none() || scope.is_null() { return EINVAL.to_errno(); }
     // SAFETY: session worker holds its reference and scope until this returns.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, consent, scope) }
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, Some(epoch), consent, scope) }
 }
 unsafe fn native_acb_send(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
-    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
+    epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
 ) -> i32 {
     if data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
     let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
@@ -772,6 +774,7 @@ unsafe fn native_acb_send(
         if *gate { return ENODEV.to_errno(); }
         if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
         if !host.admits_data() { return -(kernel::bindings::EACCES as i32); }
+        if epoch.is_some_and(|epoch| !host.grants.permits(epoch)) { return -(kernel::bindings::EACCES as i32); }
         if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
             return -(kernel::bindings::ESTALE as i32);
         }
@@ -781,7 +784,7 @@ unsafe fn native_acb_send(
             Err(error) => return super::sle_native_data::error(error).to_errno(),
         }
     }
-    let mut ticket = NativeTxTicket { owner: owner.clone(), lifetime, handle, length,
+    let mut ticket = NativeTxTicket { owner: owner.clone(), lifetime, handle, length, epoch,
         consent, scope, attempted: Cell::new(false), submitted: Cell::new(false) };
     // SAFETY: caller owns immutable bytes, the ticket and retained Backend
     // remain live until the blocking driver callback joins its completion.
