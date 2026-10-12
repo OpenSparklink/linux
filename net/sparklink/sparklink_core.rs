@@ -44,7 +44,6 @@ mod sle_power;
 mod sle_security;
 mod sle_snoop;
 mod sle_serdev;
-mod sle_spi;
 mod sle_transport;
 mod sle_uapi;
 mod sle_uart;
@@ -469,7 +468,11 @@ impl ControllerState {
                 identity: sle_dev::DeviceIdentity { id: u16::MAX, generation: 0 },
                 dev_info: unsafe { core::mem::zeroed() },
                 controller: backend,
-                conn: ConnManager::new(addr),
+                conn: {
+                    let mut connections = ConnManager::new(addr);
+                    connections.set_max_connections(sle_configfs::max_connections() as usize);
+                    connections
+                },
                 adv_scan: AdvScanInner::new(addr, b"sparklink"),
                 security: SecurityInner::new(),
                 rpa: RpaManager::new(),
@@ -1342,42 +1345,18 @@ impl kernel::InPlaceModule for SparkLinkModule {
 #[inline(never)]
 fn init_subsystem() -> Result<SubsystemGuard> {
     let mut ss = SUBSYSTEM.lock();
-    let addr = [0x5E, 0x00, 0x00, 0x00, 0x00, 0x01];
-    let controller = match sle_configfs::controller_type() {
-        1 => sle_dli::ControllerBackend::new_uart(addr, sle_uart::UartConfig::default()),
-        2 => sle_dli::ControllerBackend::new_spi(addr, sle_spi::SpiConfig::default()),
-        _ => sle_dli::ControllerBackend::new_none(),
-    };
-    // Only open if a real backend was configured; None is deferred
-    // until a USB/serdev device attaches.
-    let _ = controller.open();
-
-    let mut runtime = ControllerState::new_boxed(addr, controller)?;
-    runtime.conn.set_max_connections(sle_configfs::max_connections() as usize);
-
     let mut proto_registry = sle_transport::SleProtoRegistry::new();
     sle_transport::register_builtin_protos(&mut proto_registry);
 
-    let mut dev_registry = sle_dev::SleDevRegistry::new();
-    // Only register a device at init if a real controller backend is
-    // configured (UART/SPI via configfs).  For None (the default),
-    // the first device is registered when a USB/serdev driver probes.
-    let dev_id = if !runtime.controller.is_none() {
-        let ctrl_info = runtime.controller.info();
-        dev_registry.register(&ctrl_info).ok()
-    } else {
-        None
-    };
-
-    let mut runtimes = core::array::from_fn(|_| None);
-    if let Some(id) = dev_id {
-        runtimes[id as usize] = Some(ControllerRuntime::new(dev_registry.get(id).ok_or(ENODEV)?, runtime)?);
-    }
+    // Only a bus driver's successful registration can create a Runtime.
+    // Module load creates no synthetic controller or protocol state.
+    let dev_registry = sle_dev::SleDevRegistry::new();
+    let runtimes = core::array::from_fn(|_| None);
     *ss = Some(KBox::init(
         init!(SubsystemShared {
             runtimes,
             dev_registry,
-            active_dev_id: dev_id,
+            active_dev_id: None,
             proto_registry,
             dev_bindings: sle_transport::SleBindingTable::new(),
         }),

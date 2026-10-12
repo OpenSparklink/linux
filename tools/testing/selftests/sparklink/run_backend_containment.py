@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Execute actual UART/SPI trait methods with minimal types; no hardware claims."""
+"""Execute archived UART/SPI rejection methods; no production/hardware claims."""
 import argparse
 import hashlib
 import json
@@ -26,7 +26,7 @@ def run(output):
     records = {}
     sources = {}
     for name in ('uart', 'spi'):
-        path = here.parents[3]/'net/sparklink'/('sle_'+name+'.rs')
+        path = here/'retired-transport'/('sle_'+name+'.rs')
         data = path.read_text()
         sources[path] = data
         bodies = '\n'.join(method(data, n) for n in ('info', 'open', 'send_command', 'send_data', 'reset'))
@@ -42,7 +42,7 @@ def run(output):
     if any(p.read_text() != data for p, data in sources.items()):
         raise RuntimeError('production input changed during tests')
     result = {'status': 'BACKEND_CONTAINMENT_PASS', 'sources': records, 'tests': 2,
-              'scope': 'actual trait method bodies with fixture types; no UART/SPI hardware/framing qualification',
+              'scope': 'archived unsupported trait bodies preserved outside production, fixture types; no UART/SPI hardware/framing qualification',
               'physical_acceptance': False}
     if output:
         output.write_text(json.dumps(result, indent=2)+'\n')

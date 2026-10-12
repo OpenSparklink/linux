@@ -25,13 +25,6 @@ static MAX_CONNECTIONS: AtomicU8 = AtomicU8::new(8);
 static ADV_INTERVAL_MS: AtomicU16 = AtomicU16::new(100);
 static SCAN_WINDOW_MS: AtomicU16 = AtomicU16::new(200);
 static POWER_MODE: AtomicU8 = AtomicU8::new(0);
-static CONTROLLER_TYPE: AtomicU8 = AtomicU8::new(0);
-
-/// Get the configured controller type.
-/// 0 = None (no controller), 1 = UART, 2 = SPI.
-pub(crate) fn controller_type() -> u8 {
-    CONTROLLER_TYPE.load(Ordering::Relaxed)
-}
 
 /// Get the configured maximum number of connections (1..8).
 pub(crate) fn max_connections() -> u8 {
@@ -205,14 +198,7 @@ impl configfs::AttributeOperations<5> for SparkLinkConfig {
     type Data = SparkLinkConfig;
 
     fn show(_data: &SparkLinkConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
-        let ct = CONTROLLER_TYPE.load(Ordering::Relaxed);
-        let label = match ct {
-            0 => b"none\n" as &[u8],
-            1 => b"uart\n",
-            2 => b"spi\n",
-            4 => b"usb\n",
-            _ => b"unknown\n",
-        };
+        let label = b"none\n";
         page[..label.len()].copy_from_slice(label);
         Ok(label.len())
     }
@@ -220,15 +206,14 @@ impl configfs::AttributeOperations<5> for SparkLinkConfig {
     fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
         super::sle_authorization::require_admin()?;
         let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
-        let val = match s.trim() {
-            "none" | "0" => 0u8,
-            "uart" | "1" => 1u8,
-            "spi" | "2" => 2u8,
-            "usb" | "4" => 4u8,
+        match s.trim() {
+            "none" | "0" => {},
+            // A global selector cannot attach a real device. These old names
+            // are rejected until a registered bus Backend supplies the state.
+            "uart" | "1" | "spi" | "2" | "usb" | "4" =>
+                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
             _ => return Err(EINVAL),
-        };
-        CONTROLLER_TYPE.store(val, Ordering::Relaxed);
-        pr_info!("sparklink: controller_type set to {}\n", val);
+        }
         Ok(())
     }
 }

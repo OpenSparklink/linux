@@ -155,8 +155,11 @@ impl SerdevParserState {
                         self.events.push(sle_evt);
                     }
                 }
-                _ => {
-                    pr_debug!("sparklink-serdev: rx non-event frame\n");
+                UartFrame::Command { opcode, params } => {
+                    pr_debug!("sparklink-serdev: reject RX command opcode={:#x} len={}\n", opcode, params.len());
+                }
+                UartFrame::Data { pkt_type, handle, flags, payload } => {
+                    pr_debug!("sparklink-serdev: unsupported RX data type={:?} handle={} flags={} len={}\n", pkt_type, handle, flags, payload.len());
                 }
             }
         }

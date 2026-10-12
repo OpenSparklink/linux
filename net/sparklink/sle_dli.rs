@@ -1179,48 +1179,26 @@ pub trait SleController: Send + Sync {
 // Controller dispatch enum (avoids trait objects)
 // ---------------------------------------------------------------------------
 
-/// Concrete controller selector used by the core module.
+/// Remaining bus controller selector; only actual registration constructs it.
 ///
-/// This enum wraps all supported controller backends, allowing static
+/// This enum still wraps the registered USB/serdev/WS73 paths, allowing static
 /// dispatch without heap-allocated trait objects.
 pub enum ControllerBackend {
-    /// No controller attached. All operations return `ENODEV`.
-    None,
-    Uart(super::sle_uart::UartController),
-    Spi(super::sle_spi::SpiController),
     Usb(super::sle_usb::UsbController),
     Serdev(super::sle_serdev::SerdevController),
     Ws73(super::sle_native::NativeController),
 }
 
-// SAFETY: ControllerBackend is always stored inside Mutex<ControllerBackend>
-// in SparkLinkCtl.  The Mutex provides exclusive access, so Cell/RefCell
+// SAFETY: ControllerBackend is stored in ControllerState under each Runtime state mutex.
+//  The Mutex provides exclusive access, so Cell/RefCell
 // interior mutability in the contained controllers is sound.
 unsafe impl Send for ControllerBackend {}
-// SAFETY: ControllerBackend is always stored inside Mutex<ControllerBackend>
-// in SparkLinkCtl.  The Mutex provides exclusive access, so Cell/RefCell
+// SAFETY: ControllerBackend is stored in ControllerState under each Runtime state mutex.
+//  The Mutex provides exclusive access, so Cell/RefCell
 // interior mutability in the contained controllers is sound.
 unsafe impl Sync for ControllerBackend {}
 
 impl ControllerBackend {
-    /// Create a placeholder backend with no hardware attached.
-    pub fn new_none() -> Self {
-        Self::None
-    }
-
-    /// Returns `true` if no controller hardware is attached.
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-
-    pub fn new_uart(addr: [u8; 6], config: super::sle_uart::UartConfig) -> Self {
-        Self::Uart(super::sle_uart::UartController::new(addr, config))
-    }
-
-    pub fn new_spi(addr: [u8; 6], config: super::sle_spi::SpiConfig) -> Self {
-        Self::Spi(super::sle_spi::SpiController::new(addr, config))
-    }
-
     pub fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
         Self::Usb(super::sle_usb::UsbController::new(addr, identity))
     }
@@ -1461,9 +1439,6 @@ impl ControllerBackend {
 impl SleController for ControllerBackend {
     fn info(&self) -> SleControllerInfo {
         match self {
-            Self::None => SleControllerInfo::default(),
-            Self::Uart(c) => c.info(),
-            Self::Spi(c) => c.info(),
             Self::Usb(c) => c.info(),
             Self::Ws73(c) => c.info(),
             Self::Serdev(c) => c.info(),
@@ -1472,9 +1447,6 @@ impl SleController for ControllerBackend {
 
     fn open(&self) -> Result {
         match self {
-            Self::None => Err(ENODEV),
-            Self::Uart(c) => c.open(),
-            Self::Spi(c) => c.open(),
             Self::Usb(c) => c.open(),
             Self::Ws73(c) => c.open(),
             Self::Serdev(c) => c.open(),
@@ -1483,9 +1455,6 @@ impl SleController for ControllerBackend {
 
     fn close(&self) {
         match self {
-            Self::None => {},
-            Self::Uart(c) => c.close(),
-            Self::Spi(c) => c.close(),
             Self::Usb(c) => c.close(),
             Self::Ws73(c) => c.close(),
             Self::Serdev(c) => c.close(),
@@ -1494,9 +1463,6 @@ impl SleController for ControllerBackend {
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
         match self {
-            Self::None => Err(ENODEV),
-            Self::Uart(c) => c.send_command(opcode, params),
-            Self::Spi(c) => c.send_command(opcode, params),
             Self::Usb(c) => c.send_command(opcode, params),
             Self::Ws73(c) => c.send_command(opcode, params),
             Self::Serdev(c) => c.send_command(opcode, params),
@@ -1505,9 +1471,6 @@ impl SleController for ControllerBackend {
 
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {
         match self {
-            Self::None => Err(ENODEV),
-            Self::Uart(c) => c.send_data(handle, data),
-            Self::Spi(c) => c.send_data(handle, data),
             Self::Usb(c) => c.send_data(handle, data),
             Self::Ws73(c) => c.send_data(handle, data),
             Self::Serdev(c) => c.send_data(handle, data),
@@ -1516,9 +1479,6 @@ impl SleController for ControllerBackend {
 
     fn poll_event(&self) -> Option<SleEvent> {
         match self {
-            Self::None => None,
-            Self::Uart(c) => c.poll_event(),
-            Self::Spi(c) => c.poll_event(),
             Self::Usb(c) => c.poll_event(),
             Self::Ws73(c) => c.poll_event(),
             Self::Serdev(c) => c.poll_event(),
@@ -1527,9 +1487,6 @@ impl SleController for ControllerBackend {
 
     fn reset(&self) -> Result {
         match self {
-            Self::None => Err(ENODEV),
-            Self::Uart(c) => c.reset(),
-            Self::Spi(c) => c.reset(),
             Self::Usb(c) => c.reset(),
             Self::Ws73(c) => c.reset(),
             Self::Serdev(c) => c.reset(),

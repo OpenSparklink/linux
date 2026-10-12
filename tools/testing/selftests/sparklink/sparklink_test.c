@@ -3215,8 +3215,10 @@ static int write_configfs_attr(const char *name, const char *val)
 	if (f < 0)
 		return -1;
 	ssize_t n = write(f, val, strlen(val));
+	int saved_errno = errno;
 
 	close(f);
+	errno = saved_errno;
 	return n > 0 ? 0 : -1;
 }
 
@@ -3486,20 +3488,18 @@ static void test_configfs(void)
 	else
 		test_fail("  FAIL: power_mode=turbo should be rejected\n");
 
-	/* controller_type: write and readback */
-	if (write_configfs_attr("controller_type", "uart") == 0 &&
-	    read_configfs_attr("controller_type", buf, sizeof(buf)) == 0 &&
-	    strcmp(buf, "uart") == 0)
-		printf("  OK:   controller_type set to uart\n");
-	else
-		test_fail("  FAIL: controller_type uart write/readback\n");
-
-	if (write_configfs_attr("controller_type", "spi") == 0 &&
-	    read_configfs_attr("controller_type", buf, sizeof(buf)) == 0 &&
-	    strcmp(buf, "spi") == 0)
-		printf("  OK:   controller_type set to spi\n");
-	else
-		test_fail("  FAIL: controller_type spi write/readback\n");
+	/* Global selector cannot fabricate a registered hardware Backend. */
+	const char *unsupported[] = { "uart", "spi", "usb" };
+	for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+		errno = 0;
+		if (write_configfs_attr("controller_type", unsupported[i]) != 0 &&
+		    errno == EOPNOTSUPP &&
+		    read_configfs_attr("controller_type", buf, sizeof(buf)) == 0 &&
+		    strcmp(buf, "none") == 0)
+			printf("  OK:   controller_type=%s explicitly unsupported\n", unsupported[i]);
+		else
+			test_fail("  FAIL: controller_type fabricates selected hardware\n");
+	}
 
 	/* Invalid controller_type */
 	if (write_configfs_attr("controller_type", "i2c") != 0)
