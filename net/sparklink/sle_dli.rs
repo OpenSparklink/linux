@@ -1357,7 +1357,6 @@ impl ControllerBackend {
         match self {
             Self::Usb(c) => c.send_command_transport(opcode, params),
             Self::Ws73(c) => c.send_command_transport(opcode, params, recipe),
-            _ => Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
         }
     }
 

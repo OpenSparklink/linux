@@ -31,14 +31,8 @@ const MAX_PROTOS: usize = 8;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum SleProtoId {
-    /// UART H4-style framing (packet type indicator + header + payload).
-    H4Uart = 0,
     /// USB bulk/interrupt endpoint transport.
     UsbBulk = 1,
-    /// SPI register-based transport.
-    Spi = 2,
-    /// Reserved.
-    Reserved = 3,
 }
 
 /// Static properties of a transport protocol (like `hci_uart_proto`).
@@ -54,10 +48,6 @@ pub(crate) struct SleProtoEntry {
     pub bus: SleBus,
     /// Default max PDU payload (can be overridden per-device).
     pub max_pdu: u16,
-    /// Expected initial baud rate (UART only, 0 for others).
-    pub init_speed: u32,
-    /// Expected operational baud rate (UART only, 0 for others).
-    pub oper_speed: u32,
 }
 
 /// Global transport protocol registry.
@@ -96,28 +86,6 @@ impl SleProtoRegistry {
         Ok(())
     }
 
-    /// Unregister a transport protocol by id.
-    ///
-    /// Returns `EBUSY` if any device binding still references this protocol.
-    pub(crate) fn unregister(
-        &mut self,
-        id: SleProtoId,
-        bindings: &SleBindingTable,
-    ) -> Result {
-        let idx = id as usize;
-        if idx >= MAX_PROTOS {
-            return Err(EINVAL);
-        }
-        if self.slots[idx].is_none() {
-            return Err(ENOENT);
-        }
-        if bindings.has_bindings_for(id) {
-            return Err(EBUSY);
-        }
-        self.slots[idx] = None;
-        self.count = self.count.saturating_sub(1);
-        Ok(())
-    }
 
     /// Look up a registered protocol.
     pub(crate) fn get(&self, id: SleProtoId) -> Option<&SleProtoEntry> {
@@ -180,12 +148,6 @@ impl SleAttachInfo {
     }
 }
 
-/// Outcome of a successful `sle_attach_device()` call.
-pub(crate) struct SleAttachResult {
-    /// Allocated device id from the SleDev registry.
-    pub dev_id: u16,
-}
-
 // =========================================================================
 // Device binding record
 // =========================================================================
@@ -202,10 +164,6 @@ const MAX_BOUND_DEVS: usize = 16;
 pub(crate) struct SleDevBinding {
     /// Device id in the SleDev registry.
     pub dev_id: u16,
-    /// Transport protocol used by this device.
-    pub proto_id: SleProtoId,
-    /// Whether the device has been opened (transport active).
-    pub opened: bool,
 }
 
 /// Table of active device bindings.
@@ -252,42 +210,15 @@ impl SleBindingTable {
         entry
     }
 
-    /// Look up a binding by device id.
-    pub(crate) fn get(&self, dev_id: u16) -> Option<&SleDevBinding> {
-        let idx = dev_id as usize;
-        if idx < MAX_BOUND_DEVS {
-            self.slots[idx].as_ref()
-        } else {
-            None
-        }
-    }
 
-    /// Mutable lookup.
-    pub(crate) fn get_mut(&mut self, dev_id: u16) -> Option<&mut SleDevBinding> {
-        let idx = dev_id as usize;
-        if idx < MAX_BOUND_DEVS {
-            self.slots[idx].as_mut()
-        } else {
-            None
-        }
-    }
 
     /// Number of bound devices.
     pub(crate) fn count(&self) -> u8 {
         self.count
     }
 
-    /// Check if any binding references the given protocol.
-    pub(crate) fn has_bindings_for(&self, proto_id: SleProtoId) -> bool {
-        self.slots
-            .iter()
-            .any(|s| matches!(s, Some(b) if b.proto_id == proto_id))
-    }
 
-    /// Iterate bound devices.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &SleDevBinding> {
-        self.slots.iter().filter_map(|s| s.as_ref())
-    }
+
 }
 
 // =========================================================================
@@ -300,8 +231,6 @@ pub(crate) const USB_BULK_PROTO: SleProtoEntry = SleProtoEntry {
     name: "sparklink-usb",
     bus: SleBus::Usb,
     max_pdu: 255,
-    init_speed: 0,
-    oper_speed: 0,
 };
 
 /// Register all built-in transport protocols into the given registry.

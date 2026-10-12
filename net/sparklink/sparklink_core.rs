@@ -757,11 +757,7 @@ pub(crate) fn sle_attach_device(info: &sle_transport::SleAttachInfo) -> Result<u
     let dev_id = ss.dev_registry.register(&ctrl_info)?;
 
     // Create the transport binding.
-    let binding = sle_transport::SleDevBinding {
-        dev_id,
-        proto_id: info.proto_id,
-        opened: false,
-    };
+    let binding = sle_transport::SleDevBinding { dev_id };
     if let Err(e) = ss.dev_bindings.insert(binding) {
         let _ = ss.dev_registry.unregister(dev_id);
         return Err(e);
