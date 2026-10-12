@@ -17,15 +17,20 @@ def run(output):
     root = here.parents[3]
     net = root / 'net/sparklink'
     files = [net / n for n in ['sle_native.rs', 'sle_link_observation.rs',
-                             'sle_data_credit.rs', 'sle_native_data.rs']]
+                             'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs']]
     files.append(here / 'native-data/fixture.rs')
     originals = {p: p.read_bytes() for p in files}
     fixture = originals[files[-1]].decode()
+    fixture = fixture.replace('// @@ADMITTED@@', function((net/'sle_host.rs').read_text(), 'admits_data'))
     # The existing balanced-body extractor accepts Rust fn signatures, not
     # extern ABI spelling. Only normalize the signature; preserve whole bodies.
-    source = originals[files[0]].decode().replace('unsafe extern "C" fn', 'unsafe fn')
+    source = re.sub(r'unsafe extern "C" fn (\w+)', r'unsafe fn \1', originals[files[0]].decode())
+    start = source.index('struct NativeTxTicket {')
+    end = source.index('\n}', start) + 2
+    fixture = fixture.replace('// @@TICKET@@', source[start:end])
     for marker, name in [('RECEIVE', 'sparklink_native_receive_rust'),
                          ('SEND', 'sparklink_native_acb_send_rust'),
+                         ('COMMIT', 'sparklink_native_tx_commit_rust'),
                          ('TAKE', 'sparklink_native_acb_take_rust')]:
         fixture = fixture.replace('// @@' + marker + '@@', function(source, name))
     with tempfile.TemporaryDirectory(prefix='sparklink-native-data-') as directory:

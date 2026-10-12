@@ -2,7 +2,10 @@
 
 //! Short IRQ-safe locks for transport ingress and work references.
 //!
-//! Protected operations must not allocate, sleep, decode packets or perform I/O.
+//! Protected operations must not allocate with sleeping flags, sleep, decode
+//! packets or perform blocking I/O. The one explicit exception is prepared ACB
+//! commit: an atomic USB queue call under Host/data/admission guards, with no
+//! wait or protocol reentry. Completion joining is always outside all guards.
 //! Raw spinlocks also retain this constraint on PREEMPT_RT kernels.
 
 use kernel::{bindings, sync::lock::Backend};

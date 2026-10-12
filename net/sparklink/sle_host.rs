@@ -56,6 +56,7 @@ pub(crate) struct CommandHost {
     // Adv / scan params / scan control selection; never cleared by eviction.
     selected_policy_domains: u8,
     revoking: bool,
+    data_revoked: bool,
     revoke_cookies: [u64; 2],
     revoke_done: u8,
     revoke_deadline: u64,
@@ -79,7 +80,7 @@ impl CommandHost {
             broadcast_cookie: 0,
             scan_cookie: 0,
             recipe: None,
-                revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
+                data_revoked: false, revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
                 revoke_status: 0, revoke_opcode: 0, revoke_reply: false,
                 selected_policy_domains: 0,
                 advertising_set: super::sle_command_plan::AdvertisingSet::Unknown,
@@ -269,7 +270,13 @@ impl CommandHost {
         if let Some(cookie) = cookie { self.requests.remove_cookie(cookie); }
         Ok(())
     }
+    pub(crate) fn admits_data(&self) -> bool {
+        !self.data_revoked && self.fault.is_none()
+    }
     pub(crate) fn revoke_connections(&mut self) {
+        // First Host-locked withdrawal, before process-context recipe preparation.
+        // Actual submit takes this same lock. Already queued URBs retain debt.
+        self.data_revoked = true;
         if let Some(cookie) = self.connections.revoke() { self.requests.remove_cookie(cookie); }
     }
 
@@ -360,6 +367,7 @@ impl CommandHost {
             return Err(EBUSY);
         }
         self.revoking = false;
+        self.data_revoked = false;
         self.revoke_cookies = [0; 2]; self.revoke_done = 0; self.revoke_deadline = 0;
         self.revoke_status = 0; self.revoke_opcode = 0; self.revoke_reply = false;
         self.selected_policy_domains = 0; self.recipe = None;

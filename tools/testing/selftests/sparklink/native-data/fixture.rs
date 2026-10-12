@@ -2,7 +2,9 @@
 // Actual ACB ingress/send/take and budget/queue modules. Locks, owner lookup,
 // allocations, Backend/USB and wakeups are dependencies, not hardware evidence.
 extern crate self as kernel;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
+use std::rc::Rc as Arc;
+type ControllerRuntime = Owner;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::ffi::c_void;
@@ -12,7 +14,7 @@ pub type Result<T=()> = std::result::Result<T, Error>;
 pub const EINVAL:Error=Error(-22);pub const ENODEV:Error=Error(-19);pub const EAGAIN:Error=Error(-11);
 pub const EMSGSIZE:Error=Error(-90);pub const EIO:Error=Error(-5);pub const ENOBUFS:Error=Error(-105);
 pub const ENOMEM:Error=Error(-12);pub const EOVERFLOW:Error=Error(-75);pub const GFP_ATOMIC:()=();
-pub mod bindings {pub const EPROTO:i32=71;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
+pub mod bindings {pub const EPROTO:i32=71;pub const EALREADY:i32=114;pub const EACCES:i32=13;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
 pub unsafe fn ktime_get_boottime()->i64{super::NOW.with(|n|*n.borrow() as i64)}}
 pub mod prelude {pub use crate::{Error,Result,KVec,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO,ENOMEM,GFP_ATOMIC};}
 #[derive(Debug)] pub struct KVec<T>(Vec<T>);
@@ -33,8 +35,9 @@ const PROTOCOL_ERROR:i32=-71;const UNSUPPORTED:i32=-95;
 #[derive(Clone,Copy,PartialEq)] struct DeviceIdentity{id:u16,generation:u64}
 struct Lock<T>(RefCell<T>);
 impl<T> Lock<T>{fn new(v:T)->Self{Self(RefCell::new(v))}fn lock(&self)->RefMut<'_,T>{self.0.borrow_mut()}}
-struct Host{links:LinkObservation}
-impl Host{fn link_snapshot(&self)->(u64,bool,[Option<sle_link_observation::Link>;16]){self.links.snapshot()}}
+struct Host{links:LinkObservation,data_revoked:bool,fault:Option<Error>}
+impl Host{// @@ADMITTED@@
+fn link_snapshot(&self)->(u64,bool,[Option<sle_link_observation::Link>;16]){self.links.snapshot()}}
 struct Poll;impl Poll{fn notify_all(&self){}}
 struct Dummy{transport:*mut c_void}
 impl Dummy{fn command_transport(&self)->NativeCommandTransport{NativeCommandTransport{transport:self.transport}}}
@@ -47,7 +50,7 @@ struct Owner{
  commands:RefCell<Vec<SleEvent>>,
 }
 impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
- identity:DeviceIdentity{id,generation},host:Lock::new(Host{links:LinkObservation::new()}),
+ identity:DeviceIdentity{id,generation},host:Lock::new(Host{links:LinkObservation::new(),data_revoked:false,fault:None}),
  data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll,schedule_gate:Lock::new(false),
  native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Ws73(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
@@ -61,6 +64,8 @@ impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
 thread_local!{
  static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(Vec::new())};
  static TX:RefCell<Vec<(usize,u16,Vec<u8>)>>=const{RefCell::new(Vec::new())};
+ static BEFORE_COMMIT:RefCell<u8>=const{RefCell::new(0)};
+ static SUBMIT_RESULT:RefCell<i32>=const{RefCell::new(0)};
  static TX_RESULT:RefCell<i32>=const{RefCell::new(0)};
  static EARLY_COMPLETE:RefCell<bool>=const{RefCell::new(false)};
  static NOW:RefCell<u64>=const{RefCell::new(1)};
@@ -69,21 +74,53 @@ mod sle_usb{use super::*;
  pub fn ingress_owner(id:DeviceIdentity)->Option<Rc<Owner>>{OWNERS.with(|o|o.borrow().iter().find(|o|o.identity==id).cloned())}
  pub fn enqueue_rx(owner:&Owner,event:SleEvent){owner.commands.borrow_mut().push(event);}
 }
-unsafe fn sparklink_native_transport_acb(p:*mut c_void,handle:u16,data:*const u8,n:usize)->i32{
- TX.with(|t|t.borrow_mut().push((p as usize,handle,unsafe{std::slice::from_raw_parts(data,n)}.to_vec())));
+struct Submission {p:*mut c_void,handle:u16,data:*const u8,n:usize}
+unsafe extern "C" fn atomic_submit(context:*mut c_void)->i32{
+ let x=unsafe{&*context.cast::<Submission>()};
+ let owner=OWNERS.with(|o|o.borrow()[x.p as usize-1].clone());
+ // Actual commit body must hold all three guards at the queue operation.
+ assert!(owner.host.0.try_borrow_mut().is_err());
+ assert!(owner.data.0.try_borrow_mut().is_err());
+ assert!(owner.schedule_gate.0.try_borrow_mut().is_err());
+ let result=SUBMIT_RESULT.with(|r|*r.borrow());
+ if result==0 {TX.with(|t|t.borrow_mut().push((x.p as usize,x.handle,
+     unsafe{std::slice::from_raw_parts(x.data,x.n)}.to_vec())));}
+ result
+}
+unsafe fn sparklink_native_transport_acb(p:*mut c_void,ticket:*mut c_void,handle:u16,data:*const u8,n:usize)->i32{
+ let owner=OWNERS.with(|o|o.borrow()[p as usize-1].clone());
+ let mode=BEFORE_COMMIT.with(|b|*b.borrow());
+ match mode {
+  1=>link(&owner,handle,2),
+  2=>owner.host.lock().data_revoked=true,
+  3=>*owner.schedule_gate.lock()=true,
+  4=>{link(&owner,handle,2);link(&owner,handle,1);},
+  5=>return 0, // deliberately lying fixture; production entry must reject it.
+  _=>(),
+ }
+ let mut submission=Submission{p,handle,data,n};
+ let result=unsafe{under_test::sparklink_native_tx_commit_rust(ticket,Some(atomic_submit),
+     (&mut submission as *mut Submission).cast())};
+ if mode==6 {assert_eq!(unsafe{under_test::sparklink_native_tx_commit_rust(ticket,Some(atomic_submit),
+     (&mut submission as *mut Submission).cast())},-114);}
+ if result!=0{return result;}
  if EARLY_COMPLETE.with(|e|*e.borrow()){
-  let owner=OWNERS.with(|o|o.borrow()[p as usize-1].clone());
+  // Completion can arrive before driver return, but after the atomic submit
+  // guard releases. This is dependency injection, not a hardware completion.
   assert_eq!(receive(owner.identity.id,owner.identity.generation,&[0xa2,9,0,3,0,handle as u8,(handle>>8)as u8,1]),0);
  }
  TX_RESULT.with(|r|*r.borrow())
 }
 mod under_test{use super::*;
+// @@TICKET@@
+// @@COMMIT@@
 // @@RECEIVE@@
 // @@SEND@@
 // @@TAKE@@
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
  OWNERS.with(|o|*o.borrow_mut()=vec![a.clone(),b.clone()]);TX.with(|t|t.borrow_mut().clear());
+ BEFORE_COMMIT.with(|b|*b.borrow_mut()=0);SUBMIT_RESULT.with(|r|*r.borrow_mut()=0);
  TX_RESULT.with(|r|*r.borrow_mut()=0);EARLY_COMPLETE.with(|e|*e.borrow_mut()=false);NOW.with(|n|*n.borrow_mut()=1);(a,b)}
 fn link(owner:&Owner,handle:u16,kind:u32){owner.host.lock().links.observe(&LinkEvidence{kind,status:0,handle:handle as u32,role:1,address_type:0,address:[1;6],reserved:[0;2]});}
 fn receive(id:u16,g:u64,bytes:&[u8])->i32{unsafe{under_test::sparklink_native_receive_rust(id,g,bytes.as_ptr(),bytes.len())}}
@@ -172,4 +209,35 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
   assert_eq!((*opcode,*command_credits,*status,*complete),(0x0402,1,0,true));assert_eq!(data.0,[0xaa]);
  },_=>panic!("management reply changed")}
  assert!(matches!(&commands[2],SleEvent::HardwareError{code:7}));
+}
+
+#[test] fn actual_ticket_rechecks_down_revoke_retirement_and_reused_handle_before_submit(){
+ for (mode,expected) in [(1,-116),(2,-13),(3,-19),(4,-116),(5,-71)] {
+  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+  BEFORE_COMMIT.with(|v|*v.borrow_mut()=mode);
+  assert_eq!(send(0,7,1,0,b"never queue"),expected);
+  assert!(TX.with(|t|t.borrow().is_empty()));
+  assert_eq!(a.data.lock().credits.maximum(),Ok(254));
+  BEFORE_COMMIT.with(|v|*v.borrow_mut()=0);
+  assert_eq!(send(1,8,1,0,b"independent"),0);
+ }
+}
+#[test] fn actual_never_queued_failure_rolls_back_only_current_reservation(){
+ let(a,_)=setup();link(&a,0,1);
+ assert_eq!(send(0,7,1,0,b"old queued debt"),0);
+ SUBMIT_RESULT.with(|r|*r.borrow_mut()=-12);
+ for _ in 0..32 {assert_eq!(send(0,7,1,0,b"never queued"),-12);}
+ assert_eq!(a.data.lock().credits.maximum(),Ok(254));
+ assert_eq!(TX.with(|t|t.borrow().len()),1);
+ SUBMIT_RESULT.with(|r|*r.borrow_mut()=0);
+ for _ in 0..4 {assert_eq!(send(0,7,1,0,b"accepted"),0);}
+ assert_eq!(send(0,7,1,0,b"full"),-11);
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,5]),0);
+ assert_eq!(send(0,7,1,0,b"new"),0);
+}
+#[test] fn actual_ticket_is_single_attempt_and_usb_success_still_owes_nocp(){
+ let(a,_)=setup();link(&a,0,1);BEFORE_COMMIT.with(|v|*v.borrow_mut()=6);
+ for _ in 0..5 {assert_eq!(send(0,7,1,0,b"queued once"),0);}
+ assert_eq!(TX.with(|t|t.borrow().len()),5);
+ assert_eq!(send(0,7,1,0,b"credit exhausted"),-11);
 }

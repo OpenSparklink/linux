@@ -6,6 +6,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::ffi::c_void;
+use core::cell::Cell;
+use kernel::sync::Arc;
 use kernel::prelude::*;
 
 const PROTOCOL_ERROR: i32 = -(kernel::bindings::EPROTO as i32);
@@ -89,7 +91,7 @@ extern "C" {
     fn sparklink_native_transport_command(
         transport: *mut c_void, opcode: u16, params: *const u8, length: usize,
     ) -> i32;
-    fn sparklink_native_transport_acb(transport: *mut c_void, handle: u16,
+    fn sparklink_native_transport_acb(transport: *mut c_void, ticket: *mut c_void, handle: u16,
         data: *const u8, length: usize) -> i32;
     fn sparklink_native_transport_has_acb(transport: *mut c_void) -> bool;
 }
@@ -672,6 +674,59 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_limits_rust(
     }
 }
 
+/// One process-context operation retains Runtime and Backend through the
+/// driver's preparation, atomic commit and joined completion. The opaque C
+/// pointer must not escape the blocking send callback. Not a public ABI.
+struct NativeTxTicket {
+    owner: Arc<super::ControllerRuntime>,
+    lifetime: u64,
+    handle: u16,
+    length: usize,
+    attempted: Cell<bool>,
+    submitted: Cell<bool>,
+}
+
+/// Driver has prepared an immutable transfer. Exactly one callback may attempt
+/// commit. Host -> data -> scheduling locks serialize actual USB queueing with
+/// physical link publication, fault/revoke and registration withdrawal. The
+/// callback MUST be a non-sleeping atomic submission, with no Host reentry.
+/// Completion/wait/kill happen after these guards have all been released.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
+    opaque: *mut c_void, submit: Option<unsafe extern "C" fn(*mut c_void) -> i32>, context: *mut c_void,
+) -> i32 {
+    if opaque.is_null() || submit.is_none() { return EINVAL.to_errno(); }
+    // SAFETY: only the retained driver callback receives this live ticket;
+    // it invokes commit synchronously on the same process-context thread.
+    let ticket = unsafe { &*opaque.cast::<NativeTxTicket>() };
+    if ticket.attempted.replace(true) { return -(kernel::bindings::EALREADY as i32); }
+    let owner = &ticket.owner;
+    let host = owner.host.lock();
+    let (_, known, links) = host.link_snapshot();
+    let mut data = owner.data.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return ENODEV.to_errno(); }
+    if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
+    if !host.admits_data() { return -(kernel::bindings::EACCES as i32); }
+    if !links.iter().flatten().any(|link| link.handle == ticket.handle && link.lifetime == ticket.lifetime) {
+        return -(kernel::bindings::ESTALE as i32);
+    }
+    if let Err(error) = data.credits.reserve(ticket.lifetime, ticket.handle, ticket.length) {
+        return super::sle_native_data::error(error).to_errno();
+    }
+    // SAFETY: registered Backend contract permits only an already prepared
+    // atomic queue operation (WS73: usb_submit_urb(..., GFP_ATOMIC)). No wait,
+    // kernel allocation with sleeping flags, protocol callback or decode here.
+    let result = unsafe { submit.unwrap()(context) };
+    if result == 0 {
+        ticket.submitted.set(true); // USB queued; only genuine NOCP pays debt.
+    } else if data.credits.unsubmitted(ticket.lifetime, ticket.handle).is_err() {
+        data.credits.transport_failed();
+        return EIO.to_errno();
+    }
+    result
+}
+
 /// Internal channel entry point. The old handle-only trait stays unsupported.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
@@ -687,23 +742,31 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
         };
         controller.command_transport()
     };
-    let host = owner.host.lock();
-    let (_, known, links) = host.link_snapshot();
-    let mut budget = owner.data.lock();
-    let gate = owner.schedule_gate.lock();
-    if *gate { return ENODEV.to_errno(); }
-    if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
-    if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
-        return -(kernel::bindings::ESTALE as i32);
+    {
+        let host = owner.host.lock();
+        let (_, known, links) = host.link_snapshot();
+        let data = owner.data.lock();
+        let gate = owner.schedule_gate.lock();
+        if *gate { return ENODEV.to_errno(); }
+        if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
+        if !host.admits_data() { return -(kernel::bindings::EACCES as i32); }
+        if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
+            return -(kernel::bindings::ESTALE as i32);
+        }
+        match data.credits.maximum() {
+            Ok(maximum) if length <= maximum as usize => (),
+            Ok(_) => return -(kernel::bindings::EMSGSIZE as i32),
+            Err(error) => return super::sle_native_data::error(error).to_errno(),
+        }
     }
-    if let Err(error) = budget.credits.reserve(lifetime, handle, length) {
-        return super::sle_native_data::error(error).to_errno();
-    }
-    drop(gate); drop(budget); drop(host);
-    // SAFETY: caller owns a live kernel buffer for this blocking call. The
-    // retained Backend and lifecycle guard prevent close until it returns.
-    let result = unsafe { sparklink_native_transport_acb(transport.transport, handle, data, length) };
-    if result != 0 { owner.data.lock().credits.transport_failed(); }
+    let mut ticket = NativeTxTicket { owner: owner.clone(), lifetime, handle, length,
+        attempted: Cell::new(false), submitted: Cell::new(false) };
+    // SAFETY: caller owns immutable bytes, the ticket and retained Backend
+    // remain live until the blocking driver callback joins its completion.
+    let result = unsafe { sparklink_native_transport_acb(transport.transport,
+        (&mut ticket as *mut NativeTxTicket).cast(), handle, data, length) };
+    let result = if result == 0 && !ticket.submitted.get() { PROTOCOL_ERROR } else { result };
+    if result != 0 && ticket.submitted.get() { owner.data.lock().credits.transport_failed(); }
     owner.data_poll.notify_all();
     result
 }

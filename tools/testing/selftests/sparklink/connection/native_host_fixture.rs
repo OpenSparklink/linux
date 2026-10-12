@@ -45,7 +45,7 @@ impl CmdRequestQueue {
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
  connections:sle_connection_operation::Connections::new(),credits:1,active:None,reply:None,fault:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
- revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
+ data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){unsafe{kernel::bindings::jiffies_64=now}}
 fn reference(handle:u16)->sle_connection_operation::ExpectedLink { sle_connection_operation::ExpectedLink { lifetime:1,handle,role:0,address_type:0,address:[1;6] } }
 fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None).unwrap()}
@@ -307,6 +307,16 @@ fn adack(h:&mut CommandHost,r:&CmdRequest,code:u8) {
  clock(1);let mut h=host();h.operations.initialized=false;let p=adparams(0);let off=[0;5];
  h.submit_discovery(1,DiscoveryIntent::AdvertisingStandby,&[RecipePart{opcode:0x0c02,params:&p},RecipePart{opcode:0x0c05,params:&off}],0).unwrap();
  let r=h.next(|_|true).unwrap().unwrap();adack(&mut h,&r,0);assert!(h.advertising_set.configured());assert_eq!(h.operations.advertising,0);assert!(!h.controller_status().1);
+}
+
+
+#[test] fn actual_host_data_withdrawal_is_immediate_and_resume_requires_clean_links() {
+ let mut a=host();let b=host();assert!(a.admits_data());assert!(b.admits_data());
+ a.revoke_connections();assert!(!a.admits_data());assert!(b.admits_data());
+ a.resume_management().unwrap();assert!(a.admits_data());
+ up(&mut a,[1;6]);a.revoke_connections();assert!(!a.admits_data());
+ assert_eq!(a.resume_management(),Err(EBUSY));assert!(!a.admits_data());
+ a.fail(-5);assert!(!a.admits_data());assert!(b.admits_data());
 }
 
 }

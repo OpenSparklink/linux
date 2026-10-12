@@ -69,6 +69,21 @@ impl DataCredits {
         Ok(())
     }
 
+    /// Roll back only a reservation made under the same data lock immediately
+    /// before an atomic submit callback that returned nonzero (never queued).
+    /// No NOCP or another reserve may intervene; never use after USB acceptance.
+    pub(crate) fn unsubmitted(&mut self, lifetime: u64, handle: u16) -> Result<(), CreditError> {
+        if self.uncertain { return Err(CreditError::Fault); }
+        let index = self.debts.iter().position(|d| d.is_some_and(|d|
+            d.handle == handle && d.lifetime == lifetime)).ok_or(CreditError::Invalid)?;
+        let mut debt = self.debts[index].unwrap();
+        if debt.packets == 0 || self.outstanding == 0 { return Err(CreditError::Invalid); }
+        debt.packets -= 1;
+        self.outstanding -= 1;
+        self.debts[index] = if debt.packets == 0 { None } else { Some(debt) };
+        Ok(())
+    }
+
     /// Failed/short/uncertain transport cannot safely return a reserved credit.
     pub(crate) fn transport_failed(&mut self) { self.uncertain = true; }
 }
@@ -76,6 +91,33 @@ impl DataCredits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn known_unsubmitted_rolls_back_only_current_lifetime_debt() {
+        let mut c = DataCredits::new(254, 5);
+        c.reserve(1, 0, 4).unwrap();
+        c.reserve(1, 0, 4).unwrap();
+        c.reserve(2, 1, 4).unwrap();
+        assert_eq!(c.unsubmitted(3, 0), Err(CreditError::Invalid));
+        assert_eq!(c.outstanding, 3);
+        assert_eq!(c.unsubmitted(1, 0), Ok(()));
+        assert_eq!(c.outstanding, 2);
+        assert_eq!(c.complete(0, 1), Ok(()));
+        assert_eq!(c.complete(1, 1), Ok(()));
+        assert_eq!(c.outstanding, 0);
+    }
+    #[test]
+    fn unsubmitted_cannot_refund_uncertain_or_already_paid_debt() {
+        let mut c = DataCredits::new(254, 5);
+        c.reserve(1, 0, 4).unwrap();
+        c.transport_failed();
+        assert_eq!(c.unsubmitted(1, 0), Err(CreditError::Fault));
+        assert_eq!(c.outstanding, 1);
+        let mut c = DataCredits::new(254, 5);
+        c.reserve(1, 0, 4).unwrap();
+        c.complete(0, 1).unwrap();
+        assert_eq!(c.unsubmitted(1, 0), Err(CreditError::Invalid));
+        assert_eq!(c.outstanding, 0);
+    }
     #[test]
     fn actual_count_is_the_only_refill_and_pool_is_per_controller() {
         let mut a = DataCredits::new(254, 5);
@@ -210,6 +252,22 @@ mod verification {
         } else {
             assert_eq!(c.outstanding, before.outstanding);
             assert!(same_debts(&c,&before));
+        }
+    }
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn rejected_atomic_submission_restores_exact_prior_ledger() {
+        let mut c = symbolic_valid();
+        let before = duplicate(&c);
+        let lifetime = kani::any(); let handle = kani::any();
+        if c.reserve(lifetime, handle, kani::any()).is_ok() {
+            // Actual commit holds the data lock over reserve/submit/rollback.
+            // No controller completion is assumed authentic or timely here.
+            assert_eq!(c.unsubmitted(lifetime, handle), Ok(()));
+            assert!(invariant(&c));
+            assert_eq!(c.outstanding, before.outstanding);
+            assert!(same_debts(&c, &before));
+            assert_eq!(c.uncertain, before.uncertain);
         }
     }
     #[kani::proof]

@@ -6,6 +6,7 @@
  */
 #include <crypto/sha2.h>
 #include <linux/delay.h>
+#include <linux/completion.h>
 #include <linux/err.h>
 #include <linux/firmware.h>
 #include <linux/hex.h>
@@ -861,23 +862,71 @@ out:
 	return ret;
 }
 
-static int ws73_native_acb(void *context, u16 handle, const u8 *data, size_t length)
+struct ws73_acb_transfer {
+	struct completion done;
+	struct urb *urb;
+	int status;
+	int actual;
+};
+
+static void ws73_acb_complete(struct urb *urb)
+{
+	struct ws73_acb_transfer *transfer = urb->context;
+
+	transfer->status = urb->status;
+	transfer->actual = urb->actual_length;
+	complete(&transfer->done); /* no Host/protocol reentry */
+}
+
+static int ws73_acb_submit(void *context)
+{
+	struct ws73_acb_transfer *transfer = context;
+
+	return usb_submit_urb(transfer->urb, GFP_ATOMIC);
+}
+
+static int ws73_native_acb(void *context, struct sparklink_native_tx_ticket *ticket,
+						   u16 handle, const u8 *data, size_t length)
 {
 	struct ws73_usb *ws = context;
-	int ret;
+	struct ws73_acb_transfer transfer;
+	unsigned int timeout;
+	int ret, wire_length;
 
 	mutex_lock(&ws->tx_lock);
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) || !READ_ONCE(ws->streaming)) {
 		ret = -ENODEV;
 		goto out;
 	}
-	ret = ws73_wire_acb(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, handle,
-			    ws->info.acb_length, data, length);
-	if (ret < 0)
-		goto out;
-	ws->tx_sequence++;
-	ret = ws73_write(ws, ws->tx, ret);
-	if (ret && !READ_ONCE(ws->stopping))
+	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
+	if (!timeout) { ret = -ETIMEDOUT; goto out; }
+	wire_length = ws73_wire_acb(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, handle,
+							  ws->info.acb_length, data, length);
+	if (wire_length < 0) { ret = wire_length; goto out; }
+	transfer.urb = usb_alloc_urb(0, GFP_KERNEL); /* preparation: outside Host locks */
+	if (!transfer.urb) { ret = -ENOMEM; goto out; }
+	init_completion(&transfer.done);
+	transfer.status = -EINPROGRESS;
+	transfer.actual = 0;
+	usb_fill_bulk_urb(transfer.urb, ws->udev, usb_sndbulkpipe(ws->udev, ws->bulk_out),
+					 ws->tx, wire_length, ws73_acb_complete, &transfer);
+	ret = sparklink_native_tx_commit(ticket, ws73_acb_submit, &transfer);
+	if (!ret) {
+		ws->tx_sequence++;
+		/* No Host/state/admission lock spans this finite wait or cancellation.
+		 * Killing joins the callback before stack context and tx buffer retire.
+		 */
+		if (!wait_for_completion_timeout(&transfer.done, msecs_to_jiffies(timeout))) {
+			usb_kill_urb(transfer.urb);
+			ret = -ETIMEDOUT;
+		} else {
+			ret = transfer.status;
+			if (!ret && transfer.actual != wire_length) ret = -EREMOTEIO;
+		}
+	}
+	usb_free_urb(transfer.urb);
+	if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -EACCES &&
+		!READ_ONCE(ws->stopping))
 		ws73_async_failure(ws, ret);
 out:
 	mutex_unlock(&ws->tx_lock);

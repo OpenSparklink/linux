@@ -42,6 +42,17 @@ struct sparklink_native_identity {
  * Runtime/Host locks. It runs before a transaction/credit is allocated, and
  * again before transfer. The driver owns its dialect and supported commands.
  */
+/* Opaque core-owned, process-thread-local ticket. Valid only during send_acb.
+ * Driver prepares bytes/URB first, then calls commit exactly once. The submit
+ * callback queues one transfer atomically and MUST NOT sleep, decode, wait or
+ * reenter Host/Runtime callbacks. Zero means accepted; nonzero means NEVER
+ * queued. Completion/wait/kill/join occur after commit returns. The driver
+ * must not retain the ticket or return success without a successful commit.
+ */
+struct sparklink_native_tx_ticket;
+int sparklink_native_tx_commit(struct sparklink_native_tx_ticket *ticket,
+                              int (*submit)(void *context), void *context);
+
 struct sparklink_native_ops {
 	struct module *owner;
 	void (*get)(void *context);
@@ -68,10 +79,11 @@ struct sparklink_native_ops {
     int (*validate_connection)(void *context, unsigned int operation,
         u16 opcode, const u8 *params, size_t length);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
-	/* Optional one-transfer ACB path. Core reserved actual packet credit and
-	 * a canonical lifetime before calling; USB success is not completion.
-	 */
-	int (*send_acb)(void *context, u16 handle, const u8 *data, size_t length);
+	/* Optional one-transfer ACB path. Core retains identity and Backend;
+     * credit and canonical lifetime are checked at actual atomic submission.
+     * USB completion does not pay data debt or prove peer delivery. */
+    int (*send_acb)(void *context, struct sparklink_native_tx_ticket *ticket,
+                    u16 handle, const u8 *data, size_t length);
 };
 
 int sparklink_native_register(const struct sparklink_native_info *info,

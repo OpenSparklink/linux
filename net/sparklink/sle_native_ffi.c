@@ -191,12 +191,21 @@ int sparklink_native_health(u16 id, u64 generation)
 EXPORT_SYMBOL_GPL(sparklink_native_health);
 
 int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
-				   u16 handle, const u8 *data, size_t length)
+				   struct sparklink_native_tx_ticket *ticket, u16 handle, const u8 *data, size_t length)
 {
 	if (!transport->ops.send_acb)
 		return -EOPNOTSUPP;
-	return transport->ops.send_acb(transport->context, handle, data, length);
+	return transport->ops.send_acb(transport->context, ticket, handle, data, length);
 }
+
+extern int sparklink_native_tx_commit_rust(void *ticket,
+                                         int (*submit)(void *context), void *context);
+int sparklink_native_tx_commit(struct sparklink_native_tx_ticket *ticket,
+                              int (*submit)(void *context), void *context)
+{
+    return sparklink_native_tx_commit_rust(ticket, submit, context);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_tx_commit);
 
 bool sparklink_native_transport_has_acb(struct sparklink_native_transport *transport)
 {

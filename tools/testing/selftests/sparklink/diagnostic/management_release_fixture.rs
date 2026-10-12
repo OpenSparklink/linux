@@ -43,7 +43,7 @@ impl BoolLock {fn lock(&self)->RefMut<'_,bool>{self.0.borrow_mut()}}
 struct Owner {host:Lock,schedule_gate:BoolLock}
 struct Host {connections:sle_connection_operation::Connections,links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
- advertising_set:sle_command_plan::AdvertisingSet,operations:Operations,selected_policy_domains:u8,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
+ advertising_set:sle_command_plan::AdvertisingSet,operations:Operations,selected_policy_domains:u8,data_revoked:bool,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
 impl Host {
  // @@HOST_METHODS@@
 }
@@ -53,7 +53,7 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
 }
 fn host()->Host {Host{connections:sle_connection_operation::Connections::new(),links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),advertising_set:sle_command_plan::AdvertisingSet::Unknown,
- selected_policy_domains:0,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
+ selected_policy_domains:0,data_revoked:false,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 struct Caller {file_id:u64}
 struct Request {mode:u32}
 fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:u64)->Result {
