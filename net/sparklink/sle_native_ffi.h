@@ -34,6 +34,10 @@ int sparklink_native_transport_prepare(struct sparklink_native_transport *transp
 int sparklink_native_transport_validate_step(struct sparklink_native_transport *transport,
 	unsigned int operation, unsigned int step, unsigned int count,
 	u16 opcode, const u8 *params, size_t length);
+int sparklink_native_transport_prepare_connection(struct sparklink_native_transport *transport,
+	const struct sparklink_connection_request *request, struct sparklink_connection_plan *plan);
+int sparklink_native_transport_validate_connection(struct sparklink_native_transport *transport,
+	unsigned int operation, u16 opcode, const u8 *params, size_t length);
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,
 				       u16 opcode, const u8 *params, size_t length);
 
