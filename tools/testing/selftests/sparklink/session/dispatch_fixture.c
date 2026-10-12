@@ -22,8 +22,6 @@ static bool irq_disabled;
 #define spin_lock_irqsave(l,f) do{(f)=irq_disabled;irq_disabled=true;assert(!(l)->held);(l)->held=true;}while(0)
 #define spin_unlock_irqrestore(l,f) do{assert((l)->held);(l)->held=false;irq_disabled=(f);}while(0)
 static void spin_lock(spinlock_t *l){assert(irq_disabled&&!l->held);l->held=true;}
-static void spin_lock_bh(spinlock_t *l){assert(irq_disabled&&!l->held);l->held=true;}
-static void spin_unlock_bh(spinlock_t *l){assert(l->held);l->held=false;}
 static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 #define min(a,b) ((a)<(b)?(a):(b))
 #define min_t(t,a,b) ((t)min(a,b))

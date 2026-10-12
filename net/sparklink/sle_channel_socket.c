@@ -94,12 +94,13 @@ static struct sl_connection_session *sl_binding_session(struct sock *sk)
 {
 	struct sl_socket_binding *binding = sl_sk(sk);
 	struct sl_connection_session *s;
+	unsigned long flags;
 
-	spin_lock_bh(&binding->lock);
+	spin_lock_irqsave(&binding->lock, flags);
 	s = binding->session;
 	if (s)
 		sl_connection_session_get(s);
-	spin_unlock_bh(&binding->lock);
+	spin_unlock_irqrestore(&binding->lock, flags);
 	return s;
 }
 static struct sl_channel_progress sl_snapshot(struct sl_connection_session *s)
@@ -418,9 +419,9 @@ static int sl_publish_binding(void *context)
 	struct socket *sock = admission->sock;
 	struct sl_socket_binding *binding = admission->binding;
 	struct sl_connection_session *s = admission->session;
-	unsigned long flags;
+	unsigned long flags, binding_flags;
 	int ret = 0;
-	spin_lock_bh(&binding->lock);
+	spin_lock_irqsave(&binding->lock, binding_flags);
 	spin_lock_irqsave(&s->lock, flags);
 	if (binding->session)
 		ret = -EINVAL;
@@ -440,7 +441,7 @@ static int sl_publish_binding(void *context)
 		WRITE_ONCE(sock->sk->sk_state, TCP_ESTABLISHED);
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
-	spin_unlock_bh(&binding->lock);
+	spin_unlock_irqrestore(&binding->lock, binding_flags);
 	return ret;
 }
 static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int length)
@@ -712,7 +713,7 @@ static int sl_drained(struct sl_connection_session *s)
 }
 static int sl_release(struct socket *sock)
 {
-	unsigned long flags;
+	unsigned long flags, binding_flags;
 	struct sock *sk = sock->sk, *held = NULL;
 	struct sl_socket_binding *binding;
 	struct sl_connection_session *s;
@@ -723,7 +724,7 @@ static int sl_release(struct socket *sock)
 	s = sl_binding_session(sk);
 	if (s && sock_flag(sk, SOCK_LINGER) && sk->sk_lingertime)
 		wait_event_interruptible_timeout(*sk_sleep(sk), sl_drained(s), min_t(long, sk->sk_lingertime, msecs_to_jiffies(5000)));
-	spin_lock_bh(&binding->lock);
+	spin_lock_irqsave(&binding->lock, binding_flags);
 	binding->session = NULL;
 	if (s) {
 		spin_lock_irqsave(&s->lock, flags);
@@ -734,7 +735,7 @@ static int sl_release(struct socket *sock)
 		}
 		spin_unlock_irqrestore(&s->lock, flags);
 	}
-	spin_unlock_bh(&binding->lock);
+	spin_unlock_irqrestore(&binding->lock, binding_flags);
 	if (s) {
 		skb_queue_purge(&s->channel.tx);
 		skb_queue_purge(&s->channel.rx);
