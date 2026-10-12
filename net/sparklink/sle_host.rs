@@ -253,6 +253,9 @@ impl CommandHost {
     pub(crate) fn connection_result(&self, file: u64, request: u64) -> Option<super::sle_connection_operation::Operation> {
         self.connections.query(file, request)
     }
+    pub(crate) fn link_snapshot(&self) -> (u64, bool, [Option<super::sle_link_observation::Link>; super::sle_link_observation::CAPACITY]) {
+        self.links.snapshot()
+    }
     pub(crate) fn cancel_connection(&mut self, file: u64, request: u64) -> Result {
         let cookie = self.connections.cancel(file, request).map_err(|_| ENOENT)?;
         if let Some(cookie) = cookie { self.requests.remove_cookie(cookie); }

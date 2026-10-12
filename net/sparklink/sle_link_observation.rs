@@ -18,24 +18,26 @@ pub(crate) struct LinkEvidence {
     pub(crate) reserved: [u8; 2],
 }
 
-const CAPACITY: usize = 16;
+pub(crate) const CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Link {
-    handle: u16,
-    role: u8,
-    address_type: u8,
-    address: [u8; 6],
+pub(crate) struct Link {
+    pub(crate) lifetime: u64,
+    pub(crate) handle: u16,
+    pub(crate) role: u8,
+    pub(crate) address_type: u8,
+    pub(crate) address: [u8; 6],
 }
 
 pub(crate) struct LinkObservation {
     links: [Option<Link>; CAPACITY],
     uncertain: bool,
+    revision: u64,
 }
 
 impl LinkObservation {
     pub(crate) const fn new() -> Self {
-        Self { links: [None; CAPACITY], uncertain: false }
+        Self { links: [None; CAPACITY], uncertain: false, revision: 0 }
     }
 
     pub(crate) fn clear_for_management(&self) -> bool {
@@ -47,6 +49,19 @@ impl LinkObservation {
     }
 
     pub(crate) fn known(&self) -> bool { !self.uncertain }
+    /// Caller holds the registration Host lock. This is observed physical
+    /// state, not command history or a synthetic controller list response.
+    pub(crate) fn snapshot(&self) -> (u64, bool, [Option<Link>; CAPACITY]) {
+        (self.revision, self.known(), self.links)
+    }
+    fn advance(&mut self) -> Option<u64> {
+        let Some(next) = self.revision.checked_add(1) else {
+            self.uncertain = true;
+            return None;
+        };
+        self.revision = next;
+        Some(next)
+    }
     pub(crate) fn first_handle(&self) -> Option<u16> {
         self.known().then(|| self.links.iter().flatten().next().map(|link| link.handle)).flatten()
     }
@@ -62,9 +77,9 @@ impl LinkObservation {
         if evidence.status != 0 { return; }
         let handle = evidence.handle as u16;
         if evidence.kind == 2 {
-            if let Some(slot) = self.links.iter_mut().find(|slot|
+            if let Some(index) = self.links.iter().position(|slot|
                 slot.as_ref().is_some_and(|link| link.handle == handle)) {
-                *slot = None;
+                if self.advance().is_some() { self.links[index] = None; }
             }
             return;
         }
@@ -73,12 +88,13 @@ impl LinkObservation {
             self.uncertain = true;
             return;
         }
-        let link = Link { handle, role: evidence.role as u8,
+        let link = Link { lifetime: 0, handle, role: evidence.role as u8,
             address_type: evidence.address_type as u8, address: evidence.address };
         if let Some(existing) = self.links.iter().flatten().find(|entry| entry.handle == handle) {
-            if *existing != link { self.uncertain = true; }
-        } else if let Some(slot) = self.links.iter_mut().find(|entry| entry.is_none()) {
-            *slot = Some(link);
+            if existing.role != link.role || existing.address_type != link.address_type
+                || existing.address != link.address { self.uncertain = true; }
+        } else if let Some(index) = self.links.iter().position(Option::is_none) {
+            if let Some(lifetime) = self.advance() { self.links[index] = Some(Link { lifetime, ..link }); }
         } else {
             self.uncertain = true;
         }
@@ -94,6 +110,25 @@ mod tests {
     }
     fn disconnected(handle: u16) -> LinkEvidence {
         LinkEvidence {kind:2,status:0,handle:handle as u32,role:0,address_type:0,address:[0;6],reserved:[0;2]}
+    }
+    #[test]
+    fn snapshot_lifetime_survives_duplicates_and_detects_handle_reuse() {
+        let mut state=LinkObservation::new();assert_eq!(state.snapshot().0,0);
+        state.observe(&connected(7,[1;6]));let (revision,known,links)=state.snapshot();
+        assert!(known);assert_eq!(revision,1);assert_eq!(links[0].unwrap().lifetime,1);
+        state.observe(&connected(7,[1;6]));assert_eq!(state.snapshot().0,1);
+        state.observe(&disconnected(8));assert_eq!(state.snapshot().0,1);
+        state.observe(&disconnected(7));assert_eq!(state.snapshot().0,2);
+        state.observe(&connected(7,[2;6]));let (revision,known,links)=state.snapshot();
+        assert!(known);assert_eq!(revision,3);assert_eq!(links[0].unwrap().lifetime,3);
+        assert_eq!(links[0].unwrap().address,[2;6]);
+    }
+    #[test]
+    fn lifetime_exhaustion_never_reuses_a_token_or_hides_an_obligation() {
+        let mut state=LinkObservation::new();state.observe(&connected(7,[1;6]));
+        state.revision=u64::MAX;state.observe(&disconnected(7));
+        assert!(!state.snapshot().1);assert_eq!(state.snapshot().2[0].unwrap().handle,7);
+        assert!(!state.clear_for_management());
     }
     #[test]
     fn exact_handle_is_required_and_duplicate_delivery_is_harmless() {

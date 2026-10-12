@@ -1324,4 +1324,25 @@ struct sle_connection_result {
 #define SL_IOCTL_CONNECTION_SUBMIT _IOW(SL_MAGIC, 0x9c, struct sle_connection_submit)
 #define SL_IOCTL_CONNECTION_RESULT _IOWR(SL_MAGIC, 0x9d, struct sle_connection_result)
 
+/* Observed physical links for one live registration. event_seq is sampled
+ * atomically with the table; replay only link events newer than this barrier.
+ * lifetime is registration-local and changes on handle reuse. flags=0 with
+ * error means UNKNOWN, never an authoritative empty table. */
+#define SLE_LINK_SNAPSHOT_MAX 16
+#define SLE_LINK_SNAPSHOT_KNOWN 1
+struct sle_link_info {
+    __aligned_u64 lifetime;
+    __u16 handle;
+    __u8 role, address_type, address[6], reserved[6];
+};
+struct sle_link_snapshot {
+    __aligned_u64 generation, event_seq, revision;
+    __u32 version, profile, flags, count;
+    __s32 error;
+    __u16 dev_index;
+    __u8 reserved[2];
+    struct sle_link_info links[SLE_LINK_SNAPSHOT_MAX];
+};
+#define SL_IOCTL_LINK_SNAPSHOT _IOWR(SL_MAGIC, 0x9e, struct sle_link_snapshot)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

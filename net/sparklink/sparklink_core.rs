@@ -3203,6 +3203,48 @@ fn ioctl_connection_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     Ok(0)
 }
 
+/// Same Host -> gate -> event-log order as native physical ingress. Copyout
+/// happens after releasing every IRQ-safe lock; no cursor or state is consumed.
+#[inline(never)]
+fn ioctl_link_snapshot(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let input: SleLinkSnapshot = read_user_struct(arg)?;
+    if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if input.generation == 0 || input.event_seq != 0 || input.revision != 0 || input.profile != 0
+        || input.flags != 0 || input.count != 0 || input.error != 0 || input.dev_index != 0
+        || input.reserved != [0; 2] { return Err(EINVAL); }
+    // SAFETY: the fixed padding-free table was fully initialized by copyin.
+    if unsafe { core::slice::from_raw_parts(input.links.as_ptr().cast::<u8>(), 16 * 24) }.iter().any(|v| *v != 0) {
+        return Err(EINVAL);
+    }
+    let owner = discovery_owner(context, me)?;
+    if input.generation != owner.identity.generation { return Err(ENODEV); }
+    if owner.protocol_profile == 0 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    // SAFETY: every ABI field and reserved byte is initialized before copyout.
+    let mut out: SleLinkSnapshot = unsafe { core::mem::zeroed() };
+    out.version = 1; out.generation = owner.identity.generation;
+    out.dev_index = owner.identity.id; out.profile = owner.protocol_profile;
+    {
+        let host = owner.host.lock();
+        let gate = owner.schedule_gate.lock();
+        if *gate { return Err(ENODEV); }
+        let (revision, known, links) = host.link_snapshot();
+        out.revision = revision;
+        out.event_seq = owner.controller_events.lock().current_seq();
+        if known {
+            out.flags = LINK_SNAPSHOT_KNOWN;
+            for link in links.iter().flatten() {
+                out.links[out.count as usize] = SleLinkInfo { lifetime: link.lifetime, handle: link.handle,
+                    role: link.role, address_type: link.address_type, address: link.address, reserved: [0; 6] };
+                out.count += 1;
+            }
+        } else {
+            out.error = -(bindings::EUCLEAN as i32); // unknown is not an empty table
+        }
+    }
+    write_user_struct(arg, &out)?;
+    Ok(0)
+}
+
 /// Explicit host fields and unused bytes are checked before any admission.
 fn validate_discovery_submit(request: &SleDiscoverySubmit) -> Result<sle_command_plan::DiscoveryIntent> {
     use sle_command_plan::DiscoveryIntent;
@@ -3517,6 +3559,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
         SL_IOCTL_CONNECTION_SUBMIT => ioctl_connection_submit(context, me, arg),
         SL_IOCTL_CONNECTION_RESULT => ioctl_connection_result(context, me, arg),
+        SL_IOCTL_LINK_SNAPSHOT => ioctl_link_snapshot(context, me, arg),
         SL_IOCTL_DISCOVERY_SUBMIT => ioctl_discovery_submit(context, me, arg),
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
         SL_IOCTL_DISCOVERY_TIMING => ioctl_discovery_timing(context, me, arg),
@@ -4088,6 +4131,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_CONTROLLER_SNAPSHOT
             | SL_IOCTL_CONNECTION_SUBMIT
             | SL_IOCTL_CONNECTION_RESULT
+            | SL_IOCTL_LINK_SNAPSHOT
             | SL_IOCTL_DISCOVERY_SUBMIT
             | SL_IOCTL_DISCOVERY_RESULT
             | SL_IOCTL_DISCOVERY_TIMING

@@ -3247,3 +3247,25 @@ unsafe impl FromBytes for SleConnectionParameters {}
 unsafe impl FromBytes for SleConnectionSubmit {}
 // SAFETY: integer-only repr(C) result with initialized output bytes.
 unsafe impl FromBytes for SleConnectionResult {}
+
+pub(crate) const SL_IOCTL_LINK_SNAPSHOT: u32 = _IOWR::<SleLinkSnapshot>(SL_MAGIC, 0x9e);
+pub(crate) const LINK_SNAPSHOT_KNOWN: u32 = 1;
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleLinkInfo {
+    pub lifetime: u64, pub handle: u16, pub role: u8, pub address_type: u8,
+    pub address: [u8; 6], pub reserved: [u8; 6],
+}
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleLinkSnapshot {
+    pub generation: u64, pub event_seq: u64, pub revision: u64,
+    pub version: u32, pub profile: u32, pub flags: u32, pub count: u32,
+    pub error: i32, pub dev_index: u16, pub reserved: [u8; 2],
+    pub links: [SleLinkInfo; 16],
+}
+impl_check_reserved!(SleLinkSnapshot);
+// SAFETY: padding-free repr(C), only integer fields and byte arrays.
+unsafe impl FromBytes for SleLinkSnapshot {}
+const _: () = assert!(core::mem::size_of::<SleLinkInfo>() == 24);
+const _: () = assert!(core::mem::size_of::<SleLinkSnapshot>() == 432);
