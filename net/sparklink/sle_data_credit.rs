@@ -128,3 +128,112 @@ mod tests {
         assert_eq!(c.complete(1, 1), Err(CreditError::Fault));
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    fn invariant(c: &DataCredits) -> bool {
+        let mut sum = 0u32;
+        for i in 0..LINKS {
+            if let Some(d) = c.debts[i] {
+                if d.packets == 0 || d.lifetime == 0 || d.handle > 0x0fff { return false; }
+                sum += d.packets as u32;
+                for j in 0..i {
+                    if c.debts[j].is_some_and(|old| old.handle == d.handle) { return false; }
+                }
+            }
+        }
+        sum == c.outstanding as u32 && c.outstanding <= c.capacity as u16
+    }
+    fn symbolic_valid() -> DataCredits {
+        let mut debts = [None; LINKS];
+        for slot in &mut debts {
+            if kani::any::<bool>() {
+                *slot = Some(Debt { handle: kani::any(), lifetime: kani::any(), packets: kani::any() });
+            }
+        }
+        let c = DataCredits { maximum: kani::any(), capacity: kani::any(),
+            outstanding: kani::any(), debts, uncertain: kani::any() };
+        // Inductive representation invariant; no assumption that hardware
+        // count/handle is accurate, timely, unique or from a current lifetime.
+        kani::assume(invariant(&c));
+        c
+    }
+    fn same_debts(a: &DataCredits, b: &DataCredits) -> bool {
+        for i in 0..LINKS {
+            if a.debts[i].map(|d| (d.handle,d.lifetime,d.packets)) !=
+                b.debts[i].map(|d| (d.handle,d.lifetime,d.packets)) { return false; }
+        }
+        true
+    }
+    fn duplicate(c: &DataCredits) -> DataCredits {
+        DataCredits { maximum:c.maximum, capacity:c.capacity,
+            outstanding:c.outstanding, debts:c.debts, uncertain:c.uncertain }
+    }
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn initialization_all_parameters() {
+        let c = DataCredits::new(kani::any(), kani::any());
+        assert!(invariant(&c));
+        assert_eq!(c.outstanding, 0);
+    }
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn reservation_preserves_invariant_and_old_debt() {
+        let mut c = symbolic_valid();
+        let before = duplicate(&c);
+        let lifetime = kani::any(); let handle = kani::any();
+        let result = c.reserve(lifetime, handle, kani::any());
+        assert!(invariant(&c));
+        if result.is_ok() {
+            assert_eq!(c.outstanding, before.outstanding + 1);
+            assert!(c.debts.iter().flatten().any(|d| d.handle==handle && d.lifetime==lifetime));
+            for d in before.debts.iter().flatten() {
+                assert!(c.debts.iter().flatten().any(|next| next.handle==d.handle && next.lifetime==d.lifetime));
+            }
+        } else {
+            assert_eq!(c.outstanding, before.outstanding);
+            assert!(same_debts(&c,&before));
+        }
+    }
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn arbitrary_completion_preserves_invariant_and_exact_accounting() {
+        let mut c = symbolic_valid(); let before = duplicate(&c);
+        let count:u8 = kani::any();
+        let result = c.complete(kani::any(), count);
+        assert!(invariant(&c));
+        if result.is_ok() {
+            assert!(count > 0);
+            assert_eq!(c.outstanding, before.outstanding - count as u16);
+        } else {
+            assert_eq!(c.outstanding, before.outstanding);
+            assert!(same_debts(&c,&before));
+        }
+        // Physical attribution of an old duplicate after debt was paid is
+        // deliberately not claimed: the wire has only handle/count.
+    }
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn uncertain_transport_never_refunds_or_refills() {
+        let mut c = symbolic_valid(); let before = duplicate(&c);
+        c.transport_failed();
+        assert!(invariant(&c));
+        assert_eq!(c.complete(kani::any(), kani::any()), Err(CreditError::Fault));
+        assert_eq!(c.reserve(kani::any(),kani::any(),kani::any()), Err(CreditError::Fault));
+        assert_eq!(c.outstanding, before.outstanding);
+        assert!(same_debts(&c,&before));
+    }
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn separate_controllers_do_not_share_ledger_mutations() {
+        let mut a = symbolic_valid(); let b = symbolic_valid(); let original_b=duplicate(&b);
+        let _=a.reserve(kani::any(),kani::any(),kani::any());
+        let _=a.complete(kani::any(),kani::any());
+        a.transport_failed();
+        assert!(invariant(&a) && invariant(&b));
+        assert_eq!(b.outstanding, original_b.outstanding);
+        assert!(same_debts(&b,&original_b));
+    }
+}
