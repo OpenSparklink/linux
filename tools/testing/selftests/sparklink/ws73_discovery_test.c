@@ -609,8 +609,43 @@ static void recipe_tests(void)
 	      -EOPNOTSUPP);
 }
 
+
+static void recreate_step_tests(void)
+{
+ unsigned char handle[1] = {0};
+ unsigned char params[49] = {0};
+ unsigned char data[4] = {0, 3, 1, 42};
+ unsigned char enable[5] = {1, 0, 0, 0, 0};
+ unsigned char off[5] = {0};
+ params[1] = 3;
+ for (unsigned count = 4; count <= 5; count++) {
+  CHECK(ws73_discovery_validate_step(0x101, 0, count, 0x0c08, handle, 1) == 0);
+  CHECK(ws73_discovery_validate_step(0x101, 1, count, 0x0c02, params, 49) == 0);
+  CHECK(ws73_discovery_validate_step(0x101, 2, count, 0x0c03, data, 4) == 0);
+  if (count == 5)
+   CHECK(ws73_discovery_validate_step(0x101, 3, count, 0x0c04, data, 4) == 0);
+  CHECK(ws73_discovery_validate_step(0x101, count-1, count, 0x0c05, enable, 5) == 0);
+  CHECK(ws73_discovery_validate_step(1, 0, count, 0x0c08, handle, 1) < 0);
+  CHECK(ws73_discovery_validate_step(0x101, 1, count, 0x0c03, data, 4) < 0);
+ }
+ CHECK(ws73_discovery_validate_step(0x105, 0, 3, 0x0c08, handle, 1) == 0);
+ CHECK(ws73_discovery_validate_step(0x105, 1, 3, 0x0c02, params, 49) == 0);
+ CHECK(ws73_discovery_validate_step(0x105, 2, 3, 0x0c05, off, 5) == 0);
+ CHECK(ws73_discovery_validate_step(0x105, 2, 3, 0x0c05, enable, 5) < 0);
+ for (unsigned operation = 2; operation <= 6; operation++) {
+  if (operation == 5) continue;
+  CHECK(ws73_discovery_validate_step(0x100 | operation, 0, 4, 0x0c08, handle, 1) < 0);
+ }
+ CHECK(ws73_discovery_validate_step(0x301, 0, 4, 0x0c08, handle, 1) < 0);
+ CHECK(ws73_discovery_validate_step(0x101, 0, 3, 0x0c08, handle, 1) < 0);
+ CHECK(ws73_discovery_validate_step(0x101, 0, 4, 0x0c08, NULL, 1) < 0);
+ handle[0] = 1;
+ CHECK(ws73_discovery_validate_step(0x101, 0, 4, 0x0c08, handle, 1) < 0);
+}
+
 int main(void)
 {
+	recreate_step_tests();
 	adv_params_tests();
 	data_tests();
 	control_tests();

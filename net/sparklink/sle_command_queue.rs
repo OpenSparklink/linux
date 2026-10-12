@@ -63,6 +63,9 @@ impl CmdRequestQueue {
                 || tag.count == 0
                 || tag.count as usize > RECIPE_STEPS_MAX
                 || tag.step >= tag.count
+                || (tag.recreate && !matches!((tag.intent, tag.count),
+                    (DiscoveryIntent::Advertising(true), 4 | 5)
+                    | (DiscoveryIntent::AdvertisingStandby, 3)))
         }) {
             return Err(QueueError::Invalid);
         }
@@ -129,6 +132,13 @@ impl CmdRequestQueue {
         if cookie == 0 || !valid_parts(parts, usize::MAX) {
             return Err(QueueError::Invalid);
         }
+        if parts[0].opcode == 0x0c08
+            && (parts[0].params != [0]
+                || !matches!((intent, parts.len()),
+                    (DiscoveryIntent::Advertising(true), 4 | 5)
+                    | (DiscoveryIntent::AdvertisingStandby, 3))) {
+            return Err(QueueError::Invalid);
+        }
         if parts.len() > self.available() {
             return Err(QueueError::Full);
         }
@@ -141,6 +151,7 @@ impl CmdRequestQueue {
                 step: step as u8,
                 count: parts.len() as u8,
                 intent,
+                recreate: parts[0].opcode == 0x0c08,
             };
             // Preflight proves both bounds; no concurrent insertion is allowed.
             self.push_tagged(part.opcode, part.params, 0, cookie, Some(tag), deadline)?;

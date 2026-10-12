@@ -44,7 +44,7 @@ impl CmdRequestQueue {
 // @@ACTUAL_HOST@@
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
  connections:sle_connection_operation::Connections::new(),credits:1,active:None,reply:None,fault:None,next_cookie:1,
- broadcast_cookie:0,scan_cookie:0,recipe:None,operations,selected_policy_domains:0,
+ broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
  revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){unsafe{kernel::bindings::jiffies_64=now}}
 fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100).unwrap()}
@@ -70,7 +70,8 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert!(b.next(|_|true).unwrap().is_some());assert!(!b.links_clear_for_management());
 }
 #[test] fn settled_revoke_new_lease_accepts_create_without_losing_history_or_credits(){
- clock(1);let mut h=host();h.operations.advertising=1;h.operations.scanning=1;create(&mut h,1);h.revoke_connections();
+ clock(1);let mut h=host();h.operations.advertising=1;h.operations.scanning=1;
+ h.advertising_set=sle_command_plan::AdvertisingSet::Configured([0;49]);create(&mut h,1);h.revoke_connections();
  revoke(&mut h).unwrap();assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.revocation_result(),Some(Ok(())));
  assert_eq!(h.submit_connection(43,1,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100),Err(EBUSY));
  let credits=h.credits;h.resume_management().unwrap();assert!(!h.revoking);assert_eq!(h.credits,credits);
@@ -194,6 +195,87 @@ fn cleanup_down(h:&mut CommandHost,handle:u16){h.observe_link(&sle_link_observat
  let deadline=h.revoke_deadline;for _ in 0..10 {assert_eq!(h.cleanup_candidate(),Ok(None));assert_eq!(h.revoke_deadline,deadline);assert!(h.next(|_|true).unwrap().is_none());}
  clock(101);assert!(h.timed_out());h.fail(-110);assert_eq!(h.revocation_result().unwrap(),Err(-110));assert!(!h.timed_out());
  let original=h.connection_result(42,1).unwrap();assert_eq!((original.state,original.error,original.fault_error),(sle_connection_operation::State::Cancelled,-125,-110));
+}
+
+fn adparams(mode:u8)->[u8;49] {
+ let mut p=[0;49];p[1]=mode;p[2]=if mode==3{0}else{2};
+ p[3..6].copy_from_slice(&[0xb0,4,0]);p[6..9].copy_from_slice(&[0xb0,4,0]);p[9]=7;p[25]=127;
+ if mode==3{p[34]=1;p[37]=100;p[39]=100;}p[43]=200;p
+}
+fn adhost()->CommandHost {let mut h=host();h.operations.advertising=1;h.operations.scanning=1;
+ h.advertising_set=sle_command_plan::AdvertisingSet::Configured(adparams(0));h}
+fn adsubmit(h:&mut CommandHost,id:u64,p:&[u8;49],response:bool)->Result {
+ let data=[0,3,1,42];let enable=[1,0,0,0,0];
+ let mut parts=[RecipePart{opcode:0x0c02,params:p},RecipePart{opcode:0x0c03,params:&data},
+ RecipePart{opcode:0x0c05,params:&enable},RecipePart{opcode:0x0c05,params:&enable}];
+ if response{parts[2]=RecipePart{opcode:0x0c04,params:&data};}
+ h.submit_discovery(id,DiscoveryIntent::Advertising(true),&parts[..if response{4}else{3}],0)
+}
+fn adack(h:&mut CommandHost,r:&CmdRequest,code:u8) {
+ h.transport_complete(r.cookie);h.receive(SleEvent::NativeCommandReply{opcode:r.opcode,command_credits:1,status:code,complete:true,
+ data:if r.opcode==0x0c02{vec![20]}else{vec![]}});h.take_reply();
+}
+#[test] fn mode_transition_recreates_before_configuration_and_preserves_power_step(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(3),false).unwrap();
+ let op=h.discovery_result(1).unwrap();assert_eq!((op.count,op.power_step),(4,1));
+ let mut deadline=None;
+ for opcode in [0x0c08,0x0c02,0x0c03,0x0c05] {
+  let r=h.next(|_|true).unwrap().unwrap();assert_eq!(r.opcode,opcode);assert!(r.recipe.unwrap().recreate);
+  if let Some(d)=deadline{assert_eq!(r.deadline,d)}else{deadline=Some(r.deadline)}
+  adack(&mut h,&r,0);
+ }
+ assert!(h.next(|_|true).unwrap().is_none());let op=h.discovery_result(1).unwrap();
+ assert_eq!(op.state,State::Succeeded);assert_eq!(op.selected_power,Some(20));assert!(h.controller_status().1);
+ assert_eq!(h.advertising_set,sle_command_plan::AdvertisingSet::Configured(adparams(3)));
+}
+#[test] fn identical_configuration_retains_original_three_step_path(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(0),false).unwrap();
+ for opcode in [0x0c02,0x0c03,0x0c05] {let r=h.next(|_|true).unwrap().unwrap();assert_eq!(r.opcode,opcode);assert!(!r.recipe.unwrap().recreate);adack(&mut h,&r,0);}
+ assert_eq!(h.discovery_result(1).unwrap().count,3);
+}
+#[test] fn scan_response_transition_is_bounded_five_steps(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(3),true).unwrap();
+ for opcode in [0x0c08,0x0c02,0x0c03,0x0c04,0x0c05] {let r=h.next(|_|true).unwrap().unwrap();assert_eq!(r.opcode,opcode);adack(&mut h,&r,0);}
+ assert_eq!(h.discovery_result(1).unwrap().count,5);
+}
+#[test] fn failed_removal_never_commits_absence_or_runs_recreation(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(3),false).unwrap();let r=h.next(|_|true).unwrap().unwrap();adack(&mut h,&r,0x12);
+ assert_eq!(h.advertising_set,sle_command_plan::AdvertisingSet::Configured(adparams(0)));
+ assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.discovery_result(1).unwrap().state,State::Failed);
+ assert!(!h.controller_status().1);assert_eq!(h.operations.advertising,0);
+}
+#[test] fn removal_receipt_waits_for_successful_out_and_correct_reply(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(3),false).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+ assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x0c02,command_credits:1,status:0,complete:true,data:vec![20]}).is_some());
+ assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x0c08,command_credits:1,status:0,complete:true,data:vec![]}).is_none());
+ assert!(h.take_reply().is_none());assert!(h.advertising_set.configured());
+ h.transport_complete(r.cookie);h.take_reply();assert_eq!(h.advertising_set,sle_command_plan::AdvertisingSet::Absent);assert!(!h.controller_status().1);
+}
+#[test] fn cancelled_late_removal_does_not_flip_author_or_stop_missing_set(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(3),false).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+ revoke(&mut h).unwrap();adack(&mut h,&r,0);assert_eq!(h.advertising_set,sle_command_plan::AdvertisingSet::Absent);
+ assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.revocation_result(),Some(Ok(())));
+ assert_eq!(h.discovery_result(1).unwrap().state,State::Cancelled);assert!(!h.controller_status().1);
+ h.resume_management().unwrap();assert_eq!(h.advertising_set,sle_command_plan::AdvertisingSet::Absent);
+}
+#[test] fn cancelled_selected_creation_waits_for_actual_reply_then_retains_known_off(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(3),false).unwrap();let remove=h.next(|_|true).unwrap().unwrap();adack(&mut h,&remove,0);
+ let configure=h.next(|_|true).unwrap().unwrap();assert_eq!(configure.opcode,0x0c02);assert_eq!(h.operations.advertising,0);
+ revoke(&mut h).unwrap();assert!(h.next(|_|true).unwrap().is_none());adack(&mut h,&configure,0);
+ assert_eq!(h.advertising_set,sle_command_plan::AdvertisingSet::Configured(adparams(3)));
+ assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.revocation_result(),Some(Ok(())));
+ assert_eq!(h.discovery_result(1).unwrap().state,State::Cancelled);assert!(h.controller_status().1);
+}
+#[test] fn new_parameter_recipe_rejects_cancelled_old_inflight_configuration(){
+ clock(1);let mut h=adhost();adsubmit(&mut h,1,&adparams(0),false).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+ h.operations.cancel_domain(DiscoveryIntent::Advertising(false),-125);let n=h.requests.len();
+ assert_eq!(adsubmit(&mut h,2,&adparams(3),false),Err(EBUSY));assert_eq!(h.requests.len(),n);assert!(h.discovery_result(2).is_none());
+ adack(&mut h,&r,0);
+}
+#[test] fn initial_unknown_standby_keeps_original_off_requirement(){
+ clock(1);let mut h=host();h.operations.initialized=false;let p=adparams(0);let off=[0;5];
+ h.submit_discovery(1,DiscoveryIntent::AdvertisingStandby,&[RecipePart{opcode:0x0c02,params:&p},RecipePart{opcode:0x0c05,params:&off}],0).unwrap();
+ let r=h.next(|_|true).unwrap().unwrap();adack(&mut h,&r,0);assert!(h.advertising_set.configured());assert_eq!(h.operations.advertising,0);assert!(!h.controller_status().1);
 }
 
 }

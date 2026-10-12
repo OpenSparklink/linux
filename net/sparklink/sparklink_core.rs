@@ -3250,10 +3250,14 @@ fn ioctl_discovery_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
     for (i, step) in plan.steps[..plan.count as usize].iter().enumerate() {
         parts[i] = sle_command_plan::RecipePart { opcode: step.opcode, params: &step.params[..step.length as usize] };
     }
+    // Match management commit and physical ingress: Host before retirement gate.
+    // Hold both through the configuration observation and recipe admission.
+    let mut host = owner.host.lock();
     let gate = owner.schedule_gate.lock();
     if *gate { return Err(ENODEV); }
-    owner.host.lock().submit_discovery(request.request_id, intent, &parts[..plan.count as usize], plan.power_step as u8)?;
+    host.submit_discovery(request.request_id, intent, &parts[..plan.count as usize], plan.power_step as u8)?;
     drop(gate);
+    drop(host);
     // Drop the protocol mutex before scheduling TX (and before any transport).
     drop(state_guard);
     owner.kick_commands();

@@ -23,6 +23,8 @@ struct InFlight {
     recipe: Option<RecipeTag>,
     connection: Option<u32>,
     transport_done: bool,
+    advertising_params: Option<[u8; 49]>,
+    advertising_was_absent: bool,
 }
 
 pub(crate) struct HostReply {
@@ -50,6 +52,7 @@ pub(crate) struct CommandHost {
     scan_cookie: u64,
     recipe: Option<(RecipeTag, RecipeProgress)>,
     operations: Operations,
+    advertising_set: super::sle_command_plan::AdvertisingSet,
     // Adv / scan params / scan control selection; never cleared by eviction.
     selected_policy_domains: u8,
     revoking: bool,
@@ -79,6 +82,7 @@ impl CommandHost {
                 revoking: false, revoke_cookies: [0; 2], revoke_done: 0, revoke_deadline: 0,
                 revoke_status: 0, revoke_opcode: 0, revoke_reply: false,
                 selected_policy_domains: 0,
+                advertising_set: super::sle_command_plan::AdvertisingSet::Unknown,
                 operations <- init!(Operations {
                     entries <- pin_init::init_array_from_fn(|_| None),
                     initialized: false,
@@ -168,6 +172,31 @@ impl CommandHost {
     ) -> Result {
         if power_step as usize > parts.len() { return Err(EINVAL); }
         if !self.connections.clear() { return Err(EBUSY); }
+        // A cancelled selected configuration can still change the physical
+        // handle. Do not snapshot its old configuration for a newer recipe.
+        if parts.first().is_some_and(|part| part.opcode == 0x0c02)
+            && (self.active.is_some() || self.reply.is_some()
+                || self.operations.pending(DiscoveryIntent::Advertising(false))) {
+            return Err(EBUSY);
+        }
+        let recreate = if matches!(intent, DiscoveryIntent::Advertising(true) | DiscoveryIntent::AdvertisingStandby) {
+            let first = parts.first().ok_or(EINVAL)?;
+            if first.opcode != 0x0c02 { return Err(EINVAL); }
+            match self.advertising_set.recreate(first.params) {
+                Some(recreate) => recreate,
+                None if intent == DiscoveryIntent::AdvertisingStandby => false,
+                None => return Err(EBUSY),
+            }
+        } else { false };
+        if recreate && self.operations.advertising != 1 { return Err(EBUSY); }
+        let mut expanded = [RecipePart { opcode: 0, params: &[] }; super::sle_command_plan::RECIPE_STEPS_MAX];
+        let remove = [0u8];
+        let (parts, power_step) = if recreate {
+            if parts.len() + 1 > expanded.len() { return Err(EINVAL); }
+            expanded[0] = RecipePart { opcode: 0x0c08, params: &remove };
+            expanded[1..parts.len() + 1].copy_from_slice(parts);
+            (&expanded[..parts.len() + 1], power_step.checked_add(1).ok_or(EINVAL)?)
+        } else { (parts, power_step) };
         let slot = self.operations.slot(request_id).map_err(|error| match error {
             AdmissionError::Invalid => EINVAL,
             AdmissionError::Duplicate => EEXIST,
@@ -350,7 +379,7 @@ impl CommandHost {
                 ((op.state == State::Queued && op.error == 0)
                     || (op.state == State::Cancelled && op.error == -(kernel::bindings::ECANCELED as i32)))
                     && op.cookie != 0 && op.opcode == 0 && op.step == 0
-                    && (1..=4).contains(&op.count) && op.power_step <= op.count
+                    && (1..=super::sle_command_plan::RECIPE_STEPS_MAX as u8).contains(&op.count) && op.power_step <= op.count
                     && op.status == 0 && op.selected_power.is_none()
                     && op.completed_boottime_ns == 0
                     && op.cookie <= match op.intent {
@@ -457,7 +486,8 @@ impl CommandHost {
                     // take this path. Both domains must settle before reuse.
                     self.revoke_done |= 1 << domain;
                     if self.revoke_done == 3 {
-                        self.operations.initialized = self.operations.advertising == 1 && self.operations.scanning == 1;
+                        self.operations.initialized = self.advertising_set.configured()
+                            && self.operations.advertising == 1 && self.operations.scanning == 1;
                     }
                     continue;
                 }
@@ -479,6 +509,18 @@ impl CommandHost {
             self.connections.sent(request.cookie).map_err(|_| EINVAL)?;
         }
         self.credits -= 1;
+        let advertising_was_absent = self.advertising_set == super::sle_command_plan::AdvertisingSet::Absent;
+        let advertising_params = if request.opcode == 0x0c02 && request.param_len == 49 {
+            let mut params = [0u8; 49];
+            params.copy_from_slice(&request.params[..49]);
+            Some(params)
+        } else { None };
+        if request.opcode == 0x0c08 || (advertising_params.is_some() && advertising_was_absent) {
+            // Until a real reply, removal or creation may have reached the
+            // controller. A cached previous OFF is not a completion of it.
+            self.operations.advertising = 0;
+            self.operations.initialized = false;
+        }
         if let Some(tag) = request.recipe {
             self.selected_policy_domains |= match tag.intent {
                 DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby => 1,
@@ -520,6 +562,8 @@ impl CommandHost {
             recipe: request.recipe,
             connection: request.connection,
             transport_done: false,
+            advertising_params,
+            advertising_was_absent,
         });
         Ok(Some(request))
     }
@@ -601,6 +645,25 @@ impl CommandHost {
         if !self.active.as_ref().is_some_and(|active| active.transport_done) { return None; }
         let (event, received) = self.reply.take()?;
         let active = self.active.take()?;
+        let successful_complete = matches!(&event,
+            SleEvent::NativeCommandReply { complete: true, status: 0, .. })
+            || matches!(&event, SleEvent::CommandComplete { status: super::sle_dli::SleStatus::Success, .. });
+        if successful_complete {
+            if active.opcode == 0x0c08 {
+                self.advertising_set = super::sle_command_plan::AdvertisingSet::Absent;
+                // An acknowledged deletion proves absence, not a fake STOP.
+                self.operations.advertising = 1;
+                self.operations.initialized = false;
+            } else if let Some(params) = active.advertising_params {
+                self.advertising_set = super::sle_command_plan::AdvertisingSet::Configured(params);
+                if active.advertising_was_absent {
+                    // A new set was created after actual deletion and no
+                    // enable has yet been selected. Initial Unknown setup
+                    // still needs its original explicit OFF receipt.
+                    self.operations.advertising = 1;
+                }
+            }
+        }
         if active.connection.is_some() {
             // SAFETY: final Host processing remains in the whole-operation budget.
             self.connections.expire(unsafe { kernel::bindings::jiffies_64 });
@@ -660,6 +723,12 @@ impl CommandHost {
             (tag.intent, outcome)
         });
         if let Some((_, outcome)) = recipe {
+            if outcome == RecipeReply::Finished && current_intent
+                && active.recipe.is_some_and(|tag| tag.intent == DiscoveryIntent::Advertising(true))
+                && self.advertising_set.configured()
+                && self.operations.advertising == 2 && self.operations.scanning == 1 {
+                self.operations.initialized = true;
+            }
             if self.revoking {
                 for i in 0..2 {
                     if self.revoke_cookies[i] != active.cookie { continue; }
@@ -669,7 +738,8 @@ impl CommandHost {
                             if i == 0 { self.operations.advertising = 1; }
                             else { self.operations.scanning = 1; }
                             if self.revoke_done == 3 {
-                                self.operations.initialized = self.operations.advertising == 1 && self.operations.scanning == 1;
+                                self.operations.initialized = self.advertising_set.configured()
+                                    && self.operations.advertising == 1 && self.operations.scanning == 1;
                             }
                         }
                         RecipeReply::Failed => {

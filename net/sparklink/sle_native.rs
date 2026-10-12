@@ -275,7 +275,8 @@ impl NativeCommandTransport {
             // SAFETY: retained driver/context and borrowed parameter buffer
             // are live throughout this side-effect-free validation call.
             NativeController::result(unsafe {
-                sparklink_native_transport_validate_step(self.transport, operation,
+                sparklink_native_transport_validate_step(self.transport,
+                    operation | if tag.recreate { 0x100 } else { 0 },
                     tag.step as u32, tag.count as u32, opcode, params.as_ptr(), params.len())
             })?;
         } else {

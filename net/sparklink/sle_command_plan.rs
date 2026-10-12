@@ -4,8 +4,30 @@
 //! Shared by the kernel Host and standalone selftests. Credits, transport,
 //! opcode matching and timeouts belong to the enclosing registration's Host.
 
-pub(crate) const RECIPE_STEPS_MAX: usize = 4;
+pub(crate) const RECIPE_STEPS_MAX: usize = 5;
 pub(crate) const RECIPE_PARAMS_MAX: usize = 255;
+
+/// WS73's confirmed handle configuration belongs to the registration, not
+/// the author result ring. Mode transitions require deleting the old set;
+/// a successful in-place parameter reply alone did not make 111 connectable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdvertisingSet {
+    Unknown,
+    Absent,
+    Configured([u8; 49]),
+}
+
+impl AdvertisingSet {
+    pub(crate) fn recreate(self, params: &[u8]) -> Option<bool> {
+        if params.len() != 49 || params[0] != 0 { return None; }
+        match self {
+            Self::Unknown => None,
+            Self::Absent => Some(false),
+            Self::Configured(previous) => Some(previous.as_slice() != params),
+        }
+    }
+    pub(crate) fn configured(self) -> bool { matches!(self, Self::Configured(_)) }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DiscoveryIntent {
@@ -57,6 +79,8 @@ pub(crate) struct RecipeTag {
     pub(crate) step: u8,
     pub(crate) count: u8,
     pub(crate) intent: DiscoveryIntent,
+    /// Kernel-owned prefix; the driver checks it separately from plain recipes.
+    pub(crate) recreate: bool,
 }
 
 /// Internal lease cleanup may retain this owner's already-confirmed OFF.

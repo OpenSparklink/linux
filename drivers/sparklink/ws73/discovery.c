@@ -219,6 +219,21 @@ int ws73_discovery_validate_step(unsigned int operation, unsigned int step,
 {
 	unsigned int expected;
 	int enable = -1;
+	/* Bit 8 is an internal Host tag, never a public operation or raw write. */
+	if (operation & 0x100) {
+		unsigned int base = operation & ~0x100U;
+		if ((base != SPARKLINK_DISCOVERY_ADV_START &&
+		     base != SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF) ||
+		    (base == SPARKLINK_DISCOVERY_ADV_START && count != 4 && count != 5) ||
+		    (base == SPARKLINK_DISCOVERY_ADV_CONFIGURE_OFF && count != 3) ||
+		    step >= count)
+			return -EINVAL;
+		if (!step)
+			return opcode == 0x0c08 && size == 1 && params && !params[0] ? 0 : -EINVAL;
+		operation = base;
+		step--;
+		count--;
+	}
 
 	if (step >= count)
 		return -EINVAL;

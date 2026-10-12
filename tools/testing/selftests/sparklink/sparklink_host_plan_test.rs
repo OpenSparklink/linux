@@ -38,7 +38,7 @@ fn progress_count_bounds() {
     for count in 0..=255 {
         assert_eq!(
             RecipeProgress::new(count).is_some(),
-            (1..=4).contains(&count)
+            (1..=5).contains(&count)
         );
     }
 }
@@ -252,7 +252,7 @@ fn invalid_last_step_never_cancels_old_recipe() {
 fn invalid_empty_oversized_or_zero_opcode_recipe() {
     let mut queue = CmdRequestQueue::new();
     raw(&mut queue, 1);
-    let five = [
+    let six = [
         RecipePart {
             opcode: 1,
             params: &[],
@@ -273,13 +273,14 @@ fn invalid_empty_oversized_or_zero_opcode_recipe() {
             opcode: 5,
             params: &[],
         },
+        RecipePart { opcode: 6, params: &[] },
     ];
     assert_eq!(
         queue.push_recipe(&[], 1, Intent::Scanning(true), 0),
         Err(QueueError::Invalid)
     );
     assert_eq!(
-        queue.push_recipe(&five, 1, Intent::Scanning(true), 0),
+        queue.push_recipe(&six, 1, Intent::Scanning(true), 0),
         Err(QueueError::Invalid)
     );
     assert_eq!(
@@ -409,17 +410,18 @@ fn every_internal_parameter_length_and_zero_tail() {
 
 #[test]
 fn malformed_tags_are_rejected_without_raw_insertion() {
-    for count in 0..=5 {
-        for step in 0..=5 {
+    for count in 0..=6 {
+        for step in 0..=6 {
             let tag = RecipeTag {
                 cookie: 1,
                 step,
                 count,
                 intent: Intent::Scanning(true),
+                recreate: false,
             };
             let mut queue = CmdRequestQueue::new();
             let result = queue.push_tagged(0x1002, &[1, 0], 0, 1, Some(tag), 50);
-            assert_eq!(result.is_ok(), count > 0 && count <= 4 && step < count);
+            assert_eq!(result.is_ok(), count > 0 && count <= 5 && step < count);
             assert_eq!(queue.len(), u16::from(result.is_ok()));
             assert_eq!(
                 queue.push_tagged(0x1002, &[1, 0], 7, 1, Some(tag), 50),
@@ -461,7 +463,7 @@ fn passive_probe_has_an_intermediate_enable_and_a_final_stop_barrier() {
 fn internal_revocation_retains_only_exact_cookie_single_step_confirmed_off() {
     use sle_command_plan::retained_revocation_off as retained;
     for (intent, domain) in [(Intent::Advertising(false), 0), (Intent::Scanning(false), 1)] {
-        let tag=RecipeTag {cookie:11+domain as u64, step:0, count:1, intent};
+        let tag=RecipeTag {cookie:11+domain as u64, step:0, count:1, intent, recreate:false};
         assert_eq!(retained(tag,[11,12],[1,1]),Some(domain));
         for state in [0,2,3,u32::MAX] {
             let mut radio=[1,1];radio[domain]=state;
@@ -473,7 +475,7 @@ fn internal_revocation_retains_only_exact_cookie_single_step_confirmed_off() {
         assert_eq!(retained(RecipeTag {step:1,..tag},[11,12],[1,1]),None);
     }
     for intent in [Intent::Advertising(true),Intent::Scanning(true),Intent::AdvertisingStandby,Intent::ScanningStandby] {
-        assert_eq!(retained(RecipeTag {cookie:11,step:0,count:1,intent},[11,12],[1,1]),None);
+        assert_eq!(retained(RecipeTag {cookie:11,step:0,count:1,intent,recreate:false},[11,12],[1,1]),None);
     }
     let mut q=CmdRequestQueue::new();assert!(q.first_recipe().is_none());
     q.push_recipe(&parts()[..1],11,Intent::Advertising(false),10).unwrap();
@@ -565,5 +567,37 @@ fn revoke_disconnect_priority_preserves_existing_queue_and_capacity_across_wrapa
         for seq in 1..=CMD_REQ_QUEUE_DEPTH as u32 {q.push_tagged(0x0403,&[],seq,seq as u64,None,100).unwrap();}
         assert_eq!(q.push_cleanup(0x1403,&[7,0,0x13],100,220),Err(QueueError::Full));
         for seq in 1..=CMD_REQ_QUEUE_DEPTH as u32 {assert_eq!(q.pop().unwrap().seq,seq);}
+    }
+}
+
+#[test]
+fn advertising_set_requires_confirmed_identity_and_recreates_changed_configuration() {
+    use sle_command_plan::AdvertisingSet;
+    let p = [0u8; 49];
+    assert_eq!(AdvertisingSet::Unknown.recreate(&p), None);
+    assert!(!AdvertisingSet::Unknown.configured());
+    assert_eq!(AdvertisingSet::Absent.recreate(&p), Some(false));
+    assert!(!AdvertisingSet::Absent.configured());
+    let existing = AdvertisingSet::Configured(p);
+    assert!(existing.configured());
+    assert_eq!(existing.recreate(&p), Some(false));
+    let mut next = p;
+    next[1] = 3;
+    assert_eq!(existing.recreate(&next), Some(true));
+    assert_eq!(existing.recreate(&next[..48]), None);
+    next[0] = 1;
+    assert_eq!(existing.recreate(&next), None);
+}
+
+#[test]
+fn recreate_tag_never_accepts_scanner_or_unbounded_recipe() {
+    for intent in [Intent::Scanning(true), Intent::Advertising(true), Intent::AdvertisingStandby] {
+        for count in 1..=6 {
+            let tag = RecipeTag {cookie:1,step:0,count,intent,recreate:true};
+            let mut queue = CmdRequestQueue::new();
+            let okay = matches!((intent,count), (Intent::Advertising(true),4|5) | (Intent::AdvertisingStandby,3));
+            assert_eq!(queue.push_tagged(0x0c08,&[0],0,1,Some(tag),100).is_ok(),okay);
+            assert_eq!(queue.len(),u16::from(okay));
+        }
     }
 }
