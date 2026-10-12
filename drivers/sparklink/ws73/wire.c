@@ -121,6 +121,67 @@ int ws73_wire_command(unsigned char *out, size_t capacity, unsigned int sequence
 	return total;
 }
 
+int ws73_wire_acb(unsigned char *out, size_t capacity, unsigned int sequence,
+		  unsigned int handle, unsigned int maximum,
+		  const unsigned char *payload, size_t size)
+{
+	size_t slot, total;
+
+	/* SDK111/HCC carries standard A3 followed by handle/flags and length.
+	 * Complete SDU, low priority, reserved bit zero in this first profile.
+	 * Never copy the reference single-link builder's hardcoded handle 0.
+	 */
+	if (!out || handle > 0x0fff || !maximum || maximum > 2047 ||
+	    !size || !payload)
+		return -EINVAL;
+	if (size > maximum)
+		return -EMSGSIZE;
+	slot = 9 + size;
+	if (slot < 64)
+		slot = 64;
+	total = 64 + slot;
+	if (capacity < total)
+		return -EMSGSIZE;
+	wire_package(out, total, sequence);
+	out[64] = 0xa0;
+	out[65] = WS73_WIRE_SLE_QUEUE;
+	out[66] = (5 + size) & 255;
+	out[67] = (5 + size) >> 8;
+	out[68] = 0xa3;
+	out[69] = handle;
+	out[70] = handle >> 8;
+	out[71] = size;
+	out[72] = size >> 8;
+	memcpy(out + 73, payload, size);
+	return total;
+}
+
+int ws73_wire_acb_decode(const unsigned char *data, size_t size,
+			unsigned int maximum, unsigned int *handle,
+			const unsigned char **payload, size_t *payload_size)
+{
+	unsigned int length, identity;
+
+	if (!data || !handle || !payload || !payload_size ||
+	    !maximum || maximum > 2047)
+		return -EINVAL;
+	if (size < 5 || data[0] != 0xa3)
+		return -EPROTO;
+	length = wire_u16(data + 3);
+	identity = wire_u16(data + 1);
+	if (!length || length != size - 5 || length > maximum)
+		return -EPROTO;
+	/* Reject fragment/high-bit modes until their stateful path is connected.
+	 * Do not reinterpret an unsupported fragment as an independent SDU.
+	 */
+	if (identity & 0xf000)
+		return -EOPNOTSUPP;
+	*handle = identity;
+	*payload = data + 5;
+	*payload_size = length;
+	return 0;
+}
+
 int ws73_wire_receive(const unsigned char *data, size_t size,
 		      ws73_wire_consumer consumer, void *context)
 {
