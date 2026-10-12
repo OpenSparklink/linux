@@ -88,7 +88,6 @@ use sle_conn::{
 use sle_event::EventQueue;
 use sle_power::PowerInner;
 use sle_security::{RalEntry, RpaManager, SecurityInner};
-use sle_ssap::SsapInner;
 
 // ---------------------------------------------------------------------------
 // Userspace read/write helpers for repr(C) ioctl structures
@@ -451,7 +450,6 @@ pub(crate) struct ControllerState {
     pub(crate) security: SecurityInner,
     pub(crate) rpa: RpaManager,
     pub(crate) rpa_tick_accum: u16,
-    pub(crate) ssap: SsapInner,
     pub(crate) power: PowerInner,
     pub(crate) local_role: GtRole,
     pub(crate) broadcast: sle_event::BroadcastRing,
@@ -476,7 +474,6 @@ impl ControllerState {
                 security: SecurityInner::new(),
                 rpa: RpaManager::new(),
                 rpa_tick_accum: 0,
-                ssap: SsapInner::new(),
                 power: PowerInner::new(),
                 local_role: GtRole::TNode,
                 broadcast <- sle_event::BroadcastRing::new_in_place(),
@@ -828,15 +825,9 @@ fn do_start_adv(context: &RuntimeContext, interval_ms: u32, discovery_level: u8)
         return Err(EPERM);
     }
     s.adv_scan.start_advertising(params)?;
-    // Collect registered SSAP service UUIDs for advertising payload
-    let mut std_uuids = [0u16; 32];
-    let std_count = s.ssap.collect_std_uuids(&mut std_uuids);
-    let mut custom_uuids = [[0u8; 16]; 8];
-    let custom_count = s.ssap.collect_custom_uuids(&mut custom_uuids);
-    let _ = s.adv_scan.build_adv_pdu(
-        &std_uuids[..std_count],
-        &custom_uuids[..custom_count],
-    );
+    // Services are owned by the future userspace Engine, not a kernel DB.
+    // Explicit Native advertising data remains on its existing typed path.
+    let _ = s.adv_scan.build_adv_pdu(&[], &[]);
     match s.controller.enable_broadcast(true) {
         Ok(()) => {
             drain_controller_events(s);
@@ -1119,12 +1110,12 @@ fn init_version_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_build_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security ssap power event dli usb netlink\nlanguage: Rust"))
+    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security power event dli usb netlink\nlanguage: Rust"))
 }
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_ssap: service access protocol\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_usb: USB transport\nsle_netlink: Generic Netlink protocol"))
+    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_usb: USB transport\nsle_netlink: Generic Netlink protocol"))
 }
 
 #[inline(never)]
@@ -2413,127 +2404,12 @@ fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isiz
     }
 }
 
-/// Local SSAP ioctl sub-dispatcher (service DB, property R/W).
+/// Removed legacy local service business; reject during caller migration.
 #[inline(never)]
-fn ioctl_ssap_local(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_SSAP_REGISTER_SVC => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.ssap.register_device_info_service()?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_INFO => {
-            let info = {
-                let ss = context.lock()?;
-                let s = ss.as_ref().ok_or(ENODEV)?;
-                let mut info: SsapSummary = unsafe { core::mem::zeroed() };
-                info.service_count = s.ssap.service_count() as u16;
-                info.property_count = s.ssap.property_count() as u16;
-                info.total_entries = s.ssap.total_entries() as u16;
-                info.mtu = s.ssap.negotiated.mtu;
-                info.notification_count = s.ssap.notification_count() as u16;
-                info
-            };
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_READ => {
-            let rw: SsapReadWrite = read_user_struct(arg)?;
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let data = s.ssap.read_property(rw.handle)?;
-            let mut out: SsapReadWrite = unsafe { core::mem::zeroed() };
-            out.handle = rw.handle;
-            let copy_len = data.len().min(SSAP_DATA_MAX);
-            out.length = copy_len as u16;
-            out.data[..copy_len].copy_from_slice(&data[..copy_len]);
-            drop(ss);
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_WRITE => {
-            let rw: SsapReadWrite = read_user_struct(arg)?;
-            let len = rw.length as usize;
-            if len > SSAP_DATA_MAX {
-                return Err(EINVAL);
-            }
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.ssap.write_property(rw.handle, &rw.data[..len])?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_FIND_SVC => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let services = s.ssap.find_primary_services();
-            let mut list: SsapServiceList = unsafe { core::mem::zeroed() };
-            let count = services.len().min(15);
-            list.count = count as u16;
-            for (i, (start, end, uuid)) in services.iter().take(15).enumerate() {
-                list.services[i].start_handle = *start;
-                list.services[i].end_handle = *end;
-                list.services[i].uuid16 = uuid.as_u16().unwrap_or(0);
-                list.services[i].primary = 1;
-            }
-            drop(ss);
-            write_user_struct(arg, &list)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_NOTIFY => {
-            let handle: u16 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.ssap.notify(handle)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_DEQUEUE_NTF => {
-            Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
-        }
-        SL_IOCTL_SSAP_ADD_SVC => {
-            let mut cmd_data: SsapAddService = read_user_struct(arg)?;
-            let uuid = if cmd_data.uuid16 != 0 {
-                sle_ssap::SsapUuid::Uuid16(cmd_data.uuid16)
-            } else {
-                sle_ssap::SsapUuid::Uuid128(cmd_data.uuid128)
-            };
-            let primary = cmd_data.primary != 0;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.ssap.register_service(uuid, primary)?;
-            cmd_data.start_handle = handle;
-            drop(ss);
-            write_user_struct(arg, &cmd_data)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_ADD_PROP => {
-            let mut cmd_data: SsapAddProperty = read_user_struct(arg)?;
-            if cmd_data._reserved != [0; 2] {
-                return Err(EINVAL);
-            }
-            let uuid = sle_ssap::SsapUuid::Uuid16(cmd_data.uuid16);
-            let ops = sle_ssap::OpIndicator::try_from_raw(u32::from(cmd_data.ops))?;
-            let len = cmd_data.value_len as usize;
-            if len > SSAP_VALUE_MAX {
-                return Err(EINVAL);
-            }
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.ssap.add_property(uuid, ops, &cmd_data.value[..len])?;
-            cmd_data.handle = handle;
-            drop(ss);
-            write_user_struct(arg, &cmd_data)?;
-            Ok(0)
-        }
-        SL_IOCTL_SSAP_REMOVE_SVC => {
-            let start_handle: u16 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.ssap.remove_service(start_handle)?;
-            Ok(0)
-        }
-        _ => Err(EINVAL),
-    }
+fn ioctl_ssap_local(_context: &RuntimeContext, _cmd: u32, _arg: usize) -> Result<isize> {
+    // The local staging DB has left the production core. This rejection seam
+    // is temporary until the unpublished ioctl and callers are removed.
+    Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
 }
 
 /// AFH, security, SSAP ioctl router — delegates to domain-specific handlers.

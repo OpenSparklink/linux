@@ -74,10 +74,6 @@ impl CheckReserved for i16 {}
 pub(crate) const ADV_NAME_MAX: usize = 32;
 /// Maximum advertising/scan data payload.
 pub(crate) const ADV_DATA_MAX: usize = 252;
-/// Maximum SSAP read/write/notification data length.
-pub(crate) const SSAP_DATA_MAX: usize = 252;
-/// Maximum SSAP property value length.
-pub(crate) const SSAP_VALUE_MAX: usize = 248;
 /// Maximum DLI command parameter length.
 pub(crate) const DLI_PARAM_MAX: usize = 240;
 

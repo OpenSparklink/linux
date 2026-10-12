@@ -28,14 +28,16 @@ def run(output):
         code += '#[path="legacy_codec.rs"] mod legacy_codec;\n'
         code += 'use prelude::*; struct RuntimeContext;\n'
         code += function(inputs['sparklink_core.rs'].decode(), 'ioctl_ssap_remote')
+        code += '\n' + function(inputs['sparklink_core.rs'].decode(), 'ioctl_ssap_local')
         code += '\n#[test] fn actual_remote_ioctl_rejects_without_touching_user_pointer_or_context() { for cmd in 0..=255 { assert_eq!(ioctl_ssap_remote(&RuntimeContext, cmd, usize::MAX), Err(Error(-95))); } }\n'
+        code += '\n#[test] fn removed_local_database_ioctl_rejects_without_touching_user_pointer_or_context() { for cmd in 0..=255 { assert_eq!(ioctl_ssap_local(&RuntimeContext, cmd, usize::MAX), Err(Error(-95))); } }\n'
         (tmp / 'fixture.rs').write_text(code)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test', '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     for p in paths:
         assert p.read_bytes() == inputs[p.name], 'production input changed during tests'
-    record = {'status': 'SSAP_LEGACY_CONTAINMENT_PASS', 'rust_tests': 9,
-              'scope': 'actual full local database/session module with allocation dependency fixture; one historical codec test',
+    record = {'status': 'SSAP_LEGACY_CONTAINMENT_PASS', 'rust_tests': 10,
+              'scope': 'legacy database/session with allocation fixture; historical codec; actual local/remote rejection seams, not a wire Engine',
               'standard_ssap_acceptance': False, 'physical_acceptance': False,
               'sources': {name: hashlib.sha256(data).hexdigest() for name, data in inputs.items()},
               'remaining': ['Userspace standard codec/fragment controls, permissions and authenticated per-peer database',

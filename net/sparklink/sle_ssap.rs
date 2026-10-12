@@ -3,7 +3,8 @@
 //! SLE Service Access Protocol (SSAP) — attribute service layer.
 //!
 //! Legacy local service staging and connection metadata. This is NOT a
-//! qualified SSAP wire implementation; the replacement Engine lives in slkd.
+//! qualified SSAP wire implementation; the replacement Engine is planned for
+//! slkd and is not implemented yet.
 //!
 //! Core concepts:
 //!   - Service: a group of related entries with a UUID
