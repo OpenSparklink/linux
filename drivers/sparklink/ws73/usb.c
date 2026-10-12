@@ -694,6 +694,15 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 					      SPARKLINK_NATIVE_WS73_HCC, WS73_DISC_REPORT_EVENT,
 					      report.header, size - 5);
 	}
+	if (size && data[0] == 0xa3) {
+		unsigned int handle;
+		const unsigned char *payload;
+		size_t payload_size;
+
+		ret = ws73_wire_acb_decode(data, size, 2047, &handle, &payload, &payload_size);
+		if (ret)
+			return ret;
+	}
 	ret = sparklink_native_receive(ws->native_id, ws->native_generation, data, size);
 	if (ret == -EOPNOTSUPP) {
 		atomic_inc(&ws->unsupported_rx);
@@ -848,6 +857,29 @@ out:
 	return ret;
 }
 
+static int ws73_native_acb(void *context, u16 handle, const u8 *data, size_t length)
+{
+	struct ws73_usb *ws = context;
+	int ret;
+
+	mutex_lock(&ws->tx_lock);
+	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) || !READ_ONCE(ws->streaming)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = ws73_wire_acb(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, handle,
+			    ws->info.acb_length, data, length);
+	if (ret < 0)
+		goto out;
+	ws->tx_sequence++;
+	ret = ws73_write(ws, ws->tx, ret);
+	if (ret && !READ_ONCE(ws->stopping))
+		ws73_async_failure(ws, ret);
+out:
+	mutex_unlock(&ws->tx_lock);
+	return ret;
+}
+
 static const struct sparklink_native_ops ws73_native_ops = {
 	.owner = THIS_MODULE,
 	.get = ws73_native_get,
@@ -860,6 +892,7 @@ static const struct sparklink_native_ops ws73_native_ops = {
     .prepare_connection = ws73_native_prepare_connection,
     .validate_connection = ws73_native_validate_connection,
 	.send_command = ws73_native_command,
+	.send_acb = ws73_native_acb,
 };
 
 /* phase_lock held; previous generation's callbacks/URBs have been joined

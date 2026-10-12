@@ -21,18 +21,21 @@ impl<T> std::ops::Deref for Guard<'_,T>{type Target=T;fn deref(&self)->&T{&self.
 impl<T> std::ops::DerefMut for Guard<'_,T>{fn deref_mut(&mut self)->&mut T{&mut self.value}}
 impl<T> Drop for Guard<'_,T>{fn drop(&mut self){trace(format!("{}-",self.name));}}
 struct Host {links:LinkObservation}
-impl Host {fn observe_link(&mut self,e:&LinkEvidence){self.links.observe(e)}}
+impl Host {fn observe_link(&mut self,e:&LinkEvidence){self.links.observe(e)}
+fn link_snapshot(&self)->(u64,bool,[Option<sle_link_observation::Link>;16]){self.links.snapshot()}}
+struct Data;
+impl Data{fn reconcile(&mut self,_:&[Option<sle_link_observation::Link>;16])->Vec<()>{Vec::new()}}
 #[derive(Clone,Debug,PartialEq)] struct Record {id:u16,generation:u64,profile:u32,event:u16,body:Vec<u8>}
 struct Log {records:Vec<Record>,fail:bool}
 impl Log {fn publish(&mut self,id:DeviceIdentity,profile:u32,event:u16,body:&[u8])->Result<(),Error>{
  if self.fail{return Err(Error(-75))} self.records.push(Record{id:id.id,generation:id.generation,profile,event,body:body.to_vec()});Ok(())
 }}
-struct Poll;
-impl Poll {fn notify_all(&self){trace("notify".into());}}
-struct Owner {identity:DeviceIdentity,protocol_profile:u32,host:Lock<Host>,schedule_gate:Lock<bool>,controller_events:Lock<Log>,controller_event_poll:Poll}
+struct Poll(&'static str);
+impl Poll {fn notify_all(&self){trace(self.0.into());}}
+struct Owner {identity:DeviceIdentity,protocol_profile:u32,host:Lock<Host>,data:Lock<Data>,data_poll:Poll,schedule_gate:Lock<bool>,controller_events:Lock<Log>,controller_event_poll:Poll}
 impl Owner {fn schedule_rx(&self,delay:u64){assert_eq!(delay,0);trace("rx".into());}
 fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{identity:DeviceIdentity{id,generation},protocol_profile:1,
- host:Lock::new("host",Host{links:LinkObservation::new()}),schedule_gate:Lock::new("gate",false),controller_events:Lock::new("log",Log{records:vec![],fail:false}),controller_event_poll:Poll})}}
+ host:Lock::new("host",Host{links:LinkObservation::new()}),data:Lock::new("data",Data),data_poll:Poll("data_notify"),schedule_gate:Lock::new("gate",false),controller_events:Lock::new("log",Log{records:vec![],fail:false}),controller_event_poll:Poll("notify")})}}
 thread_local! {static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(vec![])};static TRACE:RefCell<Vec<String>>=const{RefCell::new(vec![])};}
 fn trace(v:String){TRACE.with(|t|t.borrow_mut().push(v));}
 mod sle_usb {use super::*;pub fn ingress_owner(id:DeviceIdentity)->Option<Rc<Owner>>{OWNERS.with(|o|o.borrow().iter().find(|o|o.identity==id).cloned())}}
@@ -50,7 +53,7 @@ fn up()->LinkEvidence{LinkEvidence{kind:1,status:0,handle:7,role:1,address_type:
 fn publish(id:u16,g:u64,p:u32,code:u16,body:&[u8],e:Option<LinkEvidence>)->i32{unsafe{under_test::invoke(id,g,p,code,body.as_ptr(),body.len(),e)}}
 #[test] fn actual_publisher_keeps_raw_body_and_obligation_and_reverse_unlocks(){
  let(a,b)=setup();let body=[0xaa;32];assert_eq!(publish(0,7,1,0x1401,&body,Some(up())),0);
- let order=TRACE.with(|t|t.borrow().clone());assert_eq!(order,["host+","gate+","log+","log-","gate-","host-","rx","notify"]);
+ let order=TRACE.with(|t|t.borrow().clone());assert_eq!(order,["host+","data+","gate+","log+","log-","gate-","data-","host-","rx","data_notify","notify"]);
  assert!(!a.host.lock().links.clear_for_management());assert!(b.host.lock().links.clear_for_management());
  assert_eq!(a.controller_events.lock().records,[Record{id:0,generation:7,profile:1,event:0x1401,body:body.to_vec()}]);
 }

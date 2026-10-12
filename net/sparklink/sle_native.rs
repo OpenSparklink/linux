@@ -89,6 +89,9 @@ extern "C" {
     fn sparklink_native_transport_command(
         transport: *mut c_void, opcode: u16, params: *const u8, length: usize,
     ) -> i32;
+    fn sparklink_native_transport_acb(transport: *mut c_void, handle: u16,
+        data: *const u8, length: usize) -> i32;
+    fn sparklink_native_transport_has_acb(transport: *mut c_void) -> bool;
 }
 
 pub(crate) struct NativeController {
@@ -129,6 +132,12 @@ impl Drop for NativeCommandTransport {
 
 impl NativeController {
     pub(crate) fn profile(&self) -> u32 { self.metadata.profile }
+    pub(crate) fn data_limits(&self) -> (u16, u8) {
+        // SAFETY: retained immutable copied driver operations; no I/O.
+        if unsafe { sparklink_native_transport_has_acb(self.transport) } {
+            (self.metadata.acb_length, self.metadata.acb_count)
+        } else { (0, 0) }
+    }
     pub(crate) fn command_transport(&self) -> NativeCommandTransport {
         // SAFETY: this Backend owns a live reference during acquisition.
         unsafe { sparklink_native_transport_get(self.transport) };
@@ -530,16 +539,23 @@ unsafe fn publish_native_event(
     // Host -> scheduling gate is the admission lock order. Never hold the
     // scheduling gate while waiting for Host: management/TX may hold Host.
     let mut host = owner.host.lock();
+    let mut data = if evidence.is_some() { Some(owner.data.lock()) } else { None };
     let gate = owner.schedule_gate.lock();
     if *gate { return ENODEV.to_errno(); }
     if let Some(evidence) = evidence { host.observe_link(&evidence); }
+    let retired = data.as_mut().and_then(|data| {
+        let (_, known, links) = host.link_snapshot();
+        known.then(|| data.reconcile(&links))
+    });
     // A log overflow/error must not undo a real physical cleanup obligation.
     let result = owner.controller_events.lock().publish(owner.identity, profile, event_code, bytes);
     drop(gate);
+    drop(data);
     drop(host);
+    drop(retired);
     // Physical outcomes must progress teardown even when event-log publication
     // failed. Queue work only after releasing both IRQ-safe guards.
-    if evidence.is_some() { owner.schedule_rx(0); }
+    if evidence.is_some() { owner.schedule_rx(0); owner.data_poll.notify_all(); }
     if result.is_ok() { owner.controller_event_poll.notify_all(); }
     NativeController::result_to_errno(result)
 }
@@ -549,7 +565,7 @@ unsafe fn publish_native_event(
 pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
     id: u16, generation: u64, data: *const u8, length: usize,
 ) -> i32 {
-    if data.is_null() || !(5..=260).contains(&length) { return PROTOCOL_ERROR; }
+    if data.is_null() || !(5..=super::sle_native_data::MAXIMUM + 5).contains(&length) { return PROTOCOL_ERROR; }
     let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
         return ENODEV.to_errno();
     };
@@ -557,8 +573,42 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
     let packet = unsafe { core::slice::from_raw_parts(data, length) };
     let event = u16::from_le_bytes([packet[1], packet[2]]);
     let count = u16::from_le_bytes([packet[3], packet[4]]) as usize;
+    if packet[0] == 0xa3 {
+        if event & 0xf000 != 0 || count == 0 || count != length - 5 { return PROTOCOL_ERROR; }
+        // Copy before acquiring IRQ-safe Host/data/gate locks.
+        let mut bytes = KVec::new();
+        if bytes.extend_from_slice(&packet[5..], GFP_ATOMIC).is_err() { return ENOMEM.to_errno(); }
+        let host = owner.host.lock();
+        let (_, known, links) = host.link_snapshot();
+        let mut data = owner.data.lock();
+        let gate = owner.schedule_gate.lock();
+        if *gate { return ENODEV.to_errno(); }
+        let retired = if known { Some(data.reconcile(&links)) } else { None };
+        let link = if known { links.iter().flatten().find(|link| link.handle == event) } else { None };
+        if let Some(link) = link {
+            let _ = data.push(super::sle_native_data::Packet { lifetime: link.lifetime, handle: event, bytes });
+        } else {
+            data.dropped = data.dropped.saturating_add(1);
+        }
+        drop(gate); drop(data); drop(host);
+        drop(retired);
+        owner.data_poll.notify_all();
+        return 0; // bounded ingress drop is not a USB/device recovery request
+    }
+    if length > 260 { return PROTOCOL_ERROR; }
     if packet[0] != 0xa2 || count != length - 5 { return PROTOCOL_ERROR; }
     let params = &packet[5..];
+    if event == 9 {
+        if params.len() != 3 { return PROTOCOL_ERROR; }
+        let handle = u16::from_le_bytes([params[0], params[1]]);
+        let mut data = owner.data.lock();
+        let gate = owner.schedule_gate.lock();
+        if *gate { return ENODEV.to_errno(); }
+        data.completed(handle, params[2]);
+        drop(gate); drop(data);
+        owner.data_poll.notify_all();
+        return 0; // data accounting never changes command credit
+    }
     let event = match event {
         1 | 2 => {
             if params.len() < 3 { return PROTOCOL_ERROR; }
@@ -587,5 +637,71 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         _ => return UNSUPPORTED,
     };
     super::sle_usb::enqueue_rx(&owner, event);
+    0
+}
+
+/// Internal channel entry point. The old handle-only trait stays unsupported.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
+    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
+) -> i32 {
+    if data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
+    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let _lifecycle = owner.native_lifecycle.lock();
+    let transport = {
+        let state = owner.state.lock();
+        let Some(super::sle_dli::ControllerBackend::Ws73(controller)) = state.as_ref().map(|s| &s.controller) else {
+            return UNSUPPORTED;
+        };
+        controller.command_transport()
+    };
+    let host = owner.host.lock();
+    let (_, known, links) = host.link_snapshot();
+    let mut budget = owner.data.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return ENODEV.to_errno(); }
+    if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
+    if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
+        return -(kernel::bindings::ESTALE as i32);
+    }
+    if let Err(error) = budget.credits.reserve(lifetime, handle, length) {
+        return super::sle_native_data::error(error).to_errno();
+    }
+    drop(gate); drop(budget); drop(host);
+    // SAFETY: caller owns a live kernel buffer for this blocking call. The
+    // retained Backend and lifecycle guard prevent close until it returns.
+    let result = unsafe { sparklink_native_transport_acb(transport.transport, handle, data, length) };
+    if result != 0 { owner.data.lock().credits.transport_failed(); }
+    owner.data_poll.notify_all();
+    result
+}
+
+/// Internal DTAP consumer; a stale lifetime cannot consume another link's RX.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_acb_take_rust(
+    id: u16, generation: u64, lifetime: u64, handle: u16,
+    data: *mut u8, capacity: usize, length: *mut usize,
+) -> i32 {
+    if data.is_null() || length.is_null() { return EINVAL.to_errno(); }
+    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let host = owner.host.lock();
+    let (_, known, links) = host.link_snapshot();
+    let mut queue = owner.data.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return ENODEV.to_errno(); }
+    if !known { return EAGAIN.to_errno(); }
+    if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
+        return -(kernel::bindings::ESTALE as i32);
+    }
+    let packet = match queue.take(lifetime, handle, capacity) {
+        Ok(Some(packet)) => packet,
+        Ok(None) => return EAGAIN.to_errno(),
+        Err(error) => return error.to_errno(),
+    };
+    drop(gate); drop(queue); drop(host);
+    // SAFETY: caller provides writable, disjoint kernel data/length buffers.
+    // Capacity was checked without consuming on EMSGSIZE; packet owns bytes.
+    unsafe { core::ptr::copy_nonoverlapping(packet.bytes.as_ptr(), data, packet.bytes.len());
+        *length = packet.bytes.len(); }
     0
 }

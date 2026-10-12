@@ -14,6 +14,10 @@ int sparklink_native_health_rust(u16 id, u64 generation);
 void sparklink_native_snoop_rx_rust(u16 id, u64 generation, const u8 *data, size_t length);
 void sparklink_native_snoop_tx_rust(u16 id, u64 generation, u16 opcode, const u8 *params, size_t length, int status);
 int sparklink_native_receive_rust(u16 id, u64 generation, const u8 *data, size_t length);
+int sparklink_native_acb_send_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+				 const u8 *data, size_t length);
+int sparklink_native_acb_take_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+				 u8 *data, size_t capacity, size_t *length);
 int sparklink_native_event_rust(u16 id, u64 generation, u32 profile, u16 event_code,
 				const u8 *params, size_t length);
 
@@ -40,5 +44,8 @@ int sparklink_native_transport_validate_connection(struct sparklink_native_trans
 	unsigned int operation, u16 opcode, const u8 *params, size_t length);
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,
 				       u16 opcode, const u8 *params, size_t length);
+int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
+				   u16 handle, const u8 *data, size_t length);
+bool sparklink_native_transport_has_acb(struct sparklink_native_transport *transport);
 
 #endif

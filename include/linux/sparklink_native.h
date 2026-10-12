@@ -68,6 +68,10 @@ struct sparklink_native_ops {
     int (*validate_connection)(void *context, unsigned int operation,
         u16 opcode, const u8 *params, size_t length);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
+	/* Optional one-transfer ACB path. Core reserved actual packet credit and
+	 * a canonical lifetime before calling; USB success is not completion.
+	 */
+	int (*send_acb)(void *context, u16 handle, const u8 *data, size_t length);
 };
 
 int sparklink_native_register(const struct sparklink_native_info *info,
@@ -86,6 +90,16 @@ int sparklink_native_health(u16 id, u64 generation);
  * vendor opcode-specific result layouts. A malformed Complete is not ingress.
  */
 int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t length);
+
+/* Internal DTAP/channel seam, NOT a raw userspace ioctl. Buffers are kernel
+ * owned and live for the call. Full SDU only, current canonical lifetime.
+ * Send is process-context/blocking; take is nonblocking and preserves a packet
+ * on -EMSGSIZE. No handle-only legacy send admission or synthetic replies.
+ */
+int sparklink_native_acb_send(u16 id, u64 generation, u64 lifetime, u16 handle,
+			    const u8 *data, size_t length);
+int sparklink_native_acb_take(u16 id, u64 generation, u64 lifetime, u16 handle,
+			    u8 *data, size_t capacity, size_t *length);
 
 /* Publish exact driver-validated native event parameters. IRQ-safe; copies
  * into the attributed owner's bounded log before returning. No pointer is

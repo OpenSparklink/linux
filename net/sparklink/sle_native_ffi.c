@@ -190,6 +190,33 @@ int sparklink_native_health(u16 id, u64 generation)
 }
 EXPORT_SYMBOL_GPL(sparklink_native_health);
 
+int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
+				   u16 handle, const u8 *data, size_t length)
+{
+	if (!transport->ops.send_acb)
+		return -EOPNOTSUPP;
+	return transport->ops.send_acb(transport->context, handle, data, length);
+}
+
+bool sparklink_native_transport_has_acb(struct sparklink_native_transport *transport)
+{
+	return !!transport->ops.send_acb;
+}
+
+int sparklink_native_acb_send(u16 id, u64 generation, u64 lifetime, u16 handle,
+			    const u8 *data, size_t length)
+{
+	return sparklink_native_acb_send_rust(id, generation, lifetime, handle, data, length);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_acb_send);
+
+int sparklink_native_acb_take(u16 id, u64 generation, u64 lifetime, u16 handle,
+			    u8 *data, size_t capacity, size_t *length)
+{
+	return sparklink_native_acb_take_rust(id, generation, lifetime, handle, data, capacity, length);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_acb_take);
+
 int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t length)
 {
 	return sparklink_native_receive_rust(id, generation, data, length);

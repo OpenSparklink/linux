@@ -34,6 +34,8 @@ mod sle_irq_lock;
 mod sle_mgmt;
 mod sle_link_observation;
 mod sle_native;
+mod sle_data_credit;
+mod sle_native_data;
 mod sle_netlink;
 mod sle_pdu;
 mod sle_phy;
@@ -542,6 +544,10 @@ pub(crate) struct ControllerRuntime {
     #[pin]
     pub(crate) host: Lock<KBox<sle_host::CommandHost>, IrqLockBackend>,
     #[pin]
+    pub(crate) data: Lock<sle_native_data::NativeData, IrqLockBackend>,
+    #[pin]
+    pub(crate) data_poll: PollCondVar,
+    #[pin]
     pub(crate) rx_work: DelayedWork<ControllerRuntime, 0>,
     #[pin]
     pub(crate) tx_work: DelayedWork<ControllerRuntime, 1>,
@@ -569,6 +575,10 @@ impl ControllerRuntime {
             _ => 0,
         };
         let initially_open = protocol_profile == 0;
+        let (data_length, data_count) = match &state.controller {
+            sle_dli::ControllerBackend::Ws73(controller) => controller.data_limits(),
+            _ => (0, 0),
+        };
         Arc::pin_init(pin_init!(Self {
             identity: dev.identity(),
             protocol_profile,
@@ -582,6 +592,8 @@ impl ControllerRuntime {
             transport_open: core::sync::atomic::AtomicBool::new(initially_open),
             ingress <- new_irq_lock!(ingress, "sparklink_runtime_rx"),
             host <- new_irq_lock!(host, "sparklink_runtime_host"),
+            data <- new_irq_lock!(sle_native_data::NativeData::new(data_length, data_count), "sparklink_runtime_data"),
+            data_poll <- new_poll_condvar!("sparklink_native_data"),
             rx_work <- new_delayed_work!("sparklink_runtime_rx_work"),
             tx_work <- new_delayed_work!("sparklink_runtime_tx_work"),
             schedule_gate <- new_irq_lock!(false, "sparklink_runtime_schedule"),
@@ -602,6 +614,7 @@ impl ControllerRuntime {
         // pending. Poll registers first and rechecks the closed admission gate.
         self.controller_event_poll.notify_all();
         self.snoop_poll.notify_all();
+        self.data_poll.notify_all();
         // A transaction may be faulting while copying its candidate lease.
         // Observers must not wait for that management mutex either.
         self.management.lock().settled(ENODEV.to_errno());
