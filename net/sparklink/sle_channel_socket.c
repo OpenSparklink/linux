@@ -512,20 +512,87 @@ put:
 	sl_connection_session_put(s);
 	return ret;
 }
+struct sl_receive {
+	struct sl_connection_session *session;
+	struct sock *sk;
+	struct sk_buff *skb, *last;
+	int flags;
+};
+/* Runtime holds Host/data/gate: RX admission linearizes at peek reference or
+ * unlink under Session/RX locks. No allocation, wait or user copy here. PEEK
+ * holds a reference, including zero-sized datagrams; SO_PEEK_OFF is unsupported.
+ * Revocation after this point does not revoke an already admitted user copy. */
+static int sl_take(void *context)
+{
+	struct sl_receive *receive = context;
+	struct sl_connection_session *s = receive->session;
+	unsigned long irq_flags;
+	int ret;
+
+	spin_lock_irqsave(&s->lock, irq_flags);
+	ret = sock_error(receive->sk);
+	if (ret)
+		goto unlock;
+	if (!sl_channel_active(s->progress) || !sl_binding_live(s->channel.binding) ||
+	    s->channel.sk != receive->sk) {
+		ret = -ENOTCONN;
+		goto unlock;
+	}
+	spin_lock(&s->channel.rx.lock);
+	receive->last = s->channel.rx.prev;
+	receive->skb = skb_peek(&s->channel.rx);
+	if (!receive->skb) {
+		ret = -EAGAIN;
+	} else {
+		if (receive->flags & MSG_PEEK)
+			skb_get(receive->skb);
+		else
+			__skb_unlink(receive->skb, &s->channel.rx);
+		ret = 0;
+	}
+	spin_unlock(&s->channel.rx.lock);
+unlock:
+	spin_unlock_irqrestore(&s->lock, irq_flags);
+	return ret;
+}
 static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, int flags)
 {
 	struct sl_connection_session *s = sl_binding_session(sock->sk);
+	struct sl_receive receive = { .session = s, .sk = sock->sk, .flags = flags };
 	struct sk_buff *skb;
-	int error, copied, offset = 0;
+	long timeout = sock_rcvtimeo(sock->sk, flags & MSG_DONTWAIT);
+	int error, copied;
 
 	if (!s)
 		return -ENOTCONN;
-	error = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
-	if (error) { copied = error; goto put; }
-	skb = __skb_recv_datagram(sock->sk, &s->channel.rx, flags, &offset, &error);
-	if (!skb) { copied = error; goto put; }
+	if (flags & ~(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC | MSG_CMSG_COMPAT)) {
+		copied = -EOPNOTSUPP;
+		goto put;
+	}
+	for (;;) {
+		receive.last = NULL;
+		receive.skb = NULL;
+		error = sparklink_native_session_admit(s->controller, s->generation,
+			s->lifetime, s->handle, s->epoch, sl_take, &receive);
+		if (!error)
+			break;
+		if (error != -EAGAIN || !timeout || !receive.last) {
+			copied = error;
+			goto put;
+		}
+		/* Stock wait registers first and compares the saved queue tail.
+		 * Every normal wake retries actual locked authorization/dequeue. */
+		if (__skb_wait_for_more_packets(sock->sk, &s->channel.rx, &error,
+					       &timeout, receive.last)) {
+			int status = sparklink_native_session_status(s->controller, s->generation,
+				s->lifetime, s->handle, s->epoch);
+			copied = status ? status : (error ? error : -ENOTCONN);
+			goto put;
+		}
+	}
+	skb = receive.skb;
 	copied = min_t(size_t, length, skb->len);
-	if (copied < skb->len)
+	if ((size_t)copied < skb->len)
 		msg->msg_flags |= MSG_TRUNC;
 	error = skb_copy_datagram_msg(skb, 0, msg, copied);
 	if (!error && flags & MSG_TRUNC)
