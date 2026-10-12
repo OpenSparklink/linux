@@ -46,7 +46,7 @@ use super::sle_dli::{
 
 // A complete decoded frame is consumed before unsupported RX directions are
 // rejected by serdev; this preserves byte-stream framing without executing it.
-pub const MAX_PAYLOAD_LEN: usize = 255;
+pub(crate) const MAX_PAYLOAD_LEN: usize = 255;
 
 // =========================================================================
 // UART receiver state machine
@@ -77,7 +77,7 @@ enum RxState {
 }
 
 /// Parsed DLI frame from the UART stream.
-pub enum UartFrame {
+pub(crate) enum UartFrame {
     /// Command frame (host to controller, but also used for parsing).
     Command { opcode: u16, params: KVec<u8> },
     /// Event frame from the controller.
@@ -95,7 +95,7 @@ pub enum UartFrame {
 ///
 /// Feeds bytes from the UART receiver one at a time (or in chunks)
 /// and produces complete frames when enough data is accumulated.
-pub struct UartParser {
+pub(crate) struct UartParser {
     state: RxState,
     /// Partial header accumulator (max 4 bytes).
     header: [u8; 4],
@@ -105,7 +105,7 @@ pub struct UartParser {
 
 impl UartParser {
     /// Create a new parser in the idle state.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: RxState::WaitType,
             header: [0u8; 4],
@@ -114,7 +114,7 @@ impl UartParser {
     }
 
     /// Reset the parser to the initial state.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.state = RxState::WaitType;
         self.payload.clear();
     }
@@ -124,7 +124,7 @@ impl UartParser {
     /// Returns `Some(UartFrame)` when a complete frame is assembled.
     /// Returns `None` if more bytes are needed.
     /// On protocol errors, the parser resets and returns `None`.
-    pub fn feed(&mut self, byte: u8) -> Option<UartFrame> {
+    pub(crate) fn feed(&mut self, byte: u8) -> Option<UartFrame> {
         match self.state {
             RxState::WaitType => {
                 let pkt_type = match byte {
@@ -211,7 +211,7 @@ impl UartParser {
     }
 
     /// Feed a byte slice and collect all completed frames.
-    pub fn feed_bytes(&mut self, data: &[u8], out: &mut KVec<UartFrame>) {
+    pub(crate) fn feed_bytes(&mut self, data: &[u8], out: &mut KVec<UartFrame>) {
         for &b in data {
             if let Some(frame) = self.feed(b) {
                 let _ = out.push(frame, GFP_KERNEL);
