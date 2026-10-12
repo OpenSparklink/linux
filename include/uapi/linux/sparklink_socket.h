@@ -4,7 +4,9 @@
 #include <linux/types.h>
 
 /* Experimental/unpublished. Broker binds with CAP_NET_ADMIN and can pass the
- * SOCK_SEQPACKET fd to ordinary applications. No mutation/raw DLI permission.
+ * SOCK_DGRAM fd to ordinary applications. Basic mode has no reliable delivery
+ * promise. SOCK_SEQPACKET requires a qualified reliable mode and is rejected.
+ * No mutation/raw DLI permission.
  */
 struct sockaddr_sparklink {
 	__u16 family, controller;

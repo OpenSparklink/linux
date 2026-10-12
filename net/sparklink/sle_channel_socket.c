@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Minimal native default unicast channel. SSAP/dynamic/reliable modes are not
+/* Lifetime-bound basic datagram channel, without reliable-delivery promises.
+ * SSAP/dynamic/reliable modes are not
  * advertised. Each socket binds an immutable controller/connection lifetime.
  */
 #include <linux/capability.h>
@@ -395,7 +396,7 @@ static int sl_create(struct net *net, struct socket *sock, int protocol, int ker
 
 	if (!net_eq(net, &init_net))
 		return -EAFNOSUPPORT;
-	if (sock->type != SOCK_SEQPACKET || protocol)
+	if (sock->type != SOCK_DGRAM || protocol)
 		return -EPROTONOSUPPORT;
 	sk = sk_alloc(net, PF_SPARKLINK, GFP_KERNEL, &sl_channel_proto, kern);
 	if (!sk)
