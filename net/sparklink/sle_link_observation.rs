@@ -44,6 +44,7 @@ impl LinkObservation {
         !self.uncertain && self.links.iter().all(Option::is_none)
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, handle: u16) -> bool {
         !self.uncertain && self.links.iter().flatten().any(|link| link.handle == handle)
     }
