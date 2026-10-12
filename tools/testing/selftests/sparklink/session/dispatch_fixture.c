@@ -145,6 +145,7 @@ static void direction_tests(void){
  route(&s,31,241,"forbidden RX");assert(s.channel.rx.qlen==0&&s.channel.rx_dropped==1);
  assert(sl_recvmsg(&sock,&msg,100,0)==-EACCES&&wait_calls==0);
  init_grant(&s,sk,SL_GRANT_RX);
+ assert(sl_tx_access(&s)==-EACCES);
  assert(sl_poll(NULL,&sock,NULL)==0);
  struct sl_admission admission={&s,alloc_skb(1,0),1};assert(sl_admit(&admission)==-EACCES&&admission.skb);kfree_skb(admission.skb);
  struct sl_submit_scope scope={&s,true};unsigned int before=submitted;irq_disabled=true;

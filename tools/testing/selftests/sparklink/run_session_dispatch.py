@@ -29,7 +29,7 @@ def run(output):
     structs+=re.search(r'struct sl_receive \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sl_admission \{[^}]+\};',source)[0]
     defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX','SL_CHANNEL_TX'])
-    bodies='\n'.join(function(source,n) for n in ['sl_permits','sl_session_submit','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll'])
+    bodies='\n'.join(function(source,n) for n in ['sl_permits','sl_session_submit','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll','sl_tx_access'])
     fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
     with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
         tmp=Path(directory);(tmp/'test.c').write_text(fixture)

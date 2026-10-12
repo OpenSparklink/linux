@@ -502,6 +502,19 @@ static int sl_admit(void *context)
 	spin_unlock_irqrestore(&s->lock, flags);
     return ret;
 }
+/* Early permission check prevents a receive-only fd from allocating/copying
+ * sender memory or waiting for negotiation. Final queue admission rechecks. */
+static int sl_tx_access(void *context)
+{
+	struct sl_connection_session *s = context;
+	unsigned long flags;
+	int ret;
+	spin_lock_irqsave(&s->lock, flags);
+	ret = !sl_binding_live(s->channel.binding) ? -ENOTCONN :
+		!sl_permits(s, SL_GRANT_TX) ? -EACCES : 0;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
 static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 {
 	struct sl_connection_session *s = sl_binding_session(sock->sk);
@@ -512,7 +525,7 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 
 	if (!s)
 		return -ENOTCONN;
-	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
+	ret = sparklink_native_session_admit(s->controller, s->generation, s->lifetime, s->handle, s->epoch, sl_tx_access, s);
 	if (ret)
 		goto put;
 	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
