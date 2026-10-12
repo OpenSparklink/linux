@@ -21,10 +21,6 @@
  *   sparklink_ctl sec pair <m>  - Start pairing
  *   sparklink_ctl sec info      - Show security info
  *   sparklink_ctl sec encrypt   - Enable encryption
- *   sparklink_ctl ssap register - Register device info service
- *   sparklink_ctl ssap info     - Show SSAP summary
- *   sparklink_ctl ssap read <h> - Read property by handle
- *   sparklink_ctl ssap write <h> <v> - Write property by handle
  *   sparklink_ctl pm info       - Show power management info
  *   sparklink_ctl pm suspend    - Suspend
  *   sparklink_ctl pm resume     - Resume
@@ -65,10 +61,6 @@
 #define SL_IOCTL_SEC_ENCRYPT_ON  _IO(SL_MAGIC, 0x43)
 #define SL_IOCTL_SEC_SM4_BLOCK_TEST _IOWR(SL_MAGIC, 0x47, struct sle_sm4_block_test)
 #define SL_IOCTL_SEC_HMAC_TEST   _IOWR(SL_MAGIC, 0x48, struct sle_hmac_test)
-#define SL_IOCTL_SSAP_REGISTER_SVC _IO(SL_MAGIC, 0x50)
-#define SL_IOCTL_SSAP_INFO       _IOR(SL_MAGIC, 0x51, struct ssap_summary)
-#define SL_IOCTL_SSAP_READ       _IOWR(SL_MAGIC, 0x52, struct ssap_read_write)
-#define SL_IOCTL_SSAP_WRITE      _IOW(SL_MAGIC, 0x53, struct ssap_read_write)
 #define SL_IOCTL_PM_INFO         _IOR(SL_MAGIC, 0x60, struct sle_pm_info)
 #define SL_IOCTL_PM_SET_STATE    _IOW(SL_MAGIC, 0x61, struct sle_pm_state_cmd)
 
@@ -179,21 +171,6 @@ struct sle_hmac_test {
 	uint8_t  data[160];
 	uint8_t  digest[32];
 };
-
-struct ssap_summary {
-	uint16_t service_count;
-	uint16_t property_count;
-	uint16_t total_entries;
-	uint16_t mtu;
-	uint16_t notification_count;
-	uint8_t  _reserved[6];
-} __attribute__((packed));
-
-struct ssap_read_write {
-	uint16_t handle;
-	uint16_t length;
-	uint8_t  data[252];
-} __attribute__((packed));
 
 struct sle_pm_info {
 	uint8_t  state;
@@ -310,7 +287,7 @@ static void cmd_info(int fd)
 	printf("SparkLink Control Utility\n");
 	printf("Device: %s\n", DEVICE);
 	printf("Standard: T/XS 10002-2025, T/XS 20001-2025\n");
-	printf("Modules: core pdu adv conn crypto security ssap power\n");
+	printf("Modules: core pdu adv conn crypto security power\n");
 
 	struct sci_dev_info info;
 	memset(&info, 0, sizeof(info));
@@ -512,71 +489,6 @@ static void cmd_sec(int fd, int argc, char **argv)
 	}
 }
 
-static void cmd_ssap(int fd, int argc, char **argv)
-{
-	if (argc < 1) {
-		fprintf(stderr, "Usage: sparklink_ctl ssap <register|info|read <handle>|write <handle> <value>>\n");
-		return;
-	}
-	if (strcmp(argv[0], "register") == 0) {
-		if (ioctl(fd, SL_IOCTL_SSAP_REGISTER_SVC, NULL) < 0)
-			perror("SSAP_REGISTER_SVC");
-		else
-			printf("Device info service registered\n");
-	} else if (strcmp(argv[0], "info") == 0) {
-		struct ssap_summary ss;
-		memset(&ss, 0, sizeof(ss));
-		if (ioctl(fd, SL_IOCTL_SSAP_INFO, &ss) < 0) {
-			perror("SSAP_INFO");
-			return;
-		}
-		printf("SSAP Info:\n");
-		printf("  Services:      %u\n", ss.service_count);
-		printf("  Properties:    %u\n", ss.property_count);
-		printf("  Total entries: %u\n", ss.total_entries);
-		printf("  MTU:           %u\n", ss.mtu);
-		printf("  Notifications: %u pending\n", ss.notification_count);
-	} else if (strcmp(argv[0], "read") == 0 && argc >= 2) {
-		struct ssap_read_write rw;
-		memset(&rw, 0, sizeof(rw));
-		rw.handle = (uint16_t)strtoul(argv[1], NULL, 0);
-		if (ioctl(fd, SL_IOCTL_SSAP_READ, &rw) < 0) {
-			perror("SSAP_READ");
-			return;
-		}
-		printf("Handle 0x%04x [%u bytes]: ", rw.handle, rw.length);
-		/* Try printing as text if all printable */
-		int printable = 1;
-		for (int i = 0; i < rw.length; i++) {
-			if (rw.data[i] < 0x20 || rw.data[i] > 0x7e) {
-				printable = 0;
-				break;
-			}
-		}
-		if (printable && rw.length > 0)
-			printf("\"%.*s\"\n", rw.length, rw.data);
-		else {
-			for (int i = 0; i < rw.length; i++)
-				printf("%02x ", rw.data[i]);
-			printf("\n");
-		}
-	} else if (strcmp(argv[0], "write") == 0 && argc >= 3) {
-		struct ssap_read_write rw;
-		memset(&rw, 0, sizeof(rw));
-		rw.handle = (uint16_t)strtoul(argv[1], NULL, 0);
-		size_t len = strlen(argv[2]);
-		if (len > 252) len = 252;
-		rw.length = (uint16_t)len;
-		memcpy(rw.data, argv[2], len);
-		if (ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw) < 0)
-			perror("SSAP_WRITE");
-		else
-			printf("Written %u bytes to handle 0x%04x\n", rw.length, rw.handle);
-	} else {
-		fprintf(stderr, "Unknown ssap command: %s\n", argv[0]);
-	}
-}
-
 static void cmd_pm(int fd, int argc, char **argv)
 {
 	if (argc < 1) {
@@ -752,8 +664,6 @@ static void usage(void)
 	fprintf(stderr, "                             Connection management\n");
 	fprintf(stderr, "  sec  <psk <key>|pair <m>|info|encrypt>\n");
 	fprintf(stderr, "                             Security management\n");
-	fprintf(stderr, "  ssap <register|info|read <h>|write <h> <v>>\n");
-	fprintf(stderr, "                             SSAP service layer\n");
 	fprintf(stderr, "  pm   <info|suspend|resume> Power management\n");
 	fprintf(stderr, "  event <count|read|wait [ms]> Event notification\n");
 	fprintf(stderr, "  dli  <info|stats>          DLI controller / stats\n");
@@ -782,8 +692,6 @@ int main(int argc, char **argv)
 		cmd_conn(fd, argc - 2, argv + 2);
 	else if (strcmp(argv[1], "sec") == 0)
 		cmd_sec(fd, argc - 2, argv + 2);
-	else if (strcmp(argv[1], "ssap") == 0)
-		cmd_ssap(fd, argc - 2, argv + 2);
 	else if (strcmp(argv[1], "pm") == 0)
 		cmd_pm(fd, argc - 2, argv + 2);
 	else if (strcmp(argv[1], "event") == 0)

@@ -2396,17 +2396,9 @@ fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isiz
     }
 }
 
-/// Removed legacy local service business; reject during caller migration.
+/// AFH and security ioctl router — delegates to domain-specific handlers.
 #[inline(never)]
-fn ioctl_ssap_local(_context: &RuntimeContext, _cmd: u32, _arg: usize) -> Result<isize> {
-    // The local staging DB has left the production core. This rejection seam
-    // is temporary until the unpublished ioctl and callers are removed.
-    Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
-}
-
-/// AFH, security, SSAP ioctl router — delegates to domain-specific handlers.
-#[inline(never)]
-fn ioctl_dispatch_sec_ssap(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
+fn ioctl_dispatch_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
         SL_IOCTL_AFH_SET_MAP
         | SL_IOCTL_AFH_GET_MAP
@@ -2432,40 +2424,8 @@ fn ioctl_dispatch_sec_ssap(context: &RuntimeContext, cmd: u32, arg: usize) -> Re
         | SL_IOCTL_SEC_INPUT_PASSKEY
         | SL_IOCTL_SEC_SET_PASSWORD => ioctl_security(context, cmd, arg),
 
-        SL_IOCTL_SSAP_REGISTER_SVC
-        | SL_IOCTL_SSAP_INFO
-        | SL_IOCTL_SSAP_READ
-        | SL_IOCTL_SSAP_WRITE
-        | SL_IOCTL_SSAP_FIND_SVC
-        | SL_IOCTL_SSAP_NOTIFY
-        | SL_IOCTL_SSAP_DEQUEUE_NTF
-        | SL_IOCTL_SSAP_ADD_SVC
-        | SL_IOCTL_SSAP_ADD_PROP
-        | SL_IOCTL_SSAP_REMOVE_SVC => ioctl_ssap_local(context, cmd, arg),
-
-        SL_IOCTL_SSAP_EXCHANGE_INFO
-        | SL_IOCTL_SSAP_REMOTE_DISCOVER
-        | SL_IOCTL_SSAP_REMOTE_READ
-        | SL_IOCTL_SSAP_REMOTE_WRITE
-        | SL_IOCTL_SSAP_REMOTE_EVENT
-        | SL_IOCTL_SSAP_CALL_METHOD
-        | SL_IOCTL_SSAP_FIND_BY_UUID
-        | SL_IOCTL_SSAP_READ_BY_UUID => ioctl_ssap_remote(context, cmd, arg),
-
         _ => Err(EINVAL),
     }
-}
-
-/// Remote SSAP client-side ioctl sub-dispatcher.
-///
-/// Retained unpublished ioctl numbers reject remote operations explicitly.
-/// They are removed with the userspace Engine/channel caller migration.
-#[inline(never)]
-fn ioctl_ssap_remote(_context: &RuntimeContext, _cmd: u32, _arg: usize) -> Result<isize> {
-    // The historical offset codec is not standard SSAP. Do not allocate,
-    // consume credit or claim a request was accepted before the replacement
-    // userspace Engine and per-connection channel contract are implemented.
-    Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
 }
 
 /// Handle SEC_SET_OOB ioctl in a separate stack frame to avoid
@@ -3974,7 +3934,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_CONN_READ_PEER_VERSION
             | SL_IOCTL_CONN_UPDATE_PARAMS
             | SL_IOCTL_CONN_PHY_UPDATE => ioctl_dispatch_conn(context, me, cmd, arg),
-            // --- AFH, security, SSAP ---
+            // --- AFH and security ---
             SL_IOCTL_AFH_SET_MAP
             | SL_IOCTL_AFH_GET_MAP
             | SL_IOCTL_AFH_REPORT_RSSI
@@ -3996,22 +3956,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_SEC_REJECT_PASSKEY
             | SL_IOCTL_SEC_SET_OOB
             | SL_IOCTL_SEC_INPUT_PASSKEY
-            | SL_IOCTL_SEC_SET_PASSWORD
-            | SL_IOCTL_SSAP_REGISTER_SVC
-            | SL_IOCTL_SSAP_INFO
-            | SL_IOCTL_SSAP_READ
-            | SL_IOCTL_SSAP_WRITE
-            | SL_IOCTL_SSAP_FIND_SVC
-            | SL_IOCTL_SSAP_NOTIFY
-            | SL_IOCTL_SSAP_DEQUEUE_NTF
-            | SL_IOCTL_SSAP_ADD_SVC
-            | SL_IOCTL_SSAP_ADD_PROP
-            | SL_IOCTL_SSAP_REMOVE_SVC
-            | SL_IOCTL_SSAP_EXCHANGE_INFO
-            | SL_IOCTL_SSAP_REMOTE_DISCOVER
-            | SL_IOCTL_SSAP_REMOTE_READ
-            | SL_IOCTL_SSAP_REMOTE_WRITE
-            | SL_IOCTL_SSAP_REMOTE_EVENT => ioctl_dispatch_sec_ssap(context, cmd, arg),
+            | SL_IOCTL_SEC_SET_PASSWORD => ioctl_dispatch_security(context, cmd, arg),
             // --- Infrastructure: PM, sync, DLI, events, PHY, role, RAL/RPA ---
             SL_IOCTL_PM_INFO
             | SL_IOCTL_PM_SET_STATE

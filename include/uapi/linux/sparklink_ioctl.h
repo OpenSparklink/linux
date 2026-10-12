@@ -146,10 +146,6 @@ struct sle_conn_info {
 	__u16 data_mps;
 	__u16 svc_mtu;
 	__u8  data_mode;
-	__u8  ssap_info_exchanged;
-	__u16 ssap_mtu;
-	__u8  ssap_reliable_mode;
-	__u8  ssap_version_major;
 	__u16 smtc_tx_credits;
 	__u16 smtc_rx_credits;
 	__u16 dudtc_tx_credits;
@@ -338,7 +334,7 @@ struct sle_meas_action {
 /* --- SSAP service layer ------------------------------------------------- */
 
 /* T/XS 20001-2025 V1.2.0 table 32: 32-bit operation indicator.
- * The legacy ssap_add_property.ops byte accepts only data-value bits.
+ * Permission semantics retained for userspace service code and regression.
  * Descriptor permissions must never be truncated into that staging API.
  */
 #define SL_SSAP_OP_READ             (1U << 0)
@@ -369,60 +365,6 @@ static inline int sl_ssap_ops_fits_legacy(__u32 ops)
 }
 
 
-
-struct ssap_summary {
-	__u16 service_count;
-	__u16 property_count;
-	__u16 total_entries;
-	__u16 mtu;
-	__u16 notification_count;
-	__u8  _reserved[6];
-};
-
-struct ssap_read_write {
-	__u16 handle;
-	__u16 length;
-	__u8  data[252];
-};
-
-struct ssap_service_entry {
-	__u16 start_handle;
-	__u16 end_handle;
-	__u16 uuid16;
-	__u8  primary;
-	__u8  _pad;
-};
-
-struct ssap_service_list {
-	__u16 count;
-	__u8  _pad[2];
-	struct ssap_service_entry services[15];
-};
-
-struct ssap_notification {
-	__u16 handle;
-	__u8  indication;
-	__u8  length;
-	__u8  data[252];
-};
-
-struct ssap_add_service {
-	__u16 uuid16;
-	__u8  primary;
-	__u8  _pad;
-	__u8  uuid128[16];
-	__u16 start_handle;
-	__u8  _reserved[6];
-};
-
-struct ssap_add_property {
-	__u16 uuid16;
-	__u8  ops;
-	__u8  value_len;
-	__u8  value[248];
-	__u16 handle;
-	__u8  _reserved[2];
-};
 
 /* --- Power management --------------------------------------------------- */
 
@@ -873,58 +815,7 @@ struct sle_event_stats {
 #define SL_IOCTL_SEC_INPUT_PASSKEY	_IOW(SL_MAGIC, 0x4E, struct sle_passkey_input)
 #define SL_IOCTL_SEC_SET_PASSWORD	_IOW(SL_MAGIC, 0x4F, struct sle_password_params)
 
-/* --- SSAP service layer ------------------------------------------------- */
-
-#define SL_IOCTL_SSAP_REGISTER_SVC	_IO(SL_MAGIC, 0x50)
-#define SL_IOCTL_SSAP_INFO		_IOR(SL_MAGIC, 0x51, struct ssap_summary)
-#define SL_IOCTL_SSAP_READ		_IOWR(SL_MAGIC, 0x52, struct ssap_read_write)
-#define SL_IOCTL_SSAP_WRITE		_IOW(SL_MAGIC, 0x53, struct ssap_read_write)
-#define SL_IOCTL_SSAP_FIND_SVC		_IOR(SL_MAGIC, 0x54, struct ssap_service_list)
-#define SL_IOCTL_SSAP_NOTIFY		_IOW(SL_MAGIC, 0x55, __u16)
-#define SL_IOCTL_SSAP_DEQUEUE_NTF	_IOR(SL_MAGIC, 0x56, struct ssap_notification)
-#define SL_IOCTL_SSAP_ADD_SVC		_IOWR(SL_MAGIC, 0x57, struct ssap_add_service)
-#define SL_IOCTL_SSAP_ADD_PROP		_IOWR(SL_MAGIC, 0x58, struct ssap_add_property)
-#define SL_IOCTL_SSAP_REMOVE_SVC	_IOW(SL_MAGIC, 0x59, __u16)
-
-/* --- Remote SSAP client-side operations --------------------------------- */
-
-struct ssap_remote_cmd {
-	__u16 conn_handle;
-	__u8  _reserved[2];
-};
-
-struct ssap_remote_discover {
-	__u16 conn_handle;
-	__u16 start_handle;
-	__u16 end_handle;
-	__u16 count;		/* output: number of entries discovered */
-};
-
-struct ssap_remote_read_write {
-	__u16 conn_handle;
-	__u16 handle;
-	__u16 length;
-	__u8  _pad[2];
-	__u8  data[248];
-};
-
-struct ssap_uuid_op {
-	__u16 conn_handle;
-	__u16 uuid16;		/* 0 when using uuid128 */
-	__u8  uuid128[16];	/* ignored when uuid16 != 0 */
-	__u16 handle;		/* output: matched handle */
-	__u16 length;		/* output: data length */
-	__u8  data[232];	/* output: read data (READ_BY_UUID only) */
-};
-
-#define SL_IOCTL_SSAP_EXCHANGE_INFO	_IOW(SL_MAGIC, 0x5A, struct ssap_remote_cmd)
-#define SL_IOCTL_SSAP_REMOTE_DISCOVER	_IOWR(SL_MAGIC, 0x5B, struct ssap_remote_discover)
-#define SL_IOCTL_SSAP_REMOTE_READ	_IOWR(SL_MAGIC, 0x5C, struct ssap_remote_read_write)
-#define SL_IOCTL_SSAP_REMOTE_WRITE	_IOW(SL_MAGIC, 0x5D, struct ssap_remote_read_write)
-#define SL_IOCTL_SSAP_REMOTE_EVENT	_IOR(SL_MAGIC, 0x5E, struct ssap_notification)
-#define SL_IOCTL_SSAP_CALL_METHOD	_IOWR(SL_MAGIC, 0x5F, struct ssap_remote_read_write)
-#define SL_IOCTL_SSAP_FIND_BY_UUID	_IOWR(SL_MAGIC, 0x6F, struct ssap_uuid_op)
-#define SL_IOCTL_SSAP_READ_BY_UUID	_IOWR(SL_MAGIC, 0x72, struct ssap_uuid_op)
+/* Removed unpublished SSAP ioctls 0x50..0x5f, 0x6f, 0x72; not reused. */
 
 /* --- Power management --------------------------------------------------- */
 

@@ -44,9 +44,6 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_SEC_SM4_BLOCK_TEST
         | SL_IOCTL_SEC_SM4_DEC_TEST
         | SL_IOCTL_SEC_SM4_ENC_TEST
-        | SL_IOCTL_SSAP_FIND_SVC
-        | SL_IOCTL_SSAP_INFO
-        | SL_IOCTL_SSAP_READ
         | SL_IOCTL_SUBSYS_STATS
         | SL_IOCTL_SYNC_INFO
         | SL_IOCTL_USB_DEV_COUNT => Ok(Access::Observe),
@@ -119,21 +116,6 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_SET_CONN_MTU
         | SL_IOCTL_SET_ROLE
         | SL_IOCTL_SET_SCAN_FILTER
-        | SL_IOCTL_SSAP_ADD_PROP
-        | SL_IOCTL_SSAP_ADD_SVC
-        | SL_IOCTL_SSAP_CALL_METHOD
-        | SL_IOCTL_SSAP_DEQUEUE_NTF
-        | SL_IOCTL_SSAP_EXCHANGE_INFO
-        | SL_IOCTL_SSAP_FIND_BY_UUID
-        | SL_IOCTL_SSAP_NOTIFY
-        | SL_IOCTL_SSAP_READ_BY_UUID
-        | SL_IOCTL_SSAP_REGISTER_SVC
-        | SL_IOCTL_SSAP_REMOTE_DISCOVER
-        | SL_IOCTL_SSAP_REMOTE_EVENT
-        | SL_IOCTL_SSAP_REMOTE_READ
-        | SL_IOCTL_SSAP_REMOTE_WRITE
-        | SL_IOCTL_SSAP_REMOVE_SVC
-        | SL_IOCTL_SSAP_WRITE
         | SL_IOCTL_START_ADV
         | SL_IOCTL_START_SCAN
         | SL_IOCTL_STOP_ADV

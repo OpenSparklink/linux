@@ -766,7 +766,7 @@ static void test_conn_data_loopback(int fd)
 			       info.data_mtu, info.data_mps, info.data_mode, info.svc_mtu);
 	}
 
-	/* Reject empty and oversized injected frames before TCID/SSAP access.
+	/* Reject empty and oversized injected frames before channel access.
 	 * A zero-length frame on a valid handle previously panicked in Rust.
 	 */
 	struct sle_conn_data invalid_rx;
@@ -2054,245 +2054,6 @@ cleanup:
 	ioctl(fd, SL_IOCTL_SEC_ENCRYPT_ON, NULL);
 
 	printf("  Encrypted data path: %d OK, %d FAIL\n", ok_count, fail_count);
-}
-
-static void test_ssap_service(int fd)
-{
-	test_header("SSAP: service registration and property access");
-
-	/* Step 1: Register built-in device info service */
-	int ret = ioctl(fd, SL_IOCTL_SSAP_REGISTER_SVC, NULL);
-
-	check("SSAP_REGISTER_SVC", ret);
-
-	/* Step 2: Get SSAP summary info */
-	struct ssap_summary info;
-
-	memset(&info, 0, sizeof(info));
-	ret = ioctl(fd, SL_IOCTL_SSAP_INFO, &info);
-	check("SSAP_INFO", ret);
-	if (ret == 0) {
-		printf("  services=%u properties=%u total_entries=%u mtu=%u notifications=%u\n",
-		       info.service_count, info.property_count, info.total_entries,
-		       info.mtu, info.notification_count);
-		if (info.service_count != 1)
-			printf("  WARN: expected 1 service\n");
-		if (info.property_count != 3)
-			printf("  WARN: expected 3 properties\n");
-	}
-
-	/* Step 3: Find primary services */
-	struct ssap_service_list slist;
-
-	memset(&slist, 0, sizeof(slist));
-	ret = ioctl(fd, SL_IOCTL_SSAP_FIND_SVC, &slist);
-	check("SSAP_FIND_SVC", ret);
-	if (ret == 0) {
-		printf("  found %u primary services\n", slist.count);
-		for (int i = 0; i < slist.count && i < 15; i++) {
-			printf("    svc[%d]: handle=%u-%u uuid=0x%04x primary=%u\n",
-			       i, slist.services[i].start_handle,
-			       slist.services[i].end_handle,
-			       slist.services[i].uuid16,
-			       slist.services[i].primary);
-		}
-	}
-
-	/* Step 4: Read device name property (handle 0x0011) */
-	struct ssap_read_write rw;
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0x0011;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	check("SSAP_READ (device_name)", ret);
-	if (ret == 0) {
-		printf("  device_name[%u]: \"%.*s\"\n", rw.length, rw.length, rw.data);
-	}
-
-	/* Step 5: Read firmware version (handle 0x0012) */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0x0012;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	check("SSAP_READ (fw_version)", ret);
-	if (ret == 0) {
-		printf("  fw_version[%u]: \"%.*s\"\n", rw.length, rw.length, rw.data);
-	}
-
-	/* Step 6: Write status property (handle 0x0013) */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0x0013;
-	rw.length = 1;
-	rw.data[0] = 0x42;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("SSAP_WRITE (status)", ret);
-
-	/* Step 7: Read back the written value */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0x0013;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	check("SSAP_READ (status readback)", ret);
-	if (ret == 0 && rw.length == 1 && rw.data[0] == 0x42) {
-		printf("  OK:   Status readback matches: 0x%02x\n", rw.data[0]);
-	} else if (ret == 0) {
-		test_fail("  FAIL: Status readback mismatch: len=%u data[0]=0x%02x\n",
-		       rw.length, rw.data[0]);
-	}
-
-	/* Step 8: Check notification was generated from the write */
-	struct ssap_summary info2;
-
-	memset(&info2, 0, sizeof(info2));
-	ret = ioctl(fd, SL_IOCTL_SSAP_INFO, &info2);
-	if (ret == 0 && info2.notification_count > 0) {
-		printf("  OK:   %u notification(s) pending after write\n",
-		       info2.notification_count);
-
-		/* Dequeue the notification */
-		struct ssap_notification ntf;
-
-		memset(&ntf, 0, sizeof(ntf));
-		ret = ioctl(fd, SL_IOCTL_SSAP_DEQUEUE_NTF, &ntf);
-		check("SSAP_DEQUEUE_NTF", ret);
-		if (ret == 0) {
-			printf("  notification: handle=0x%04x ind=%u len=%u data[0]=0x%02x\n",
-			       ntf.handle, ntf.indication, ntf.length,
-			       ntf.length > 0 ? ntf.data[0] : 0);
-		}
-	} else {
-		printf("  INFO: no notifications pending\n");
-	}
-
-	/* Step 9: Try reading non-existent handle */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0xFFFF;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret < 0) {
-		printf("  OK:   Read invalid handle: correctly rejected (errno=%d)\n", errno);
-	} else {
-		printf("  WARN: expected error for invalid handle\n");
-	}
-}
-
-static void test_ssap_dynamic_registration(int fd)
-{
-	test_header("SSAP dynamic service registration");
-
-	/* Step 1: Add a custom primary service with 16-bit UUID */
-	struct ssap_add_service svc;
-
-	memset(&svc, 0, sizeof(svc));
-	svc.uuid16 = 0x1234;
-	svc.primary = 1;
-	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-	check("SSAP_ADD_SVC (uuid16=0x1234, primary)", ret);
-	uint16_t svc_handle = 0;
-
-	if (ret == 0) {
-		svc_handle = svc.start_handle;
-		printf("  OK:   service registered, start_handle=%u\n", svc_handle);
-	}
-
-	/* Step 2: Add a property to the service (Read+Write, ops=0x03) */
-	struct ssap_add_property prop;
-
-	memset(&prop, 0, sizeof(prop));
-	prop.uuid16 = 0x2A00;
-	prop.ops = 0x03; /* Read | Write */
-	prop.value_len = 5;
-	memcpy(prop.value, "hello", 5);
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &prop);
-	check("SSAP_ADD_PROP (uuid16=0x2A00, ops=RW)", ret);
-	uint16_t prop_handle = 0;
-
-	if (ret == 0) {
-		prop_handle = prop.handle;
-		printf("  OK:   property added, handle=%u\n", prop_handle);
-	}
-
-	/* Step 3: Add a second property with Notify (ops=0x04) */
-	struct ssap_add_property prop2;
-
-	memset(&prop2, 0, sizeof(prop2));
-	prop2.uuid16 = 0x2A01;
-	prop2.ops = 0x04; /* Notify */
-	prop2.value_len = 0;
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &prop2);
-	check("SSAP_ADD_PROP (uuid16=0x2A01, ops=Notify)", ret);
-	if (ret == 0) {
-		printf("  OK:   second property added, handle=%u\n", prop2.handle);
-	}
-
-	/* Step 4: Verify service count increased via SSAP_INFO */
-	struct ssap_summary info;
-
-	memset(&info, 0, sizeof(info));
-	ret = ioctl(fd, SL_IOCTL_SSAP_INFO, &info);
-	check("SSAP_INFO (after dynamic add)", ret);
-	if (ret == 0) {
-		printf("  OK:   services=%u properties=%u\n",
-		       info.service_count, info.property_count);
-	}
-
-	/* Step 5: Read the property we just created */
-	if (prop_handle != 0) {
-		struct ssap_read_write rw;
-
-		memset(&rw, 0, sizeof(rw));
-		rw.handle = prop_handle;
-		ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-		check("SSAP_READ (dynamic property)", ret);
-		if (ret == 0 && rw.length >= 5) {
-			printf("  OK:   read back %u bytes: '%.*s'\n",
-			       rw.length, rw.length, rw.data);
-		}
-	}
-
-	/* Step 6: Add a second service with 128-bit UUID */
-	struct ssap_add_service svc2;
-
-	memset(&svc2, 0, sizeof(svc2));
-	svc2.uuid16 = 0; /* use uuid128 */
-	svc2.primary = 1;
-	/* Fill uuid128 with a test pattern */
-	for (int i = 0; i < 16; i++)
-		svc2.uuid128[i] = (uint8_t)(0xA0 + i);
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc2);
-	check("SSAP_ADD_SVC (uuid128, primary)", ret);
-	if (ret == 0) {
-		printf("  OK:   128-bit UUID service registered, start_handle=%u\n",
-		       svc2.start_handle);
-	}
-
-	/* Step 7: Remove the first service */
-	if (svc_handle != 0) {
-		ret = ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &svc_handle);
-		check("SSAP_REMOVE_SVC (handle)", ret);
-		if (ret == 0) {
-			printf("  OK:   service start_handle=%u removed\n", svc_handle);
-		}
-	}
-
-	/* Step 8: Try removing a non-existent service */
-	uint16_t bad_handle = 0xFFFF;
-
-	ret = ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &bad_handle);
-	if (ret < 0) {
-		printf("  OK:   Remove non-existent service rejected (errno=%d)\n", errno);
-	} else {
-		printf("  WARN: expected error for non-existent service\n");
-	}
-
-	/* Step 9: Verify service count after removal */
-	struct ssap_summary info2;
-
-	memset(&info2, 0, sizeof(info2));
-	ret = ioctl(fd, SL_IOCTL_SSAP_INFO, &info2);
-	check("SSAP_INFO (after remove)", ret);
-	if (ret == 0) {
-		printf("  OK:   services=%u properties=%u (after removal)\n",
-		       info2.service_count, info2.property_count);
-	}
 }
 
 static void test_power_management(int fd)
@@ -3838,19 +3599,6 @@ static void test_ioctl_throughput(int fd)
 	printf("  OK:   DEV_COUNT x%d: %lu ns total, %lu ns/call\n",
 	       iterations, (unsigned long)ns, (unsigned long)(ns / iterations));
 
-	/* 2. SSAP_INFO ioctl throughput (reads global subsystem with lock) */
-	struct ssap_summary info;
-
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	for (int i = 0; i < iterations; i++) {
-		memset(&info, 0, sizeof(info));
-		ioctl(fd, SL_IOCTL_SSAP_INFO, &info);
-	}
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	ns = elapsed_ns(&t0, &t1);
-	printf("  OK:   SSAP_INFO x%d: %lu ns total, %lu ns/call\n",
-	       iterations, (unsigned long)ns, (unsigned long)(ns / iterations));
-
 	/* 3. PM_INFO ioctl (reads power subsystem state) */
 	struct sle_pm_info pm;
 
@@ -3897,22 +3645,6 @@ static void test_ioctl_throughput(int fd)
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	ns = elapsed_ns(&t0, &t1);
 	printf("  OK:   GET_ROLE x%d: %lu ns total, %lu ns/call\n",
-	       iterations, (unsigned long)ns, (unsigned long)(ns / iterations));
-
-	/* 7. SSAP_READ latency (read a known property) */
-	struct ssap_read_write rw;
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 1; /* DIS property handle */
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	for (int i = 0; i < iterations; i++) {
-		rw.handle = 1;
-		rw.length = 0;
-		ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	}
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	ns = elapsed_ns(&t0, &t1);
-	printf("  OK:   SSAP_READ x%d: %lu ns total, %lu ns/call\n",
 	       iterations, (unsigned long)ns, (unsigned long)(ns / iterations));
 
 	/* 8. Completed advertise start+stop cycle latency (not enqueue latency). */
@@ -5029,216 +4761,6 @@ static void test_conn_max_capacity(int fd)
 	}
 }
 
-/*
- * SSAP notification vs indication distinction.
- *
- * Ref: TXS-50004 section 10.5 (notification) / 10.6 (indication).
- * Tests that property writes with Notify-capable properties generate
- * notifications, and that the indication flag is correctly set for
- * Indicate-capable properties.
- */
-static void test_ssap_indication(int fd)
-{
-	test_header("SSAP: notification vs indication");
-
-	/* Add a service with two properties:
-	 *   prop1: Notify (ops=0x04)
-	 *   prop2: Indicate (ops=0x08)
-	 */
-	struct ssap_add_service svc;
-
-	memset(&svc, 0, sizeof(svc));
-	svc.uuid16 = 0xFE01;
-	svc.primary = 1;
-	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-	if (ret < 0) {
-		test_fail("  FAIL: SSAP_ADD_SVC: %s\n", strerror(errno));
-		return;
-	}
-
-	struct ssap_add_property p_ntf;
-
-	memset(&p_ntf, 0, sizeof(p_ntf));
-	p_ntf.uuid16 = 0xFE11;
-	p_ntf.ops = 0x07; /* Read|Write|Notify */
-	p_ntf.value_len = 1;
-	p_ntf.value[0] = 0x00;
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ntf);
-	if (ret < 0) {
-		test_fail("  FAIL: add notify property: %s\n", strerror(errno));
-		return;
-	}
-	uint16_t h_ntf = p_ntf.handle;
-
-	printf("  OK:   Notify property handle=0x%04x\n", h_ntf);
-
-	struct ssap_add_property p_ind;
-
-	memset(&p_ind, 0, sizeof(p_ind));
-	p_ind.uuid16 = 0xFE12;
-	p_ind.ops = 0x0B; /* Read|Write|Indicate */
-	p_ind.value_len = 1;
-	p_ind.value[0] = 0x00;
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ind);
-	if (ret < 0) {
-		test_fail("  FAIL: add indicate property: %s\n", strerror(errno));
-		return;
-	}
-	uint16_t h_ind = p_ind.handle;
-
-	printf("  OK:   Indicate property handle=0x%04x\n", h_ind);
-
-	/* Write to notify property */
-	struct ssap_read_write rw;
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ntf;
-	rw.length = 1;
-	rw.data[0] = 0xAA;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE (notify prop)", ret);
-
-	/* Trigger notification for notify property */
-	ret = ioctl(fd, SL_IOCTL_SSAP_NOTIFY, &h_ntf);
-	check("SSAP_NOTIFY (notify prop)", ret);
-
-	/* Write to indicate property */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ind;
-	rw.length = 1;
-	rw.data[0] = 0xBB;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE (indicate prop)", ret);
-
-	/* Trigger notification for indicate property */
-	ret = ioctl(fd, SL_IOCTL_SSAP_NOTIFY, &h_ind);
-	check("SSAP_NOTIFY (indicate prop)", ret);
-
-	/* Dequeue and check: notify prop should produce indication=0 */
-	struct ssap_notification ntf1;
-
-	memset(&ntf1, 0, sizeof(ntf1));
-	ret = ioctl(fd, SL_IOCTL_SSAP_DEQUEUE_NTF, &ntf1);
-	if (ret == 0) {
-		printf("  OK:   Dequeued: handle=0x%04x indication=%u data=0x%02x\n",
-		       ntf1.handle, ntf1.indication, ntf1.data[0]);
-		if (ntf1.handle == h_ntf && ntf1.indication == 0) {
-			printf("  OK:   Notify property: notification mode (indication=0)\n");
-		} else {
-			printf("  WARN: unexpected handle=0x%04x or indication=%u\n",
-			       ntf1.handle, ntf1.indication);
-		}
-	}
-
-	/* Second dequeue: indicate prop via SSAP_NOTIFY also produces
-	 * indication=0 (SSAP_NOTIFY always uses notification mode).
-	 * The indication path requires a separate SSAP_INDICATE ioctl
-	 * which is not yet exposed. */
-	struct ssap_notification ntf2;
-
-	memset(&ntf2, 0, sizeof(ntf2));
-	ret = ioctl(fd, SL_IOCTL_SSAP_DEQUEUE_NTF, &ntf2);
-	if (ret == 0) {
-		printf("  OK:   Dequeued: handle=0x%04x indication=%u data=0x%02x\n",
-		       ntf2.handle, ntf2.indication, ntf2.data[0]);
-		if (ntf2.handle == h_ind) {
-			printf("  OK:   Indicate property queued via SSAP_NOTIFY\n");
-		}
-	}
-
-	/* Cleanup: remove service */
-	uint16_t sh = svc.start_handle;
-
-	ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &sh);
-}
-
-/*
- * SSAP service discovery with UUID filter.
- *
- * Ref: TXS-50004 section 10.2, service discovery tests.
- * Tests that SSAP_FIND_SVC returns only matching services when filtered
- * by 16-bit UUID, and returns all services when no filter is applied.
- */
-static void test_ssap_service_discovery(int fd)
-{
-	test_header("SSAP: service discovery with multiple services");
-
-	/* Get baseline service count */
-	struct ssap_summary base;
-
-	memset(&base, 0, sizeof(base));
-	ioctl(fd, SL_IOCTL_SSAP_INFO, &base);
-	int base_count = base.service_count;
-
-	/* Add 3 services with different UUIDs */
-	uint16_t svc_handles[3];
-	uint16_t uuids[] = { 0x1800, 0x1801, 0x180A };
-
-	for (int i = 0; i < 3; i++) {
-		struct ssap_add_service svc;
-
-		memset(&svc, 0, sizeof(svc));
-		svc.uuid16 = uuids[i];
-		svc.primary = 1;
-		int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-		if (ret < 0) {
-			test_fail("  FAIL: add service 0x%04x: %s\n", uuids[i], strerror(errno));
-			goto sd_cleanup;
-		}
-		svc_handles[i] = svc.start_handle;
-		printf("  OK:   Service 0x%04x registered (handle=%u)\n",
-		       uuids[i], svc_handles[i]);
-	}
-
-	/* Verify total service count increased by 3 */
-	struct ssap_summary info;
-
-	memset(&info, 0, sizeof(info));
-	ioctl(fd, SL_IOCTL_SSAP_INFO, &info);
-	if ((int)info.service_count == base_count + 3) {
-		printf("  OK:   service_count=%u (base=%d +3)\n",
-		       info.service_count, base_count);
-	} else {
-		printf("  WARN: service_count=%u (expected %d)\n",
-		       info.service_count, base_count + 3);
-	}
-
-	/* Find all services */
-	struct ssap_service_list slist;
-
-	memset(&slist, 0, sizeof(slist));
-	int ret = ioctl(fd, SL_IOCTL_SSAP_FIND_SVC, &slist);
-
-	if (ret == 0) {
-		printf("  OK:   FIND_SVC returned %u services\n", slist.count);
-
-		/* Verify all UUIDs are present */
-		for (int i = 0; i < 3; i++) {
-			int found = 0;
-
-			for (int j = 0; j < slist.count; j++) {
-				if (slist.services[j].uuid16 == uuids[i]) {
-					found = 1;
-					break;
-				}
-			}
-			if (found) {
-				printf("  OK:   UUID 0x%04x found\n", uuids[i]);
-			} else {
-				test_fail("  FAIL: UUID 0x%04x missing\n", uuids[i]);
-			}
-		}
-	}
-
-sd_cleanup:
-	/* Remove all added services */
-	for (int i = 2; i >= 0; i--) {
-		if (svc_handles[i] != 0)
-			ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &svc_handles[i]);
-	}
-}
 
 /*
  * Device switch state isolation test.
@@ -5368,13 +4890,7 @@ static void test_dev_switch_isolation(int fd)
 	printf("  OK:   State isolation: %d/6 steps passed\n", ok_count);
 }
 
-/*
- * SSAP property operations edge cases.
- *
- * Ref: TXS-50004 section 10.3/10.4, read/write operations.
- * Tests boundary conditions: zero-length write, max-length write,
- * write to read-only property, read-after-write consistency.
- */
+
 
 /*
  * Per-fd device affinity (DEV_SELECT / DEV_GET_ACTIVE).
@@ -5553,129 +5069,6 @@ static void test_per_fd_device_select(int fd)
 		ioctl(fd, SL_IOCTL_DISCONNECT, &h_a);
 
 	printf("  OK:   Per-fd device affinity: %d checks passed\n", ok);
-}
-
-static void test_ssap_prop_edge_cases(int fd)
-{
-	test_header("SSAP: property operation edge cases");
-
-	/* Add a test service with properties of different capabilities */
-	struct ssap_add_service svc;
-
-	memset(&svc, 0, sizeof(svc));
-	svc.uuid16 = 0xFE20;
-	svc.primary = 1;
-	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-	if (ret < 0) {
-		test_fail("  FAIL: add service: %s\n", strerror(errno));
-		return;
-	}
-	uint16_t svc_h = svc.start_handle;
-
-	/* Read-only property */
-	struct ssap_add_property p_ro;
-
-	memset(&p_ro, 0, sizeof(p_ro));
-	p_ro.uuid16 = 0xFE21;
-	p_ro.ops = 0x01; /* Read only */
-	p_ro.value_len = 4;
-	memcpy(p_ro.value, "RDONLY", 4);
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ro);
-	if (ret < 0) {
-		test_fail("  FAIL: add read-only prop\n");
-		goto edge_cleanup;
-	}
-	uint16_t h_ro = p_ro.handle;
-
-	/* Read-write property */
-	struct ssap_add_property p_rw;
-
-	memset(&p_rw, 0, sizeof(p_rw));
-	p_rw.uuid16 = 0xFE22;
-	p_rw.ops = 0x03; /* Read | Write */
-	p_rw.value_len = 0;
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_rw);
-	if (ret < 0) {
-		test_fail("  FAIL: add read-write prop\n");
-		goto edge_cleanup;
-	}
-	uint16_t h_rw = p_rw.handle;
-
-	/* Test 1: Write to read-only property should fail */
-	struct ssap_read_write rw;
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ro;
-	rw.length = 1;
-	rw.data[0] = 0xFF;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	if (ret < 0) {
-		printf("  OK:   Write to read-only: rejected (errno=%d)\n", errno);
-	} else {
-		printf("  WARN: Write to read-only succeeded (unexpected)\n");
-	}
-
-	/* Test 2: Read-only value should be unchanged */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ro;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret == 0 && rw.length == 4 && memcmp(rw.data, "RDONLY", 4) == 0) {
-		printf("  OK:   Read-only value preserved\n");
-	} else {
-		printf("  WARN: Read-only value changed (len=%u)\n", rw.length);
-	}
-
-	/* Test 3: Zero-length read on empty property */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret == 0 && rw.length == 0) {
-		printf("  OK:   Read empty property: len=0\n");
-	} else {
-		printf("  WARN: Read empty property: ret=%d len=%u\n", ret, rw.length);
-	}
-
-	/* Test 4: Large write (fill buffer) */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	rw.length = 248;
-	memset(rw.data, 0x42, 248);
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE (248 bytes)", ret);
-
-	/* Test 5: Readback should match */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret == 0 && rw.length == 248 && rw.data[0] == 0x42 && rw.data[247] == 0x42) {
-		printf("  OK:   Readback 248 bytes: consistent\n");
-	} else {
-		printf("  WARN: Readback mismatch: len=%u data[0]=0x%02x\n",
-		       rw.length, rw.data[0]);
-	}
-
-	/* Test 6: Overwrite with shorter data */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	rw.length = 2;
-	rw.data[0] = 0xAB;
-	rw.data[1] = 0xCD;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE (2 bytes overwrite)", ret);
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret == 0 && rw.length == 2 && rw.data[0] == 0xAB && rw.data[1] == 0xCD) {
-		printf("  OK:   Overwrite readback: 2 bytes correct\n");
-	} else {
-		printf("  WARN: Overwrite readback: len=%u data=0x%02x%02x\n",
-		       rw.length, rw.data[0], rw.data[1]);
-	}
-
-edge_cleanup:
-	ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &svc_h);
 }
 
 /* ------------------------------------------------------------------ *
@@ -6514,9 +5907,6 @@ static void test_channel_tcid_standard(int fd)
 	else
 		test_fail("  FAIL: svc_mtu=%u out of range\n", info.svc_mtu);
 
-	/* ssap_mtu should be set to default when no SSAP exchange occurred */
-	printf("  INFO: ssap_info_exchanged=%u ssap_mtu=%u\n",
-	       info.ssap_info_exchanged, info.ssap_mtu);
 
 	uint16_t dh = h;
 
@@ -6660,191 +6050,6 @@ static void test_dli_info_consistency(int fd)
 		       dli.max_connections, gnl_max_conn,
 		       dli.max_mtu, gnl_max_mtu,
 		       dli.max_mps, gnl_max_mps);
-}
-
-/* ------------------------------------------------------------------ *
- * test_ssap_multi_notify — §10.6 multiple property notifications    *
- *                                                                    *
- * Registers a service with 3 notifiable properties, writes distinct *
- * values, triggers notify on all 3, then dequeues and verifies the  *
- * notifications arrive in order with correct handle and data.       *
- * ------------------------------------------------------------------ */
-static void test_ssap_multi_notify(int fd)
-{
-	test_header("SSAP: multi-property notification (§10.6)");
-
-	/* Register a service with 3 notifiable properties */
-	struct ssap_add_service svc;
-
-	memset(&svc, 0, sizeof(svc));
-	svc.uuid16 = 0x2000;
-	svc.primary = 1;
-	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-	check("ADD_SVC (0x2000)", ret);
-	uint16_t svc_h = svc.start_handle;
-
-	uint16_t handles[3];
-
-	for (int i = 0; i < 3; i++) {
-		struct ssap_add_property prop;
-
-		memset(&prop, 0, sizeof(prop));
-		prop.uuid16 = 0x2001 + i;
-		prop.ops = 0x07;  /* Read + Write + Notify */
-		ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &prop);
-		check("ADD_PROP (notifiable)", ret);
-		handles[i] = prop.handle;
-		printf("  OK:   prop[%d] handle=0x%04x uuid=0x%04x\n",
-		       i, handles[i], 0x2001 + i);
-	}
-
-	/* Write distinct values to each */
-	for (int i = 0; i < 3; i++) {
-		struct ssap_read_write rw;
-
-		memset(&rw, 0, sizeof(rw));
-		rw.handle = handles[i];
-		rw.data[0] = 0xA0 + i;
-		rw.data[1] = 0xB0 + i;
-		rw.length = 2;
-		ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-		check("WRITE (pre-notify)", ret);
-	}
-
-	/* Trigger notifications for all 3 — ordered */
-	for (int i = 0; i < 3; i++) {
-		uint16_t nh = handles[i];
-
-		ret = ioctl(fd, SL_IOCTL_SSAP_NOTIFY, &nh);
-		check("SSAP_NOTIFY", ret);
-	}
-
-	/* Dequeue and verify order + data */
-	int ok_count = 0;
-
-	for (int i = 0; i < 3; i++) {
-		struct ssap_notification ntf;
-
-		memset(&ntf, 0, sizeof(ntf));
-		ret = ioctl(fd, SL_IOCTL_SSAP_DEQUEUE_NTF, &ntf);
-		if (ret == 0) {
-			printf("  OK:   ntf[%d]: handle=0x%04x data=0x%02x%02x\n",
-			       i, ntf.handle, ntf.data[0], ntf.data[1]);
-			if (ntf.handle == handles[i] &&
-			    ntf.data[0] == (uint8_t)(0xA0 + i) &&
-			    ntf.data[1] == (uint8_t)(0xB0 + i)) {
-				ok_count++;
-			} else {
-				printf("  WARN: expected handle=0x%04x data=0x%02x%02x\n",
-				       handles[i], 0xA0 + i, 0xB0 + i);
-			}
-		} else {
-			printf("  WARN: dequeue[%d] failed: %s\n",
-			       i, strerror(errno));
-		}
-	}
-
-	if (ok_count == 3)
-		printf("  OK:   All 3 notifications matched (ordered)\n");
-
-	/* Verify queue is now empty */
-	struct ssap_notification ntf_extra;
-
-	memset(&ntf_extra, 0, sizeof(ntf_extra));
-	ret = ioctl(fd, SL_IOCTL_SSAP_DEQUEUE_NTF, &ntf_extra);
-	if (ret < 0 && errno == EAGAIN) {
-		printf("  OK:   Notification queue empty after dequeue\n");
-	} else {
-		printf("  WARN: expected EAGAIN, got ret=%d\n", ret);
-	}
-
-	ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &svc_h);
-}
-
-/* ------------------------------------------------------------------ *
- * test_ssap_write_readonly — §10.5 write to read-only property      *
- *                                                                    *
- * Verifies that writing to a property with only Read permission     *
- * returns an error, and that writing to a Write-permitted property  *
- * succeeds.  Also tests writing with length=0 and max length.       *
- * ------------------------------------------------------------------ */
-static void test_ssap_write_readonly(int fd)
-{
-	test_header("SSAP: write permission enforcement (§10.5)");
-
-	struct ssap_add_service svc;
-
-	memset(&svc, 0, sizeof(svc));
-	svc.uuid16 = 0x2100;
-	svc.primary = 1;
-	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-	check("ADD_SVC (0x2100)", ret);
-	uint16_t svc_h = svc.start_handle;
-
-	/* Read-only property (ops = 0x01) */
-	struct ssap_add_property prop_ro;
-
-	memset(&prop_ro, 0, sizeof(prop_ro));
-	prop_ro.uuid16 = 0x2101;
-	prop_ro.ops = 0x01; /* Read only */
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &prop_ro);
-	check("ADD_PROP (read-only)", ret);
-	uint16_t h_ro = prop_ro.handle;
-
-	/* Write-only property (ops = 0x02) */
-	struct ssap_add_property prop_wo;
-
-	memset(&prop_wo, 0, sizeof(prop_wo));
-	prop_wo.uuid16 = 0x2102;
-	prop_wo.ops = 0x02; /* Write only */
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &prop_wo);
-	check("ADD_PROP (write-only)", ret);
-	uint16_t h_wo = prop_wo.handle;
-
-	/* Test 1: Write to read-only should fail */
-	struct ssap_read_write rw;
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ro;
-	rw.data[0] = 0x42;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	if (ret < 0) {
-		printf("  OK:   Write to read-only rejected: %s\n",
-		       strerror(errno));
-	} else {
-		printf("  WARN: Write to read-only succeeded (expected error)\n");
-	}
-
-	/* Test 2: Write to write-only should succeed */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_wo;
-	rw.data[0] = 0x99;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE to write-only", ret);
-
-	/* Test 3: Read from write-only should fail */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_wo;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret < 0) {
-		printf("  OK:   Read from write-only rejected: %s\n",
-		       strerror(errno));
-	} else {
-		printf("  WARN: Read from write-only succeeded (expected error)\n");
-	}
-
-	/* Test 4: Write with length=0 (edge case) */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_wo;
-	rw.length = 0;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE length=0", ret);
-
-	ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &svc_h);
 }
 
 /* ------------------------------------------------------------------ *
@@ -7316,173 +6521,6 @@ static void test_conn_send_bounds(int fd)
 	uint16_t dh = h;
 
 	ioctl(fd, SL_IOCTL_DISCONNECT, &dh);
-}
-
-/* ------------------------------------------------------------------ *
- * test_ssap_permission_matrix — comprehensive permission checking   *
- *                                                                    *
- * Tests the full permission matrix for SSAP properties:             *
- * - Read-only (ops=0x01): read OK, write EACCES                    *
- * - Write-only (ops=0x02): write OK, read EACCES                   *
- * - Read+Write (ops=0x03): both OK                                 *
- * - Notify-only (ops=0x04): read EACCES, write EACCES              *
- * - Invalid handle (0xFFFF): ENOENT                                *
- * ------------------------------------------------------------------ */
-static void test_ssap_permission_matrix(int fd)
-{
-	test_header("SSAP permission matrix (§10.3/10.4)");
-
-	/* Register service */
-	struct ssap_add_service svc;
-
-	memset(&svc, 0, sizeof(svc));
-	svc.uuid16 = 0x2200;
-	svc.primary = 1;
-	int ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-
-	check("ADD_SVC (0x2200)", ret);
-	uint16_t svc_h = svc.start_handle;
-
-	/* Property: Read-only (0x01) */
-	struct ssap_add_property p_ro;
-
-	memset(&p_ro, 0, sizeof(p_ro));
-	p_ro.uuid16 = 0x2201;
-	p_ro.ops = 0x01;
-	ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ro);
-	uint16_t h_ro = p_ro.handle;
-
-	/* Property: Write-only (0x02) */
-	struct ssap_add_property p_wo;
-
-	memset(&p_wo, 0, sizeof(p_wo));
-	p_wo.uuid16 = 0x2202;
-	p_wo.ops = 0x02;
-	ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_wo);
-	uint16_t h_wo = p_wo.handle;
-
-	/* Property: Read+Write (0x03) */
-	struct ssap_add_property p_rw;
-
-	memset(&p_rw, 0, sizeof(p_rw));
-	p_rw.uuid16 = 0x2203;
-	p_rw.ops = 0x03;
-	ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_rw);
-	uint16_t h_rw = p_rw.handle;
-
-	/* Property: Notify-only (0x04) */
-	struct ssap_add_property p_ntf;
-
-	memset(&p_ntf, 0, sizeof(p_ntf));
-	p_ntf.uuid16 = 0x2204;
-	p_ntf.ops = 0x04;
-	ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &p_ntf);
-	uint16_t h_ntf = p_ntf.handle;
-
-	struct ssap_read_write rw;
-
-	/* Test Read-only: read OK, write fail */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ro;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	check("READ from read-only", ret);
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ro;
-	rw.data[0] = 0x01;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	if (ret < 0)
-		printf("  OK:   WRITE to read-only rejected (%s)\n",
-		       strerror(errno));
-	else
-		printf("  WARN: WRITE to read-only succeeded\n");
-
-	/* Test Write-only: write OK, read fail */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_wo;
-	rw.data[0] = 0x55;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE to write-only", ret);
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_wo;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret < 0)
-		printf("  OK:   READ from write-only rejected (%s)\n",
-		       strerror(errno));
-	else
-		printf("  WARN: READ from write-only succeeded\n");
-
-	/* Test Read+Write: both OK */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	rw.data[0] = 0xAA;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	check("WRITE to rw", ret);
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_rw;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	check("READ from rw", ret);
-	if (ret == 0 && rw.data[0] == 0xAA)
-		printf("  OK:   RW property: write 0xAA, read 0xAA\n");
-
-	/* Test Notify-only: read and write both fail */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ntf;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret < 0)
-		printf("  OK:   READ from notify-only rejected (%s)\n",
-		       strerror(errno));
-	else
-		printf("  OK:   READ from notify-only returned (ops may include read)\n");
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = h_ntf;
-	rw.data[0] = 0x01;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	if (ret < 0)
-		printf("  OK:   WRITE to notify-only rejected (%s)\n",
-		       strerror(errno));
-	else
-		printf("  OK:   WRITE to notify-only returned (ops may include write)\n");
-
-	/* Test invalid handle */
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0xFFFF;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret < 0 && errno == ENOENT) {
-		printf("  OK:   READ handle=0xFFFF rejected (ENOENT)\n");
-	} else {
-		printf("  WARN: expected ENOENT for handle=0xFFFF, got ret=%d\n", ret);
-	}
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = 0xFFFF;
-	rw.data[0] = 0x01;
-	rw.length = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_WRITE, &rw);
-	if (ret < 0 && errno == ENOENT) {
-		printf("  OK:   WRITE handle=0xFFFF rejected (ENOENT)\n");
-	} else {
-		printf("  WARN: expected ENOENT for handle=0xFFFF, got ret=%d\n", ret);
-	}
-
-	/* Notify on invalid handle */
-	uint16_t bogus = 0xFFFF;
-
-	ret = ioctl(fd, SL_IOCTL_SSAP_NOTIFY, &bogus);
-	if (ret < 0)
-		printf("  OK:   NOTIFY handle=0xFFFF rejected (%s)\n",
-		       strerror(errno));
-	else
-		printf("  WARN: NOTIFY handle=0xFFFF succeeded\n");
-
-	ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &svc_h);
 }
 
 /* ------------------------------------------------------------------ *
@@ -8090,356 +7128,6 @@ static void test_dli_reset_behavior(int fd)
 }
 
 /* ------------------------------------------------------------------ *
- * test_ssap_air_interface — SSAP PDU processing over transport      *
- *                                                                    *
- * Verifies that SSAP PDUs injected with TCID 0x0A prefix are       *
- * routed to SsapSession::process_incoming() and that responses      *
- * and side effects are generated correctly.                         *
- * ------------------------------------------------------------------ */
-static void test_ssap_air_interface(int fd)
-{
-	test_header("SSAP air interface transport");
-
-	int ret;
-	int ok_count = 0;
-	int fail_count = 0;
-
-	/* Step 1: Register demo SSAP service (device info) */
-	ret = ioctl(fd, SL_IOCTL_SSAP_REGISTER_SVC);
-	check("SSAP register service (demo)", ret);
-
-	/* Step 2: Create a connection */
-	struct sle_connect_params cp;
-
-	memset(&cp, 0, sizeof(cp));
-	cp.peer_addr[0] = 0xBB;
-	cp.peer_addr[1] = 0xBB;
-	cp.peer_addr[5] = 0x01;
-	ret = ioctl(fd, SL_IOCTL_CONNECT, &cp);
-	if (ret <= 0) {
-		test_fail("  FAIL: CONNECT returned %d\n", ret);
-		fail_count++;
-		return;
-	}
-	uint16_t handle = (uint16_t)ret;
-
-	ok_count++;
-
-	/* Step 3: Accept connection */
-	struct sle_inject_conn_resp resp;
-
-	memset(&resp, 0, sizeof(resp));
-	resp.handle = handle;
-	resp.response_type = 0;
-	resp.bandwidth_mhz = 1;
-	resp.mcs_index = 4;
-	resp.supervision_timeout = 100;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_RESP, &resp);
-	check("INJECT_CONN_RESP", ret);
-
-	/* Step 4: Inject ExchangeInfoReq SSAP PDU via INJECT_CONN_DATA
-	 * Wire format: [TCID=0x0A] [opcode=0x02] [MTU LE16=100,0]
-	 */
-	struct sle_conn_data inj;
-
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	inj.data[0] = 0x0A;  /* TCID: SERVICE_MGMT */
-	inj.data[1] = 0x02;  /* opcode: ExchangeInfoReq */
-	inj.data[2] = 100;   /* MTU low byte */
-	inj.data[3] = 0;     /* MTU high byte */
-	inj.length = 4;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT ExchangeInfoReq (TCID 0x0A)", ret);
-
-	/* Step 5: Verify SSAP session state via CONN_INFO */
-	struct sle_conn_info info;
-
-	memset(&info, 0, sizeof(info));
-	info.handle = handle;
-	ret = ioctl(fd, SL_IOCTL_CONN_INFO, &info);
-	check("CONN_INFO (post ExchangeInfo)", ret);
-
-	if (ret == 0) {
-		if (info.ssap_info_exchanged == 1) {
-			printf("  OK:   ssap_info_exchanged=1\n");
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_info_exchanged=%u, expected 1\n",
-			       info.ssap_info_exchanged);
-			fail_count++;
-		}
-		if (info.ssap_mtu == 100) {
-			printf("  OK:   ssap_mtu=%u (min of 100 and 247)\n",
-			       info.ssap_mtu);
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_mtu=%u, expected 100\n",
-			       info.ssap_mtu);
-			fail_count++;
-		}
-		/* Old-format ExchangeInfoReq lacks MCC bit3 → no reliable mode */
-		if (info.ssap_reliable_mode == 0) {
-			printf("  OK:   ssap_reliable_mode=0 (old format)\n");
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_reliable_mode=%u, expected 0\n",
-			       info.ssap_reliable_mode);
-			fail_count++;
-		}
-	}
-
-	/* Step 5b: Inject NEW-format ExchangeInfoReq with MCC bit3 (reliable)
-	 * Wire: [TCID=0x0A][opcode=0x02][MCC=0x0B][MTU=0xC8,0x00][VER=1,0]
-	 * MCC=0x0B: bit0=MTU, bit1=version, bit3=reliable mode
-	 */
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	inj.data[0] = 0x0A;  /* TCID: SERVICE_MGMT */
-	inj.data[1] = 0x02;  /* opcode: ExchangeInfoReq */
-	inj.data[2] = 0x0B;  /* MCC: MTU + version + reliable */
-	inj.data[3] = 200;   /* MTU low byte */
-	inj.data[4] = 0;     /* MTU high byte */
-	inj.data[5] = 1;     /* version major */
-	inj.data[6] = 0;     /* version minor */
-	inj.length = 7;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT new-format ExchangeInfoReq (reliable)", ret);
-
-	memset(&info, 0, sizeof(info));
-	info.handle = handle;
-	ret = ioctl(fd, SL_IOCTL_CONN_INFO, &info);
-	check("CONN_INFO (post new-format ExchangeInfo)", ret);
-
-	if (ret == 0) {
-		if (info.ssap_mtu == 100) {
-			printf("  OK:   ssap_mtu=%u (min of 200 and 100)\n",
-			       info.ssap_mtu);
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_mtu=%u, expected 100\n",
-			       info.ssap_mtu);
-			fail_count++;
-		}
-		if (info.ssap_reliable_mode == 1) {
-			printf("  OK:   ssap_reliable_mode=1 (new format)\n");
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_reliable_mode=%u, expected 1\n",
-			       info.ssap_reliable_mode);
-			fail_count++;
-		}
-		if (info.ssap_version_major == 1) {
-			printf("  OK:   ssap_version_major=%u\n",
-			       info.ssap_version_major);
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_version_major=%u, expected 1\n",
-			       info.ssap_version_major);
-			fail_count++;
-		}
-	}
-
-	/* Step 5c: Inject a TCID_Connect_Req signaling PDU on management channel
-	 * to verify transport control signaling dispatcher.
-	 * Wire: [TCID=0x02][code=0x10][identifier=0x01][length=18,0]
-	 *        [srcTCID=0x82][optionOfs=0][flags=0]
-	 *        [mode=0x30][mtu=247,0][mps=247,0]
-	 *        [txWin=16][maxTx=4][retxTO=0xD0,0x07][rspTO=0xD0,0x07]
-	 *        [reorderTO=0xD0,0x07][crcInit=0,0]
-	 */
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	inj.data[0]  = 0x02;  /* TCID: MANAGEMENT */
-	inj.data[1]  = 0x10;  /* code: TCID_Connect_Req */
-	inj.data[2]  = 0x01;  /* identifier */
-	inj.data[3]  = 18;    /* length low */
-	inj.data[4]  = 0;     /* length high */
-	inj.data[5]  = 0x82;  /* srcTCID (peer's proposed TCID) */
-	inj.data[6]  = 0;     /* optionOffset=0 */
-	inj.data[7]  = 0;     /* E=0, M_EN=0, RFU=0 */
-	inj.data[8]  = 0x30;  /* transportMode=3 (reliable) */
-	inj.data[9]  = 247;   /* mtu low */
-	inj.data[10] = 0;     /* mtu high */
-	inj.data[11] = 247;   /* mps low */
-	inj.data[12] = 0;     /* mps high */
-	inj.data[13] = 16;    /* txWindow */
-	inj.data[14] = 4;     /* maxTxThreshold */
-	inj.data[15] = 0xD0;  /* retransmissionTimeout low (2000ms) */
-	inj.data[16] = 0x07;  /* retransmissionTimeout high */
-	inj.data[17] = 0xD0;  /* responseTimeout low */
-	inj.data[18] = 0x07;  /* responseTimeout high */
-	inj.data[19] = 0xD0;  /* reorderTimeout low */
-	inj.data[20] = 0x07;  /* reorderTimeout high */
-	inj.data[21] = 0;     /* crcInit low */
-	inj.data[22] = 0;     /* crcInit high */
-	inj.length = 23;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT TCID_Connect_Req (reliable mode)", ret);
-
-	/* Verify that the reliable channel was created by checking CONN_INFO */
-	memset(&info, 0, sizeof(info));
-	info.handle = handle;
-	ret = ioctl(fd, SL_IOCTL_CONN_INFO, &info);
-	check("CONN_INFO (post TCID_Connect_Req)", ret);
-
-	if (ret == 0) {
-		if (info.ssap_reliable_mode == 1) {
-			printf("  OK:   ssap_reliable_mode=1 (after TCID_Connect_Req)\n");
-			ok_count++;
-		} else {
-			test_fail("  FAIL: ssap_reliable_mode=%u, expected 1\n",
-			       info.ssap_reliable_mode);
-			fail_count++;
-		}
-	}
-
-	/* Step 5d: Inject a TCID_Disconnect_Req to verify cleanup. */
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	inj.data[0] = 0x02;  /* TCID: MANAGEMENT */
-	inj.data[1] = 0x12;  /* code: TCID_Disconnect_Req */
-	inj.data[2] = 0x02;  /* identifier */
-	inj.data[3] = 2;     /* length low */
-	inj.data[4] = 0;     /* length high */
-	inj.data[5] = 0x82;  /* srcTCID */
-	inj.data[6] = 0x81;  /* dstTCID (the one allocated for incoming ConnectReq) */
-	inj.length = 7;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT TCID_Disconnect_Req", ret);
-
-	/* Step 6: Register a dedicated test service with a writable property
-	 * to avoid handle collisions from prior test registrations.
-	 */
-	struct ssap_add_service test_svc;
-
-	memset(&test_svc, 0, sizeof(test_svc));
-	test_svc.uuid16 = 0xFFA0;
-	test_svc.primary = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &test_svc);
-	if (ret < 0) {
-		test_fail("  FAIL: SSAP_ADD_SVC for air test: %s\n",
-		       strerror(errno));
-		fail_count++;
-		goto cleanup;
-	}
-
-	struct ssap_add_property test_prop;
-
-	memset(&test_prop, 0, sizeof(test_prop));
-	test_prop.uuid16 = 0xFFA1;
-	test_prop.ops = 0x07;  /* READ | WRITE_NO_RSP | WRITE_WITH_RSP */
-	test_prop.value[0] = 0x00;
-	test_prop.value_len = 1;
-	ret = ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &test_prop);
-	if (ret < 0) {
-		test_fail("  FAIL: SSAP_ADD_PROP for air test: %s\n",
-		       strerror(errno));
-		fail_count++;
-		goto cleanup;
-	}
-	uint16_t writable_handle = test_prop.handle;
-
-	printf("  OK:   registered test property handle=0x%04x\n",
-	       writable_handle);
-	ok_count++;
-
-	/* Step 7: Inject WriteReq to the test property via TCID 0x0A
-	 * Wire format: [TCID=0x0A] [opcode=0x0D] [handle LE16] [value]
-	 */
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	inj.data[0] = 0x0A;  /* TCID: SERVICE_MGMT */
-	inj.data[1] = 0x0D;  /* opcode: WriteReq */
-	inj.data[2] = writable_handle & 0xFF;
-	inj.data[3] = (writable_handle >> 8) & 0xFF;
-	inj.data[4] = 0xAA;  /* new value */
-	inj.length = 5;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT WriteReq (TCID 0x0A)", ret);
-
-	/* Step 8: Verify property value changed via SSAP_READ ioctl */
-	struct ssap_read_write rw;
-
-	memset(&rw, 0, sizeof(rw));
-	rw.handle = writable_handle;
-	ret = ioctl(fd, SL_IOCTL_SSAP_READ, &rw);
-	if (ret == 0 && rw.length >= 1 && rw.data[0] == 0xAA) {
-		printf("  OK:   WriteReq via air changed property to 0xAA\n");
-		ok_count++;
-	} else {
-		test_fail("  FAIL: property read after WriteReq: ret=%d len=%u val=0x%02x\n",
-		       ret, rw.length, rw.data[0]);
-		fail_count++;
-	}
-
-	/* Step 9: Inject FindStructureReq for entire handle range
-	 * Wire format: [TCID=0x0A] [opcode=0x04] [start LE16] [end LE16]
-	 */
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	inj.data[0] = 0x0A;  /* TCID: SERVICE_MGMT */
-	inj.data[1] = 0x04;  /* opcode: FindStructureReq */
-	inj.data[2] = 0x00;  /* start handle low */
-	inj.data[3] = 0x00;  /* start handle high */
-	inj.data[4] = 0xFF;  /* end handle low */
-	inj.data[5] = 0xFF;  /* end handle high */
-	inj.length = 6;
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT FindStructureReq (TCID 0x0A)", ret);
-	/* FindStructureRsp generated and sent to controller —
-	 * we verify by confirming no crash and checking service count.
-	 */
-	struct ssap_summary ssap_info;
-
-	memset(&ssap_info, 0, sizeof(ssap_info));
-	ret = ioctl(fd, SL_IOCTL_SSAP_INFO, &ssap_info);
-	if (ret == 0 && ssap_info.service_count >= 1) {
-		printf("  OK:   FindStructureReq processed (%u services)\n",
-		       ssap_info.service_count);
-		ok_count++;
-	} else {
-		test_fail("  FAIL: SSAP_INFO post FindStructure: ret=%d svc=%u\n",
-		       ret, ssap_info.service_count);
-		fail_count++;
-	}
-
-	/* Step 10: Inject regular data (non-SSAP) — should go to rx_queue */
-	memset(&inj, 0, sizeof(inj));
-	inj.handle = handle;
-	const char *user_msg = "hello-over-air";
-
-	inj.length = strlen(user_msg);
-	memcpy(inj.data, user_msg, inj.length);
-	ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
-	check("INJECT regular data", ret);
-
-	struct sle_conn_data recv_buf;
-
-	memset(&recv_buf, 0, sizeof(recv_buf));
-	recv_buf.handle = handle;
-	ret = ioctl(fd, SL_IOCTL_CONN_RECV, &recv_buf);
-	if (ret == 0 && recv_buf.length == strlen(user_msg) &&
-	    memcmp(recv_buf.data, user_msg, recv_buf.length) == 0) {
-		printf("  OK:   regular data routed to rx_queue\n");
-		ok_count++;
-	} else {
-		test_fail("  FAIL: regular data recv: ret=%d len=%u\n",
-		       ret, recv_buf.length);
-		fail_count++;
-	}
-
-cleanup:
-	/* Clean up: disconnect */
-	;
-	uint16_t disc_handle = handle;
-
-	ioctl(fd, SL_IOCTL_DISCONNECT, &disc_handle);
-
-	printf("  SSAP air interface: %d OK, %d FAIL\n", ok_count, fail_count);
-}
-
-/* ------------------------------------------------------------------ *
  * test_credit_flow_control — credit-based flow control on SMTC      *
  *                                                                    *
  * Verifies that reliable transport channels enforce credit-based    *
@@ -8511,7 +7199,7 @@ static void test_credit_flow_control(int fd)
 		fail_count++;
 	}
 
-	/* Step 4: Inject 5 SSAP ExchangeInfoReq PDUs.
+	/* Step 4: Inject 5 opaque legacy transport fixture PDUs.
 	 * Each consumes 1 RX credit and 1 TX credit (for the response).
 	 * After 5: tx=11, rx=11 (both above watermark 4).
 	 */
@@ -8521,7 +7209,7 @@ static void test_credit_flow_control(int fd)
 		memset(&inj, 0, sizeof(inj));
 		inj.handle = handle;
 		inj.data[0] = 0x0A; /* TCID: SMTC */
-		inj.data[1] = 0x02; /* ExchangeInfoReq (SsapMsgCode 0x02) */
+		inj.data[1] = 0x02; /* Opaque test byte; no SSAP service processing. */
 		inj.data[2] = 23;   /* MTU LE16 */
 		inj.data[3] = 0;
 		inj.length = 4;
@@ -8557,7 +7245,7 @@ static void test_credit_flow_control(int fd)
 		memset(&inj, 0, sizeof(inj));
 		inj.handle = handle;
 		inj.data[0] = 0x0A;
-		inj.data[1] = 0x02; /* ExchangeInfoReq (SsapMsgCode 0x02) */
+		inj.data[1] = 0x02; /* Opaque test byte; no SSAP service processing. */
 		inj.data[2] = 23; inj.data[3] = 0;
 		inj.length = 4;
 		ret = ioctl(fd, SL_IOCTL_INJECT_CONN_DATA, &inj);
@@ -9862,70 +8550,6 @@ static void test_ext_advertising(int fd)
 	printf("  Extended advertising: %d OK, %d FAIL\n", ok_count, fail_count);
 }
 
-/* ------------------------------------------------------------------ *
- * test_ssap_capacity_stress — SSAP service/property limits          *
- *                                                                    *
- * Registers services until the subsystem refuses, verifying that    *
- * capacity limits are enforced without crashing.                    *
- * ------------------------------------------------------------------ */
-static void test_ssap_capacity_stress(int fd)
-{
-	test_header("SSAP capacity stress");
-
-	int svc_count = 0;
-	uint16_t svc_handles[64];
-	int ret;
-
-	/* Register services until we hit the limit */
-	for (int i = 0; i < 64; i++) {
-		struct ssap_add_service svc;
-
-		memset(&svc, 0, sizeof(svc));
-		svc.uuid16 = (uint16_t)(0x3000 + i);
-		svc.primary = 1;
-		ret = ioctl(fd, SL_IOCTL_SSAP_ADD_SVC, &svc);
-		if (ret < 0) {
-			printf("  OK:   Service limit reached at %d: %s\n",
-			       i, strerror(errno));
-			break;
-		}
-		svc_handles[i] = svc.start_handle;
-		svc_count++;
-
-		/* Add 2 properties to each service */
-		for (int j = 0; j < 2; j++) {
-			struct ssap_add_property prop;
-
-			memset(&prop, 0, sizeof(prop));
-			prop.uuid16 = (uint16_t)(0x3000 + i * 16 + j + 1);
-			prop.ops = 0x03; /* RW */
-			ioctl(fd, SL_IOCTL_SSAP_ADD_PROP, &prop);
-		}
-	}
-
-	if (svc_count > 0) {
-		printf("  OK:   Registered %d services\n", svc_count);
-	}
-
-	/* Get SSAP summary */
-	struct ssap_summary info;
-
-	memset(&info, 0, sizeof(info));
-	ret = ioctl(fd, SL_IOCTL_SSAP_INFO, &info);
-	check("SSAP_INFO (after stress)", ret);
-	if (ret == 0) {
-		printf("  services=%u properties=%u total=%u\n",
-		       info.service_count, info.property_count,
-		       info.total_entries);
-	}
-
-	/* Clean up */
-	for (int i = 0; i < svc_count; i++) {
-		uint16_t h = svc_handles[i];
-
-		ioctl(fd, SL_IOCTL_SSAP_REMOVE_SVC, &h);
-	}
-}
 
 /* ------------------------------------------------------------------ *
  * test_sync_link_management — sync unicast/multicast link lifecycle *
@@ -10657,82 +9281,6 @@ static void fuzz_fill(void *buf, size_t len)
 		p[i] = (uint8_t)(fuzz_rand() & 0xFF);
 }
 
-/* -----------------------------------------------------------------------
- * Remote SSAP client-side ioctl tests
- *
- * Verifies that the remote SSAP ioctls correctly reject operations when
- * no connection is established, and that the ioctl/struct interfaces
- * are properly wired up.
- * ----------------------------------------------------------------------- */
-static void test_ssap_remote_ioctls(int fd)
-{
-	test_header("SSAP remote client-side ioctls (no connection)");
-	int ret;
-
-	/* EXCHANGE_INFO: should fail with no active connection */
-	struct ssap_remote_cmd exc;
-	memset(&exc, 0, sizeof(exc));
-	exc.conn_handle = 0x0001;
-	ret = ioctl(fd, SL_IOCTL_SSAP_EXCHANGE_INFO, &exc);
-	if (ret < 0) {
-		printf("  OK:   EXCHANGE_INFO rejected (no conn): errno=%d\n", errno);
-	} else {
-		test_fail("  FAIL: EXCHANGE_INFO should fail without connection\n");
-	}
-
-	/* REMOTE_DISCOVER: should fail with no active connection */
-	struct ssap_remote_discover disc;
-	memset(&disc, 0, sizeof(disc));
-	disc.conn_handle = 0x0001;
-	disc.start_handle = 0x0001;
-	disc.end_handle = 0xFFFF;
-	ret = ioctl(fd, SL_IOCTL_SSAP_REMOTE_DISCOVER, &disc);
-	if (ret < 0) {
-		printf("  OK:   REMOTE_DISCOVER rejected (no conn): errno=%d\n", errno);
-	} else {
-		test_fail("  FAIL: REMOTE_DISCOVER should fail without connection\n");
-	}
-
-	/* REMOTE_READ: should fail with no active connection */
-	struct ssap_remote_read_write rrw;
-	memset(&rrw, 0, sizeof(rrw));
-	rrw.conn_handle = 0x0001;
-	rrw.handle = 0x0010;
-	ret = ioctl(fd, SL_IOCTL_SSAP_REMOTE_READ, &rrw);
-	if (ret < 0) {
-		printf("  OK:   REMOTE_READ rejected (no conn): errno=%d\n", errno);
-	} else {
-		test_fail("  FAIL: REMOTE_READ should fail without connection\n");
-	}
-
-	/* REMOTE_WRITE: should fail with no active connection */
-	memset(&rrw, 0, sizeof(rrw));
-	rrw.conn_handle = 0x0001;
-	rrw.handle = 0x0010;
-	rrw.length = 4;
-	rrw.data[0] = 0xDE;
-	rrw.data[1] = 0xAD;
-	rrw.data[2] = 0xBE;
-	rrw.data[3] = 0xEF;
-	ret = ioctl(fd, SL_IOCTL_SSAP_REMOTE_WRITE, &rrw);
-	if (ret < 0) {
-		printf("  OK:   REMOTE_WRITE rejected (no conn): errno=%d\n", errno);
-	} else {
-		test_fail("  FAIL: REMOTE_WRITE should fail without connection\n");
-	}
-
-	/* REMOTE_EVENT: should return EAGAIN when no events queued */
-	struct ssap_notification ntf;
-	memset(&ntf, 0, sizeof(ntf));
-	ret = ioctl(fd, SL_IOCTL_SSAP_REMOTE_EVENT, &ntf);
-	if (ret < 0 && errno == EAGAIN) {
-		printf("  OK:   REMOTE_EVENT returned EAGAIN (empty queue)\n");
-	} else if (ret < 0) {
-		printf("  OK:   REMOTE_EVENT rejected: errno=%d\n", errno);
-	} else {
-		test_fail("  FAIL: REMOTE_EVENT should fail with no events\n");
-	}
-}
 
 /* -----------------------------------------------------------------------
  * P1 5.4 — Capability / channel negotiation closure
@@ -12357,12 +10905,6 @@ static void test_ioctl_fuzz(int fd)
 		SL_IOCTL_SEC_GET_PASSKEY, SL_IOCTL_SEC_CONFIRM_PASSKEY,
 		SL_IOCTL_SEC_REJECT_PASSKEY, SL_IOCTL_SEC_SET_OOB,
 		SL_IOCTL_SEC_INPUT_PASSKEY, SL_IOCTL_SEC_SET_PASSWORD,
-		/* SSAP */
-		SL_IOCTL_SSAP_REGISTER_SVC, SL_IOCTL_SSAP_INFO,
-		SL_IOCTL_SSAP_READ,     SL_IOCTL_SSAP_WRITE,
-		SL_IOCTL_SSAP_FIND_SVC, SL_IOCTL_SSAP_NOTIFY,
-		SL_IOCTL_SSAP_DEQUEUE_NTF, SL_IOCTL_SSAP_ADD_SVC,
-		SL_IOCTL_SSAP_ADD_PROP, SL_IOCTL_SSAP_REMOVE_SVC,
 		/* Power management */
 		SL_IOCTL_PM_INFO,       SL_IOCTL_PM_SET_STATE,
 		SL_IOCTL_PM_SET_INTERVAL, SL_IOCTL_PM_FORCE_ACTIVE,
@@ -12468,8 +11010,7 @@ static void test_ioctl_fuzz(int fd)
 		SL_IOCTL_CONN_SEND, SL_IOCTL_INJECT_CONN_DATA,
 		SL_IOCTL_EXT_ADV_SET_DATA, SL_IOCTL_EXT_ADV_SET_SCAN_RSP,
 		SL_IOCTL_SEC_SM3_TEST,
-		SL_IOCTL_SEC_HMAC_TEST, SL_IOCTL_SSAP_READ,
-		SL_IOCTL_SSAP_WRITE,
+		SL_IOCTL_SEC_HMAC_TEST,
 	};
 	int phase5 = 0;
 
@@ -12705,8 +11246,6 @@ static void test_genetlink(void)
 	X(test_security_oob_pin_password, fd) \
 	X(test_rpa_management, fd) \
 	X(test_encrypted_data_path, fd) \
-	X(test_ssap_service, fd) \
-	X(test_ssap_dynamic_registration, fd) \
 	X(test_power_management, fd) \
 	X(test_unknown_ioctl, fd) \
 	X(test_event_notification, fd) \
@@ -12728,11 +11267,8 @@ static void test_genetlink(void)
 	X(test_conn_invalid_handle, fd) \
 	X(test_air_medium_bidir, fd) \
 	X(test_conn_max_capacity, fd) \
-	X(test_ssap_indication, fd) \
-	X(test_ssap_service_discovery, fd) \
 	X(test_dev_switch_isolation, fd) \
 	X(test_per_fd_device_select, fd) \
-	X(test_ssap_prop_edge_cases, fd) \
 	X(test_scan_filter_reject, fd) \
 	X(test_scan_uuid_filter, fd) \
 	X(test_scan_filter_bounds, fd) \
@@ -12742,14 +11278,11 @@ static void test_genetlink(void)
 	X(test_conn_info_fields, fd) \
 	X(test_channel_tcid_standard, fd) \
 	X(test_dli_info_consistency, fd) \
-	X(test_ssap_multi_notify, fd) \
-	X(test_ssap_write_readonly, fd) \
 	X(test_conn_data_counters, fd) \
 	X(test_pm_state_transitions, fd) \
 	X(test_subsys_stats, fd) \
 	X(test_pm_param_validation, fd) \
 	X(test_conn_send_bounds, fd) \
-	X(test_ssap_permission_matrix, fd) \
 	X(test_conn_stale_handle_ops, fd) \
 	X(test_dli_opcode_validation, fd) \
 	X(test_event_overflow, fd) \
@@ -12757,8 +11290,6 @@ static void test_genetlink(void)
 	X(test_adv_scan_role_enforcement, fd) \
 	X(test_conn_list_accuracy, fd) \
 	X(test_dli_reset_behavior, fd) \
-	X(test_ssap_capacity_stress, fd) \
-	X(test_ssap_air_interface, fd) \
 	X(test_credit_flow_control, fd) \
 	X(test_supervision_timeout, fd) \
 	X(test_crc12_verification, fd) \
@@ -12768,7 +11299,6 @@ static void test_genetlink(void)
 	X(test_sync_link_management, fd) \
 	X(test_sync_mcast_bis, fd) \
 	X(test_phy_extreme_params, fd) \
-	X(test_ssap_remote_ioctls, fd) \
 	X(test_capability_negotiation, fd) \
 	X(test_dli_extended_commands, fd) \
 	X(test_dli_security_commands, fd) \

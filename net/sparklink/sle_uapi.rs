@@ -276,63 +276,7 @@ pub(crate) const SL_IOCTL_SEC_INPUT_PASSKEY: u32 = _IOW::<SlePasskeyInput>(SL_MA
 /// Set password (1..32 bytes) for password-based pairing.
 pub(crate) const SL_IOCTL_SEC_SET_PASSWORD: u32 = _IOW::<SlePasswordParams>(SL_MAGIC, 0x4F);
 
-// --- SSAP service layer ioctls ---
-
-/// Register the built-in device info service.
-pub(crate) const SL_IOCTL_SSAP_REGISTER_SVC: u32 = _IO(SL_MAGIC, 0x50);
-
-/// Get SSAP service/property count summary.
-pub(crate) const SL_IOCTL_SSAP_INFO: u32 = _IOR::<SsapSummary>(SL_MAGIC, 0x51);
-
-/// Read a property by handle.
-pub(crate) const SL_IOCTL_SSAP_READ: u32 = _IOWR::<SsapReadWrite>(SL_MAGIC, 0x52);
-
-/// Write a property by handle.
-pub(crate) const SL_IOCTL_SSAP_WRITE: u32 = _IOW::<SsapReadWrite>(SL_MAGIC, 0x53);
-
-/// Find primary services.
-pub(crate) const SL_IOCTL_SSAP_FIND_SVC: u32 = _IOR::<SsapServiceList>(SL_MAGIC, 0x54);
-
-/// Send a notification for a property handle.
-pub(crate) const SL_IOCTL_SSAP_NOTIFY: u32 = _IOW::<u16>(SL_MAGIC, 0x55);
-
-/// Dequeue one pending notification.
-pub(crate) const SL_IOCTL_SSAP_DEQUEUE_NTF: u32 = _IOR::<SsapNotification>(SL_MAGIC, 0x56);
-
-/// Register a dynamic SSAP service from userspace.
-pub(crate) const SL_IOCTL_SSAP_ADD_SVC: u32 = _IOWR::<SsapAddService>(SL_MAGIC, 0x57);
-
-/// Add a property to the last registered service.
-pub(crate) const SL_IOCTL_SSAP_ADD_PROP: u32 = _IOWR::<SsapAddProperty>(SL_MAGIC, 0x58);
-
-/// Remove a service by its start handle.
-pub(crate) const SL_IOCTL_SSAP_REMOVE_SVC: u32 = _IOW::<u16>(SL_MAGIC, 0x59);
-
-// --- Remote SSAP client-side ioctls ---
-
-/// Initiate SSAP ExchangeInfo (MTU negotiation) with connected peer.
-pub(crate) const SL_IOCTL_SSAP_EXCHANGE_INFO: u32 = _IOW::<SsapRemoteCmd>(SL_MAGIC, 0x5A);
-
-/// Discover remote services via FindStructure.
-pub(crate) const SL_IOCTL_SSAP_REMOTE_DISCOVER: u32 = _IOWR::<SsapRemoteDiscover>(SL_MAGIC, 0x5B);
-
-/// Read a remote property by handle.
-pub(crate) const SL_IOCTL_SSAP_REMOTE_READ: u32 = _IOWR::<SsapRemoteReadWrite>(SL_MAGIC, 0x5C);
-
-/// Write a remote property by handle.
-pub(crate) const SL_IOCTL_SSAP_REMOTE_WRITE: u32 = _IOW::<SsapRemoteReadWrite>(SL_MAGIC, 0x5D);
-
-/// Dequeue one inbound remote notification/indication.
-pub(crate) const SL_IOCTL_SSAP_REMOTE_EVENT: u32 = _IOR::<SsapNotification>(SL_MAGIC, 0x5E);
-
-/// Invoke a method on a remote peer's SSAP service.
-pub(crate) const SL_IOCTL_SSAP_CALL_METHOD: u32 = _IOWR::<SsapRemoteReadWrite>(SL_MAGIC, 0x5F);
-
-/// Find service/property by UUID on a remote peer.
-pub(crate) const SL_IOCTL_SSAP_FIND_BY_UUID: u32 = _IOWR::<SsapUuidOp>(SL_MAGIC, 0x6F);
-
-/// Read a property by UUID on a remote peer.
-pub(crate) const SL_IOCTL_SSAP_READ_BY_UUID: u32 = _IOWR::<SsapUuidOp>(SL_MAGIC, 0x72);
+// Removed unpublished SSAP ioctls 0x50..0x5f, 0x6f, 0x72; not reused.
 
 // --- Power management ioctls ---
 
@@ -917,14 +861,6 @@ pub(crate) struct SleConnInfo {
     pub svc_mtu: u16,
     /// Data channel transport mode (0=unreliable, 1=reliable).
     pub data_mode: u8,
-    /// SSAP ExchangeInfo completed flag (1=yes, 0=no).
-    pub ssap_info_exchanged: u8,
-    /// SSAP session negotiated MTU (0 if no session bound).
-    pub ssap_mtu: u16,
-    /// SSAP reliable mode negotiated (1=yes, 0=no).
-    pub ssap_reliable_mode: u8,
-    /// SSAP negotiated protocol major version.
-    pub ssap_version_major: u8,
     /// SMTC TX credits remaining (Reliable channel).
     pub smtc_tx_credits: u16,
     /// SMTC RX credits remaining (Reliable channel).
@@ -1489,190 +1425,6 @@ pub(crate) struct SleHmacTest {
 
 // SAFETY: SleHmacTest is repr(C) with only primitive fields.
 unsafe impl FromBytes for SleHmacTest {}
-
-// ---------------------------------------------------------------------------
-// SSAP service layer userspace data structures
-// ---------------------------------------------------------------------------
-
-/// SSAP summary info returned to userspace.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapSummary {
-    /// Number of registered services.
-    pub service_count: u16,
-    /// Total number of properties across all services.
-    pub property_count: u16,
-    /// Total SSAP entries (services + properties + methods + events).
-    pub total_entries: u16,
-    /// Negotiated MTU.
-    pub mtu: u16,
-    /// Pending notification count.
-    pub notification_count: u16,
-    pub(crate) _reserved: [u8; 6],
-}
-
-/// SSAP read/write payload for property access.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapReadWrite {
-    /// Property handle.
-    pub handle: u16,
-    /// Data length in bytes.
-    pub length: u16,
-    /// Data buffer (max 252 bytes).
-    pub data: [u8; 252],
-}
-
-// SAFETY: SsapReadWrite is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapReadWrite {}
-
-/// Service entry in the discovery result list.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapServiceEntry {
-    /// Service start handle.
-    pub start_handle: u16,
-    /// Service end handle.
-    pub end_handle: u16,
-    /// Service UUID (16-bit; 0 if 128-bit).
-    pub uuid16: u16,
-    /// Whether primary service.
-    pub primary: u8,
-    pub(crate) _pad: u8,
-}
-
-/// Service list returned from FIND_SVC.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapServiceList {
-    /// Number of services in the list.
-    pub count: u16,
-    pub(crate) _pad: [u8; 2],
-    /// Up to 15 services.
-    pub services: [SsapServiceEntry; 15],
-}
-
-/// Dequeued notification/indication payload.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapNotification {
-    /// Property handle that generated the notification.
-    pub handle: u16,
-    /// 1 = indication, 0 = notification.
-    pub indication: u8,
-    /// Data length.
-    pub length: u8,
-    /// Notification data (max 252 bytes).
-    pub data: [u8; 252],
-}
-
-/// Dynamic SSAP service registration from userspace.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapAddService {
-    /// Service UUID (16-bit, or 0 for 128-bit specified in uuid128).
-    pub uuid16: u16,
-    /// Whether primary (1) or secondary (0) service.
-    pub primary: u8,
-    pub(crate) _pad: u8,
-    /// 128-bit UUID (used when uuid16 == 0).
-    pub uuid128: [u8; 16],
-    /// Output: assigned start handle.
-    pub start_handle: u16,
-    pub(crate) _reserved: [u8; 6],
-}
-
-// SAFETY: SsapAddService is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapAddService {}
-
-/// Add a property to the last registered SSAP service.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapAddProperty {
-    /// Property UUID (16-bit).
-    pub uuid16: u16,
-    /// Local staging value rights: b0 READ, b1 WRITE_NO_RSP, b2 WRITE_WITH_RSP,
-    /// b3 NOTIFY, b4 INDICATE, b5 BROADCAST; b6/b7 reserved.
-    pub ops: u8,
-    /// Length of initial value data.
-    pub value_len: u8,
-    /// Initial value data (max 248 bytes).
-    pub value: [u8; 248],
-    /// Output: assigned property handle.
-    pub handle: u16,
-    pub(crate) _reserved: [u8; 2],
-}
-
-// SAFETY: SsapAddProperty is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapAddProperty {}
-
-/// Remote SSAP command targeting a specific connection handle.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapRemoteCmd {
-    /// Connection handle of the remote peer.
-    pub conn_handle: u16,
-    pub(crate) _reserved: [u8; 2],
-}
-
-// SAFETY: SsapRemoteCmd is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapRemoteCmd {}
-
-/// Remote service discovery via FindStructure.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapRemoteDiscover {
-    /// Connection handle of the remote peer.
-    pub conn_handle: u16,
-    /// Start handle of the range to discover (input).
-    pub start_handle: u16,
-    /// End handle of the range to discover (input).
-    pub end_handle: u16,
-    /// Number of discovered entries returned (output).
-    pub count: u16,
-}
-
-// SAFETY: SsapRemoteDiscover is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapRemoteDiscover {}
-
-/// Remote SSAP read/write targeting a specific connection.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapRemoteReadWrite {
-    /// Connection handle of the remote peer.
-    pub conn_handle: u16,
-    /// Property handle on the remote device.
-    pub handle: u16,
-    /// Data length in bytes.
-    pub length: u16,
-    pub(crate) _pad: [u8; 2],
-    /// Data buffer (max 248 bytes).
-    pub data: [u8; 248],
-}
-
-// SAFETY: SsapRemoteReadWrite is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapRemoteReadWrite {}
-
-/// UUID-based SSAP operation (find-by-uuid, read-by-uuid).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct SsapUuidOp {
-    /// Connection handle of the remote peer.
-    pub conn_handle: u16,
-    /// 16-bit UUID (0 when using uuid128).
-    pub uuid16: u16,
-    /// 128-bit UUID (ignored when uuid16 != 0).
-    pub uuid128: [u8; 16],
-    /// Output: matched handle.
-    pub handle: u16,
-    /// Output: data length.
-    pub length: u16,
-    /// Output: read data (READ_BY_UUID only).
-    pub data: [u8; 232],
-}
-
-// SAFETY: SsapUuidOp is repr(C) with only primitive fields.
-unsafe impl FromBytes for SsapUuidOp {}
 
 // ---------------------------------------------------------------------------
 // Power management userspace data structures
@@ -2879,13 +2631,6 @@ impl_check_reserved!(SleRalQueryParams, [_reserved, _pad]);
 impl_check_reserved!(SleSecInfo, [_reserved]);
 impl_check_reserved!(SleHashTest, [_pad]);
 impl_check_reserved!(SleSm4BlockTest, [_pad]);
-impl_check_reserved!(SsapSummary, [_reserved]);
-impl_check_reserved!(SsapServiceEntry, [_pad]);
-impl_check_reserved!(SsapServiceList, [_pad]);
-impl_check_reserved!(SsapAddService, [_pad, _reserved]);
-impl_check_reserved!(SsapAddProperty, [_reserved]);
-impl_check_reserved!(SsapRemoteCmd, [_reserved]);
-impl_check_reserved!(SsapRemoteReadWrite, [_pad]);
 impl_check_reserved!(SlePmInfo, [_pad, _reserved]);
 impl_check_reserved!(SlePmStateCmd, [_reserved]);
 impl_check_reserved!(SleEventStats, [_pad]);
@@ -2906,9 +2651,6 @@ impl_check_reserved!(SleMeasCap, [_reserved]);
 // Structs without padding fields — no-op validation.
 impl_check_reserved!(SlePskParams);
 impl_check_reserved!(SleHmacTest);
-impl_check_reserved!(SsapReadWrite);
-impl_check_reserved!(SsapNotification);
-impl_check_reserved!(SsapRemoteDiscover);
 impl_check_reserved!(SleOobData);
 impl_check_reserved!(SlePasskeyInput);
 impl_check_reserved!(SlePmInterval);
@@ -2916,7 +2658,6 @@ impl_check_reserved!(SleDliCmd);
 // Query.event is output-only. Only the handler validates input version/flags.
 impl_check_reserved!(SleControllerEventQuery);
 impl_check_reserved!(SlePhyMcsSelect);
-impl_check_reserved!(SsapUuidOp);
 impl_check_reserved!(SleMeasLinkParam);
 impl_check_reserved!(SleMeasAction);
 impl_check_reserved!(SleConnPhyUpdate);

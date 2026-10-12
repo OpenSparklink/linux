@@ -61,20 +61,19 @@ pub enum NlCmd {
     Pair = 16,
     GetSecInfo = 17,
     EncryptOn = 18,
-    SsapRegister = 19,
-    GetSsapInfo = 20,
-    SsapRead = 21,
-    SsapWrite = 22,
     GetPmInfo = 23,
     SetPmState = 24,
     SetPmInterval = 25,
     Event = 26,
     GetDliInfo = 27,
+    GetVersion = 28,
+    SetRole = 29,
+    GetRole = 30,
 }
 
 impl NlCmd {
-    /// Total number of defined commands (for policy array sizing).
-    pub const COUNT: usize = 28;
+    /// UAPI policy range, including retired command holes.
+    pub const COUNT: usize = 34;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,62 +91,70 @@ pub enum NlAttr {
     DevName = 3,
     DevBus = 4,
     DevCount = 5,
+    ProtoVersion = 6,
+    GenlVersion = 7,
     // Address
-    Addr = 6,
-    PeerAddr = 7,
+    Addr = 8,
+    PeerAddr = 9,
     // Connection
-    Handle = 8,
-    ConnState = 9,
-    GtRole = 10,
-    Bandwidth = 11,
-    McsIndex = 12,
-    TxBytes = 13,
-    RxBytes = 14,
-    Timeout10ms = 15,
+    Handle = 10,
+    ConnState = 11,
+    GtRole = 12,
+    Bandwidth = 13,
+    McsIndex = 14,
+    TxBytes = 15,
+    RxBytes = 16,
+    Timeout10ms = 17,
     // Adv/scan
-    DiscoveryLevel = 16,
-    IntervalMs = 17,
-    WindowMs = 18,
-    Rssi = 19,
-    ScanResults = 20,
+    DiscoveryLevel = 18,
+    IntervalMs = 19,
+    WindowMs = 20,
+    Rssi = 21,
+    ScanResults = 22,
     // Data
-    Data = 21,
-    DataLen = 22,
+    Data = 23,
+    DataLen = 24,
     // Security
-    Psk = 23,
-    PairMethod = 24,
-    SecState = 25,
-    SecMode = 26,
-    Encrypted = 27,
-    KeyFingerprint = 28,
-    // SSAP
-    SvcCount = 29,
-    PropCount = 30,
-    PropHandle = 31,
-    Mtu = 32,
+    Psk = 25,
+    PairMethod = 26,
+    SecState = 27,
+    SecMode = 28,
+    Encrypted = 29,
+    KeyFingerprint = 30,
+    // Generic transport MTU; no service DB fields
+    Mtu = 34,
     // Power
-    PmState = 33,
-    ForceActive = 34,
-    PowerPct = 35,
-    PmIntervalMin = 36,
-    PmIntervalMax = 37,
-    PmLatency = 38,
+    PmState = 35,
+    ForceActive = 36,
+    PowerPct = 37,
+    PmIntervalMin = 38,
+    PmIntervalMax = 39,
+    PmLatency = 40,
     // Events
-    EventType = 39,
-    EventPayload = 40,
-    EventPending = 41,
-    EventTotal = 42,
-    EventDropped = 43,
+    EventType = 41,
+    EventPayload = 42,
+    EventPending = 43,
+    EventTotal = 44,
+    EventDropped = 45,
     // DLI
-    DliBus = 44,
-    DliFwVer = 45,
-    DliFeatures = 46,
-    DliMaxConn = 47,
+    DliBus = 46,
+    DliFwVer = 47,
+    DliFeatures = 48,
+    DliMaxConn = 49,
+    DliMaxMtu = 50,
+    DliMaxMps = 51,
+    DliTransportModes = 52,
+    DliMeasurementCap = 53,
+    DliSecurityCap = 54,
+    DataMtu = 55,
+    DataMps = 56,
+    DataMode = 57,
+    SvcMtu = 58,
 }
 
 impl NlAttr {
     /// Total number of attribute types.
-    pub const COUNT: usize = 48;
+    pub const COUNT: usize = 59;
 }
 
 // ---------------------------------------------------------------------------
