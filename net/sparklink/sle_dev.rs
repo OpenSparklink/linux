@@ -338,7 +338,7 @@ impl SleDevRegistry {
 
     /// Update hardware-read metadata for a registered device.
     ///
-    /// Called after USB/serdev probe reads the real MAC and firmware version
+    /// Called after a registered bus probe reads the real MAC and firmware version
     /// from the controller, so that the registry reflects actual hardware state.
     pub(crate) fn update_hw_info(&mut self, id: u16, addr: [u8; 6], fw_version: u32) {
         if let Some(dev) = self.get_mut(id) {

@@ -12,7 +12,7 @@ def function(text,name):
 
 def run(output):
     here=Path(__file__).resolve().parent;net=here.parents[3]/'net/sparklink'
-    paths=[net/'sle_uart.rs',net/'sle_dli.rs',here/'retired-transport/sle_uart.rs',here/'retired-transport/sle_spi.rs']
+    paths=[here/'retired-transport/uart_decoder.rs',net/'sle_dli.rs',here/'retired-transport/sle_uart.rs',here/'retired-transport/sle_spi.rs']
     contents={p:p.read_text() for p in paths}
     dli=contents[net/'sle_dli.rs'];a=dli.index('#[repr(u8)]',dli.index('/// DLI packet type'));b=dli.index('\n}',a)+2;enum=dli[a:b]
     encoder=function(contents[here/'retired-transport/sle_uart.rs'],'encode_command')
@@ -55,7 +55,7 @@ def run(output):
     }
     '''.replace('ENUM',enum).replace('ENCODER',encoder).replace('SPI',spi)
     with tempfile.TemporaryDirectory(prefix='sparklink-retired-transport-') as temp:
-        t=Path(temp);(t/'framing.rs').write_text(contents[net/'sle_uart.rs']);(t/'fixture.rs').write_text(fixture)
+        t=Path(temp);(t/'framing.rs').write_text(contents[here/'retired-transport/uart_decoder.rs']);(t/'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(t/'fixture.rs'),'-o',str(t/'test')],check=True)
         subprocess.run([str(t/'test')],check=True)
     assert all(p.read_text()==s for p,s in contents.items())

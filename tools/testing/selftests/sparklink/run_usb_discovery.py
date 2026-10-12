@@ -25,7 +25,9 @@ def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3]/'net/sparklink'
     inputs = {n: (net/n).read_text() for n in
-              ['sle_usb_ffi.c', 'sle_usb.rs', 'sle_serdev.rs', 'sle_dli.rs', 'sparklink_core.rs']}
+              ['sle_usb_ffi.c', 'sle_usb.rs', 'sle_dli.rs', 'sparklink_core.rs']}
+    archived=here/'retired-serdev/sle_serdev.rs'
+    serdev_source=archived.read_text()
     c = inputs['sle_usb_ffi.c']
     fixture = (here/'usb-discovery/register_fixture.c').read_text()
     fixture = fixture.replace('/* @@STRUCT@@ */', block(c, c.index('struct sle_usb_dev {'))+';')
@@ -38,7 +40,7 @@ def run(output):
     rust = rust.replace('// @@INFO_STRUCT@@', block(dli, dli.index('pub struct SleControllerInfo {')))
     rust = rust.replace('// @@DEFAULT@@', function(dli[dli.index('impl Default for SleControllerInfo'):], 'default'))
     for marker, source in [('USB_INFO', 'sle_usb.rs'), ('SERDEV_INFO', 'sle_serdev.rs')]:
-        rust = rust.replace('// @@'+marker+'@@', function(inputs[source], 'info'))
+        rust = rust.replace('// @@'+marker+'@@', function(serdev_source if source=='sle_serdev.rs' else inputs[source], 'info'))
     attach = function(inputs['sparklink_core.rs'], 'sle_attach_device')
     assembly = attach[attach.index('    let bus = proto.bus;'):]
     end = assembly.index('\n    // Register in the SleDev registry.')
@@ -59,12 +61,14 @@ def run(output):
                         str(tmp/'fixture.rs'), '-o', str(tmp/'rust-test')], check=True)
         subprocess.run([str(tmp/'rust-test'), '--test-threads=1'], check=True)
     assert all((net/n).read_text() == s for n, s in inputs.items())
+    assert archived.read_text()==serdev_source
     record = {'status': 'GENERIC_USB_DESCRIPTOR_CAPABILITY_SOURCE_BOUNDARIES_PASS',
               'c_cases': c_record['c_cases'], 'rust_tests': 5,
-              'scope': 'actual C register/unregister; actual Rust info structs/default, USB/serdev info and attach metadata projection; descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
+              'scope': 'actual C register/unregister; actual Rust info structs/default, USB info and attach metadata projection, archived serdev info; descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
               'physical_acceptance': False, 'generic_dialect_acceptance': False,
               'full_capability_provenance_contract': False, 'natural_fault_root_cause_closed': False,
-              'sources': {n: hashlib.sha256(s.encode()).hexdigest() for n, s in inputs.items()}}
+              'sources': {n: hashlib.sha256(s.encode()).hexdigest() for n, s in inputs.items()},
+              'archived_serdev_info_sha256': hashlib.sha256(serdev_source.encode()).hexdigest()}
     if output:
         output.write_text(json.dumps(record, indent=2)+'\n')
     print(json.dumps(record, indent=2))

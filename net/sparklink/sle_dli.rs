@@ -35,7 +35,7 @@ pub(crate) const CTRL_EVENT_RING_SIZE: usize = 32;
 // Shared event ring for hardware controller backends
 // ---------------------------------------------------------------------------
 
-/// Thread-safe event ring buffer used by USB and serdev controllers to
+/// Thread-safe event ring buffer used by the remaining generic USB controller to
 /// buffer asynchronous events received from hardware completion callbacks
 /// until `EventPump` polls them via `SleController::poll_event()`.
 pub(crate) struct ControllerEventRing {
@@ -1181,11 +1181,10 @@ pub trait SleController: Send + Sync {
 
 /// Remaining bus controller selector; only actual registration constructs it.
 ///
-/// This enum still wraps the registered USB/serdev/WS73 paths, allowing static
+/// This enum still wraps the registered USB/WS73 paths, allowing static
 /// dispatch without heap-allocated trait objects.
 pub enum ControllerBackend {
     Usb(super::sle_usb::UsbController),
-    Serdev(super::sle_serdev::SerdevController),
     Ws73(super::sle_native::NativeController),
 }
 
@@ -1201,10 +1200,6 @@ unsafe impl Sync for ControllerBackend {}
 impl ControllerBackend {
     pub fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
         Self::Usb(super::sle_usb::UsbController::new(addr, identity))
-    }
-
-    pub fn new_serdev(addr: [u8; 6], dev_id: u16) -> Self {
-        Self::Serdev(super::sle_serdev::SerdevController::new(addr, dev_id))
     }
 }
 
@@ -1432,8 +1427,6 @@ impl ControllerBackend {
     pub fn dhkey_verify(&self, params: &[u8]) -> Result {
         self.send_command(SleOpcode::DhkeyVerify, params)
     }
-
-
 }
 
 impl SleController for ControllerBackend {
@@ -1441,7 +1434,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.info(),
             Self::Ws73(c) => c.info(),
-            Self::Serdev(c) => c.info(),
         }
     }
 
@@ -1449,7 +1441,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.open(),
             Self::Ws73(c) => c.open(),
-            Self::Serdev(c) => c.open(),
         }
     }
 
@@ -1457,7 +1448,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.close(),
             Self::Ws73(c) => c.close(),
-            Self::Serdev(c) => c.close(),
         }
     }
 
@@ -1465,7 +1455,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.send_command(opcode, params),
             Self::Ws73(c) => c.send_command(opcode, params),
-            Self::Serdev(c) => c.send_command(opcode, params),
         }
     }
 
@@ -1473,7 +1462,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.send_data(handle, data),
             Self::Ws73(c) => c.send_data(handle, data),
-            Self::Serdev(c) => c.send_data(handle, data),
         }
     }
 
@@ -1481,7 +1469,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.poll_event(),
             Self::Ws73(c) => c.poll_event(),
-            Self::Serdev(c) => c.poll_event(),
         }
     }
 
@@ -1489,7 +1476,6 @@ impl SleController for ControllerBackend {
         match self {
             Self::Usb(c) => c.reset(),
             Self::Ws73(c) => c.reset(),
-            Self::Serdev(c) => c.reset(),
         }
     }
 }

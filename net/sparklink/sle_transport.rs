@@ -7,39 +7,11 @@
 //! probe time, following the same model as Bluetooth's `hci_uart_proto` +
 //! `hci_register_dev()`.
 //!
-//! Architecture:
-//!
-//! ```text
-//!   Layer 1: Transport protocol registration (like hci_uart_register_proto)
-//!     ┌──────────────────────┐  ┌──────────────────────┐
-//!     │  SleProto::H4Uart    │  │  SleProto::UsbBulk   │
-//!     │  id=0, "sparklink-h4"│  │  id=1, "sparklink-usb"│
-//!     └──────┬───────────────┘  └──────┬───────────────┘
-//!            │ register()              │ register()
-//!            ▼                         ▼
-//!     ┌─────────────────────────────────────┐
-//!     │         SleProtoRegistry            │
-//!     │  slots: [Option<SleProtoEntry>; 8]  │
-//!     └──────────────┬──────────────────────┘
-//!                    │
-//!   Layer 2: Device attach (like hci_register_dev)
-//!                    │
-//!     probe():       ▼
-//!       sle_attach_device(&SleAttachInfo) → dev_id
-//!       ──► allocate SleDev in registry
-//!       ──► associate protocol id
-//!       ──► register with subsystem
-//!
-//!     disconnect():
-//!       sle_detach_device(dev_id)
-//!       ──► close controller
-//!       ──► unregister SleDev
-//! ```
-//!
-//! Drivers call `sle_attach_device()` from their probe/open callback,
-//! and `sle_detach_device()` from their disconnect/close callback.
-
-#![allow(dead_code)]
+//! Only the USB transport descriptor is registered by the production core.
+//! Historical H4/SPI descriptors have no registered bus provider and are not
+//! advertised. They remain experimental references outside the default graph.
+//! The remaining static registry is to be replaced by the shared Backend seam;
+//! a descriptor is not evidence of initialized hardware or transport capability.
 
 use kernel::prelude::*;
 
@@ -322,16 +294,6 @@ impl SleBindingTable {
 // Built-in protocol definitions
 // =========================================================================
 
-/// Built-in H4 UART transport protocol entry.
-pub(crate) const H4_UART_PROTO: SleProtoEntry = SleProtoEntry {
-    id: SleProtoId::H4Uart,
-    name: "sparklink-h4",
-    bus: SleBus::Uart,
-    max_pdu: 255,
-    init_speed: 115_200,
-    oper_speed: 1_000_000,
-};
-
 /// Built-in USB bulk transport protocol entry.
 pub(crate) const USB_BULK_PROTO: SleProtoEntry = SleProtoEntry {
     id: SleProtoId::UsbBulk,
@@ -342,19 +304,7 @@ pub(crate) const USB_BULK_PROTO: SleProtoEntry = SleProtoEntry {
     oper_speed: 0,
 };
 
-/// Built-in SPI register transport protocol entry.
-pub(crate) const SPI_REG_PROTO: SleProtoEntry = SleProtoEntry {
-    id: SleProtoId::Spi,
-    name: "sparklink-spi",
-    bus: SleBus::Spi,
-    max_pdu: 255,
-    init_speed: 0,
-    oper_speed: 0,
-};
-
 /// Register all built-in transport protocols into the given registry.
 pub(crate) fn register_builtin_protos(reg: &mut SleProtoRegistry) {
-    let _ = reg.register(H4_UART_PROTO);
     let _ = reg.register(USB_BULK_PROTO);
-    let _ = reg.register(SPI_REG_PROTO);
 }

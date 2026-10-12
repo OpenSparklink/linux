@@ -24,3 +24,9 @@ usb selections with EOPNOTSUPP and invalid names with EINVAL. It cannot select
 an attached device; use the per-registration controller API. No compatibility
 period or real UART/SPI support is claimed. Kernel K#4/#9/#10/#19 and U#1/#6/#8
 remain open; clean module/VM plus exact real WS73 RF/data regression are gates.
+
+Follow-up: the sole serdev consumer proved unconnected at Kab9e5ec; its skeleton
+and decoder now reside in selftests. No UART/parser is linked by the production
+core; a proper registered provider must reconnect an appropriate per-device
+framer through the Backend seam. Historical claims above retain their batch
+baseline, not current production support.

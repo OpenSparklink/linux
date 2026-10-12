@@ -43,10 +43,8 @@ mod sle_phy;
 mod sle_power;
 mod sle_security;
 mod sle_snoop;
-mod sle_serdev;
 mod sle_transport;
 mod sle_uapi;
-mod sle_uart;
 mod sle_usb;
 mod sle_workers;
 
@@ -723,7 +721,7 @@ pub(crate) fn sle_quiesce_device(id: u16) {
 
 /// Attach a newly-discovered physical device to the subsystem.
 ///
-/// Called from USB probe, serdev probe, or any other transport driver's
+/// Called from a registered USB probe or a future Backend driver's
 /// hardware enumeration callback. Allocates a `SleDev` in the global
 /// registry, creates a transport binding, and logs the attachment.
 ///
@@ -786,7 +784,7 @@ pub(crate) fn sle_attach_device(info: &sle_transport::SleAttachInfo) -> Result<u
 
 /// Detach a device from the subsystem.
 ///
-/// Called from USB disconnect, serdev remove, or module unload cleanup.
+/// Called from registered USB disconnect or module unload cleanup.
 /// Removes the transport binding and unregisters the SleDev.  If the
 /// device was the active one, reverts to the no-controller state.  If it
 /// was inactive, its saved state is discarded.
@@ -1014,20 +1012,6 @@ pub(crate) fn sle_resume_device(dev_id: u16) {
     }
 }
 
-pub(crate) fn sle_switch_controller_serdev(dev_id: u16, addr: [u8; 6], fw_version: u32) {
-    let result = (|| -> Result<Arc<ControllerRuntime>> {
-        let backend = sle_dli::ControllerBackend::new_serdev(addr, dev_id);
-        let state = ControllerState::new_boxed(addr, backend)?;
-        let mut guard = SUBSYSTEM.lock();
-        let ss = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
-        ss.dev_registry.update_hw_info(dev_id, addr, fw_version);
-        ss.activate_new_device(dev_id, state)
-    })();
-    match result {
-        Ok(owner) => owner.start_workers(),
-        Err(e) => pr_err!("sparklink: activating serdev Runtime failed: {:?}\n", e),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Module definition
@@ -1304,8 +1288,6 @@ impl kernel::InPlaceModule for SparkLinkModule {
 
         // SAFETY: Called exactly once during module init.
         unsafe { SUBSYSTEM.init() };
-        // SAFETY: Called exactly once during module init.
-        unsafe { sle_serdev::init_serdev_parser() };
         // SAFETY: Called exactly once during module init.
         unsafe { sle_usb::init_usb_event_ring() };
 
