@@ -283,6 +283,15 @@ static int sl_release(struct socket *sock)
 	if (!sk)
 		return 0;
 	ss = sl_sk(sk);
+	/* Explicit finite linger drains admitted software TX through the real
+	 * driver. It does not invent controller completion or peer delivery.
+	 * Without linger (or after its bound), close discards unsent packets.
+	 */
+	if (ss->bound && sock_flag(sk, SOCK_LINGER) && sk->sk_lingertime &&
+	    !READ_ONCE(ss->dead))
+		wait_event_interruptible_timeout(*sk_sleep(sk),
+			READ_ONCE(ss->dead) || skb_queue_empty(&ss->tx),
+			min_t(long, sk->sk_lingertime, msecs_to_jiffies(5000)));
 	mutex_lock(&sl_channel_registry);
 	WRITE_ONCE(ss->dead, true);
 	if (ss->bound) {
