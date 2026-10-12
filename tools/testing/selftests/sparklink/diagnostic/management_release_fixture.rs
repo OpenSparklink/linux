@@ -19,7 +19,7 @@ mod under_test {
 use super::*;
 type Error=i32;
 type Result<T=()>=std::result::Result<T,Error>;
-mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EOPNOTSUPP:u32=95;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
+mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EOPNOTSUPP:u32=95;pub const ESTALE:u32=116;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
 use kernel::bindings;
 fn error_from_errno(value:i32)->i32 {value}
 const ENODEV:i32=-19;const EBUSY:i32=-16;
