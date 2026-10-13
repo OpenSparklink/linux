@@ -107,7 +107,7 @@ pub(crate) const SL_IOCTL_DEV_SELECT: u32 = _IOW::<i16>(SL_MAGIC, 0x07);
 
 /// Query the effective device for this fd (returns u16).
 /// If the fd has a per-fd affinity, returns that; otherwise returns
-/// the global active_dev_id (or 0xFFFF if no device is active).
+/// this File binding (or 0xFFFF when unselected); no global fallback.
 pub(crate) const SL_IOCTL_DEV_GET_ACTIVE: u32 = _IOR::<u16>(SL_MAGIC, 0x08);
 
 /// Start SLE advertising (device discovery - discoverable side).

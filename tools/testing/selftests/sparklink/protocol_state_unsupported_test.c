@@ -2,6 +2,7 @@
 /* Passive VM syscall rejection; no injection, firmware or service actions. */
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +10,53 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+/* Real per-File binding: no implicit default, dup shares clear/rebind. */
+static int explicit_affinity_probe(int selected_fd)
+{
+    uint16_t id = UINT16_MAX, unset = 0;
+    struct sle_controller_snapshot selected = { .version = 1 };
+    if (ioctl(selected_fd, SL_IOCTL_DEV_GET_ACTIVE, &id) || id >= 16 ||
+        ioctl(selected_fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &selected)) return 1;
+    int fd = open("/dev/sparklink", O_RDWR);
+    if (fd < 0) return 1;
+    int alias = -1, rc = 1;
+    struct sle_controller_snapshot query = { .version = 1 }, before = query;
+    if (ioctl(fd, SL_IOCTL_DEV_GET_ACTIVE, &unset) || unset != UINT16_MAX) goto done;
+    errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &query) != -1 || errno != ENODEV ||
+        memcmp(&query, &before, sizeof(query))) goto done;
+    struct pollfd poll_fd = { .fd = fd, .events = POLLIN };
+    if (poll(&poll_fd, 1, 0) != 1 || !(poll_fd.revents & POLLERR)) goto done;
+    int16_t index = id;
+    if (ioctl(fd, SL_IOCTL_DEV_SELECT, &index)) goto done;
+    query = before;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &query) || query.generation != selected.generation) goto done;
+    alias = dup(fd);
+    if (alias < 0) goto done;
+    index = -1;
+    if (ioctl(alias, SL_IOCTL_DEV_SELECT, &index) || ioctl(fd, SL_IOCTL_DEV_GET_ACTIVE, &unset) || unset != UINT16_MAX) goto done;
+    query = before; errno = 0;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &query) != -1 || errno != ENODEV ||
+        memcmp(&query, &before, sizeof(query))) goto done;
+    /* Another open File on this controller is unaffected by dup's clear. */
+    query = before;
+    if (ioctl(selected_fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &query) || query.generation != selected.generation) goto done;
+    index = id;
+    if (ioctl(alias, SL_IOCTL_DEV_SELECT, &index)) goto done;
+    index = -2; errno = 0;
+    if (ioctl(fd, SL_IOCTL_DEV_SELECT, &index) != -1 || errno != EINVAL) goto done;
+    if (close(fd)) goto done;
+    fd = -1; query = before;
+    if (ioctl(alias, SL_IOCTL_CONTROLLER_SNAPSHOT, &query) || query.generation != selected.generation) goto done;
+    rc = 0;
+done:
+    if (alias >= 0) close(alias);
+    if (fd >= 0) close(fd);
+    return rc;
+}
+
 static int protocol_state_probe(int fd) {
+    if (explicit_affinity_probe(fd)) return 1;
     const struct { unsigned long cmd; int observe; } cases[] = {
     { SL_IOCTL_AFH_CLASSIFY, 0 },
     { SL_IOCTL_AFH_GET_MAP, 1 },
@@ -28,7 +75,10 @@ static int protocol_state_probe(int fd) {
     { SL_IOCTL_CONN_RECV, 0 },
     { SL_IOCTL_CONN_SEND, 0 },
     { SL_IOCTL_CONN_UPDATE_PARAMS, 0 },
+    { SL_IOCTL_DEV_SWITCH, 0 },
     { SL_IOCTL_DISCONNECT, 0 },
+    { SL_IOCTL_DLI_INFO, 1 },
+    { SL_IOCTL_DLI_RESET, 0 },
     { SL_IOCTL_EXT_ADV_CONFIGURE, 0 },
     { SL_IOCTL_EXT_ADV_DISABLE, 0 },
     { SL_IOCTL_EXT_ADV_ENABLE, 0 },

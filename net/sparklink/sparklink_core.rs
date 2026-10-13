@@ -355,11 +355,10 @@ impl ControllerRuntime {
     }
 }
 
-/// Global metadata and compatibility default route; no protocol state bridge.
+/// Global registration metadata only; protocol access requires a File binding.
 pub(crate) struct SubsystemShared {
     runtimes: [Option<Arc<ControllerRuntime>>; sle_dev::SLE_DEV_MAX],
     pub(crate) dev_registry: sle_dev::SleDevRegistry,
-    pub(crate) active_dev_id: Option<u16>,
 }
 
 struct RuntimeContext {
@@ -367,12 +366,7 @@ struct RuntimeContext {
 }
 
 impl RuntimeContext {
-    fn default_selection() -> Self {
-        let ss = SUBSYSTEM.lock();
-        Self {
-            owner: ss.as_ref().and_then(|s| s.active_dev_id.and_then(|id| s.runtime(id))),
-        }
-    }
+
 
     fn from_owner(owner: Arc<ControllerRuntime>) -> Self {
         Self { owner: Some(owner) }
@@ -391,13 +385,7 @@ impl SubsystemShared {
         self.runtimes.get(id as usize)?.clone()
     }
 
-    pub(crate) fn switch_to_device(&mut self, new_id: u16) -> Result {
-        if self.dev_registry.get(new_id).is_none() || self.runtime(new_id).is_none() {
-            return Err(ENODEV);
-        }
-        self.active_dev_id = Some(new_id);
-        Ok(())
-    }
+
 
 }
 
@@ -513,7 +501,7 @@ pub(crate) fn cancel_backend_reservation(identity: sle_dev::DeviceIdentity) {
 /// same reserved identity. A competing install/retire/reuse wins cleanly;
 /// failed candidates drop after the registry guard, with no lock across I/O.
 pub(crate) fn install_backend_runtime(
-    identity: sle_dev::DeviceIdentity, state: KBox<ControllerState>, select: bool,
+    identity: sle_dev::DeviceIdentity, state: KBox<ControllerState>,
     queried: Option<([u8; 6], u32)>,
 ) -> Result<Arc<ControllerRuntime>> {
     let registration = {
@@ -538,7 +526,6 @@ pub(crate) fn install_backend_runtime(
         if slot.is_some() { return Err(EBUSY); }
         *slot = Some(owner.clone());
         if let Some((addr, version)) = queried { shared.dev_registry.update_hw_info(identity.id, addr, version); }
-        if select { shared.active_dev_id = Some(identity.id); }
     }
     Ok(owner)
 }
@@ -562,7 +549,6 @@ pub(crate) fn sle_detach_device(identity: sle_dev::DeviceIdentity) {
         // Reserve the retiring identity until joined cleanup finishes. A
         // duplicate detach cannot free the index while this owner is draining.
         dev.begin_unregister();
-        if ss.active_dev_id == Some(dev_id) { ss.active_dev_id = None; }
         ss.runtimes.get_mut(dev_id as usize).and_then(Option::take)
     };
     if let Some(owner) = owner { owner.invalidate(); }
@@ -637,18 +623,10 @@ struct DebugfsHolder {
     #[pin]
     _subsystems: File<CString>,
     #[pin]
-    adv_count: File<Atomic<usize>>,
-    #[pin]
-    scan_count: File<Atomic<usize>>,
-    #[pin]
-    conn_count: File<Atomic<usize>>,
-    #[pin]
-    ioctl_count: File<Atomic<usize>>,
-    #[pin]
-    _dli_info: File<Atomic<u32>>,
+    _dli_info: File<CString>,
     _mgmt_dir: Dir,
     #[pin]
-    _mgmt_stats: File<Atomic<u32>>,
+    _mgmt_stats: File<CString>,
     _transport_dir: Dir,
     #[pin]
     _transport_info: File<Atomic<u32>>,
@@ -709,52 +687,8 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
             _version <- debugfs.read_only_file(c"version", ver),
             _build_info <- debugfs.read_only_file(c"build_info", build),
             _subsystems <- debugfs.read_only_file(c"subsystems", subsys),
-            adv_count <- debugfs.read_write_file(c"adv_count", Atomic::<usize>::new(0)),
-            scan_count <- debugfs.read_write_file(c"scan_count", Atomic::<usize>::new(0)),
-            conn_count <- debugfs.read_write_file(c"conn_count", Atomic::<usize>::new(0)),
-            ioctl_count <- debugfs.read_write_file(c"ioctl_count", Atomic::<usize>::new(0)),
-            _dli_info <- debugfs.read_callback_file(
-                c"dli_controller",
-                Atomic::<u32>::new(0),
-                &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
-                    let context = RuntimeContext::default_selection();
-                    if let Ok(guard) = context.lock() {
-                        let ss = guard.as_ref().expect("validated live Runtime");
-                        let cinfo = ss.controller.info();
-                        let major = (cinfo.fw_version >> 16) & 0xFF;
-                        let minor = (cinfo.fw_version >> 8) & 0xFF;
-                        let patch = cinfo.fw_version & 0xFF;
-                        writeln!(f, "bus: {:?}", cinfo.bus)?;
-                        writeln!(f, "firmware: {}.{}.{}", major, minor, patch)?;
-                        writeln!(f, "features: 0x{:016x}", cinfo.features)?;
-                        writeln!(f, "features_ext: 0x{:04x}", cinfo.features_ext)?;
-                        writeln!(f, "max_connections: {}", cinfo.max_connections)?;
-                        writeln!(f, "max_mtu: {}", cinfo.max_mtu)?;
-                        writeln!(f, "max_mps: {}", cinfo.max_mps)?;
-                        writeln!(f, "transport_modes: 0x{:02x}", cinfo.transport_modes)?;
-                        writeln!(f, "measurement_cap: 0x{:02x}", cinfo.measurement_cap)?;
-                        writeln!(f, "security_cap: 0x{:04x}", cinfo.security_cap)?;
-                    }
-                    Ok(())
-                },
-            ),
-            _mgmt_stats <- mgmt_dir.read_callback_file(
-                c"stats",
-                Atomic::<u32>::new(0),
-                &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
-                    let context = RuntimeContext::default_selection();
-                    if let Ok(guard) = context.lock() {
-                        let ss = guard.as_ref().expect("validated live Runtime");
-                        let q = &ss.cmd_pending;
-                        writeln!(f, "pending: {}", q.pending_count)?;
-                        writeln!(f, "submitted: {}", q.total_submitted)?;
-                        writeln!(f, "resolved: {}", q.total_resolved)?;
-                        writeln!(f, "timeouts: {}", q.total_timeouts)?;
-                        writeln!(f, "cmd_queue_depth: {}", ss.cmd_queue.len())?;
-                    }
-                    Ok(())
-                },
-            ),
+            _dli_info <- debugfs.read_only_file(c"dli_controller", CString::try_from_fmt(fmt!("legacy default projection retired: use selected ControllerSnapshot\n"))?),
+            _mgmt_stats <- mgmt_dir.read_only_file(c"stats", CString::try_from_fmt(fmt!("legacy queue projection retired: use selected Native diagnostic result\n"))?),
             _mgmt_dir: mgmt_dir,
             _transport_info <- transport_dir.read_callback_file(
                 c"info",
@@ -881,7 +815,6 @@ fn init_subsystem() -> Result<SubsystemGuard> {
         init!(SubsystemShared {
             runtimes,
             dev_registry,
-            active_dev_id: None,
         }),
         GFP_KERNEL,
     )?);
@@ -949,25 +882,12 @@ fn ioctl_dispatch_adv(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u3
     }
 }
 
-/// DEV_SWITCH ioctl — changes only the legacy selection index.
-#[inline(never)]
-fn ioctl_dev_switch(arg: usize) -> Result<isize> {
-    let target_id: u16 = read_user_struct(arg)?;
-    let mut ss = SUBSYSTEM.lock();
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    if s.dev_registry.get(target_id).is_none() {
-        return Err(ENODEV);
-    }
-    s.switch_to_device(target_id)?;
-    pr_info!("sparklink: switched active device to sle{}\n", target_id);
-    Ok(0)
-}
 
 /// DEV_SELECT ioctl — per-fd device affinity.
 ///
-/// Sets which controller this fd targets.  -1 means follow the global
-/// active_dev_id; ≥0 binds the fd to that specific controller.  On each
-/// subsequent ioctl the handler will auto-switch if needed.
+/// Nonnegative indices bind this File to one exact registration owner.
+/// -1 clears this File binding; there is no implicit controller selection.
+/// dup/fork share the same File binding. An owned lease prevents rebinding.
 #[inline(never)]
 fn ioctl_dev_select(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     if me.owned_target.lock().is_some() { return Err(EBUSY); }
@@ -994,7 +914,7 @@ fn ioctl_dev_get_active(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     let target = me.target.lock().clone();
     let effective = match target {
         Some(owner) => owner.identity.id,
-        None => SUBSYSTEM.lock().as_ref().ok_or(ENODEV)?.active_dev_id.unwrap_or(0xFFFF),
+        None => u16::MAX,
     };
     write_user_struct(arg, &effective)?;
     Ok(0)
@@ -1022,7 +942,7 @@ fn ioctl_dispatch_adv_basic(context: &RuntimeContext, cmd: u32, arg: usize) -> R
             write_user_struct(arg, &info)?;
             Ok(0)
         }
-        SL_IOCTL_DEV_SWITCH => ioctl_dev_switch(arg),
+        SL_IOCTL_DEV_SWITCH => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_DEV_LIST => {
             let ss = SUBSYSTEM.lock();
             let s = ss.as_ref().ok_or(ENODEV)?;
@@ -1751,41 +1671,15 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         | SL_IOCTL_SYNC_MCAST_ACCEPT
         | SL_IOCTL_SYNC_MCAST_REJECT => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_SYNC_DATA_SEND => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_DLI_INFO => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let cinfo = s.controller.info();
-            let mut name = [0u8; 32];
-            let copy_len = cinfo.name.len().min(31);
-            name[..copy_len].copy_from_slice(&cinfo.name[..copy_len]);
-            let info = SleDliInfo {
-                bus: cinfo.bus as u8,
-                _pad: [0u8; 3],
-                firmware_version: cinfo.fw_version,
-                features: cinfo.features,
-                max_connections: cinfo.max_connections,
-                max_adv_sets: 0, // Unavailable in this legacy ABI, not a capability promise.
-                transport_modes: cinfo.transport_modes,
-                measurement_cap: cinfo.measurement_cap,
-                max_mtu: cinfo.max_mtu,
-                max_mps: cinfo.max_mps,
-                security_cap: cinfo.security_cap,
-                features_ext: cinfo.features_ext,
-                name,
-                _reserved: [0u8; 4],
-            };
-            drop(ss);
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_DLI_RESET => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.controller.reset()?;
-            Ok(0)
-        }
+        SL_IOCTL_DLI_INFO => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        SL_IOCTL_DLI_RESET => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_DLI_SEND_CMD => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_MGMT_STATS => {
+            // Only actual standard Diagnostic author transactions use this
+            // ledger. Never project its zero counters as Native Host state.
+            if context.owner.as_ref().ok_or(ENODEV)?.protocol_profile != 0 {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
             let stats = SleMgmtStats {
@@ -1926,7 +1820,7 @@ impl MiscDevice for SparkLinkCtl {
             let target = me.target.lock().clone();
             let context = match target {
                 Some(owner) => RuntimeContext::from_owner(owner),
-                None => RuntimeContext::default_selection(),
+                None => RuntimeContext { owner: None },
             };
             let Some(owner) = context.owner.as_ref() else { return bindings::POLLERR | bindings::POLLHUP; };
             if owner.identity != subscription.identity { return bindings::POLLERR | bindings::POLLHUP; }
@@ -1955,7 +1849,10 @@ impl MiscDevice for SparkLinkCtl {
         }
         // Unqualified legacy models are retired, even for privileged callers.
         if matches!(cmd,
-            SL_IOCTL_AFH_CLASSIFY
+            SL_IOCTL_DEV_SWITCH
+            | SL_IOCTL_DLI_INFO
+            | SL_IOCTL_DLI_RESET
+            | SL_IOCTL_AFH_CLASSIFY
             | SL_IOCTL_AFH_GET_MAP
             | SL_IOCTL_AFH_HOP_NEXT
             | SL_IOCTL_AFH_REPORT_RETX
@@ -2053,7 +1950,7 @@ impl MiscDevice for SparkLinkCtl {
         } else {
             match target {
                 Some(owner) => RuntimeContext::from_owner(owner),
-                None => RuntimeContext::default_selection(),
+                None => RuntimeContext { owner: None },
             }
         };
         let context = &context;
