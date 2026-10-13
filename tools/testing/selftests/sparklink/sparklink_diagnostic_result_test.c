@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
 
+#include "retired-event-poll/legacy_abi.h"
 _Static_assert(sizeof(struct sle_diagnostic_result) == 104, "diagnostic ABI");
 _Static_assert(sizeof(struct sle_diagnostic_submit) == 40, "admission ABI");
 _Static_assert(sizeof(struct sle_dli_event) == 256, "legacy event ABI");
