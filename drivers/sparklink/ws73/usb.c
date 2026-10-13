@@ -86,6 +86,9 @@ struct ws73_usb {
 	int failure_error;
 	struct kref references;
 	struct mutex phase_lock;
+	struct mutex backend_lock;
+	struct sparklink_native_identity reservation;
+	bool backend_reserved;
 	struct mutex tx_lock;
 	struct urb *rx_urb;
 	struct urb *notification_urb;
@@ -338,6 +341,62 @@ static int ws73_download_image(struct ws73_usb *ws, const struct firmware *fw,
 	return 0;
 }
 
+/* Pending ownership serializes only metadata calls, never firmware/USB I/O.
+ * Probe owns the driver ref; disconnect joins all producers before cancellation.
+ */
+static int ws73_reserve_backend_locked(struct ws73_usb *ws)
+{
+    struct sparklink_backend_pending status;
+    struct sparklink_native_identity identity;
+    int ret;
+
+    if (ws->backend_reserved) {
+        ret = sparklink_backend_pending_query(ws->reservation.id, ws->reservation.generation, &status);
+        if (!ret) return 0;
+        if (ret != -ENODEV) return ret;
+        ws->backend_reserved = false;
+    }
+    if (READ_ONCE(ws->stopping)) return -ENODEV;
+    ret = sparklink_backend_reserve(SPARKLINK_BACKEND_USB, SPARKLINK_NATIVE_WS73_HCC, &identity);
+    if (ret) return ret;
+    ws->reservation = identity;
+    ws->backend_reserved = true;
+    return 0;
+}
+
+static int ws73_reserve_backend(struct ws73_usb *ws)
+{
+    int ret;
+    mutex_lock(&ws->backend_lock);
+    ret = ws73_reserve_backend_locked(ws);
+    mutex_unlock(&ws->backend_lock);
+    if (ret && ret != -ENODEV) dev_warn(&ws->intf->dev, "pending reserve failed: %d\n", ret);
+    return ret;
+}
+
+static void ws73_pending_status(struct ws73_usb *ws, unsigned int phase, int error)
+{
+    int ret;
+    if (READ_ONCE(ws->stopping)) return;
+    mutex_lock(&ws->backend_lock);
+    /* Diagnostics never allocate or resurrect a cancelled generation. */
+    ret = ws->backend_reserved ? sparklink_backend_pending_update(ws->reservation.id,
+                        ws->reservation.generation, phase, error) : -ENODEV;
+    mutex_unlock(&ws->backend_lock);
+    if (ret && ret != -ENODEV && ret != -EBUSY)
+        dev_warn(&ws->intf->dev, "pending status phase=%u error=%d update=%d\n", phase, error, ret);
+}
+
+static void ws73_cancel_backend(struct ws73_usb *ws)
+{
+    mutex_lock(&ws->backend_lock);
+    if (ws->backend_reserved) {
+        sparklink_backend_cancel(ws->reservation.id, ws->reservation.generation);
+        ws->backend_reserved = false;
+    }
+    mutex_unlock(&ws->backend_lock);
+}
+
 static void ws73_boot_work(struct work_struct *work)
 {
 	struct ws73_usb *ws = container_of(work, struct ws73_usb, boot_work);
@@ -359,6 +418,7 @@ static void ws73_boot_work(struct work_struct *work)
 	if (ret)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_LOADING);
+	ws73_pending_status(ws, WS73_LOADING, 0);
 	/* Validate all images before the first device write. */
 	for (i = 0; i < ARRAY_SIZE(images); i++) {
 		ret = request_firmware(&images[i], ws73_images[i].name,
@@ -415,6 +475,7 @@ out:
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "boot failed: %d\n", ret);
 	}
+	if (ret && !READ_ONCE(ws->stopping)) ws73_pending_status(ws, READ_ONCE(ws->failure_stage), ret);
 }
 
 static unsigned long long ws73_now_ms(void *context)
@@ -506,6 +567,7 @@ static void ws73_runtime_phase(void *context, enum ws73_bsle_phase phase)
 		WRITE_ONCE(ws->stage, stages[phase]);
 		dev_info(&ws->intf->dev, "BSLE phase %u\n", phase);
 	}
+	ws73_pending_status(ws, READ_ONCE(ws->stage), 0);
 }
 
 static void ws73_release(struct kref *reference)
@@ -581,6 +643,9 @@ static void ws73_fault_work(struct work_struct *work)
 		ws->notification_urb = ws->rx_urb = NULL;
 		smp_store_release(&ws->metadata_valid, false);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
+		/* Explicit post-join fault lifecycle may own a new pending identity. */
+		ws73_reserve_backend(ws);
+		ws73_pending_status(ws, READ_ONCE(ws->failure_stage), cause);
 		dev_err(&ws->intf->dev, "native RX stopped: %d\n", ws->last_error);
 		/* A genuine controller error is not a qualified protocol restore. */
 		ret = ws73_admit_recovery(ws, READ_ONCE(ws->controller_error) == 0x100 ? cause : -EIO, &delay);
@@ -976,6 +1041,9 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	unsigned int credits = 1; /* one probe window after fresh BSLE open */
 	int ret;
 
+	ret = ws73_reserve_backend(ws);
+	if (ret) goto out;
+	ws73_pending_status(ws, READ_ONCE(ws->stage), 0);
 	mutex_lock(&ws73_ports_lock);
 	ret = ws->port->budget.exhausted ||
 		(!restore && ws->port->budget.attempts == WS73_RECOVERY_LIMIT) ||
@@ -1032,6 +1100,7 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	if (ret)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_QUERYING);
+	ws73_pending_status(ws, WS73_QUERYING, 0);
 	ws->dli_result.status = 0x100;
 	ret = ws73_dli_query(&io, &credits, &ws->info, &ws->dli_result);
 	if (ret)
@@ -1068,7 +1137,17 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 			.info = native_info, .ops = &ws73_native_ops, .context = ws,
 		};
 
-		ret = sparklink_backend_register(&backend, &identity);
+        struct sparklink_native_identity reserved;
+        mutex_lock(&ws->backend_lock);
+        reserved = ws->reservation;
+        mutex_unlock(&ws->backend_lock);
+        /* No backend/registry lock across open or any transport callback. */
+        ret = sparklink_backend_register_reserved(&backend, &reserved, &identity);
+        if (!ret) {
+            mutex_lock(&ws->backend_lock);
+            ws->backend_reserved = false;
+            mutex_unlock(&ws->backend_lock);
+        }
 	}
 	if (ret)
 		goto out;
@@ -1085,6 +1164,9 @@ out:
 		WRITE_ONCE(ws->failure_ms, ktime_to_ms(ktime_get()));
 		WRITE_ONCE(ws->failure_error, ret);
 		WRITE_ONCE(ws->last_error, ret);
+		/* Open failure may have retired the attempted reservation. */
+		ws73_reserve_backend(ws);
+		ws73_pending_status(ws, READ_ONCE(ws->failure_stage), ret);
 		WRITE_ONCE(ws->stage, WS73_FAILED);
 		dev_err(&ws->intf->dev, "runtime bring-up failed: %d\n", ret);
 		if (ws->dli_result.opcode)
@@ -1230,16 +1312,26 @@ static ssize_t controller_information_show(struct device *dev,
 static DEVICE_ATTR_RO(controller_information);
 
 static ssize_t native_runtime_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
+                                  struct device_attribute *attr, char *buf)
 {
-	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+    struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+    struct sparklink_backend_pending pending = {};
+    struct sparklink_native_identity reserved;
+    bool is_reserved;
+    int ret = -ENOENT;
 
-	return sysfs_emit(buf,
-			 "id=%d generation=%llu streaming=%u broken=%u unsupported=%d last_event=%04x controller_error=%x\n",
-			 READ_ONCE(ws->native_id), READ_ONCE(ws->native_generation),
-			 READ_ONCE(ws->streaming), READ_ONCE(ws->broken),
-			 atomic_read(&ws->unsupported_rx), READ_ONCE(ws->last_unsupported_event),
-			 READ_ONCE(ws->controller_error));
+    if (!ws) return -ENODEV;
+    mutex_lock(&ws->backend_lock);
+    is_reserved = ws->backend_reserved;
+    reserved = ws->reservation;
+    if (is_reserved) ret = sparklink_backend_pending_query(reserved.id, reserved.generation, &pending);
+    mutex_unlock(&ws->backend_lock);
+    return sysfs_emit(buf,
+        "id=%d generation=%llu streaming=%u broken=%u unsupported=%d last_event=%04x controller_error=%x reserved=%u pending_id=%u pending_generation=%llu core_pending_ret=%d core_phase=%u core_error=%d\n",
+        READ_ONCE(ws->native_id), READ_ONCE(ws->native_generation),
+        READ_ONCE(ws->streaming), READ_ONCE(ws->broken), atomic_read(&ws->unsupported_rx),
+        READ_ONCE(ws->last_unsupported_event), READ_ONCE(ws->controller_error),
+        is_reserved, reserved.id, reserved.generation, ret, pending.phase, pending.error);
 }
 static DEVICE_ATTR_RO(native_runtime);
 
@@ -1308,6 +1400,7 @@ static int ws73_probe(struct usb_interface *intf, const struct usb_device_id *id
 	}
 	kref_init(&ws->references);
 	mutex_init(&ws->phase_lock);
+	mutex_init(&ws->backend_lock);
 	mutex_init(&ws->tx_lock);
 	ws->native_id = -1;
 	ws->controller_error = 0x100; /* no controller error byte observed */
@@ -1330,6 +1423,17 @@ static int ws73_probe(struct usb_interface *intf, const struct usb_device_id *id
 	INIT_WORK(&ws->fault_work, ws73_fault_work);
 	INIT_DELAYED_WORK(&ws->recovery_work, ws73_recovery_work);
 	INIT_DELAYED_WORK(&ws->health_work, ws73_health_work);
+    {
+        int ret = ws73_reserve_backend(ws);
+        if (ret) {
+            mutex_lock(&ws73_ports_lock);
+            ws->port->attached = false;
+            mutex_unlock(&ws73_ports_lock);
+            kref_put(&ws->references, ws73_release);
+            return ret;
+        }
+        ws73_pending_status(ws, ws->stage, 0);
+    }
 	usb_set_intfdata(intf, ws);
 	dev_info(&intf->dev, "WS73 %s interface (%u endpoints)\n",
 		 eps == 2 ? "boot" : "runtime", eps);
@@ -1358,6 +1462,7 @@ static void ws73_disconnect(struct usb_interface *intf)
 		ws->native_id = -1;
 	}
 	ws73_native_close(ws);
+	ws73_cancel_backend(ws);
 	WRITE_ONCE(ws->stage, WS73_REMOVING);
 	usb_set_intfdata(intf, NULL);
 	mutex_lock(&ws73_ports_lock);
