@@ -33,7 +33,7 @@ def run(output):
     inputs={name:source_path(net,name).read_text() for name in ['sle_conn.rs','sparklink_core.rs','sle_usb_ffi.c']}
     conn=inputs['sle_conn.rs']
     methods='\n'.join(function(conn,n) for n in ['find_mut','find','find_first_connected_mut','resolve_handle','send'])
-    rust=(here/'connection/tx_fixture.rs').read_text().replace('// @@CONN_METHODS@@',methods).replace('// @@SEQ_METHOD@@',function(conn,'advance_tx')).replace('// @@IOCTL@@',function(inputs['sparklink_core.rs'],'ioctl_conn_send'))
+    rust=(here/'connection/tx_fixture.rs').read_text().replace('// @@CONN_METHODS@@',methods).replace('// @@SEQ_METHOD@@',function(conn,'advance_tx')).replace('// @@IOCTL@@',function((here/'retired-protocol-state/ioctl_conn_send.rs.txt').read_text(),'ioctl_conn_send'))
     usb=inputs['sle_usb_ffi.c']
     defines='\n'.join(re.search(r'(?m)^#define '+n+r' .+$',usb).group() for n in ['SLE_USB_MAX_DEVS','SLE_CMD_TIMEOUT_MS'])
     archive=here/'retired-usb-registration/handle_only_data.c'; archived=archive.read_text()
@@ -46,7 +46,7 @@ def run(output):
         subprocess.run([os.environ.get('CC','clang'),'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(path/'tx.c'),'-o',str(path/'c-test')],check=True)
         subprocess.run([str(path/'c-test')],check=True,env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1:abort_on_error=1',UBSAN_OPTIONS='halt_on_error=1'))
     assert all(source_path(net,n).read_text()==v for n,v in inputs.items()), 'production inputs changed during tests'
-    result={'status':'CONNECTION_TX_SUBMISSION_BOUNDARY_PASS','scope':'actual Rust sender/ioctl plus retired test-only unqualified C USB data body with controlled dependencies; not socket/protocol/RF qualification','physical_acceptance':False,'socket_acceptance':False,'rust_tests':11,'usb_boundaries':['range','allocation','errno','all short completions','exact completion','max length'],'retired_c_data_only_sha256': hashlib.sha256(archived.encode()).hexdigest(), 'sources':{n:hashlib.sha256(v.encode()).hexdigest() for n,v in inputs.items()}}
+    result={'status':'HISTORICAL_CONNECTION_TX_BOUNDARY_PASS','scope':'historical archived Rust sender/ioctl and retired test-only unqualified C USB data body with controlled dependencies; not socket/protocol/RF qualification','physical_acceptance':False,'socket_acceptance':False,'rust_tests':11,'usb_boundaries':['range','allocation','errno','all short completions','exact completion','max length'],'retired_c_data_only_sha256': hashlib.sha256(archived.encode()).hexdigest(), 'sources':{n:hashlib.sha256(v.encode()).hexdigest() for n,v in inputs.items()}}
     if output:output.write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))
 

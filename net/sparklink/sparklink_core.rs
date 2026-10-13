@@ -14,13 +14,11 @@
 //!   - Transport: Async/sync data link management
 //!   - Security: SM2/SM3/SM4 pairing and encryption (future)
 
-mod sle_adv;
 mod sle_backend;
 mod sle_authorization;
 mod sle_management;
 mod sle_grant;
 mod sle_configfs;
-mod sle_conn;
 mod sle_command_plan;
 mod sle_discovery_operation;
 mod sle_connection_operation;
@@ -38,8 +36,6 @@ mod sle_native;
 mod sle_sessions;
 mod sle_data_credit;
 mod sle_native_data;
-mod sle_pdu;
-mod sle_phy;
 mod sle_security;
 mod sle_snoop;
 mod sle_uapi;
@@ -48,7 +44,6 @@ mod sle_workers;
 
 use sle_dli::SleController;
 use sle_uapi::*;
-use sle_workers::drain_controller_events;
 use sle_irq_lock::{IrqLockBackend, new_irq_lock};
 use kernel::sync::lock::Lock;
 use kernel::workqueue::{DelayedWork, new_delayed_work};
@@ -76,10 +71,6 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-use sle_adv::{AdvParams, AdvScanInner, ScanParams};
-use sle_conn::{
-    ConnManager, ConnState, GtRole, CONN_DATA_MAX,
-};
 use sle_security::{RalEntry, RpaManager, SecurityInner};
 
 // ---------------------------------------------------------------------------
@@ -216,12 +207,9 @@ pub(crate) struct ControllerState {
     pub(crate) identity: sle_dev::DeviceIdentity,
     pub(crate) dev_info: SciDevInfo,
     pub(crate) controller: sle_dli::ControllerBackend,
-    pub(crate) conn: ConnManager,
-    pub(crate) adv_scan: AdvScanInner,
     pub(crate) security: SecurityInner,
     pub(crate) rpa: RpaManager,
     pub(crate) rpa_tick_accum: u16,
-    pub(crate) local_role: GtRole,
     pub(crate) cmd_pending: sle_mgmt::CmdPendingQueue,
     pub(crate) cmd_queue: sle_mgmt::CmdRequestQueue,
     pub(crate) command_credits: u8,
@@ -229,22 +217,15 @@ pub(crate) struct ControllerState {
 
 impl ControllerState {
     #[inline(never)]
-    pub(crate) fn new_boxed(addr: [u8; 6], backend: sle_dli::ControllerBackend) -> Result<KBox<Self>> {
+    pub(crate) fn new_boxed(_addr: [u8; 6], backend: sle_dli::ControllerBackend) -> Result<KBox<Self>> {
         KBox::init(
             init!(ControllerState {
                 identity: sle_dev::DeviceIdentity { id: u16::MAX, generation: 0 },
                 dev_info: unsafe { core::mem::zeroed() },
                 controller: backend,
-                conn: {
-                    let mut connections = ConnManager::new(addr);
-                    connections.set_max_connections(sle_configfs::max_connections() as usize);
-                    connections
-                },
-                adv_scan: AdvScanInner::new(addr, b"sparklink"),
                 security: SecurityInner::new(),
                 rpa: RpaManager::new(),
                 rpa_tick_accum: 0,
-                local_role: GtRole::TNode,
                 cmd_pending <- sle_mgmt::CmdPendingQueue::new_in_place(),
                 cmd_queue <- sle_mgmt::CmdRequestQueue::new_in_place(),
                 command_credits: 1,
@@ -608,94 +589,16 @@ pub(crate) fn sle_detach_device(identity: sle_dev::DeviceIdentity) {
 // ---------------------------------------------------------------------------
 
 /// Start advertising / broadcast with the given interval.
-fn do_start_adv(context: &RuntimeContext, interval_ms: u32, discovery_level: u8) -> Result<i32> {
-    let interval = if interval_ms == 0 {
-        u32::from(sle_configfs::adv_interval_ms())
-    } else {
-        interval_ms
-    };
-    let params = AdvParams {
-        discovery_level,
-        interval_slots: interval * 8,
-        broadcast_type: sle_pdu::BroadcastType::AccessibleScannable,
-        tx_power: 0,
-    };
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    if s.local_role != GtRole::GNode {
-        return Err(EPERM);
-    }
-    s.adv_scan.start_advertising(params)?;
-    // Services are owned by the future userspace Engine, not a kernel DB.
-    // Explicit Native advertising data remains on its existing typed path.
-    let _ = s.adv_scan.build_adv_pdu(&[], &[]);
-    match s.controller.enable_broadcast(true) {
-        Ok(()) => {
-            drain_controller_events(s);
-        }
-        Err(e) => {
-            s.adv_scan.abort_advertising();
-            return Err(e);
-        }
-    }
-    Ok(0)
-}
+
 
 /// Stop advertising / broadcast.
-fn do_stop_adv(context: &RuntimeContext) -> Result<i32> {
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    if !s.adv_scan.is_advertising() { return Err(EBUSY); }
-    s.controller.enable_broadcast(false)?;
-    s.adv_scan.stop_advertising()?;
-    Ok(0)
-}
+
 
 /// Start scanning with the given window and interval.
-fn do_start_scan(context: &RuntimeContext, window_ms: u32, interval_ms: u32, filter_level: u8) -> Result<i32> {
-    let window = if window_ms == 0 {
-        u32::from(sle_configfs::scan_window_ms())
-    } else {
-        window_ms
-    };
-    let interval = if interval_ms == 0 {
-        window * 2
-    } else {
-        interval_ms
-    };
-    let params = ScanParams {
-        window_slots: window * 8,
-        interval_slots: interval * 8,
-        filter_level,
-        active: false,
-    };
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    if s.local_role != GtRole::TNode {
-        return Err(EPERM);
-    }
-    s.adv_scan.start_scanning(params)?;
-    match s.controller.enable_scan(true) {
-        Ok(()) => {
-            drain_controller_events(s);
-        }
-        Err(e) => {
-            s.adv_scan.abort_scanning();
-            return Err(e);
-        }
-    }
-    Ok(0)
-}
+
 
 /// Stop scanning.
-fn do_stop_scan(context: &RuntimeContext) -> Result<i32> {
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    if !s.adv_scan.is_scanning() { return Err(EBUSY); }
-    s.controller.enable_scan(false)?;
-    s.adv_scan.stop_scanning()?;
-    Ok(0)
-}
+
 
 // ---------------------------------------------------------------------------
 // C FFI exports for genetlink action commands
@@ -763,7 +666,7 @@ struct DebugfsHolder {
     _power_stats: File<CString>,
     _conn_dir: Dir,
     #[pin]
-    _conn_stats: File<Atomic<u32>>,
+    _conn_stats: File<CString>,
     #[pin]
     _device_list: File<Atomic<u32>>,
 }
@@ -788,12 +691,12 @@ fn init_version_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_build_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security dli; Native events; registry-only genl\nlanguage: Rust"))
+    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core Host Session Channel crypto security dli; Native events; registry-only genl\nlanguage: Rust"))
 }
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nPM: unsupported hardware control\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
+    CString::try_from_fmt(fmt!("Native Host/Session/Channel: discovery, physical links, data\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nPM: unsupported hardware control\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
 }
 
 #[inline(never)]
@@ -801,6 +704,7 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
     let ver = init_version_string()?;
     let build = init_build_string()?;
     let subsys = init_subsys_string()?;
+    let unavailable_connection_stats = CString::try_from_fmt(fmt!("legacy model retired: use identity-bound LinkSnapshot\n"))?;
     let unsupported_pm = CString::try_from_fmt(fmt!("unsupported: no qualified hardware PM snapshot\n"))?;
 
     let debugfs = Dir::new(c"sparklink");
@@ -876,20 +780,7 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
             _transport_dir: transport_dir,
             _power_stats <- power_dir.read_only_file(c"stats", unsupported_pm),
             _power_dir: power_dir,
-            _conn_stats <- conn_dir.read_callback_file(
-                c"stats",
-                Atomic::<u32>::new(0),
-                &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
-                    let context = RuntimeContext::default_selection();
-                    if let Ok(guard) = context.lock() {
-                        let ss = guard.as_ref().expect("validated live Runtime");
-                        writeln!(f, "active: {}", ss.conn.active_count())?;
-                        writeln!(f, "total_created: {}", ss.conn.total_created)?;
-                        writeln!(f, "total_completed: {}", ss.conn.total_completed)?;
-                    }
-                    Ok(())
-                },
-            ),
+            _conn_stats <- conn_dir.read_only_file(c"stats", unavailable_connection_stats),
             _conn_dir: conn_dir,
             _device_list <- debugfs.read_callback_file(
                 c"devices",
@@ -1061,7 +952,7 @@ fn ioctl_dispatch_adv(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u3
         | SL_IOCTL_EXT_ADV_REMOVE
         | SL_IOCTL_EXT_ADV_INFO
         | SL_IOCTL_EXT_ADV_ENABLE_EX
-        | SL_IOCTL_EXT_ADV_TICK => ioctl_dispatch_ext_adv(context, cmd, arg),
+        | SL_IOCTL_EXT_ADV_TICK => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_INJECT_ADV | SL_IOCTL_INJECT_RAW_ADV => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         _ => Err(EINVAL),
     }
@@ -1122,28 +1013,8 @@ fn ioctl_dev_get_active(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
 #[inline(never)]
 fn ioctl_dispatch_adv_basic(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
-        SL_IOCTL_START_ADV => {
-            let uparams: SleAdvParams = read_user_struct(arg)?;
-            do_start_adv(context, u32::from(uparams.interval_ms), uparams.discovery_level)?;
-            Ok(0)
-        }
-        SL_IOCTL_STOP_ADV => {
-            do_stop_adv(context)?;
-            Ok(0)
-        }
-        SL_IOCTL_START_SCAN => {
-            let uparams: SleScanParams = read_user_struct(arg)?;
-            do_start_scan(context,
-                u32::from(uparams.window_ms),
-                u32::from(uparams.interval_ms),
-                uparams.filter_discovery_level,
-            )?;
-            Ok(0)
-        }
-        SL_IOCTL_STOP_SCAN => {
-            do_stop_scan(context)?;
-            Ok(0)
-        }
+        SL_IOCTL_START_ADV | SL_IOCTL_STOP_ADV | SL_IOCTL_START_SCAN | SL_IOCTL_STOP_SCAN
+            => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_DEV_COUNT => {
             let ss = SUBSYSTEM.lock();
             let count = ss.as_ref().map_or(0, |s| s.dev_registry.count());
@@ -1153,9 +1024,9 @@ fn ioctl_dispatch_adv_basic(context: &RuntimeContext, cmd: u32, arg: usize) -> R
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
             let mut info = s.dev_info;
-            info.state = if s.adv_scan.is_advertising() { SciState::Advertising as u8 }
-                else if s.adv_scan.is_scanning() { SciState::Scanning as u8 }
-                else { SciState::Idle as u8 };
+            // This legacy metadata ABI cannot represent Native readiness/radio state.
+            // Current state comes from ControllerSnapshot/typed discovery results.
+            info.state = 0xff;
             drop(ss);
             write_user_struct(arg, &info)?;
             Ok(0)
@@ -1169,533 +1040,44 @@ fn ioctl_dispatch_adv_basic(context: &RuntimeContext, cmd: u32, arg: usize) -> R
             write_user_struct(arg, &mask)?;
             Ok(0)
         }
-        SL_IOCTL_SCAN_RESULT_COUNT => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            drain_controller_events(s);
-            let count = s.adv_scan.scan_result_count();
-            Ok(count as isize)
-        }
-        SL_IOCTL_SET_SCAN_FILTER => {
-            let params: SleScanFilter = read_user_struct(arg)?;
-            let count = (params.uuid_count as usize).min(sle_adv::SCAN_FILTER_MAX_UUIDS);
-            let mut filter = sle_adv::ScanFilter::default();
-            filter.uuid_count = count as u8;
-            filter.uuids[..count].copy_from_slice(&params.uuids[..count]);
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.set_scan_filter(filter);
-            Ok(0)
-        }
-        SL_IOCTL_CLEAR_SCAN_FILTER => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.clear_scan_filter();
-            Ok(0)
-        }
+        SL_IOCTL_SCAN_RESULT_COUNT | SL_IOCTL_SET_SCAN_FILTER | SL_IOCTL_CLEAR_SCAN_FILTER
+            => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         _ => Err(EINVAL),
     }
 }
 
 /// Extended advertising ioctl sub-dispatcher.
-#[inline(never)]
-fn ioctl_dispatch_ext_adv(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_EXT_ADV_CONFIGURE => {
-            let cfg: SleExtAdvConfig = read_user_struct(arg)?;
-            let primary_phy = sle_adv::ExtAdvPhy::from_raw(cfg.primary_phy).ok_or(EINVAL)?;
-            let secondary_phy = sle_adv::ExtAdvPhy::from_raw(cfg.secondary_phy).ok_or(EINVAL)?;
-            let bcast = sle_pdu::BroadcastType::from_raw(cfg.broadcast_type).ok_or(EINVAL)?;
-            let params = sle_adv::ExtAdvParams {
-                discovery_level: cfg.discovery_level,
-                interval_slots: u32::from(cfg.interval_ms) * 8,
-                broadcast_type: bcast,
-                tx_power: cfg.tx_power_dbm,
-                primary_phy,
-                secondary_phy,
-                sid: cfg.sid,
-                include_tx_power: cfg.include_tx_power != 0,
-                extended_adv_timing: cfg.ext_adv_timing,
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.ext_adv_configure(cfg.handle, params)?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_SET_DATA => {
-            let d: SleExtAdvData = read_user_struct(arg)?;
-            let len = (d.data_len as usize).min(ADV_DATA_MAX);
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.ext_adv_set_data(d.handle, &d.data[..len])?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_SET_SCAN_RSP => {
-            let d: SleExtAdvData = read_user_struct(arg)?;
-            let len = (d.data_len as usize).min(ADV_DATA_MAX);
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.ext_adv_set_scan_rsp(d.handle, &d.data[..len])?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_ENABLE => {
-            let handle: u8 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.ext_adv_enable(handle)?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_DISABLE => {
-            let handle: u8 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.ext_adv_disable(handle)?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_REMOVE => {
-            let handle: u8 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan.ext_adv_remove(handle)?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_INFO => {
-            let params: SleExtAdvInfo = read_user_struct(arg)?;
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let (state, sid, phy, data_len, tx_count, timing, max_ev, ev_sent) =
-                s.adv_scan.ext_adv_info(params.handle)?;
-            drop(ss);
-            let out = SleExtAdvInfo {
-                handle: params.handle,
-                state: match state {
-                    sle_adv::ExtAdvState::Idle => 0,
-                    sle_adv::ExtAdvState::Configured => 1,
-                    sle_adv::ExtAdvState::Active => 2,
-                },
-                sid,
-                primary_phy: phy,
-                data_len: data_len as u16,
-                ext_adv_timing: timing,
-                max_adv_events: max_ev,
-                tx_count,
-                events_sent: ev_sent,
-                _pad: [0u8; 4],
-            };
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_ENABLE_EX => {
-            let p: SleExtAdvEnableParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.adv_scan
-                .ext_adv_enable_ex(p.handle, p.duration_10ms, p.max_adv_events)?;
-            Ok(0)
-        }
-        SL_IOCTL_EXT_ADV_TICK => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let disabled = s.adv_scan.ext_adv_tick();
-            // Drive RPA refresh: each tick is 10ms, accumulate into
-            // full seconds for the RPA manager.
-            s.rpa_tick_accum += 1;
-            if s.rpa_tick_accum >= 100 {
-                // 100 * 10ms = 1 second
-                s.rpa_tick_accum = 0;
-                s.rpa.rpa_tick(1)?;
-            }
-            Ok(disabled as c_long)
-        }
-        _ => Err(EINVAL),
-    }
-}
+
 
 /// Connection data send — isolated for stack safety (SleConnData = 260B + tx_buf = 256B).
-#[inline(never)]
-fn ioctl_conn_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
-    let cd: SleConnData = read_user_struct(arg)?;
-    let len = cd.length as usize;
-    if len > CONN_DATA_MAX {
-        return Err(EINVAL);
-    }
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    let s: &mut ControllerState = s;
-    let controller = &s.controller;
-    let sent = s.conn.send(cd.handle, &cd.data[..len], |host_handle, wire_handle, payload| {
-        let handle = if controller.uses_command_host() {
-            wire_handle.ok_or(EPIPE)?
-        } else {
-            host_handle
-        };
-        let mut tx_buf = [0u8; 1 + CONN_DATA_MAX];
-        tx_buf[0] = sle_conn::tcid::DEFAULT_DATA as u8;
-        tx_buf[1..1 + payload.len()].copy_from_slice(payload);
-        controller.send_data(handle, &tx_buf[..1 + payload.len()])
-    })?;
-    Ok(sent as isize)
-}
+
 
 /// Connection data receive — isolated for stack safety (2x SleConnData = 520B).
-#[inline(never)]
-fn ioctl_conn_recv(context: &RuntimeContext, arg: usize) -> Result<isize> {
-    let cd: SleConnData = read_user_struct(arg)?;
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    let handle = s.conn.resolve_handle(cd.handle)?;
-    let mut out: SleConnData = unsafe { core::mem::zeroed() };
-    out.handle = handle;
-    let recv_len = s.conn.recv(handle, &mut out.data)?;
-    out.length = recv_len.min(CONN_DATA_MAX) as u16;
-    drop(ss);
-    write_user_struct(arg, &out)?;
-    Ok(0)
-}
 
-fn ioctl_dispatch_conn(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
+#[inline(never)]
+fn ioctl_dispatch_conn(_context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u32, _arg: usize) -> Result<isize> {
     match cmd {
-        SL_IOCTL_CONNECT => {
-            let cp: SleConnectParams = read_user_struct(arg)?;
-            let role = if cp.gt_role == 1 {
-                GtRole::GNode
-            } else {
-                GtRole::TNode
-            };
-            let handle = {
-                let mut ss = context.lock()?;
-                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-                let handle = s.conn.connect(cp.peer_addr, role)?;
-                match s.controller.create_connection(&cp.peer_addr) {
-                    Ok(()) => {
-                        drain_controller_events(s);
-                        s.conn.confirm_connecting_by_addr(&cp.peer_addr);
-                    }
-                    Err(e) => {
-                        s.conn.abort_connecting(handle);
-                        return Err(e);
-                    }
-                }
-                handle
-            };
-            Ok(handle as isize)
-        }
-        SL_IOCTL_DISCONNECT => {
-            let handle: u16 = read_user_struct(arg)?;
-            let (_handle, _peer_addr, _old_state, _new_state) = {
-                let mut ss = context.lock()?;
-                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-                let handle = s.conn.resolve_handle(handle)?;
-                let peer_addr = s.conn.info(handle).map(|e| e.peer_addr).unwrap_or([0u8; 6]);
-                let old_state = s.conn.info(handle).map(|e| e.state as u8).unwrap_or(0);
-                let asynchronous = s.controller.uses_command_host();
-                let wire_handle = if asynchronous {
-                    s.conn.controller_handle(handle)?
-                } else {
-                    Some(handle)
-                };
-                s.conn.disconnect(handle)?;
-                // Before ConnectionEstablished, retain the outgoing entry.
-                // Its completion learns the controller handle and sends the
-                // deferred disconnect; a queued command is not a disconnect.
-                if let Some(wire_handle) = wire_handle {
-                    match s.controller.disconnect(wire_handle) {
-                        Ok(()) => {
-                            drain_controller_events(s);
-                            if !asynchronous && s.conn
-                                .info(handle)
-                                .map(|e| e.state == ConnState::DisconnectPending)
-                                .unwrap_or(false)
-                            {
-                                s.conn.confirm_disconnecting(handle);
-                            }
-                        }
-                        Err(error) => {
-                            s.conn.abort_disconnecting(handle);
-                            return Err(error);
-                        }
-                    }
-                }
-                let new_state = s.conn.info(handle).map(|e| e.state as u8).unwrap_or(0);
-                (handle, peer_addr, old_state, new_state)
-            };
-            Ok(0)
-        }
-        SL_IOCTL_CONN_INFO => {
-            let req: SleConnInfo = read_user_struct(arg)?;
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let handle = if req.handle == 0 {
-                let (handles, count) = s.conn.active_handles();
-                if count == 0 {
-                    return Err(EPIPE);
-                }
-                handles[0]
-            } else {
-                req.handle
-            };
-            let entry = s.conn.info(handle)?;
-            let mut info: SleConnInfo = unsafe { core::mem::zeroed() };
-            info.handle = entry.handle;
-            info.state = entry.state as u8;
-            info.peer_addr = entry.peer_addr;
-            info.local_role = entry.local_role as u8;
-            info.bandwidth_mhz = entry.params.bandwidth_mhz;
-            info.mcs_index = entry.params.mcs_index;
-            info.event_group_period = entry.params.event_group_period;
-            info.supervision_timeout = entry.params.supervision_timeout;
-            info.tx_seq = entry.seq.tx_seq;
-            info.rx_seq = entry.seq.rx_seq;
-            // Legacy direct submission has no queued payloads. Acceptance is
-            // not a remote delivery acknowledgement or an async queue depth.
-            info.tx_pending = 0;
-            info.rx_pending = entry.rx_queue.len() as u16;
-            info.tx_bytes = entry.tx_bytes;
-            info.rx_bytes = entry.rx_bytes;
-            info.data_mtu = entry.channels.data.mtu;
-            info.data_mps = entry.channels.data.mps;
-            info.data_mode = entry.channels.data.mode as u8;
-            info.svc_mtu = entry.channels.svc_mgmt.mtu;
-            info.smtc_tx_credits = entry.channels.svc_mgmt.tx_credits;
-            info.smtc_rx_credits = entry.channels.svc_mgmt.rx_credits;
-            info.dudtc_tx_credits = entry.channels.data.tx_credits;
-            info.dudtc_rx_credits = entry.channels.data.rx_credits;
-            drop(ss);
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_CONN_SEND => ioctl_conn_send(context, arg),
-        SL_IOCTL_CONN_RECV => ioctl_conn_recv(context, arg),
-        SL_IOCTL_INJECT_CONN_RESP => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_INJECT_CONN_DATA => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_CONN_COUNT => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            Ok(s.conn.active_count() as isize)
-        }
-        SL_IOCTL_CONN_LIST => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let (handles, count) = s.conn.active_handles();
-            let mut list: SleConnList = unsafe { core::mem::zeroed() };
-            let count = count.min(8);
-            list.count = count as u16;
-            list.handles[..count].copy_from_slice(&handles[..count]);
-            drop(ss);
-            write_user_struct(arg, &list)?;
-            Ok(0)
-        }
-        SL_IOCTL_SET_CONN_MTU => {
-            let params: SleConnMtuParams = read_user_struct(arg)?;
-            let mps = if params.mps > 0 {
-                Some(params.mps)
-            } else {
-                None
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.handle)?;
-            s.conn.set_data_mtu(handle, params.mtu, mps)?;
-            Ok(0)
-        }
-        SL_IOCTL_CONN_READ_PEER_FEATURES => {
-            let req: SleConnPeerCap = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(req.handle)?;
-            let entry = s.conn.info(handle)?;
-            if !entry.peer_cap.features_valid {
-                let hb = handle.to_le_bytes();
-                s.controller
-                    .send_command(sle_dli::SleOpcode::ReadFeatures, &hb)?;
-                drain_controller_events(s);
-            }
-            let entry = s.conn.info(handle)?;
-            let mut out: SleConnPeerCap = unsafe { core::mem::zeroed() };
-            out.handle = handle;
-            out.features = entry.peer_cap.features;
-            out.features_valid = if entry.peer_cap.features_valid { 1 } else { 0 };
-            out.version = entry.peer_cap.version;
-            out.manufacturer = entry.peer_cap.manufacturer;
-            out.subversion = entry.peer_cap.subversion;
-            out.version_valid = if entry.peer_cap.version_valid { 1 } else { 0 };
-            drop(ss);
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_CONN_READ_PEER_VERSION => {
-            let req: SleConnPeerCap = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(req.handle)?;
-            let entry = s.conn.info(handle)?;
-            if !entry.peer_cap.version_valid {
-                let hb = handle.to_le_bytes();
-                s.controller
-                    .send_command(sle_dli::SleOpcode::ReadVersion, &hb)?;
-                drain_controller_events(s);
-            }
-            let entry = s.conn.info(handle)?;
-            let mut out: SleConnPeerCap = unsafe { core::mem::zeroed() };
-            out.handle = handle;
-            out.features = entry.peer_cap.features;
-            out.features_valid = if entry.peer_cap.features_valid { 1 } else { 0 };
-            out.version = entry.peer_cap.version;
-            out.manufacturer = entry.peer_cap.manufacturer;
-            out.subversion = entry.peer_cap.subversion;
-            out.version_valid = if entry.peer_cap.version_valid { 1 } else { 0 };
-            drop(ss);
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_CONN_UPDATE_PARAMS => {
-            let up: SleConnParamUpdate = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(up.handle)?;
-            let interval = if up.interval_max > 0 {
-                up.interval_max
-            } else {
-                up.interval_min
-            };
-            s.conn
-                .update_conn_params(handle, interval, up.latency, up.supervision_timeout)?;
-            let mut params = [0u8; 10];
-            params[0..2].copy_from_slice(&handle.to_le_bytes());
-            params[2..4].copy_from_slice(&up.interval_min.to_le_bytes());
-            params[4..6].copy_from_slice(&up.interval_max.to_le_bytes());
-            params[6..8].copy_from_slice(&up.latency.to_le_bytes());
-            params[8..10].copy_from_slice(&up.supervision_timeout.to_le_bytes());
-            s.controller
-                .send_command(sle_dli::SleOpcode::ConnParamUpdate, &params)?;
-            Ok(0)
-        }
-        SL_IOCTL_CONN_PHY_UPDATE => {
-            let pu: SleConnPhyUpdate = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(pu.handle)?;
-            let mcs = if pu.mcs_index != 0xFF {
-                pu.mcs_index
-            } else {
-                s.conn.info(handle)?.params.mcs_index
-            };
-            let bw = if pu.bandwidth_mhz != 0 {
-                pu.bandwidth_mhz
-            } else {
-                s.conn.info(handle)?.params.bandwidth_mhz
-            };
-            s.conn.update_phy_params(handle, mcs, bw)?;
-            let mut params = [0u8; 4];
-            params[0..2].copy_from_slice(&handle.to_le_bytes());
-            params[2] = mcs;
-            params[3] = bw;
-            s.controller
-                .send_command(sle_dli::SleOpcode::SetPhyParam, &params)?;
-            Ok(0)
-        }
+        SL_IOCTL_CONNECT
+        | SL_IOCTL_DISCONNECT
+        | SL_IOCTL_CONN_INFO
+        | SL_IOCTL_CONN_SEND
+        | SL_IOCTL_CONN_RECV
+        | SL_IOCTL_INJECT_CONN_RESP
+        | SL_IOCTL_INJECT_CONN_DATA
+        | SL_IOCTL_CONN_COUNT
+        | SL_IOCTL_CONN_LIST
+        | SL_IOCTL_SET_CONN_MTU
+        | SL_IOCTL_CONN_READ_PEER_FEATURES
+        | SL_IOCTL_CONN_READ_PEER_VERSION
+        | SL_IOCTL_CONN_UPDATE_PARAMS
+        | SL_IOCTL_CONN_PHY_UPDATE => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         _ => Err(EINVAL),
     }
 }
+
 
 /// AFH ioctl sub-dispatcher (channel map, RSSI, hopping).
-#[inline(never)]
-fn ioctl_afh(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_AFH_SET_MAP => {
-            let params: SleAfhMapParams = read_user_struct(arg)?;
-            let map = sle_phy::ChannelMap::from_raw(params.map);
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.handle)?;
-            let min_ch = if params.min_channels > 0 {
-                params.min_channels
-            } else {
-                2
-            };
-            s.conn.set_channel_map(handle, map, min_ch)?;
-            Ok(0)
-        }
-        SL_IOCTL_AFH_GET_MAP => {
-            let params: SleAfhMapParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.handle)?;
-            let map = s.conn.get_channel_map(handle)?;
-            drop(ss);
-            let out = SleAfhMapParams {
-                handle,
-                min_channels: 0,
-                _pad: 0,
-                map: map.map,
-                used_count: map.used_count(),
-                _pad2: 0,
-            };
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_AFH_REPORT_RSSI => {
-            let rpt: SleAfhRssiReport = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(rpt.handle)?;
-            s.conn.report_rssi(handle, rpt.channel, rpt.rssi_dbm)?;
-            Ok(0)
-        }
-        SL_IOCTL_AFH_CLASSIFY => {
-            let params: SleAfhClassifyParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.handle)?;
-            let min_ch = if params.min_channels > 0 {
-                params.min_channels
-            } else {
-                2
-            };
-            let map = s
-                .conn
-                .classify_channels(handle, params.threshold_dbm, min_ch)?;
-            drop(ss);
-            let out = SleAfhClassifyParams {
-                handle,
-                threshold_dbm: params.threshold_dbm,
-                min_channels: min_ch,
-                map_out: map.map,
-                used_count: map.used_count(),
-                _pad: 0,
-            };
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_AFH_HOP_NEXT => {
-            let params: SleAfhHopInfo = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(params.handle)?;
-            let (ch, freq, ec) = s.conn.hop_next(handle)?;
-            drop(ss);
-            let out = SleAfhHopInfo {
-                handle,
-                channel: ch,
-                _pad: 0,
-                freq_mhz: freq,
-                event_counter: ec,
-            };
-            write_user_struct(arg, &out)?;
-            Ok(0)
-        }
-        SL_IOCTL_AFH_REPORT_RETX => {
-            let rpt: SleAfhRetxReport = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let handle = s.conn.resolve_handle(rpt.handle)?;
-            s.conn
-                .report_retx(handle, rpt.channel, rpt.retransmitted != 0)?;
-            Ok(0)
-        }
-        _ => Err(EINVAL),
-    }
-}
+
 
 /// Security ioctl sub-dispatcher (pairing, encryption, crypto tests).
 #[inline(never)]
@@ -1708,25 +1090,7 @@ fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isiz
             s.security.set_psk(params.psk);
             Ok(0)
         }
-        SL_IOCTL_SEC_PAIR => {
-            let params: SlePairParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            match params.method {
-                1 => s.security.pair_just_works()?,
-                2 => s.security.pair_psk()?,
-                3 => s.security.pair_numeric_comparison()?,
-                4 => s.security.pair_passkey_entry()?,
-                5 => s.security.pair_oob()?,
-                6 => s.security.pair_password()?,
-                _ => return Err(EINVAL),
-            }
-            let handle = s.conn.first_active_handle().unwrap_or(0);
-            let auth_req: u8 = if params.method == 3 { 0x04 } else { 0x00 };
-            s.controller.request_pair(handle, auth_req, params.method)?;
-            drain_controller_events(s);
-            Ok(0)
-        }
+        SL_IOCTL_SEC_PAIR => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_SEC_INFO => {
             let info = {
                 let ss = context.lock()?;
@@ -1812,7 +1176,7 @@ fn ioctl_dispatch_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Re
         | SL_IOCTL_AFH_REPORT_RSSI
         | SL_IOCTL_AFH_CLASSIFY
         | SL_IOCTL_AFH_HOP_NEXT
-        | SL_IOCTL_AFH_REPORT_RETX => ioctl_afh(context, cmd, arg),
+        | SL_IOCTL_AFH_REPORT_RETX => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
 
         SL_IOCTL_SEC_SET_PSK
         | SL_IOCTL_SEC_PAIR
@@ -1882,256 +1246,11 @@ fn ioctl_ral_read_rpa(context: &RuntimeContext, arg: usize, is_local: bool) -> R
 }
 
 /// Sync link ioctl sub-dispatcher (separate stack frame for large structs).
-#[inline(never)]
-fn ioctl_sync_link(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_SYNC_UCAST_PARAM => {
-            let mut cfg = read_user_struct::<SleSyncCigConfig>(arg)?;
-            let params = sle_conn::SyncCigParams {
-                cig_id: cfg.cig_id,
-                sdu_interval_g2t: cfg.sdu_interval_g2t,
-                sdu_interval_t2g: cfg.sdu_interval_t2g,
-                max_sdu_g2t: cfg.max_sdu_g2t,
-                max_sdu_t2g: cfg.max_sdu_t2g,
-                retransmit_g2t: cfg.retransmit_g2t,
-                retransmit_t2g: cfg.retransmit_t2g,
-                max_latency_g2t: cfg.max_latency_g2t,
-                max_latency_t2g: cfg.max_latency_t2g,
-                adapt_mode: cfg.adapt_mode,
-                link_count: cfg.link_count,
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let result = s.conn.sync_ucast_configure(&params)?;
-            cfg.cig_id = result.cig_id;
-            cfg.link_count = result.link_count;
-            cfg.handles_out = result.handles;
-            let (links, cnt) = s.conn.sync_links_for_group(
-                result.cig_id, sle_conn::SyncLinkType::Unicast);
-            let (buf, len) = sle_conn::encode_sync_param_cmd(
-                result.cig_id,
-                params.sdu_interval_g2t, params.sdu_interval_t2g,
-                params.adapt_mode,
-                params.max_latency_g2t, params.max_latency_t2g,
-                cnt, &links[..cnt as usize],
-            );
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncUcastParam, &buf[..len]);
-            drop(ss);
-            write_user_struct(arg, &cfg)?;
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_UCAST_CREATE => {
-            let cmd_data = read_user_struct::<SleSyncCreateCmd>(arg)?;
-            let count = cmd_data.link_count.min(8) as usize;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let created = s
-                .conn
-                .sync_ucast_create(cmd_data.group_id, &cmd_data.acl_handles[..count])?;
-            let (links, cnt) = s.conn.sync_links_for_group(
-                cmd_data.group_id, sle_conn::SyncLinkType::Unicast);
-            let (buf, len) = sle_conn::encode_sync_create_cmd(
-                cmd_data.group_id, &links[..cnt as usize]);
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncUcastCreate, &buf[..len]);
-            Ok(created as isize)
-        }
-        SL_IOCTL_SYNC_UCAST_REMOVE => {
-            let cig_id = read_user_struct::<u8>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_ucast_remove(cig_id)?;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncUcastRemove, &[cig_id]);
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_MCAST_PARAM => {
-            let mut cfg = read_user_struct::<SleSyncBigConfig>(arg)?;
-            let params = sle_conn::SyncBigParams {
-                big_id: cfg.big_id,
-                sdu_interval_g2t: cfg.sdu_interval_g2t,
-                sdu_interval_t2g: cfg.sdu_interval_t2g,
-                max_sdu_g2t: cfg.max_sdu_g2t,
-                max_sdu_t2g: cfg.max_sdu_t2g,
-                retransmit_g2t: cfg.retransmit_g2t,
-                retransmit_t2g: cfg.retransmit_t2g,
-                max_latency_g2t: cfg.max_latency_g2t,
-                max_latency_t2g: cfg.max_latency_t2g,
-                adapt_mode: cfg.adapt_mode,
-                link_count: cfg.link_count,
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let result = s.conn.sync_mcast_configure(&params)?;
-            cfg.big_id = result.big_id;
-            cfg.link_count = result.link_count;
-            cfg.handles_out = result.handles;
-            let (links, cnt) = s.conn.sync_links_for_group(
-                result.big_id, sle_conn::SyncLinkType::Multicast);
-            let (buf, len) = sle_conn::encode_sync_param_cmd(
-                result.big_id,
-                params.sdu_interval_g2t, params.sdu_interval_t2g,
-                params.adapt_mode,
-                params.max_latency_g2t, params.max_latency_t2g,
-                cnt, &links[..cnt as usize],
-            );
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncMcastParam, &buf[..len]);
-            drop(ss);
-            write_user_struct(arg, &cfg)?;
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_MCAST_CREATE => {
-            let cmd_data = read_user_struct::<SleSyncCreateCmd>(arg)?;
-            let count = cmd_data.link_count.min(8) as usize;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            let created = s
-                .conn
-                .sync_mcast_create(cmd_data.group_id, &cmd_data.acl_handles[..count])?;
-            let (links, cnt) = s.conn.sync_links_for_group(
-                cmd_data.group_id, sle_conn::SyncLinkType::Multicast);
-            let (buf, len) = sle_conn::encode_sync_create_cmd(
-                cmd_data.group_id, &links[..cnt as usize]);
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncMcastCreate, &buf[..len]);
-            Ok(created as isize)
-        }
-        SL_IOCTL_SYNC_MCAST_REMOVE => {
-            let big_id = read_user_struct::<u8>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_mcast_remove(big_id)?;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncMcastRemove, &[big_id]);
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_DATAPATH_CFG => {
-            let cmd_data = read_user_struct::<SleSyncDatapathCmd>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_datapath_config(
-                cmd_data.sync_handle,
-                cmd_data.direction,
-                cmd_data.path_id,
-                cmd_data.codec_id,
-            )?;
-            let (buf, len) = sle_conn::encode_sync_datapath_cmd(
-                cmd_data.sync_handle, cmd_data.direction,
-                cmd_data.path_id, cmd_data.codec_id);
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncDataPathConfig, &buf[..len]);
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_DATAPATH_REMOVE => {
-            let sync_handle = read_user_struct::<u16>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_datapath_remove(sync_handle)?;
-            let mut buf = [0u8; 3];
-            buf[0..2].copy_from_slice(&sync_handle.to_le_bytes());
-            buf[2] = 0xFF;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncDataPathRemove, &buf);
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_INFO => {
-            let mut info = read_user_struct::<SleSyncLinkInfo>(arg)?;
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let link = s.conn.sync_link_info(info.sync_handle)?;
-            info.acl_handle = link.acl_handle;
-            info.group_id = link.cig_id;
-            info.stream_id = link.cis_id;
-            info.link_type = link.link_type as u8;
-            info.state = link.state as u8;
-            info.sdu_interval_g2t = link.sdu_interval_g2t;
-            info.sdu_interval_t2g = link.sdu_interval_t2g;
-            info.max_sdu_g2t = link.max_sdu_g2t;
-            info.max_sdu_t2g = link.max_sdu_t2g;
-            info.datapath_configured = if link.datapath_configured { 1 } else { 0 };
-            drop(ss);
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_UCAST_ACCEPT => {
-            let sync_handle = read_user_struct::<u16>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_ucast_accept(sync_handle)?;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncUcastAccept,
-                &sync_handle.to_le_bytes());
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_UCAST_REJECT => {
-            let cmd = read_user_struct::<SleSyncRejectCmd>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_ucast_reject(cmd.sync_handle, cmd.reason)?;
-            let mut buf = [0u8; 3];
-            buf[0..2].copy_from_slice(&cmd.sync_handle.to_le_bytes());
-            buf[2] = cmd.reason;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncUcastReject, &buf);
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_MCAST_ACCEPT => {
-            let sync_handle = read_user_struct::<u16>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_mcast_accept(sync_handle)?;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncMcastAccept,
-                &sync_handle.to_le_bytes());
-            Ok(0)
-        }
-        SL_IOCTL_SYNC_MCAST_REJECT => {
-            let cmd = read_user_struct::<SleSyncRejectCmd>(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.conn.sync_mcast_reject(cmd.sync_handle, cmd.reason)?;
-            let mut buf = [0u8; 3];
-            buf[0..2].copy_from_slice(&cmd.sync_handle.to_le_bytes());
-            buf[2] = cmd.reason;
-            let _ = s.controller.send_command(
-                sle_dli::SleOpcode::SyncMcastReject, &buf);
-            Ok(0)
-        }
-        _ => Err(EINVAL),
-    }
-}
+
 
 /// Sync data send ioctl — isolated for stack safety (256+251 byte locals).
 #[inline(never)]
-fn ioctl_sync_data_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
-    let cmd = read_user_struct::<SleSyncDataCmd>(arg)?;
-    let len = (cmd.len as usize).min(247);
-    let ss = context.lock()?;
-    let s = ss.as_ref().ok_or(ENODEV)?;
-    let link = s.conn.sync_link_info(cmd.sync_handle)?;
-    if link.state != sle_conn::SyncLinkState::Active {
-        return Err(EPIPE);
-    }
-    if !link.datapath_configured {
-        return Err(EINVAL);
-    }
-    let seg = match cmd.segment {
-        0 => sle_conn::SyncSegment::Complete,
-        1 => sle_conn::SyncSegment::First,
-        2 => sle_conn::SyncSegment::Middle,
-        _ => sle_conn::SyncSegment::Last,
-    };
-    let hdr = sle_conn::encode_sync_data_header(
-        cmd.sync_handle, seg, false, cmd.priority != 0,
-        len as u16);
-    let mut tx_buf = [0u8; 4 + 247];
-    tx_buf[..4].copy_from_slice(&hdr);
-    tx_buf[4..4 + len].copy_from_slice(&cmd.data[..len]);
-    s.controller.send_data(cmd.sync_handle, &tx_buf[..4 + len])?;
-    Ok(len as isize)
-}
+
 
 fn management_error(error: sle_management::Failure) -> Error {
     match error {
@@ -2799,8 +1918,8 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         | SL_IOCTL_SYNC_UCAST_ACCEPT
         | SL_IOCTL_SYNC_UCAST_REJECT
         | SL_IOCTL_SYNC_MCAST_ACCEPT
-        | SL_IOCTL_SYNC_MCAST_REJECT => ioctl_sync_link(context, cmd, arg),
-        SL_IOCTL_SYNC_DATA_SEND => ioctl_sync_data_send(context, arg),
+        | SL_IOCTL_SYNC_MCAST_REJECT => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        SL_IOCTL_SYNC_DATA_SEND => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_DLI_INFO => {
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
@@ -2814,7 +1933,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
                 firmware_version: cinfo.fw_version,
                 features: cinfo.features,
                 max_connections: cinfo.max_connections,
-                max_adv_sets: sle_adv::EXT_ADV_MAX_SETS as u8,
+                max_adv_sets: 0, // Unavailable in this legacy ABI, not a capability promise.
                 transport_modes: cinfo.transport_modes,
                 measurement_cap: cinfo.measurement_cap,
                 max_mtu: cinfo.max_mtu,
@@ -2849,37 +1968,6 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             write_user_struct(arg, &stats)?;
             Ok(0)
         }
-        SL_IOCTL_SUBSYS_STATS => {
-            let (dev_count, pending_count, runtime_count) = {
-                let guard = SUBSYSTEM.lock();
-                let s = guard.as_ref().ok_or(ENODEV)?;
-                {
-                    let runtimes = s.runtimes.iter().flatten().count() as u8;
-                    let devices = s.dev_registry.count() as u16;
-                    (devices, (devices - u16::from(runtimes)) as u8, runtimes)
-                }
-            };
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let stats = SleSubsysStats {
-                dev_count,
-                pending_count,
-                runtime_count,
-                active_connections: s.conn.active_count() as u16,
-                mgmt_pending: s.cmd_pending.pending_count,
-                total_conn_created: s.conn.total_created as u32,
-                total_conn_completed: s.conn.total_completed as u32,
-                total_mgmt_submitted: s.cmd_pending.total_submitted as u32,
-                total_mgmt_timeouts: s.cmd_pending.total_timeouts as u32,
-                power_state: 0xff, // Unknown: no hardware PM snapshot.
-                _pad: [0; 3],
-                power_transitions: 0, // Unavailable, not a measured zero.
-                crc_errors: sle_pdu::crc_error_count(),
-            };
-            drop(ss);
-            write_user_struct(arg, &stats)?;
-            Ok(0)
-        }
         SL_IOCTL_USB_DEV_COUNT => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         // No authenticated PHY transaction or confirmed hardware snapshot is
         // implemented. Local models must not impersonate controller state.
@@ -2891,32 +1979,8 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         | SL_IOCTL_PHY_SET_BW
         | SL_IOCTL_PHY_GET_SINR
         | SL_IOCTL_PHY_SET_SINR => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_SET_ROLE => {
-            let role_byte: u8 = read_user_struct(arg)?;
-            let role = match role_byte {
-                0 => GtRole::TNode,
-                1 => GtRole::GNode,
-                _ => return Err(EINVAL),
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            if s.conn.active_handles().1 > 0 {
-                dev_warn!(
-                    me.dev,
-                    "sparklink: cannot change role with active connections\n"
-                );
-                return Err(EBUSY);
-            }
-            s.local_role = role;
-            dev_info!(me.dev, "sparklink: local role set to {:?}\n", role);
-            Ok(0)
-        }
-        SL_IOCTL_GET_ROLE => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            write_user_struct(arg, &(s.local_role as u8))?;
-            Ok(0)
-        }
+        SL_IOCTL_SET_ROLE | SL_IOCTL_GET_ROLE
+            => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_RAL_ADD => {
             ioctl_ral_add(context, arg)?;
             Ok(0)
@@ -3100,6 +2164,63 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_PM_FORCE_ACTIVE | SL_IOCTL_PM_TICK | SL_IOCTL_PM_ACTIVITY) {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
+        // Unqualified legacy models are retired, even for privileged callers.
+        if matches!(cmd,
+            SL_IOCTL_AFH_CLASSIFY
+            | SL_IOCTL_AFH_GET_MAP
+            | SL_IOCTL_AFH_HOP_NEXT
+            | SL_IOCTL_AFH_REPORT_RETX
+            | SL_IOCTL_AFH_REPORT_RSSI
+            | SL_IOCTL_AFH_SET_MAP
+            | SL_IOCTL_CLEAR_SCAN_FILTER
+            | SL_IOCTL_CONNECT
+            | SL_IOCTL_CONN_COUNT
+            | SL_IOCTL_CONN_INFO
+            | SL_IOCTL_CONN_LIST
+            | SL_IOCTL_CONN_PHY_UPDATE
+            | SL_IOCTL_CONN_READ_PEER_FEATURES
+            | SL_IOCTL_CONN_READ_PEER_VERSION
+            | SL_IOCTL_CONN_RECV
+            | SL_IOCTL_CONN_SEND
+            | SL_IOCTL_CONN_UPDATE_PARAMS
+            | SL_IOCTL_DISCONNECT
+            | SL_IOCTL_EXT_ADV_CONFIGURE
+            | SL_IOCTL_EXT_ADV_DISABLE
+            | SL_IOCTL_EXT_ADV_ENABLE
+            | SL_IOCTL_EXT_ADV_ENABLE_EX
+            | SL_IOCTL_EXT_ADV_INFO
+            | SL_IOCTL_EXT_ADV_REMOVE
+            | SL_IOCTL_EXT_ADV_SET_DATA
+            | SL_IOCTL_EXT_ADV_SET_SCAN_RSP
+            | SL_IOCTL_EXT_ADV_TICK
+            | SL_IOCTL_GET_ROLE
+            | SL_IOCTL_INJECT_CONN_DATA
+            | SL_IOCTL_INJECT_CONN_RESP
+            | SL_IOCTL_SCAN_RESULT_COUNT
+            | SL_IOCTL_SEC_PAIR
+            | SL_IOCTL_SET_CONN_MTU
+            | SL_IOCTL_SET_ROLE
+            | SL_IOCTL_SET_SCAN_FILTER
+            | SL_IOCTL_START_ADV
+            | SL_IOCTL_START_SCAN
+            | SL_IOCTL_STOP_ADV
+            | SL_IOCTL_STOP_SCAN
+            | SL_IOCTL_SYNC_DATAPATH_CFG
+            | SL_IOCTL_SYNC_DATAPATH_REMOVE
+            | SL_IOCTL_SYNC_DATA_SEND
+            | SL_IOCTL_SYNC_INFO
+            | SL_IOCTL_SYNC_MCAST_ACCEPT
+            | SL_IOCTL_SYNC_MCAST_CREATE
+            | SL_IOCTL_SYNC_MCAST_PARAM
+            | SL_IOCTL_SYNC_MCAST_REJECT
+            | SL_IOCTL_SYNC_MCAST_REMOVE
+            | SL_IOCTL_SYNC_UCAST_ACCEPT
+            | SL_IOCTL_SYNC_UCAST_CREATE
+            | SL_IOCTL_SYNC_UCAST_PARAM
+            | SL_IOCTL_SYNC_UCAST_REJECT
+            | SL_IOCTL_SYNC_UCAST_REMOVE) {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
         // Per-fd device routing: DEV_SELECT and DEV_GET_ACTIVE are handled
         // before capturing a RuntimeContext so they can query/set affinity.
         match cmd {
@@ -3243,7 +2364,6 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_DLI_RESET
             | SL_IOCTL_DLI_SEND_CMD
             | SL_IOCTL_MGMT_STATS
-            | SL_IOCTL_SUBSYS_STATS
             | SL_IOCTL_USB_DEV_COUNT
             | SL_IOCTL_PHY_INFO
             | SL_IOCTL_PHY_SET_MCS

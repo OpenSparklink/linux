@@ -14,7 +14,7 @@ import tempfile
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
-    paths = [net / 'sle_phy.rs', net / 'sparklink_core.rs',
+    paths = [here / 'retired-protocol-state/sle_phy.rs', net / 'sparklink_core.rs',
              here / 'phy-model/legacy_model.rs', here / 'phy-model/model_tests.rs']
     contents = {str(p): p.read_bytes() for p in paths}
     core = (net / 'sparklink_core.rs').read_text()
@@ -26,7 +26,7 @@ def run(output):
     assert 'start_encrypt()' not in core
     with tempfile.TemporaryDirectory(prefix='sparklink-phy-model-') as temp:
         tmp = Path(temp)
-        (tmp / 'channel.rs').write_bytes(contents[str(net / 'sle_phy.rs')])
+        (tmp / 'channel.rs').write_bytes(contents[str(here / 'retired-protocol-state/sle_phy.rs')])
         for name in ['legacy_model.rs', 'model_tests.rs']:
             (tmp / name).write_bytes(contents[str(here / 'phy-model' / name)])
         rustc = os.environ.get('RUSTC', 'rustc')

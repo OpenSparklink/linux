@@ -15,6 +15,7 @@ TEST_GEN_PROGS_EXTENDED += sparklink_event_copy_test
 TEST_GEN_PROGS_EXTENDED += sparklink_diagnostic_result_test
 TEST_GEN_PROGS_EXTENDED += sparklink_setup_release_test
 TEST_GEN_PROGS_EXTENDED += genl_registry_test
+TEST_GEN_PROGS_EXTENDED += protocol_state_unsupported_test
 TEST_GEN_PROGS_EXTENDED += virtual_runtime_test
 
 TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containment.py

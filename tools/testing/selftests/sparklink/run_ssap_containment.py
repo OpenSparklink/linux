@@ -14,7 +14,7 @@ def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
     paths = [here / 'ssap/legacy_staging.rs', net / 'sparklink_core.rs', net / 'sle_workers.rs',
-             net / 'sle_conn.rs', net / 'sle_uapi.rs', net / 'sle_authorization.rs',
+             here / 'retired-protocol-state/sle_conn.rs', net / 'sle_uapi.rs', net / 'sle_authorization.rs',
              net.parents[1] / 'include/uapi/linux/sparklink_ioctl.h']
     inputs = {p.name: p.read_bytes() for p in paths}
     fixture = here / 'ssap'

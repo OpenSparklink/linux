@@ -17,8 +17,6 @@ struct InFlight {
     opcode: u16,
     seq: u32,
     cookie: u64,
-    enable: Option<bool>,
-    peer_addr: Option<[u8; 6]>,
     deadline: u64,
     recipe: Option<RecipeTag>,
     connection: Option<u32>,
@@ -30,10 +28,6 @@ struct InFlight {
 pub(crate) struct HostReply {
     pub(crate) seq: u32,
     pub(crate) event: SleEvent,
-    pub(crate) current_intent: bool,
-    pub(crate) enable: Option<bool>,
-    pub(crate) peer_addr: Option<[u8; 6]>,
-    pub(crate) recipe: Option<(DiscoveryIntent, RecipeReply)>,
 }
 
 /// Access only under the owner's IRQ-safe host lock. No I/O or allocation
@@ -578,24 +572,6 @@ impl CommandHost {
             opcode: request.opcode,
             seq: request.seq,
             cookie: request.cookie,
-            enable: if (request.opcode == SleOpcode::EnableBroadcast as u16
-                || request.opcode == SleOpcode::EnableScan as u16)
-                && request.param_len == 1
-                && request.params[0] <= 1
-            {
-                Some(request.params[0] == 1)
-            } else {
-                None
-            },
-            peer_addr: if request.opcode == SleOpcode::CreateConnection as u16
-                && request.param_len == 6
-            {
-                let mut addr = [0u8; 6];
-                addr.copy_from_slice(&request.params[..6]);
-                Some(addr)
-            } else {
-                None
-            },
             // SAFETY: reading the kernel clock does not dereference user memory.
             deadline: unsafe { kernel::bindings::jiffies_64 }
                 .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64)
@@ -800,10 +776,6 @@ impl CommandHost {
         Some(HostReply {
             seq: active.seq,
             event,
-            current_intent,
-            enable: active.enable,
-            peer_addr: active.peer_addr,
-            recipe,
         })
     }
 

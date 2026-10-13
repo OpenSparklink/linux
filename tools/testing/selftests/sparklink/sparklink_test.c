@@ -6145,44 +6145,11 @@ static void test_pm_state_transitions(int fd)
  * ------------------------------------------------------------------ */
 static void test_subsys_stats(int fd)
 {
-	test_header("Subsystem statistics observability");
-
-	/* First query dev_count for cross-reference */
-	int dev_count = ioctl(fd, SL_IOCTL_DEV_COUNT, NULL);
-
-	int ret;
-
-	struct sle_subsys_stats ss;
-
-	memset(&ss, 0, sizeof(ss));
-	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
-	check("SUBSYS_STATS", ret);
-	if (ret == 0) {
-		printf("  dev_count=%u pending=%u runtime=%u active_conn=%u\n",
-		       ss.dev_count, ss.pending_count, ss.runtime_count,
-		       ss.active_connections);
-		printf("  conn: created=%u completed=%u\n",
-		       ss.total_conn_created, ss.total_conn_completed);
-		printf("  mgmt: submitted=%u timeouts=%u pending=%u\n",
-		       ss.total_mgmt_submitted, ss.total_mgmt_timeouts,
-		       ss.mgmt_pending);
-		printf("  power: state=%u transitions=%u\n",
-		       ss.power_state, ss.power_transitions);
-
-		/* Cross-reference: dev_count should match */
-		if (dev_count > 0 && ss.dev_count == (uint16_t)dev_count)
-			printf("  OK:   dev_count matches DEV_COUNT ioctl\n");
-		else if (dev_count > 0)
-			printf("  WARN: dev_count mismatch: stats=%u ioctl=%d\n",
-			       ss.dev_count, dev_count);
-
-		/* total_conn_created >= total_conn_completed */
-		if (ss.total_conn_created >= ss.total_conn_completed)
-			printf("  OK:   created(%u) >= completed(%u)\n",
-			       ss.total_conn_created, ss.total_conn_completed);
-		else
-			printf("  WARN: created < completed\n");
-	}
+    unsigned char data[36], original[36];
+    memset(data, 0xa5, sizeof(data)); memcpy(original, data, sizeof(data));
+    unsigned long retired = _IOR(SL_MAGIC, 0x86, unsigned char[36]);
+    if (ioctl(fd, retired, data) != -1 || errno != ENOTTY || memcmp(data, original, sizeof(data)))
+        test_fail("  FAIL: retired mixed stats must be ENOTTY and unchanged\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -6971,12 +6938,7 @@ static void test_dli_reset_behavior(int fd)
 	check("DLI_RESET (second)", ret);
 	usleep(10000);
 
-	/* Verify manager operations still work after reset */
-	struct sle_subsys_stats ss;
-
-	memset(&ss, 0, sizeof(ss));
-	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
-	check("SUBSYS_STATS (post-reset)", ret);
+	test_subsys_stats(fd);
 }
 
 /* ------------------------------------------------------------------ *
@@ -7449,127 +7411,9 @@ static size_t build_raw_adv_pdu(uint8_t *buf, const uint8_t *payload,
 
 static void test_crc12_verification(int fd)
 {
-	test_header("CRC-12 receive-side verification");
-
-	int ok_count = 0, fail_count = 0;
-	int ret;
-	struct sle_subsys_stats ss;
-	struct sle_inject_raw_adv raw;
-
-	/* Start scanning so process_adv_pdu accepts PDUs */
-	struct sle_scan_params sp;
-
-	memset(&sp, 0, sizeof(sp));
-	sp.window_ms = 100;
-	sp.interval_ms = 200;
-	sp.filter_discovery_level = 0;
-	ret = ioctl(fd, SL_IOCTL_START_SCAN, &sp);
-	if (ret < 0) {
-		test_fail("  FAIL: START_SCAN failed: %s\n", strerror(errno));
-		return;
-	}
-
-	/* Read initial CRC error count */
-	memset(&ss, 0, sizeof(ss));
-	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
-	uint32_t initial_crc_errors = 0;
-
-	if (ret == 0)
-		initial_crc_errors = ss.crc_errors;
-
-	/* Step 1: Inject raw ADV PDU with valid CRC — should succeed */
-	uint8_t payload[] = { 0x01, 0x01, 0x02 }; /* DiscoveryLevel TLV */
-
-	memset(&raw, 0, sizeof(raw));
-	raw.rssi = -40;
-	raw.pdu_len = (uint16_t)build_raw_adv_pdu(raw.pdu_data, payload,
-						    sizeof(payload), 0);
-	ret = ioctl(fd, SL_IOCTL_INJECT_RAW_ADV, &raw);
-	if (ret == 0) {
-		printf("  OK:   raw ADV with valid CRC accepted\n");
-		ok_count++;
-	} else {
-		test_fail("  FAIL: raw ADV with valid CRC rejected: %s\n",
-		       strerror(errno));
-		fail_count++;
-	}
-
-	/* Step 2: Inject raw ADV PDU with corrupted CRC — should fail with EILSEQ */
-	memset(&raw, 0, sizeof(raw));
-	raw.rssi = -40;
-	raw.pdu_len = (uint16_t)build_raw_adv_pdu(raw.pdu_data, payload,
-						    sizeof(payload), 1);
-	ret = ioctl(fd, SL_IOCTL_INJECT_RAW_ADV, &raw);
-	if (ret < 0 && errno == EINVAL) {
-		printf("  OK:   raw ADV with bad CRC rejected (EINVAL)\n");
-		ok_count++;
-	} else {
-		test_fail("  FAIL: expected EINVAL for bad CRC, got ret=%d errno=%d\n",
-		       ret, errno);
-		fail_count++;
-	}
-
-	/* Step 3: CRC error counter incremented */
-	memset(&ss, 0, sizeof(ss));
-	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
-	if (ret == 0 && ss.crc_errors >= initial_crc_errors + 1) {
-		printf("  OK:   crc_errors incremented: %u -> %u\n",
-		       initial_crc_errors, ss.crc_errors);
-		ok_count++;
-	} else {
-		test_fail("  FAIL: crc_errors not incremented (initial=%u, now=%u)\n",
-		       initial_crc_errors, ret == 0 ? ss.crc_errors : 0);
-		fail_count++;
-	}
-
-	/* Step 4: Inject another bad CRC and verify counter increments again */
-	uint8_t payload2[] = { 0x01, 0x01, 0x03, 0x02, 0x02, 0x07, 0x00 };
-
-	memset(&raw, 0, sizeof(raw));
-	raw.rssi = -55;
-	raw.pdu_len = (uint16_t)build_raw_adv_pdu(raw.pdu_data, payload2,
-						    sizeof(payload2), 1);
-	ret = ioctl(fd, SL_IOCTL_INJECT_RAW_ADV, &raw);
-	if (ret < 0 && errno == EINVAL) {
-		printf("  OK:   second bad CRC also rejected\n");
-		ok_count++;
-	} else {
-		test_fail("  FAIL: second bad CRC not rejected\n");
-		fail_count++;
-	}
-
-	memset(&ss, 0, sizeof(ss));
-	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
-	if (ret == 0 && ss.crc_errors >= initial_crc_errors + 2) {
-		printf("  OK:   crc_errors=%u after two bad PDUs\n", ss.crc_errors);
-		ok_count++;
-	} else {
-		test_fail("  FAIL: crc_errors=%u expected >=%u\n",
-		       ret == 0 ? ss.crc_errors : 0, initial_crc_errors + 2);
-		fail_count++;
-	}
-
-	/* Step 5: Valid CRC does not increment error counter */
-	uint32_t before = ss.crc_errors;
-
-	memset(&raw, 0, sizeof(raw));
-	raw.rssi = -30;
-	raw.pdu_len = (uint16_t)build_raw_adv_pdu(raw.pdu_data, payload2,
-						    sizeof(payload2), 0);
-	ret = ioctl(fd, SL_IOCTL_INJECT_RAW_ADV, &raw);
-	memset(&ss, 0, sizeof(ss));
-	ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
-	if (ret == 0 && ss.crc_errors == before) {
-		printf("  OK:   valid CRC does not increment error counter\n");
-		ok_count++;
-	} else {
-		test_fail("  FAIL: crc_errors changed on valid PDU (%u -> %u)\n",
-		       before, ss.crc_errors);
-		fail_count++;
-	}
-
-	ioctl(fd, SL_IOCTL_STOP_SCAN, NULL);
-	printf("  CRC-12 verification: %d OK, %d FAIL\n", ok_count, fail_count);
+    unsigned char data[264] = {0};
+    if (ioctl(fd, SL_IOCTL_INJECT_RAW_ADV, data) != -1 || errno != EOPNOTSUPP)
+        test_fail("  FAIL: production raw injection must be unsupported\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -10773,7 +10617,6 @@ static void test_ioctl_fuzz(int fd)
 		SL_IOCTL_DLI_INFO,      SL_IOCTL_USB_DEV_COUNT,
 		SL_IOCTL_DLI_POLL_EVENT, SL_IOCTL_DLI_RESET,
 		/* Stats */
-		SL_IOCTL_SUBSYS_STATS,
 		/* PHY */
 		SL_IOCTL_PHY_INFO,      SL_IOCTL_PHY_SET_MCS,
 		SL_IOCTL_PHY_SET_TXPOWER, SL_IOCTL_PHY_MCS_SELECT,

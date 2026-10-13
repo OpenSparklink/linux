@@ -1,0 +1,18 @@
+            enable: if (request.opcode == SleOpcode::EnableBroadcast as u16
+                || request.opcode == SleOpcode::EnableScan as u16)
+                && request.param_len == 1
+                && request.params[0] <= 1
+            {
+                Some(request.params[0] == 1)
+            } else {
+                None
+            },
+            peer_addr: if request.opcode == SleOpcode::CreateConnection as u16
+                && request.param_len == 6
+            {
+                let mut addr = [0u8; 6];
+                addr.copy_from_slice(&request.params[..6]);
+                Some(addr)
+            } else {
+                None
+            },

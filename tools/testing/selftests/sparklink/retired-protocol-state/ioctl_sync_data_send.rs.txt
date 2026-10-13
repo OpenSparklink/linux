@@ -1,0 +1,27 @@
+fn ioctl_sync_data_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
+    let cmd = read_user_struct::<SleSyncDataCmd>(arg)?;
+    let len = (cmd.len as usize).min(247);
+    let ss = context.lock()?;
+    let s = ss.as_ref().ok_or(ENODEV)?;
+    let link = s.conn.sync_link_info(cmd.sync_handle)?;
+    if link.state != sle_conn::SyncLinkState::Active {
+        return Err(EPIPE);
+    }
+    if !link.datapath_configured {
+        return Err(EINVAL);
+    }
+    let seg = match cmd.segment {
+        0 => sle_conn::SyncSegment::Complete,
+        1 => sle_conn::SyncSegment::First,
+        2 => sle_conn::SyncSegment::Middle,
+        _ => sle_conn::SyncSegment::Last,
+    };
+    let hdr = sle_conn::encode_sync_data_header(
+        cmd.sync_handle, seg, false, cmd.priority != 0,
+        len as u16);
+    let mut tx_buf = [0u8; 4 + 247];
+    tx_buf[..4].copy_from_slice(&hdr);
+    tx_buf[4..4 + len].copy_from_slice(&cmd.data[..len]);
+    s.controller.send_data(cmd.sync_handle, &tx_buf[..4 + len])?;
+    Ok(len as isize)
+}

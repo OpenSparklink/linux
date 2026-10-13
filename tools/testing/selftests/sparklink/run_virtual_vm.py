@@ -35,6 +35,7 @@ def run(args):
               'scope': 'Empty-USB KVM, actual test provider + Core/Host; no RF/data/recovery proof',
               'module_info': info, 'source_sha256': sha(here / 'virtual_runtime_test.c'),
               'registry_probe_sha256': sha(here / 'genl_registry_test.c'),
+              'protocol_state_probe_sha256': sha(here / 'protocol_state_unsupported_test.c'),
               'inputs': {name: sha(path) for name, path in paths.items() if path.is_file()}}
     manifest = out / 'manifest.json'
 
@@ -108,6 +109,7 @@ busybox poweroff -f
         if (result.returncode or log.count('VIRTUAL_RUNTIME_PASS:') != 2
                 or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
                 or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
+                or log.count('PROTOCOL_STATE_REFUSAL_PASS:') != 4
                 or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
                 or log.count('VIRTUAL_GLOBAL_POWER_POLICY_PASS:') != 2
                 or log.count('GENL_REGISTRY_PASS:') != 10
@@ -121,6 +123,7 @@ busybox poweroff -f
             raise RuntimeError('input changed during VM')
         record.update(status='PASS_VIRTUAL_CORE_HOST_VM', module_rounds=2,
                       registry_results=[line for line in log.splitlines() if 'GENL_REGISTRY_PASS:' in line],
+                      protocol_state_results=[line for line in log.splitlines() if 'PROTOCOL_STATE_REFUSAL_PASS:' in line],
                       power_results=[line for line in log.splitlines() if 'VIRTUAL_POWER_' in line or 'VIRTUAL_GLOBAL_POWER_' in line],
                       query_results=[line for line in log.splitlines() if 'VIRTUAL_RUNTIME_PASS:' in line],
                       diagnostic_fd_results=[line for line in log.splitlines()

@@ -71,7 +71,6 @@ impl CheckReserved for i16 {}
 
 /// Maximum name length in SleInjectAdv / SleAdvParams.
 /// Maximum advertising/scan data payload.
-pub(crate) const ADV_DATA_MAX: usize = 252;
 /// Maximum DLI command parameter length.
 pub(crate) const DLI_PARAM_MAX: usize = 240;
 
@@ -401,7 +400,6 @@ pub(crate) const SL_IOCTL_DLI_SEND_CMD: u32 = _IOWR::<SleDliCmd>(SL_MAGIC, 0x84)
 pub(crate) const SL_IOCTL_MGMT_STATS: u32 = _IOR::<SleMgmtStats>(SL_MAGIC, 0x85);
 
 /// Get unified subsystem statistics (admin observability).
-pub(crate) const SL_IOCTL_SUBSYS_STATS: u32 = _IOR::<SleSubsysStats>(SL_MAGIC, 0x86);
 
 // --- PHY layer ioctls ---
 
@@ -1567,37 +1565,7 @@ unsafe impl FromBytes for SleMgmtStats {}
 /// from the management plane, connection manager, power manager,
 /// device registry, and transport framework into a single read.
 #[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub(crate) struct SleSubsysStats {
-    /// Number of registered devices in the SleDev registry.
-    pub dev_count: u16,
-    /// Reserved identities without an installed Runtime; not Ready count.
-    pub pending_count: u8,
-    /// Installed Runtime objects, including Setup/faulted; not Ready count.
-    pub runtime_count: u8,
-    /// Active connections.
-    pub active_connections: u16,
-    /// Management plane pending commands.
-    pub mgmt_pending: u16,
-    /// Total connections created (lifetime).
-    pub total_conn_created: u32,
-    /// Total connections completed (lifetime).
-    pub total_conn_completed: u32,
-    /// Total management commands submitted (lifetime).
-    pub total_mgmt_submitted: u32,
-    /// Total management command timeouts.
-    pub total_mgmt_timeouts: u32,
-    /// Power state (0=Active, 1=Sniff, 2=Idle, 3=Suspended).
-    pub power_state: u8,
-    pub(crate) _pad: [u8; 3],
-    /// Power state transitions.
-    pub power_transitions: u32,
-    /// CRC-12 verification failures (advertising PDUs).
-    pub crc_errors: u32,
-}
 
-// SAFETY: SleSubsysStats is repr(C) with only primitive fields.
-unsafe impl FromBytes for SleSubsysStats {}
 
 
 // ---------------------------------------------------------------------------
@@ -1939,7 +1907,6 @@ impl_check_reserved!(SlePmInfo, [_pad, _reserved]);
 impl_check_reserved!(SlePmStateCmd, [_reserved]);
 impl_check_reserved!(SleDliInfo, [_pad, _reserved]);
 impl_check_reserved!(SleMgmtStats, [_pad]);
-impl_check_reserved!(SleSubsysStats, [_pad]);
 impl_check_reserved!(SlePhyInfo, [_pad, _reserved]);
 impl_check_reserved!(SlePhyMcsCmd, [_reserved]);
 impl_check_reserved!(SlePhyTxPowerCmd, [_reserved]);

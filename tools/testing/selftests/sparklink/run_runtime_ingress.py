@@ -19,7 +19,7 @@ def run(output):
     inputs = {path: path.read_text() for path in paths}
     source = inputs[paths[0]]
     names = ['publish_runtime', 'unpublish_runtime', 'ingress_owner', 'drain_runtime_events',
-             'drain_events_for', 'take_dropped_stats', 'enqueue_rx', 'enqueue_command']
+             'take_dropped_stats', 'enqueue_rx', 'enqueue_command']
     bodies = '\n'.join(function(source, name) for name in names)
     identity = re.search(r'pub\(crate\) struct DeviceIdentity \{[^}]+\}', inputs[paths[2]]).group()
     stats = re.search(r'pub\(crate\) struct RxDropStats \{[^}]+\}', source).group()

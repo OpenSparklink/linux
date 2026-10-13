@@ -43,7 +43,6 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_SEC_SM4_BLOCK_TEST
         | SL_IOCTL_SEC_SM4_DEC_TEST
         | SL_IOCTL_SEC_SM4_ENC_TEST
-        | SL_IOCTL_SUBSYS_STATS
         | SL_IOCTL_SYNC_INFO
         | SL_IOCTL_USB_DEV_COUNT => Ok(Access::Observe),
         SL_IOCTL_DIAGNOSTIC_SUBMIT

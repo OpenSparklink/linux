@@ -8,4 +8,6 @@ def source_path(net, name):
         return net.parents[1]/'drivers/sparklink/standard_usb.c'
     if name == 'sle_usb.rs':
         return net/'sle_standard_dli.rs'
+    if name in {'sle_conn.rs','sle_phy.rs'}:
+        return net.parents[1]/'tools/testing/selftests/sparklink/retired-protocol-state'/name
     return net/name

@@ -1,0 +1,36 @@
+    // A disable or superseded enable response must not confirm a newer
+    // pending start that happens to use the same DLI opcode.
+    // Failure of an older disable barrier must also abort a newer pending
+    // start whose parameters cannot safely follow that failed disable.
+    let barrier_failed = reply.recipe.is_some_and(|(intent, outcome)|
+        !intent.enabled() && outcome == super::sle_command_plan::RecipeReply::Failed);
+    if reply.current_intent || barrier_failed {
+        if let Some((intent, outcome)) = reply.recipe {
+            use super::sle_command_plan::{DiscoveryIntent, RecipeReply};
+            match (intent, outcome) {
+                (DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby, RecipeReply::Failed) => state.adv_scan.abort_advertising(),
+                (DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby, RecipeReply::Failed) => state.adv_scan.abort_scanning(),
+                (DiscoveryIntent::Advertising(true), RecipeReply::Finished) => state.adv_scan.confirm_advertising(),
+                (DiscoveryIntent::Scanning(true), RecipeReply::Finished) => state.adv_scan.confirm_scanning(),
+                _ => {}
+            }
+        } else if let sle_dli::SleEvent::CommandComplete { opcode, status, .. } = &reply.event {
+            match opcode {
+                sle_dli::SleOpcode::EnableBroadcast => {
+                    if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
+                        state.adv_scan.confirm_advertising();
+                    } else if *status != sle_dli::SleStatus::Success {
+                        state.adv_scan.abort_advertising();
+                    }
+                }
+                sle_dli::SleOpcode::EnableScan => {
+                    if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
+                        state.adv_scan.confirm_scanning();
+                    } else if *status != sle_dli::SleStatus::Success {
+                        state.adv_scan.abort_scanning();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }

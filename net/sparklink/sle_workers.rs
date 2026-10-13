@@ -11,9 +11,7 @@ use kernel::time::msecs_to_jiffies;
 use kernel::workqueue::{self, impl_has_delayed_work, DelayedWork, WorkItem};
 use pin_init::init_array_from_fn;
 
-use super::sle_conn;
 use super::sle_dli;
-use super::sle_dli::SleController;
 use super::sle_uapi::*;
 use super::sle_ingress;
 use super::{ControllerRuntime, ControllerState};
@@ -97,9 +95,7 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
             if *status != sle_dli::SleStatus::Success =>
         {
             state.cmd_pending.resolve_seq(reply.seq, *status as u8, &[]);
-            if let Some(addr) = reply.peer_addr {
-                state.conn.abort_controller_connect(&addr);
-            }
+
         }
         sle_dli::SleEvent::NativeCommandReply { status, complete, data, .. }
             if *complete || *status != 0 =>
@@ -107,42 +103,6 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
             state.cmd_pending.resolve_seq(reply.seq, *status, data.as_slice());
         }
         _ => {} // Successful Status awaits a domain-specific terminal event.
-    }
-    // A disable or superseded enable response must not confirm a newer
-    // pending start that happens to use the same DLI opcode.
-    // Failure of an older disable barrier must also abort a newer pending
-    // start whose parameters cannot safely follow that failed disable.
-    let barrier_failed = reply.recipe.is_some_and(|(intent, outcome)|
-        !intent.enabled() && outcome == super::sle_command_plan::RecipeReply::Failed);
-    if reply.current_intent || barrier_failed {
-        if let Some((intent, outcome)) = reply.recipe {
-            use super::sle_command_plan::{DiscoveryIntent, RecipeReply};
-            match (intent, outcome) {
-                (DiscoveryIntent::Advertising(_) | DiscoveryIntent::AdvertisingStandby, RecipeReply::Failed) => state.adv_scan.abort_advertising(),
-                (DiscoveryIntent::Scanning(_) | DiscoveryIntent::ScanningStandby, RecipeReply::Failed) => state.adv_scan.abort_scanning(),
-                (DiscoveryIntent::Advertising(true), RecipeReply::Finished) => state.adv_scan.confirm_advertising(),
-                (DiscoveryIntent::Scanning(true), RecipeReply::Finished) => state.adv_scan.confirm_scanning(),
-                _ => {}
-            }
-        } else if let sle_dli::SleEvent::CommandComplete { opcode, status, .. } = &reply.event {
-            match opcode {
-                sle_dli::SleOpcode::EnableBroadcast => {
-                    if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
-                        state.adv_scan.confirm_advertising();
-                    } else if *status != sle_dli::SleStatus::Success {
-                        state.adv_scan.abort_advertising();
-                    }
-                }
-                sle_dli::SleOpcode::EnableScan => {
-                    if reply.enable == Some(true) && *status == sle_dli::SleStatus::Success {
-                        state.adv_scan.confirm_scanning();
-                    } else if *status != sle_dli::SleStatus::Success {
-                        state.adv_scan.abort_scanning();
-                    }
-                }
-                _ => {}
-            }
-        }
     }
     process_controller_event(state, &reply.event);
     owner.kick_commands();
@@ -157,8 +117,6 @@ fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error:
     while let Some(request) = host.cancel_next() {
         state.cmd_pending.fail_seq(request.seq, error.to_errno());
     }
-    state.adv_scan.abort_advertising();
-    state.adv_scan.abort_scanning();
 }
 
 
@@ -203,128 +161,9 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
         }
     }
 
-    // 2. Drive pending state machine transitions (DLI async confirmation).
+    // Legacy connection/discovery/DTAP/sync projections are retired.
+    // Native Host and Session own the actual physical and data state.
     match ev {
-        sle_dli::SleEvent::CommandComplete { opcode, status, .. }
-            if !shared.controller.uses_command_host() =>
-        {
-            match opcode {
-                sle_dli::SleOpcode::EnableBroadcast => {
-                    if *status == sle_dli::SleStatus::Success {
-                        shared.adv_scan.confirm_advertising();
-                    } else {
-                        shared.adv_scan.abort_advertising();
-                    }
-                }
-                sle_dli::SleOpcode::EnableScan => {
-                    if *status == sle_dli::SleStatus::Success {
-                        shared.adv_scan.confirm_scanning();
-                    } else {
-                        shared.adv_scan.abort_scanning();
-                    }
-                }
-                _ => {}
-            }
-        }
-        sle_dli::SleEvent::ConnComplete {
-            handle: evt_handle,
-            addr,
-            status,
-        } => {
-            if *status == sle_dli::SleStatus::Success {
-                if let Some((host_handle, disconnect_pending)) =
-                    shared.conn.record_controller_handle(addr, *evt_handle)
-                {
-                    if disconnect_pending {
-                        if shared.controller.disconnect(*evt_handle).is_err() {
-                            shared.conn.abort_disconnecting(host_handle);
-                        }
-                    }
-                } else if !shared.conn.has_addr(addr) {
-                    // Incoming connection — no prior ConnectPending entry
-                    // and no existing entry for this address.
-                    let _ = shared.conn.accept_incoming(*evt_handle, addr);
-                }
-            } else {
-                shared.conn.abort_controller_connect(addr);
-            }
-        }
-        sle_dli::SleEvent::Disconnected { handle, .. } => {
-            let host_handle = shared.conn.host_handle(*handle).unwrap_or(*handle);
-            shared.conn.confirm_disconnecting_by_handle(host_handle);
-        }
-        sle_dli::SleEvent::AdvReport {
-            addr,
-            rssi,
-            discovery_level,
-            data,
-        } => {
-            let _ =
-                shared
-                    .adv_scan
-                    .process_adv_report(addr, *rssi, *discovery_level, data.as_slice());
-        }
-        sle_dli::SleEvent::DataReceived { handle, data } => {
-            let raw = data.as_slice();
-            if raw.is_empty() {
-                // Empty payload, nothing to route.
-            } else if u16::from(raw[0]) == sle_conn::tcid::MANAGEMENT
-                && raw.len() >= sle_conn::CREDIT_GRANT_PDU_SIZE
-                && raw[1] == sle_conn::CREDIT_GRANT_PDU_TYPE
-            {
-                // Credit grant signaling on management channel (T/XS 20002-2025 §7.3.3).
-                // Format: [TCID 0x02] [code 0xFC] [identifier] [length LE16] [target_tcid] [credits LE16]
-                let target_tcid = u16::from(raw[5]);
-                let credits = u16::from_le_bytes([raw[6], raw[7]]);
-                let _ = shared.conn.receive_credits(*handle, target_tcid, credits);
-            } else if u16::from(raw[0]) == sle_conn::tcid::MANAGEMENT
-                && raw.len() >= 5
-                && raw[1] != sle_conn::CREDIT_GRANT_PDU_TYPE
-            {
-                // Transport control signaling on management channel (T/XS 20002-2025 §7.3.4).
-                let sig_data = &raw[1..];
-                let mut resp_buf = [0u8; 32];
-                let resp_len = shared
-                    .conn
-                    .handle_transport_signaling(*handle, sig_data, &mut resp_buf)
-                    .unwrap_or(0);
-                if resp_len > 0 {
-                    let _ = shared.controller.send_data(*handle, &resp_buf[..resp_len]);
-                }
-            } else if u16::from(raw[0]) == sle_conn::tcid::SERVICE_MGMT {
-                // No standard SSAP Engine/PDU owner is registered. Reject this
-                // channel without parsing, ACKing, consuming credit or draining
-                // notifications belonging to another peer.
-                return;
-            } else {
-                // Unqualified dynamic reliable input has no production consumer.
-                let first_byte_tcid = u16::from(raw[0]);
-                let is_dynamic_reliable = raw.len() > 1
-                    && shared
-                        .conn
-                        .dynamic_reliable_tcid(*handle)
-                        .map(|t| t == first_byte_tcid)
-                        .unwrap_or(false);
-                if is_dynamic_reliable {
-                    // Dynamic reliable-channel processing is not qualified.
-                    return;
-                } else {
-                    // User data — strip TCID prefix if present, enqueue to rx_queue.
-                    let tcid = if u16::from(raw[0]) == sle_conn::tcid::DEFAULT_DATA && raw.len() > 1
-                    {
-                        let _ = shared
-                            .conn
-                            .consume_rx_credit(*handle, sle_conn::tcid::DEFAULT_DATA);
-                        sle_conn::tcid::DEFAULT_DATA
-                    } else {
-                        0 // Legacy data without TCID prefix.
-                    };
-                    let payload = if tcid != 0 { &raw[1..] } else { raw };
-                    let seq = shared.conn.info(*handle).map(|e| e.seq.rx_seq).unwrap_or(0);
-                    let _ = shared.conn.receive_data(*handle, payload, seq);
-                }
-            }
-        }
         // -----------------------------------------------------------------
         // Pairing events — drive the security state machine and
         // send response commands back to the controller.
@@ -391,47 +230,7 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
             shared.security.on_pair_failure(*handle, *reason);
         }
         // -----------------------------------------------------------------
-        // Sync link setup events — update ConnManager state machine.
-        // -----------------------------------------------------------------
-        sle_dli::SleEvent::SyncUcastSetupRequest {
-            async_handle,
-            sync_handle,
-            event_group_set_id,
-            event_group_id,
-        } => {
-            let _ = shared.conn.handle_sync_ucast_setup_request(
-                *async_handle,
-                *sync_handle,
-                *event_group_set_id,
-                *event_group_id,
-            );
-        }
-        sle_dli::SleEvent::SyncUcastSetupComplete {
-            sync_handle,
-            status,
-            ..
-        } => {
-            let _ = shared
-                .conn
-                .handle_sync_ucast_setup_complete(*sync_handle, *status);
-        }
-        sle_dli::SleEvent::SyncMcastSetupRequest {
-            async_handle,
-            sync_handle,
-        } => {
-            let _ = shared
-                .conn
-                .handle_sync_mcast_setup_request(*async_handle, *sync_handle);
-        }
-        sle_dli::SleEvent::SyncMcastSetupComplete {
-            sync_handle,
-            status,
-            ..
-        } => {
-            let _ = shared
-                .conn
-                .handle_sync_mcast_setup_complete(*sync_handle, *status);
-        }
+
         _ => {}
     }
 
@@ -441,51 +240,7 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
 ///
 /// Drain the selected owner's reserved Host replies and bounded ingress.
 /// Bus callbacks publish real events; this helper does not generate replies.
-pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
-    let mut tagged = match new_event_batch() {
-        Ok(batch) => batch,
-        Err(_) => {
-            // Leave attributed events queued for the owner worker.
-            pr_err!("sparklink: cannot allocate inline RX staging\n");
-            return;
-        }
-    };
-    // Multiple rounds: each round may generate new DLI commands whose
-    // responses arrive in a subsequent round. Limit total iterations
-    // to bound lock hold time on the ioctl path.
-    let mut total = 0u32;
-    for _round in 0..4 {
-        let mut drained_this_round = 0u32;
 
-        if let Some(owner) = sle_ingress::ingress_owner(shared.identity) {
-            if process_host_reply(&owner, shared) {
-                drained_this_round += 1;
-                total += 1;
-            }
-        }
-
-        // 2. This registration's bounded ingress (exact identity).
-        // Do not dequeue more events than this invocation can process.
-        let count =
-            sle_ingress::drain_events_for(shared.identity, &mut tagged[..(32 - total) as usize]);
-        for item in tagged.iter_mut().take(count) {
-            let (dev_id, ev_opt) = core::mem::take(item);
-            if let Some(ev) = ev_opt {
-                debug_assert_eq!(dev_id, Some(shared.identity.id));
-                process_controller_event(shared, &ev);
-                drained_this_round += 1;
-                total += 1;
-                if total >= 32 {
-                    return;
-                }
-            }
-        }
-
-        if drained_this_round == 0 {
-            break;
-        }
-    }
-}
 
 impl ControllerRuntime {
     pub(crate) fn start_workers(self: &Arc<Self>) {

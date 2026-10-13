@@ -13,6 +13,8 @@
 #include <grp.h>
 #define GENL_REGISTRY_EMBEDDED
 #include "genl_registry_test.c"
+#define PROTOCOL_STATE_EMBEDDED
+#include "protocol_state_unsupported_test.c"
 #include <time.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
@@ -270,6 +272,7 @@ int main(void)
 	struct controller a = create(), b = create();
 	CHECK(a.status.id != b.status.id && a.status.generation != b.status.generation);
 	CHECK(!registry_probe(2));
+	CHECK(!protocol_state_probe(a.fd));
 	rejected_power(a.fd, 0);
 	int policy = open("/sys/kernel/config/sparklink/power_mode", O_RDWR);
 	CHECK(policy >= 0);
@@ -281,6 +284,7 @@ int main(void)
 	pid_t observer = fork(); CHECK(observer >= 0);
 	if (!observer) {
 		CHECK(!setgroups(0, NULL) && !setgid(1000) && !setuid(1000));
+		CHECK(!protocol_state_probe(a.fd));
 		rejected_power(a.fd, 1);
 		int result = registry_probe(2); fflush(stdout); _exit(result);
 	}

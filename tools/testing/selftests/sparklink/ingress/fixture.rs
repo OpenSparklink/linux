@@ -69,8 +69,8 @@ mod actual {
   a.ingress.lock().entries.push_back((Some(0),SleEvent::Packet(11)));b.ingress.lock().entries.push_back((Some(1),SleEvent::Packet(22)));
   a.dropped_decode.store(7,Ordering::Relaxed);b.dropped_decode.store(9,Ordering::Relaxed);a.dropped_commands.store(2,Ordering::Relaxed);a.dropped_mac.store(3,Ordering::Relaxed);a.ingress.lock().dropped=4;
   let drops=take_dropped_stats(&a);assert_eq!((drops.ring,drops.command_complete,drops.mac_complete,drops.decode),(4,2,3,7));assert_eq!(take_dropped_stats(&a).decode,0);assert_eq!(take_dropped_stats(&b).decode,9);
-  let mut out=[(None,None)];assert_eq!(drain_events_for(a.identity,&mut out),1);assert_eq!(out[0],(Some(0),Some(SleEvent::Packet(11))));
-  let mut out=[(None,None)];assert_eq!(drain_events_for(b.identity,&mut out),1);assert_eq!(out[0],(Some(1),Some(SleEvent::Packet(22))));
+  let mut out=[(None,None)];assert_eq!(drain_runtime_events(&a,&mut out),1);assert_eq!(out[0],(Some(0),Some(SleEvent::Packet(11))));
+  let mut out=[(None,None)];assert_eq!(drain_runtime_events(&b,&mut out),1);assert_eq!(out[0],(Some(1),Some(SleEvent::Packet(22))));
  }
  #[test] fn competing_publication_has_one_winner_and_preserves_its_owner(){
   clear();let a=owner(0,1);let b=owner(0,2);let barrier=Arc::new(Barrier::new(3));

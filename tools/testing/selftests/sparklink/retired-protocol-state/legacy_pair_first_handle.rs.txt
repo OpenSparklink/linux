@@ -1,0 +1,19 @@
+        SL_IOCTL_SEC_PAIR => {
+            let params: SlePairParams = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            match params.method {
+                1 => s.security.pair_just_works()?,
+                2 => s.security.pair_psk()?,
+                3 => s.security.pair_numeric_comparison()?,
+                4 => s.security.pair_passkey_entry()?,
+                5 => s.security.pair_oob()?,
+                6 => s.security.pair_password()?,
+                _ => return Err(EINVAL),
+            }
+            let handle = s.conn.first_active_handle().unwrap_or(0);
+            let auth_req: u8 = if params.method == 3 { 0x04 } else { 0x00 };
+            s.controller.request_pair(handle, auth_req, params.method)?;
+            drain_controller_events(s);
+            Ok(0)
+        }

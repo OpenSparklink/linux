@@ -648,21 +648,7 @@ struct sle_sinr_thresholds {
 
 /* --- Subsystem statistics ----------------------------------------------- */
 
-struct sle_subsys_stats {
-	__u16 dev_count;
-	__u8  pending_count;
-	__u8  runtime_count;
-	__u16 active_connections;
-	__u16 mgmt_pending;
-	__u32 total_conn_created;
-	__u32 total_conn_completed;
-	__u32 total_mgmt_submitted;
-	__u32 total_mgmt_timeouts;
-	__u8  power_state; /* 0xff: unavailable; not a hardware snapshot. */
-	__u8  _pad2[3];
-	__u32 power_transitions;
-	__u32 crc_errors;
-};
+
 
 /* --- Event wire format -------------------------------------------------- */
 
@@ -856,7 +842,6 @@ struct sle_controller_event_query {
 
 /* --- Subsystem statistics ----------------------------------------------- */
 
-#define SL_IOCTL_SUBSYS_STATS		_IOR(SL_MAGIC, 0x86, struct sle_subsys_stats)
 /* Versioned, per-fd-bound typed controller discovery operations.
  * Select a device first. Result request_id=0/generation=0 probes identity and
  * radio state. Submit requires the returned generation and a caller-chosen

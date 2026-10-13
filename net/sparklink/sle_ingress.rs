@@ -77,12 +77,7 @@ pub(crate) fn drain_runtime_events(
 }
 
 /// Inline draining never removes events belonging to another device.
-pub(crate) fn drain_events_for(
-    identity: super::sle_dev::DeviceIdentity,
-    out: &mut [(Option<u16>, Option<SleEvent>)],
-) -> usize {
-    ingress_owner(identity).map_or(0, |owner| drain_runtime_events(&owner, out))
-}
+
 
 pub(crate) struct RxDropStats {
     pub(crate) ring: u32,
