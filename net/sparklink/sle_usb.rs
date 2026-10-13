@@ -864,7 +864,7 @@ impl UsbController {
         if ret != 0 { return Err(if ret < 0 { Error::from_errno(ret) } else { EIO }); }
         // The caller's identity query must refer to this same observation.
         if metadata.address != addr || metadata.command_credits != credits ||
-            u32::from_le_bytes(metadata.version[..4].try_into().unwrap()) != fw_version { return Err(EPROTO); }
+            u32::from_le_bytes(metadata.version[..4].try_into().unwrap()) != fw_version { return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32))); }
         Ok(Self { metadata, device, identity })
     }
 

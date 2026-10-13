@@ -27,6 +27,7 @@ impl UsbDevice { fn as_raw(&self)->*mut UsbDeviceOpaque { std::ptr::null_mut() }
 impl Error { fn from_errno(n:i32)->Self { Self(n) } }
 type Result<T> = std::result::Result<T,Error>;
 const EIO:Error=Error(-5);const EPROTO:Error=Error(-71);
+mod kernel { pub(crate) mod bindings { pub(crate) const EPROTO:i32=71; } }
 static INPUT:std::sync::Mutex<(i32,UsbMetadata)>=std::sync::Mutex::new((0,UsbMetadata{capabilities:UsbCapabilities{command_max:255,acb_length:0,icb_length:0,acb_count:0,icb_count:0,features:[0;10]},version:[0;5],address:[0;6],command_credits:0}));
 unsafe fn sle_usb_dev_get_metadata(_: *mut UsbDeviceOpaque,output:*mut UsbMetadata)->i32 { let input=INPUT.lock().unwrap();if input.0==0 { unsafe{*output=input.1;} }input.0 }
 // @@SNAPSHOT_TYPE@@
