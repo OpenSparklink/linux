@@ -19,8 +19,6 @@
 //!   BLK  Bulk IN      0x92 Async data from controller
 //!   BLK  Bulk OUT     0x12 Async data and commands to controller
 
-#![allow(dead_code, unreachable_pub)]
-
 use kernel::alloc::KVec;
 use kernel::device;
 use kernel::prelude::*;
@@ -29,7 +27,7 @@ use kernel::usb;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::sle_dli::{
-    DliPacketType, SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode, SleStatus,
+    SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode, SleStatus,
 };
 use super::sle_dev::DeviceIdentity;
 
@@ -38,15 +36,6 @@ use super::sle_ingress::{enqueue_rx, ingress_owner};
 // ---------------------------------------------------------------------------
 // USB FFI — C wrapper functions from sle_usb_ffi.c
 // ---------------------------------------------------------------------------
-
-/// Opaque handle returned by `sle_usb_alloc_ctx()`.
-///
-/// The real struct lives in C (`struct sle_urb_ctx`). Rust only holds
-/// a pointer and never dereferences it directly.
-#[repr(C)]
-pub struct SleUrbCtxOpaque {
-    _opaque: [u8; 0],
-}
 
 /// Independent C allocation; immutable identity and retained USB references.
 #[repr(C)]
@@ -86,47 +75,7 @@ impl UsbDevice {
 }
 
 extern "C" {
-    fn sle_usb_alloc_ctx(buf_size: i32) -> *mut SleUrbCtxOpaque;
-    fn sle_usb_free_ctx(ctx: *mut SleUrbCtxOpaque);
-    fn sle_usb_submit_bulk_out(
-        ctx: *mut SleUrbCtxOpaque,
-        udev: *mut core::ffi::c_void,
-        ep: u8,
-        data: *const u8,
-        len: i32,
-        rust_ctx: *mut core::ffi::c_void,
-        timeout_ms: i32,
-    ) -> i32;
-    fn sle_usb_submit_bulk_in(
-        ctx: *mut SleUrbCtxOpaque,
-        udev: *mut core::ffi::c_void,
-        ep: u8,
-        rust_ctx: *mut core::ffi::c_void,
-    ) -> i32;
-    fn sle_usb_submit_intr_in(
-        ctx: *mut SleUrbCtxOpaque,
-        udev: *mut core::ffi::c_void,
-        ep: u8,
-        rust_ctx: *mut core::ffi::c_void,
-        interval: i32,
-    ) -> i32;
-    fn sle_usb_kill_ctx(ctx: *mut SleUrbCtxOpaque);
-    fn sle_usb_sync_bulk_out(
-        udev: *mut core::ffi::c_void,
-        ep: u8,
-        data: *const u8,
-        len: i32,
-        timeout_ms: i32,
-    ) -> i32;
-    fn sle_usb_sync_bulk_in(
-        udev: *mut core::ffi::c_void,
-        ep: u8,
-        buf: *mut u8,
-        size: i32,
-        timeout_ms: i32,
-    ) -> i32;
-
-    // Per-device USB state table: high-level send functions
+    // Retained per-probe USB context: high-level operations
     fn sle_usb_dev_register(dev_id: i32, intf_ptr: *mut core::ffi::c_void, generation: u64, output: *mut *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_get(context: *mut UsbDeviceOpaque);
     fn sle_usb_dev_put(context: *mut UsbDeviceOpaque);
@@ -143,179 +92,6 @@ extern "C" {
     fn sle_usb_dev_get_mac(context: *mut UsbDeviceOpaque, mac: *mut u8) -> i32;
     fn sle_usb_dev_suspend(context: *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_resume(context: *mut UsbDeviceOpaque) -> i32;
-}
-
-// ---------------------------------------------------------------------------
-// URB context: safe Rust wrapper
-// ---------------------------------------------------------------------------
-
-/// Safe wrapper around the C-side URB context.
-///
-/// Owns the allocation and frees it on drop. Provides methods for
-/// submitting and cancelling transfers without exposing raw pointers.
-pub(crate) struct SleUrbCtx {
-    inner: *mut SleUrbCtxOpaque,
-}
-
-// SAFETY: The C-side sle_urb_ctx is heap-allocated and has no thread
-// affinity. USB core completion callbacks are synchronized via
-// usb_kill_urb before free.
-unsafe impl Send for SleUrbCtx {}
-// SAFETY: Access to the inner pointer is synchronized by usb_kill_urb
-// before deallocation; callback serialization is handled by USB core.
-unsafe impl Sync for SleUrbCtx {}
-
-impl SleUrbCtx {
-    /// Allocate a new URB context with the given buffer size.
-    pub(crate) fn new(buf_size: usize) -> Result<Self> {
-        // SAFETY: sle_usb_alloc_ctx handles all internal allocation.
-        let ptr = unsafe { sle_usb_alloc_ctx(buf_size as i32) };
-        if ptr.is_null() {
-            return Err(ENOMEM);
-        }
-        Ok(Self { inner: ptr })
-    }
-
-    /// Submit a bulk OUT (TX) transfer asynchronously.
-    ///
-    /// `udev_ptr` is the raw `struct usb_device *` from the kernel.
-    /// Completion will invoke `sparklink_usb_complete` with `rust_ctx`.
-    pub(crate) fn submit_bulk_out(
-        &self,
-        udev_ptr: *mut core::ffi::c_void,
-        ep: u8,
-        data: &[u8],
-        rust_ctx: *mut core::ffi::c_void,
-    ) -> Result {
-        // SAFETY: inner is valid (checked in new), data pointer and len
-        // are consistent, udev_ptr must be valid by caller contract.
-        let ret = unsafe {
-            sle_usb_submit_bulk_out(
-                self.inner,
-                udev_ptr,
-                ep,
-                data.as_ptr(),
-                data.len() as i32,
-                rust_ctx,
-                0,
-            )
-        };
-        if ret < 0 {
-            Err(Error::from_errno(ret))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Submit a bulk IN (RX) transfer asynchronously.
-    pub(crate) fn submit_bulk_in(
-        &self,
-        udev_ptr: *mut core::ffi::c_void,
-        ep: u8,
-        rust_ctx: *mut core::ffi::c_void,
-    ) -> Result {
-        // SAFETY: inner/udev_ptr valid by caller contract.
-        let ret = unsafe { sle_usb_submit_bulk_in(self.inner, udev_ptr, ep, rust_ctx) };
-        if ret < 0 {
-            Err(Error::from_errno(ret))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Submit an interrupt IN transfer (auto-resubmitting).
-    pub(crate) fn submit_intr_in(
-        &self,
-        udev_ptr: *mut core::ffi::c_void,
-        ep: u8,
-        rust_ctx: *mut core::ffi::c_void,
-        interval: i32,
-    ) -> Result {
-        // SAFETY: inner/udev_ptr valid by caller contract.
-        let ret = unsafe { sle_usb_submit_intr_in(self.inner, udev_ptr, ep, rust_ctx, interval) };
-        if ret < 0 {
-            Err(Error::from_errno(ret))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Cancel a pending transfer.
-    pub(crate) fn kill(&self) {
-        // SAFETY: inner is valid.
-        unsafe { sle_usb_kill_ctx(self.inner) };
-    }
-}
-
-impl Drop for SleUrbCtx {
-    fn drop(&mut self) {
-        // SAFETY: inner was allocated by sle_usb_alloc_ctx.
-        unsafe { sle_usb_free_ctx(self.inner) };
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Synchronous bulk transfer helpers
-// ---------------------------------------------------------------------------
-
-/// Blocking bulk OUT transfer — sends `data` and waits for completion.
-///
-/// Returns the number of bytes actually transferred.
-pub(crate) fn sync_bulk_out(
-    udev_ptr: *mut core::ffi::c_void,
-    ep: u8,
-    data: &[u8],
-    timeout_ms: i32,
-) -> Result<usize> {
-    // SAFETY: udev_ptr must be a valid struct usb_device pointer.
-    let ret = unsafe {
-        sle_usb_sync_bulk_out(udev_ptr, ep, data.as_ptr(), data.len() as i32, timeout_ms)
-    };
-    if ret < 0 {
-        Err(Error::from_errno(ret))
-    } else {
-        Ok(ret as usize)
-    }
-}
-
-/// Blocking bulk IN transfer — waits for data from the device.
-///
-/// Returns slice length of received data in the provided buffer.
-pub(crate) fn sync_bulk_in(
-    udev_ptr: *mut core::ffi::c_void,
-    ep: u8,
-    buf: &mut [u8],
-    timeout_ms: i32,
-) -> Result<usize> {
-    // SAFETY: udev_ptr valid, buf pointer and size consistent.
-    let ret = unsafe {
-        sle_usb_sync_bulk_in(udev_ptr, ep, buf.as_mut_ptr(), buf.len() as i32, timeout_ms)
-    };
-    if ret < 0 {
-        Err(Error::from_errno(ret))
-    } else {
-        Ok(ret as usize)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Completion callback from C — receives URB completion events
-// ---------------------------------------------------------------------------
-
-/// Generic transfer completion has no registration identity. It may report
-/// transport status but must never infer an RX owner from an opaque pointer.
-#[no_mangle]
-pub(crate) extern "C" fn sparklink_usb_complete(
-    _ctx: *mut core::ffi::c_void,
-    _data: *const u8,
-    length: i32,
-    status: i32,
-) {
-    pr_debug!(
-        "sparklink-usb: unregistered completion status={} len={}\n",
-        status,
-        length
-    );
 }
 
 /// Registered RX endpoints carry identity copied into their C URB allocation
@@ -399,132 +175,18 @@ pub(crate) extern "C" fn sparklink_usb_registered_complete(
 // ---------------------------------------------------------------------------
 
 /// USB interface class for SLE wireless controllers.
-pub const SLE_USB_CLASS: u8 = 0xE0;
+const SLE_USB_CLASS: u8 = 0xE0;
 /// USB interface subclass: RF controller.
-pub const SLE_USB_SUBCLASS: u8 = 0x01;
+const SLE_USB_SUBCLASS: u8 = 0x01;
 /// USB interface protocol: SparkLink DLI.
-pub const SLE_USB_PROTOCOL: u8 = 0x05;
-
-// ---------------------------------------------------------------------------
-// Endpoint addresses and sizes (host perspective)
-// ---------------------------------------------------------------------------
-
-/// Interrupt IN endpoint for DLI events (T/XS 10003-2025 Table 3).
-pub const EP_EVENT_IN: u8 = 0x91;
-/// Bulk IN endpoint for async data reception (T/XS 10003-2025 Table 3).
-pub const EP_DATA_IN: u8 = 0x92;
-/// Bulk OUT endpoint for async data and commands (T/XS 10003-2025 Table 3).
-pub const EP_CMD_DATA_OUT: u8 = 0x12;
-
-/// Interrupt endpoint max packet size.
-pub const EP_EVENT_MAX_PKT: usize = 64;
-/// Bulk endpoint max packet size (full-speed).
-pub const EP_BULK_FS_MAX_PKT: usize = 64;
-/// Bulk endpoint max packet size (high-speed).
-pub const EP_BULK_HS_MAX_PKT: usize = 512;
-
-/// USB class request type for DLI control transfers.
-pub const SLE_USB_REQ_TYPE: u8 = 0x20;
-
-// ---------------------------------------------------------------------------
-// Timeouts (milliseconds)
-// ---------------------------------------------------------------------------
-
-/// Timeout for DLI command responses.
-pub const CMD_TIMEOUT_MS: u32 = 5000;
-/// Timeout for bulk data transfers.
-pub const DATA_TIMEOUT_MS: u32 = 1000;
-/// Interval for polling the event interrupt endpoint.
-pub const EVENT_POLL_INTERVAL_MS: u32 = 4;
-
-// ---------------------------------------------------------------------------
-// DLI packet size limits
-// ---------------------------------------------------------------------------
-
-/// Maximum parameter length in a DLI command or event packet.
-pub const DLI_PARAM_MAX: usize = 255;
-
-/// Maximum async data payload (9-bit length field).
-pub const DLI_DATA_PAYLOAD_MAX: usize = 511;
-
-// ---------------------------------------------------------------------------
-// DLI USB packet builders
-// ---------------------------------------------------------------------------
-
-/// Build a DLI command packet for USB bulk OUT transmission.
-///
-/// Wire format per T/XS 10003-2025 §7.2 (all multi-byte values
-/// little-endian):
-///
-///     Byte 0:      0xA1 (DliPacketType::Command)
-///     Bytes 1-2:   opcode (LE16)
-///     Bytes 3-4:   parameter length (LE16)
-///     Bytes 5..N:  parameters
-pub fn build_command_packet(opcode: SleOpcode, params: &[u8]) -> Result<KVec<u8>> {
-    let param_len = params.len().min(DLI_PARAM_MAX);
-    let total = 5 + param_len;
-    let mut buf = KVec::with_capacity(total, GFP_KERNEL)?;
-
-    buf.push(DliPacketType::Command as u8, GFP_KERNEL)?;
-    let op = opcode as u16;
-    buf.push(op as u8, GFP_KERNEL)?;
-    buf.push((op >> 8) as u8, GFP_KERNEL)?;
-    let plen = param_len as u16;
-    buf.push(plen as u8, GFP_KERNEL)?;
-    buf.push((plen >> 8) as u8, GFP_KERNEL)?;
-    for &b in &params[..param_len] {
-        buf.push(b, GFP_KERNEL)?;
-    }
-    Ok(buf)
-}
-
-/// Build a DLI async unicast data packet for USB bulk OUT.
-///
-/// Wire format:
-///
-///     Byte 0:      0xA3 (DliPacketType::AsyncUnicast)
-///     Bytes 1-2:   link_id_seg field (LE16)
-///                  [15:4] = link_id (12 bits)
-///                  [3:2]  = segmentation (2 bits)
-///                  [1]    = reserved
-///                  [0]    = priority
-///     Bytes 3-4:   data_len field (LE16)
-///                  [8:0]  = payload length (9 bits)
-///                  [15:9] = reserved
-///     Bytes 5..N:  payload
-pub fn build_async_data_packet(
-    link_id: u16,
-    seg: u8,
-    priority: bool,
-    data: &[u8],
-) -> Result<KVec<u8>> {
-    let payload_len = data.len().min(DLI_DATA_PAYLOAD_MAX);
-    let total = 5 + payload_len;
-    let mut buf = KVec::with_capacity(total, GFP_KERNEL)?;
-
-    buf.push(DliPacketType::AsyncUnicast as u8, GFP_KERNEL)?;
-
-    let link_id_seg: u16 =
-        ((link_id & 0x0FFF) << 4) | (u16::from(seg & 0x03) << 2) | u16::from(priority);
-    buf.push(link_id_seg as u8, GFP_KERNEL)?;
-    buf.push((link_id_seg >> 8) as u8, GFP_KERNEL)?;
-
-    let data_len_field: u16 = (payload_len as u16) & 0x01FF;
-    buf.push(data_len_field as u8, GFP_KERNEL)?;
-    buf.push((data_len_field >> 8) as u8, GFP_KERNEL)?;
-
-    for &b in &data[..payload_len] {
-        buf.push(b, GFP_KERNEL)?;
-    }
-    Ok(buf)
-}
+const SLE_USB_PROTOCOL: u8 = 0x05;
 
 // ---------------------------------------------------------------------------
 // DLI USB packet parsers
 // ---------------------------------------------------------------------------
 
 /// Parsed DLI event from the interrupt IN endpoint.
-pub struct DliUsbEvent {
+struct DliUsbEvent {
     /// Raw event code (T/XS 10003-2025).
     pub event_code: u16,
     /// Event parameters.
@@ -539,7 +201,7 @@ pub struct DliUsbEvent {
 ///     Bytes 0-1:   event_code (LE16)
 ///     Bytes 2-3:   parameter length (LE16)
 ///     Bytes 4..N:  parameters
-pub fn parse_event_packet(data: &[u8]) -> Result<DliUsbEvent> {
+fn parse_event_packet(data: &[u8]) -> Result<DliUsbEvent> {
     if data.len() < 4 {
         return Err(EINVAL);
     }
@@ -565,18 +227,6 @@ pub fn parse_event_packet(data: &[u8]) -> Result<DliUsbEvent> {
     Ok(DliUsbEvent { event_code, params })
 }
 
-/// Parsed async data header.
-pub struct DliAsyncHeader {
-    /// 12-bit link identifier.
-    pub link_id: u16,
-    /// 2-bit segmentation indicator (0=complete, 1=first, 2=cont, 3=last).
-    pub seg: u8,
-    /// Priority flag.
-    pub priority: bool,
-    /// Payload length (9 bits).
-    pub data_len: u16,
-}
-
 /// Extract discovery_level from raw advertising TLV data.
 ///
 /// Scans the TLV entries (type 0x01 = discovery level per T/XS 20001)
@@ -597,28 +247,8 @@ fn extract_discovery_level(data: &[u8]) -> u8 {
     0
 }
 
-/// Parse the async/sync data header from a bulk IN packet.
-///
-/// Expects the raw packet starting with the type byte already stripped
-/// (or starting at byte 1 of the full packet).
-pub fn parse_async_data_header(data: &[u8]) -> Result<DliAsyncHeader> {
-    if data.len() < 4 {
-        return Err(EINVAL);
-    }
-
-    let link_id_seg = u16::from_le_bytes([data[0], data[1]]);
-    let data_len_field = u16::from_le_bytes([data[2], data[3]]);
-
-    Ok(DliAsyncHeader {
-        link_id: (link_id_seg >> 4) & 0x0FFF,
-        seg: ((link_id_seg >> 2) & 0x03) as u8,
-        priority: (link_id_seg & 1) != 0,
-        data_len: data_len_field & 0x01FF,
-    })
-}
-
 /// Convert a raw event code and parameters into an [`SleEvent`].
-pub fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
+fn event_to_sle(evt: &DliUsbEvent) -> Option<SleEvent> {
     match evt.event_code {
         // T/XS 10003-2025 9.1.2: opcode(2), credits(1), return params.
         // Nonzero-opcode return params start with that command's status byte.
@@ -1182,14 +812,12 @@ fn raw_to_status(raw: u8) -> SleStatus {
 /// Uses bulk and interrupt transfers to communicate with the radio
 /// controller firmware over the DLI protocol.
 ///
-/// Actual USB I/O is delegated to the C FFI layer which maintains a
-/// per-device table mapping `dev_id` to `usb_device` and URB contexts.
+/// Actual USB I/O uses a retained per-probe C allocation.
 /// Runtime reference to a specific USB allocation, never an index lookup.
 #[derive(Clone)]
-pub struct UsbController {
+pub(crate) struct UsbController {
     addr: [u8; 6],
-    /// Device ID in the sle_dev registry. Used to index the C-side
-    /// USB device table for actual I/O.
+    /// Owns the immutable USB allocation independently of registry reuse.
     device: UsbDevice,
     identity: super::sle_dev::DeviceIdentity,
 }
@@ -1245,8 +873,8 @@ impl SleController for UsbController {
     }
 
     fn open(&self) -> Result {
-        // Register event listener via the C device table.
-        // SAFETY: dev_id was validated during probe.
+        // Start the listener using this retained allocation.
+        // SAFETY: this controller owns its context reference.
         let ret = unsafe { sle_usb_dev_start_evt(self.device.as_raw()) };
         if ret < 0 {
             pr_warn!("sparklink-usb: event listener start failed: {}\n", ret);
@@ -1265,7 +893,7 @@ impl SleController for UsbController {
     }
 
     fn close(&self) {
-        // SAFETY: dev_id was validated during probe; stop is idempotent.
+        // SAFETY: owned context reference; stop is idempotent.
         unsafe { sle_usb_dev_stop_evt(self.device.as_raw()) };
         unsafe { sle_usb_dev_stop_data(self.device.as_raw()) };
         pr_info!("sparklink-usb: close dev_id={}\n", self.identity.id);
@@ -1285,7 +913,7 @@ impl SleController for UsbController {
     }
 
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {
-        // SAFETY: dev_id is valid, data pointer and length are consistent.
+        // SAFETY: owned context reference, data pointer and length are consistent.
         let ret = unsafe {
             sle_usb_dev_send_data(
                 self.device.as_raw(),
@@ -1325,7 +953,7 @@ impl SleController for UsbController {
 static USB_DEV_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Returns the number of currently attached USB SLE controllers.
-pub fn usb_device_count() -> u32 {
+pub(crate) fn usb_device_count() -> u32 {
     USB_DEV_COUNT.load(Ordering::Relaxed)
 }
 

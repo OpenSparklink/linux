@@ -7,16 +7,9 @@
  * URB lifecycle management (allocation, fill, submit, complete) and
  * expose a minimal, type-safe surface to Rust.
  *
- * Architecture:
- *
- *   Rust (sle_usb.rs)         C (sle_usb_ffi.c)        kernel USB core
- *   ─────────────────         ─────────────────         ──────────────
- *   sle_usb_alloc()      ──► sle_usb_alloc_urb()  ──► usb_alloc_urb()
- *   sle_usb_submit_bulk()──► sle_usb_submit_bulk()──► usb_fill_bulk_urb()
- *                                                  ──► usb_submit_urb()
- *   <completion callback> ◄── sle_usb_bulk_out_cb()   ◄── USB core IRQ
- *   sle_usb_kill()        ──► sle_usb_kill_urb()  ──► usb_kill_urb()
- *   sle_usb_free()        ──► sle_usb_free_urb()  ──► usb_free_urb()
+ * Actual ownership: UsbDevice retains a per-probe context. C owns the two RX
+ * URBs; registered callbacks carry immutable id/generation into Runtime ingress.
+ * Low-level RX helpers are private implementation details, not a second Rust API.
  */
 
 #include <linux/usb.h>
@@ -31,36 +24,23 @@
  * Rust-side completion callback declaration
  * -----------------------------------------------------------------------
  * Rust provides this function via #[no_mangle]. It receives:
- *   ctx      — opaque pointer passed during submit (Rust uses this to
- *              identify which URB completed)
+ *   dev_id/generation — immutable registration identity of the RX allocation
  *   data     — pointer to the transfer buffer
  *   length   — actual number of bytes transferred
  *   status   — URB completion status (0 = success, negative = error)
  */
-extern void sparklink_usb_complete(void *ctx, const u8 *data,
-				   int length, int status);
 extern void sparklink_usb_registered_complete(u32 dev_id, u64 generation,
 					      const u8 *data, int length,
 					      int status);
 
-/* Forward declarations for exported FFI functions */
-struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size);
-void sle_usb_free_ctx(struct sle_urb_ctx *ctx);
-int sle_usb_submit_bulk_out(struct sle_urb_ctx *ctx,
-			    struct usb_device *udev, u8 ep,
-			    const u8 *data, int len,
-			    void *rust_ctx, int timeout_ms);
-int sle_usb_submit_bulk_in(struct sle_urb_ctx *ctx,
-			   struct usb_device *udev, u8 ep,
-			   void *rust_ctx);
-int sle_usb_submit_intr_in(struct sle_urb_ctx *ctx,
-			   struct usb_device *udev, u8 ep,
-			   void *rust_ctx, int interval);
-void sle_usb_kill_ctx(struct sle_urb_ctx *ctx);
-int sle_usb_sync_bulk_out(struct usb_device *udev, u8 ep,
-			  const u8 *data, int len, int timeout_ms);
-int sle_usb_sync_bulk_in(struct usb_device *udev, u8 ep,
-			 u8 *buf, int size, int timeout_ms);
+/* Private RX lifecycle helpers. */
+static struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size);
+static void sle_usb_free_ctx(struct sle_urb_ctx *ctx);
+static int sle_usb_submit_bulk_in(struct sle_urb_ctx *ctx,
+			   struct usb_device *udev, u8 ep);
+static int sle_usb_submit_intr_in(struct sle_urb_ctx *ctx,
+			   struct usb_device *udev, u8 ep, int interval);
+static void sle_usb_kill_ctx(struct sle_urb_ctx *ctx);
 
 /* -----------------------------------------------------------------------
  * URB context: bookkeeping for in-flight transfers
@@ -70,7 +50,6 @@ struct sle_urb_ctx {
 	struct urb *urb;
 	u8 *buf;
 	int buf_size;
-	void *rust_ctx;  /* opaque pointer handed back to Rust on completion */
 	/* Immutable after registration, before first submit. USB kill/join
 	 * precedes free; identity belongs to this URB allocation, not its slot.
 	 */
@@ -82,24 +61,13 @@ struct sle_urb_ctx {
  * Completion handler: called by USB core when transfer finishes
  * -----------------------------------------------------------------------
  */
-static void sle_usb_bulk_out_cb(struct urb *urb)
-{
-	struct sle_urb_ctx *ctx = urb->context;
-
-	/* Preserve transport status without feeding the transmitted bytes into RX. */
-	sparklink_usb_complete(ctx->rust_ctx, NULL, 0, urb->status);
-}
-
 static void sle_usb_receive_complete(struct sle_urb_ctx *ctx, struct urb *urb)
 {
-	if (ctx->registration_generation)
-		sparklink_usb_registered_complete(ctx->registration_id,
-						  ctx->registration_generation,
-						  ctx->buf, urb->actual_length,
-						  urb->status);
-	else
-		sparklink_usb_complete(ctx->rust_ctx, ctx->buf,
-				       urb->actual_length, urb->status);
+	/* All live RX URBs belong to a registered immutable identity. */
+	sparklink_usb_registered_complete(ctx->registration_id,
+					  ctx->registration_generation,
+					  ctx->buf, urb->actual_length,
+					  urb->status);
 }
 
 /* Bulk IN (data) callback with auto-resubmit for continuous reception */
@@ -134,7 +102,7 @@ static void sle_usb_intr_cb(struct urb *urb)
 }
 
 /* -----------------------------------------------------------------------
- * Exported FFI functions
+ * Private RX allocation and submission helpers
  * -----------------------------------------------------------------------
  */
 
@@ -144,7 +112,7 @@ static void sle_usb_intr_cb(struct urb *urb)
  *
  * Returns NULL on allocation failure.
  */
-struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size)
+static struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size)
 {
 	struct sle_urb_ctx *ctx;
 
@@ -166,7 +134,6 @@ struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size)
 	}
 
 	ctx->buf_size = buf_size;
-	ctx->rust_ctx = NULL;
 	return ctx;
 }
 
@@ -174,7 +141,7 @@ struct sle_urb_ctx *sle_usb_alloc_ctx(int buf_size)
  * sle_usb_free_ctx - Free a URB context and its resources.
  * @ctx: context allocated by sle_usb_alloc_ctx
  */
-void sle_usb_free_ctx(struct sle_urb_ctx *ctx)
+static void sle_usb_free_ctx(struct sle_urb_ctx *ctx)
 {
 	if (!ctx)
 		return;
@@ -183,68 +150,24 @@ void sle_usb_free_ctx(struct sle_urb_ctx *ctx)
 	kfree(ctx);
 }
 
-/**
- * sle_usb_submit_bulk_out - Submit a bulk OUT transfer (host to device).
- * @ctx:       URB context
- * @udev:      USB device
- * @ep:        endpoint address (e.g. 0x12)
- * @data:      payload to send
- * @len:       payload length
- * @rust_ctx:  opaque pointer passed to completion callback
- * @timeout_ms: 0 for async, > 0 for synchronous timeout
- *
- * Returns 0 on success, negative errno on failure.
- */
-int sle_usb_submit_bulk_out(struct sle_urb_ctx *ctx,
-			    struct usb_device *udev, u8 ep,
-			    const u8 *data, int len,
-			    void *rust_ctx, int timeout_ms)
-{
-	unsigned int pipe;
-	int actual_len;
 
-	if (!ctx || !udev || len > ctx->buf_size)
-		return -EINVAL;
-
-	if (timeout_ms > 0) {
-		/* Synchronous: use usb_bulk_msg */
-		memcpy(ctx->buf, data, len);
-		pipe = usb_sndbulkpipe(udev, ep);
-		return usb_bulk_msg(udev, pipe, ctx->buf, len,
-				    &actual_len, timeout_ms);
-	}
-
-	/* Asynchronous: fill and submit URB */
-	memcpy(ctx->buf, data, len);
-	ctx->rust_ctx = rust_ctx;
-	pipe = usb_sndbulkpipe(udev, ep);
-
-	usb_fill_bulk_urb(ctx->urb, udev, pipe,
-			  ctx->buf, len,
-			  sle_usb_bulk_out_cb, ctx);
-
-	return usb_submit_urb(ctx->urb, GFP_KERNEL);
-}
 
 /**
  * sle_usb_submit_bulk_in - Submit a bulk IN transfer (device to host).
  * @ctx:       URB context
  * @udev:      USB device
  * @ep:        endpoint address (e.g. 0x92)
- * @rust_ctx:  opaque pointer passed to completion callback
  *
  * Returns 0 on success, negative errno on failure.
  */
-int sle_usb_submit_bulk_in(struct sle_urb_ctx *ctx,
-			   struct usb_device *udev, u8 ep,
-			   void *rust_ctx)
+static int sle_usb_submit_bulk_in(struct sle_urb_ctx *ctx,
+			   struct usb_device *udev, u8 ep)
 {
 	unsigned int pipe;
 
 	if (!ctx || !udev)
 		return -EINVAL;
 
-	ctx->rust_ctx = rust_ctx;
 	pipe = usb_rcvbulkpipe(udev, ep);
 
 	usb_fill_bulk_urb(ctx->urb, udev, pipe,
@@ -259,22 +182,19 @@ int sle_usb_submit_bulk_in(struct sle_urb_ctx *ctx,
  * @ctx:       URB context
  * @udev:      USB device
  * @ep:        endpoint address (e.g. 0x91)
- * @rust_ctx:  opaque pointer passed to completion callback
  * @interval:  polling interval (from endpoint descriptor)
  *
  * Returns 0 on success, negative errno on failure.
  * The URB auto-resubmits on successful completion.
  */
-int sle_usb_submit_intr_in(struct sle_urb_ctx *ctx,
-			   struct usb_device *udev, u8 ep,
-			   void *rust_ctx, int interval)
+static int sle_usb_submit_intr_in(struct sle_urb_ctx *ctx,
+			   struct usb_device *udev, u8 ep, int interval)
 {
 	unsigned int pipe;
 
 	if (!ctx || !udev)
 		return -EINVAL;
 
-	ctx->rust_ctx = rust_ctx;
 	pipe = usb_rcvintpipe(udev, ep);
 
 	usb_fill_int_urb(ctx->urb, udev, pipe,
@@ -288,72 +208,15 @@ int sle_usb_submit_intr_in(struct sle_urb_ctx *ctx,
  * sle_usb_kill_ctx - Cancel a pending URB.
  * @ctx: URB context
  */
-void sle_usb_kill_ctx(struct sle_urb_ctx *ctx)
+static void sle_usb_kill_ctx(struct sle_urb_ctx *ctx)
 {
 	if (ctx && ctx->urb)
 		usb_kill_urb(ctx->urb);
 }
 
-/**
- * sle_usb_sync_bulk_out - Blocking bulk OUT transfer.
- * @udev:      USB device
- * @ep:        endpoint address
- * @data:      payload
- * @len:       payload length
- * @timeout_ms: timeout in milliseconds
- *
- * Uses a kmalloc'd bounce buffer to avoid DMA from stack memory.
- * Returns actual bytes transferred on success, negative errno on failure.
- */
-int sle_usb_sync_bulk_out(struct usb_device *udev, u8 ep,
-			  const u8 *data, int len, int timeout_ms)
-{
-	int actual_len = 0;
-	int ret;
-	unsigned int pipe = usb_sndbulkpipe(udev, ep);
-	u8 *bounce;
 
-	bounce = kmalloc(len, GFP_KERNEL);
-	if (!bounce)
-		return -ENOMEM;
-	memcpy(bounce, data, len);
 
-	ret = usb_bulk_msg(udev, pipe, bounce, len,
-			   &actual_len, timeout_ms);
-	kfree(bounce);
-	return ret ? ret : actual_len;
-}
 
-/**
- * sle_usb_sync_bulk_in - Blocking bulk IN transfer.
- * @udev:  USB device
- * @ep:    endpoint address
- * @buf:   receive buffer
- * @size:  buffer capacity
- * @timeout_ms: timeout in milliseconds
- *
- * Uses a kmalloc'd bounce buffer to avoid DMA from stack memory.
- * Returns actual bytes received on success, negative errno on failure.
- */
-int sle_usb_sync_bulk_in(struct usb_device *udev, u8 ep,
-			 u8 *buf, int size, int timeout_ms)
-{
-	int actual_len = 0;
-	int ret;
-	unsigned int pipe = usb_rcvbulkpipe(udev, ep);
-	u8 *bounce;
-
-	bounce = kmalloc(size, GFP_KERNEL);
-	if (!bounce)
-		return -ENOMEM;
-
-	ret = usb_bulk_msg(udev, pipe, bounce, size,
-			   &actual_len, timeout_ms);
-	if (!ret)
-		memcpy(buf, bounce, actual_len);
-	kfree(bounce);
-	return ret ? ret : actual_len;
-}
 
 /* =======================================================================
  * Per-probe USB context ownership
@@ -438,7 +301,7 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation,
 	intf = (struct usb_interface *)intf_ptr;
 
 	/* A missing descriptor is not a test controller. Discover and allocate
-	 * privately; publish the table entry only after preparation succeeds.
+	 * privately; return the owning allocation only after preparation succeeds.
 	 */
 	ret = usb_find_common_endpoints(intf->cur_altsetting,
 					&bulk_in, &bulk_out, &int_in, NULL);
@@ -641,7 +504,6 @@ static int sle_usb_dev_start_evt_locked(struct sle_usb_dev *d)
 
 	ret = sle_usb_submit_intr_in(d->evt_urb, d->udev,
 				      d->ep_intr_in,
-				      NULL,
 				      d->ep_intr_in_interval);
 	return ret;
 }
@@ -672,8 +534,7 @@ static int sle_usb_dev_start_data_locked(struct sle_usb_dev *d)
 		return -ENODEV;
 
 	return sle_usb_submit_bulk_in(d->rx_urb, d->udev,
-				      d->ep_bulk_in,
-				      NULL);
+				      d->ep_bulk_in);
 }
 
 /**
@@ -1098,7 +959,6 @@ static int sle_usb_dev_resume_locked(struct sle_usb_dev *d)
 	if (d->evt_urb && d->udev) {
 		ret = sle_usb_submit_intr_in(d->evt_urb, d->udev,
 					     d->ep_intr_in,
-					     NULL,
 					     d->ep_intr_in_interval);
 		if (ret) {
 			pr_err("sparklink-usb: dev %d resume evt URB failed: %d\n",
@@ -1110,8 +970,7 @@ static int sle_usb_dev_resume_locked(struct sle_usb_dev *d)
 	/* Re-submit bulk IN data URB */
 	if (d->rx_urb && d->udev) {
 		ret = sle_usb_submit_bulk_in(d->rx_urb, d->udev,
-					     d->ep_bulk_in,
-					     NULL);
+					     d->ep_bulk_in);
 		if (ret)
 			pr_err("sparklink-usb: dev %d resume data URB failed: %d\n",
 			       d->id, ret);
