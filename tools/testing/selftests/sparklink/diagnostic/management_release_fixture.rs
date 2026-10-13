@@ -373,4 +373,12 @@ fn queued_policy()->Host {
  assert_eq!(gate.state,sle_management::FREE);assert!(owner.host.lock().data_revoked);
 }
 
+#[test] fn query_only_policy_predicate_keeps_active_physical_obligation() {
+ let mut h=host();h.active=Some(active());h.credits=0;
+ assert!(h.query_policy_untouched());assert!(!h.quiet());assert!(!h.policy_untouched());
+ assert_eq!(h.active.as_ref().unwrap().deadline,1000);assert_eq!(h.credits,0);
+ h.operations.initialized=true;assert!(!h.query_policy_untouched());
+ h.operations.initialized=false;h.selected_policy_domains=1;assert!(!h.query_policy_untouched());
+}
+
 }

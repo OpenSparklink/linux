@@ -168,7 +168,7 @@ fn identity_version_profile_and_missing_sequence_fail() {
     assert_eq!(ioctl_diagnostic_result(&ctx, Pin::new(&ctl), 1), Err(Error(-95)));
     INPUT.with(|p| { p.borrow_mut().version = 1; p.borrow_mut().seq = 999; });
     assert_eq!(ioctl_diagnostic_result(&ctx, Pin::new(&ctl), 1), Err(ENOENT));
-    ctx.owner.as_mut().unwrap().protocol_profile = 0;
+    ctx.owner.as_mut().unwrap().protocol_profile = 2;
     assert_eq!(ioctl_diagnostic_result(&ctx, Pin::new(&ctl), 1), Err(Error(-95)));
     ctx.owner.as_mut().unwrap().protocol_profile = 1;
     *ctl.target.lock() = None;

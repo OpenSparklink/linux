@@ -117,11 +117,11 @@ impl CommandHost {
 
     /// Metadata-only diagnostic admission supplies the original absolute
     /// deadline; queue wait does not grant a fresh full timeout on transmission.
-    pub(crate) fn enqueue_diagnostic(&mut self, opcode: u16, seq: u32, deadline: u64) -> Result {
+    pub(crate) fn enqueue_diagnostic(&mut self, opcode: u16, params: &[u8], seq: u32, deadline: u64) -> Result {
         if let Some(error) = self.fault { return Err(error); }
         let cookie = self.next_cookie;
         let next_cookie = cookie.checked_add(1).ok_or(EOVERFLOW)?;
-        self.requests.push_tagged(opcode, &[], seq, cookie, None, deadline).map_err(Error::from)?;
+        self.requests.push_tagged(opcode, params, seq, cookie, None, deadline).map_err(Error::from)?;
         self.next_cookie = next_cookie;
         Ok(())
     }
@@ -382,6 +382,16 @@ impl CommandHost {
     pub(crate) fn policy_untouched(&self) -> bool {
         self.quiet() && self.fault.is_none() && !self.revoking
             && self.recipe.is_none() && self.selected_policy_domains == 0 && self.broadcast_cookie == 0 && self.scan_cookie == 0
+            && !self.operations.initialized
+            && self.operations.advertising == 0 && self.operations.scanning == 0
+            && self.operations.entries.iter().all(Option::is_none)
+    }
+
+    /// A standard query-only lease may still have a physical reply obligation.
+    /// This predicate ignores quietness but never invents radio Off/Ready.
+    pub(crate) fn query_policy_untouched(&self) -> bool {
+        self.recipe.is_none() && self.selected_policy_domains == 0
+            && self.broadcast_cookie == 0 && self.scan_cookie == 0
             && !self.operations.initialized
             && self.operations.advertising == 0 && self.operations.scanning == 0
             && self.operations.entries.iter().all(Option::is_none)

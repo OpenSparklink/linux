@@ -53,12 +53,13 @@ impl Host {
 struct Owner {identity:Identity,protocol_profile:u32,management:TestMutex<Management>,schedule_gate:TestMutex<bool>,host:TestMutex<Host>}
 impl Owner {fn schedule_rx(&self, delay: u32) {assert_eq!(delay,0); RX_WAKES.with(|n|n.set(n.get()+1));}
     fn kick_commands(&self){}}
-struct Controller;
-impl Controller {fn validate_command(&self,opcode:u16,params:&[u8])->Result{if matches!(opcode,0x0402|0x0403|0x0404|0x0406)&&params.is_empty(){Ok(())}else{Err(Error(-95))}}}
+struct Controller(u32);
+impl Controller {fn validate_command(&self,opcode:u16,params:&[u8])->Result{if params == diagnostic_parameters(self.0,opcode)? {Ok(())}else{Err(Error(-95))}}}
 struct State {cmd_pending:CmdPendingQueue,controller:Controller}
 struct RuntimeContext {owner:Option<Owner>,state:TestMutex<Option<State>>}
 impl RuntimeContext {fn lock(&self)->Result<MutexGuard<'_,Option<State>>>{Ok(self.state.lock())}}
 struct SparkLinkCtl {file_id:u64,target:TestMutex<Option<Target>>,diagnostic_request_id:TestMutex<u64>}
+// @@PARAMETERS@@
 // @@SUBMIT_STRUCT@@
 thread_local! {
  static INPUT:std::cell::RefCell<SleDiagnosticSubmit>=std::cell::RefCell::new(request(1));
@@ -73,7 +74,7 @@ fn setup()->(RuntimeContext,SparkLinkCtl){
  RX_WAKES.with(|n|n.set(0));
  let _ = core::mem::size_of::<sle_mgmt::CmdRequest>();
  let identity=Identity{generation:7};
- (RuntimeContext{owner:Some(Owner{identity,protocol_profile:1,management:TestMutex::new(Management{file:42}),schedule_gate:TestMutex::new(false),host:TestMutex::new(Host{requests:sle_command_queue::CmdRequestQueue::new(),fault:None,next_cookie:1,active:None,credits:3,reply:None})}),state:TestMutex::new(Some(State{cmd_pending:CmdPendingQueue::new(),controller:Controller}))},SparkLinkCtl{file_id:42,target:TestMutex::new(Some(Target{identity})),diagnostic_request_id:TestMutex::new(0)})
+ (RuntimeContext{owner:Some(Owner{identity,protocol_profile:1,management:TestMutex::new(Management{file:42}),schedule_gate:TestMutex::new(false),host:TestMutex::new(Host{requests:sle_command_queue::CmdRequestQueue::new(),fault:None,next_cookie:1,active:None,credits:3,reply:None})}),state:TestMutex::new(Some(State{cmd_pending:CmdPendingQueue::new(),controller:Controller(1)}))},SparkLinkCtl{file_id:42,target:TestMutex::new(Some(Target{identity})),diagnostic_request_id:TestMutex::new(0)})
 }
 fn submit(c:&RuntimeContext,f:&SparkLinkCtl,r:SleDiagnosticSubmit,arg:usize)->Result<isize>{INPUT.with(|p|*p.borrow_mut()=r);OUTPUT.with(|p|*p.borrow_mut()=None);ioctl_diagnostic_submit(c,Pin::new(f),arg)}
 fn seq()->u32{OUTPUT.with(|p|p.borrow().as_ref().unwrap().seq)}
@@ -128,7 +129,7 @@ fn seq()->u32{OUTPUT.with(|p|p.borrow().as_ref().unwrap().seq)}
  for r in [SleDiagnosticSubmit{flags:1,..request(1)},SleDiagnosticSubmit{generation:0,..request(1)},request(0),SleDiagnosticSubmit{timeout_ms:0,..request(1)},SleDiagnosticSubmit{timeout_ms:5001,..request(1)},SleDiagnosticSubmit{reserved:1,..request(1)},SleDiagnosticSubmit{seq:1,..request(1)},SleDiagnosticSubmit{action:3,..request(1)}]{assert_eq!(submit(&c,&f,r,1),Err(EINVAL));}
  let r=SleDiagnosticSubmit{generation:8,..request(1)};assert_eq!(submit(&c,&f,r,1),Err(ENODEV));
  let r=SleDiagnosticSubmit{opcode:0x0c05,..request(1)};assert_eq!(submit(&c,&f,r,1),Err(Error(-95)));
- c.owner.as_mut().unwrap().protocol_profile=0;assert_eq!(submit(&c,&f,request(1),1),Err(Error(-95)));c.owner.as_mut().unwrap().protocol_profile=1;
+ c.owner.as_mut().unwrap().protocol_profile=2;assert_eq!(submit(&c,&f,request(1),1),Err(Error(-95)));c.owner.as_mut().unwrap().protocol_profile=1;
  let o=c.owner.as_ref().unwrap();*o.schedule_gate.lock()=true;o.management.lock().file=0;assert_eq!(submit(&c,&f,request(1),1),Err(ENODEV));
 }
 #[test] fn another_author_cannot_cancel_original_even_with_own_lease(){
@@ -167,4 +168,20 @@ fn seq()->u32{OUTPUT.with(|p|p.borrow().as_ref().unwrap().seq)}
  assert_eq!(c.state.lock().as_ref().unwrap().cmd_pending.find_request(42,1).unwrap().deadline,deadline);
  let mut bad=request(2);bad.timeout_ms=0;assert_eq!(submit(&c,&f,bad,1),Err(EINVAL));
  assert_eq!(RX_WAKES.with(|n|n.get()),2);
+}
+
+#[test] fn standard_fixed_address_type_reaches_actual_queue_and_retries_once() {
+ let(mut c,f)=setup();c.owner.as_mut().unwrap().protocol_profile=0;c.state.lock().as_mut().unwrap().controller.0=0;
+ let r=SleDiagnosticSubmit{opcode:0x0406,..request(1)};submit(&c,&f,r,1).unwrap();submit(&c,&f,r,1).unwrap();
+ let mut h=c.owner.as_ref().unwrap().host.lock();assert_eq!(h.requests.len(),1);let q=h.requests.pop().unwrap();
+ assert_eq!(q.opcode,0x0406);assert_eq!(q.param_len,1);assert_eq!(q.params[0],0);
+ assert_eq!(*f.diagnostic_request_id.lock(),1);
+}
+#[test] fn dialect_query_parameters_are_exact_and_mutations_always_reject() {
+ for opcode in 0..=u16::MAX {
+  for profile in [0,1,2,u32::MAX] {
+   let expected=match (profile,opcode) {(0,0x0406)=>Some(&[0][..]),(0,0x0401..=0x0404)|(1,0x0402|0x0403|0x0404|0x0406)=>Some(&[][..]),_=>None};
+   match expected {Some(p)=>assert_eq!(diagnostic_parameters(profile,opcode),Ok(p)),None=>assert_eq!(diagnostic_parameters(profile,opcode),Err(Error(-95)))}
+  }
+ }
 }

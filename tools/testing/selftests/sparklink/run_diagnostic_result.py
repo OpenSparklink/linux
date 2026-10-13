@@ -43,6 +43,7 @@ def run(output):
         fixture = (here / 'diagnostic/admission_fixture.rs').read_text()
         for marker, body in {
             '// @@SUBMIT_STRUCT@@': declaration,
+            '// @@PARAMETERS@@': function(inputs['sparklink_core.rs'].decode(), 'diagnostic_parameters'),
             '// @@SUBMIT_HANDLER@@': function(inputs['sparklink_core.rs'].decode(), 'ioctl_diagnostic_submit'),
             '// @@ENQUEUE@@': function(inputs['sle_host.rs'].decode(), 'enqueue_diagnostic'),
             '// @@CANCEL@@': function(inputs['sle_host.rs'].decode(), 'cancel_diagnostic'),
@@ -63,7 +64,7 @@ def run(output):
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 48, 'result_tests': 14, 'admission_tests': 12, 'host_deadline_tests': 6, 'connection_dependency_tests': 11, 'link_dependency_tests': 5,
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 50, 'result_tests': 14, 'admission_tests': 14, 'host_deadline_tests': 6, 'connection_dependency_tests': 11, 'link_dependency_tests': 5,
               'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},

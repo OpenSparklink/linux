@@ -140,7 +140,7 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert_eq!(a.connection_result(42,1).unwrap().state,sle_connection_operation::State::Faulted);assert!(!a.links_clear_for_management());assert!(b.fault.is_none());
 }
 #[test] fn native_queries_and_discovery_still_require_complete_after_successful_status(){
- clock(1);let mut h=host();h.enqueue_diagnostic(0x0403,9,100).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+ clock(1);let mut h=host();h.enqueue_diagnostic(0x0403,&[],9,100).unwrap();let r=h.next(|_|true).unwrap().unwrap();
  assert!(h.receive(status(0x0403,0)).is_some());assert!(!h.transport_complete(r.cookie));assert!(h.take_reply().is_none());
  h.receive(SleEvent::NativeCommandReply{opcode:0x0403,command_credits:1,status:0,complete:true,data:vec![0]});assert!(h.take_reply().is_some());
  let parts=[RecipePart{opcode:0x0c04,params:&[0]}];h.enqueue_recipe(DiscoveryIntent::Advertising(false),&parts).unwrap();let r=h.next(|_|true).unwrap().unwrap();

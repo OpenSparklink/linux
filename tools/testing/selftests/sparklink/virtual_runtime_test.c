@@ -16,6 +16,7 @@
 
 struct controller { int control, fd; struct sparklink_virtual_status status; };
 static unsigned int query_count;
+static uint64_t request_id;
 #define CHECK(expr) do { if (!(expr)) { \
 	fprintf(stderr, "VIRTUAL_RUNTIME_FAIL line=%u errno=%d\n", __LINE__, errno); exit(1); } } while (0)
 
@@ -45,6 +46,15 @@ static struct controller create(void)
 	uint16_t id = c.status.id;
 	CHECK(!ioctl(c.fd, SL_IOCTL_DEV_SELECT, &id));
 	CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
+	struct sle_management_request managed = { .version = 1,
+		.generation = c.status.generation, .mode = SLE_MANAGEMENT_MANAGED };
+	CHECK(ioctl(c.fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &managed) == -1 && errno == EOPNOTSUPP);
+	struct sle_diagnostic_submit unauthorized = { .version = 1, .generation = c.status.generation,
+		.request_id = 1, .timeout_ms = 5000, .opcode = 0x0404, .action = 1 };
+	CHECK(ioctl(c.fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &unauthorized) == -1 && errno == EPERM);
+	struct sle_dli_cmd legacy = { .opcode = 0x0404 };
+	CHECK(ioctl(c.fd, SL_IOCTL_DLI_SEND_CMD, &legacy) == -1 && errno == EOPNOTSUPP);
+
 	struct sle_management_request lease = { .version = 1,
 		.generation = c.status.generation, .mode = SLE_MANAGEMENT_DIAGNOSTIC };
 	CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &lease) && lease.lease);
@@ -58,11 +68,12 @@ static void config(struct controller c, unsigned int delay, unsigned int drop, u
 	CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_CONFIG, &cfg));
 }
 
-static void submit(struct controller c, uint16_t opcode)
+static uint32_t submit(struct controller c, uint16_t opcode)
 {
-	struct sle_dli_cmd cmd = { .opcode = opcode };
-	if (opcode == 0x0406) { cmd.param_len = 1; cmd.params[0] = 0; }
-	CHECK(!ioctl(c.fd, SL_IOCTL_DLI_SEND_CMD, &cmd) && cmd.seq);
+	struct sle_diagnostic_submit cmd = { .version = 1, .generation = c.status.generation,
+		.request_id = ++request_id, .timeout_ms = 5000, .opcode = opcode, .action = 1 };
+	CHECK(!ioctl(c.fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) && cmd.seq);
+	return cmd.seq;
 }
 
 static void query(struct controller c, uint16_t opcode, unsigned int length)
@@ -70,15 +81,15 @@ static void query(struct controller c, uint16_t opcode, unsigned int length)
 	struct sle_controller_snapshot s = snapshot(c);
 	struct sle_mgmt_stats before, after;
 	CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &before) && !before.pending);
-	submit(c, opcode);
+	uint32_t seq = submit(c, opcode);
 	double deadline = now() + 3;
-	struct sle_dli_event e;
+	struct sle_diagnostic_result e;
 	for (;;) {
-		memset(&e, 0, sizeof(e));
-		if (!ioctl(c.fd, SL_IOCTL_DLI_POLL_EVENT, &e)) {
-			if (e.opcode == opcode && e.event_type == 1) break;
-		} else CHECK(errno == EAGAIN);
-		CHECK(now() < deadline);
+		e = (struct sle_diagnostic_result){ .version = 1, .generation = c.status.generation, .seq = seq };
+		CHECK(!ioctl(c.fd, SL_IOCTL_DIAGNOSTIC_RESULT, &e));
+		CHECK(e.seq == seq && e.opcode == opcode && !e.error);
+		if (e.state == 2) break;
+		CHECK(e.state == 1 && now() < deadline);
 		usleep(1000);
 	}
 	CHECK(!e.status && e.data_len == length);
@@ -109,6 +120,41 @@ static void stale(struct controller c)
 {
 	struct sle_controller_snapshot s = { .version = 1, .generation = c.status.generation };
 	CHECK(ioctl(c.fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &s) == -1 && errno == ENODEV);
+}
+
+static void release_inflight_queries(struct controller c, struct controller peer)
+{
+	struct sle_management_query q = { .version = 1, .generation = c.status.generation };
+	struct sle_mgmt_stats before, after;
+	CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_QUERY, &q) && q.flags == 1 && q.lease);
+	CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &before) && !before.pending);
+	config(c, 500, 0, 0); submit(c, 0x0404); pending(c);
+	submit(c, 0x0403); submit(c, 0x0406);
+	struct sparklink_virtual_status driver_before, driver_after;
+	CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &driver_before));
+	struct sle_management_request release = { .version = 1, .generation = c.status.generation,
+		.lease = q.lease, .mode = SLE_MANAGEMENT_DIAGNOSTIC };
+	CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_RELEASE, &release));
+	q = (struct sle_management_query){ .version = 1, .generation = c.status.generation };
+	CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_QUERY, &q) && q.state == SLE_MANAGEMENT_REVOKING && !q.flags);
+	query(peer, 0x0406, 6);
+	double deadline = now() + 3;
+	for (;;) {
+		q = (struct sle_management_query){ .version = 1, .generation = c.status.generation };
+		CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_QUERY, &q));
+		if (q.state == SLE_MANAGEMENT_FREE) break;
+		CHECK(q.state == SLE_MANAGEMENT_REVOKING && now() < deadline); usleep(1000);
+	}
+	CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &driver_after));
+	CHECK(driver_after.submitted == driver_before.submitted && !driver_after.pending);
+	CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &after) && !after.pending &&
+		after.total_submitted == before.total_submitted + 3 && after.total_resolved == before.total_resolved + 3);
+	CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
+	struct sle_management_request acquire = { .version = 1, .generation = c.status.generation,
+		.mode = SLE_MANAGEMENT_DIAGNOSTIC };
+	CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire));
+	config(c, 0, 0, 0); query(c, 0x0406, 6);
+	puts("VIRTUAL_QUERY_RELEASE_PASS: queued_cancel=2 inflight_reply=1 no_typed_stops=1 peer=1 setup=1");
 }
 
 static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
@@ -151,6 +197,7 @@ int main(void)
 	for (unsigned int i = 0; i < 5; i++) {
 		query(a, queries[i], lengths[i]); query(b, queries[i], lengths[i]);
 	}
+	release_inflight_queries(b, a);
 	int alias = dup(a.control); CHECK(alias >= 0 && !close(a.control)); a.control = alias;
 	query(a, 0x0406, 6);
 	struct sparklink_virtual_control bad = { .delay_ms = 6001 };

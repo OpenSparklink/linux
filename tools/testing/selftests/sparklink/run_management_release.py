@@ -38,7 +38,7 @@ def run(output):
         depth += (acquire[end]=='{')-(acquire[end]=='}'); end += 1
     commit = acquire[start:end]
     methods = '\n'.join(function(inputs['sle_host.rs'].decode(), n) for n in
-                        ['validate_connection_cleanup','revoke_connections','observe_link','links_clear_for_management','quiet', 'resume_management', 'policy_untouched', 'policy_unsubmitted',
+                        ['validate_connection_cleanup','revoke_connections','observe_link','links_clear_for_management','quiet', 'resume_management', 'policy_untouched', 'query_policy_untouched', 'policy_unsubmitted',
                          'cancel_unsubmitted_policy', 'controller_status', 'discovery_radio',
                          'current_recipe', 'can_send', 'retained_revocation',
                          'retained_revocation_ready', 'next', 'cancel_recipe_progress', 'enqueue_recipe_until', 'enqueue_recipe',

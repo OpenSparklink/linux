@@ -1155,7 +1155,7 @@ struct sle_snoop_query {
 };
 #define SL_IOCTL_SNOOP_GET _IOWR(SL_MAGIC, 0x8e, struct sle_snoop_query)
 
-/* Owner-private result of a raw WS73 diagnostic admitted by the same fd.
+/* Owner-private result of a metadata diagnostic admitted by the same fd.
  * Input: version=1, flags=0, exact generation and nonzero admission seq.
  * State: 1 pending, 2 complete-success, 3 failed (error or controller status).
  * Missing/evicted is ENOENT; queries never acknowledge or remove a result.
