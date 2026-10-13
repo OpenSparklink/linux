@@ -3,9 +3,7 @@
 // No transport or real VFS/device operation is performed here.
 use std::cell::{RefCell,RefMut}; use std::rc::Rc; type Arc<T>=Rc<T>;
 #[derive(Clone,Copy,Debug,PartialEq)] struct Error(i32);
-impl Error {fn from_errno(e:i32)->Self{Self(e)}}
 const ENODEV:Error=Error(-19);type Result<T>=std::result::Result<T,Error>;
-mod kernel {pub mod bindings {pub const EOPNOTSUPP:i32=95;}}
 thread_local!{static HELD:RefCell<Vec<&'static str>>=const{RefCell::new(vec![])};static OWNER:RefCell<Option<Arc<ControllerRuntime>>>=const{RefCell::new(None)};}
 struct Lock<T>{name:&'static str,value:RefCell<T>}struct Guard<'a,T>{name:&'static str,value:RefMut<'a,T>}
 impl<T> Lock<T>{fn lock(&self)->Guard<'_,T>{HELD.with(|v|v.borrow_mut().push(self.name));Guard{name:self.name,value:self.value.borrow_mut()}}}
@@ -28,7 +26,7 @@ impl Driver{fn prepare_connection(&self,r:&SleConnectionSubmit)->Result<Plan>{
  OWNER.with(|v|{let borrowed=v.borrow();let o=borrowed.as_ref().unwrap();match self.scenario{1=>o.host.lock().candidate=None,2=>*o.schedule_gate.lock()=true,_=>{}}});
  if self.scenario==3{return Err(Error(-95))} Ok(Plan{opcode:0x1403,length:3,params:[0,0,0x13]})
 }}
-mod sle_dli{use super::*;pub enum ControllerBackend{Native(Driver),Unsupported}}
+mod sle_dli{use super::*;pub enum ControllerBackend{Native(Driver)} impl ControllerBackend{pub(super) fn provider(&self)->&Driver{let Self::Native(c)=self;c}}}
 mod actual{use super::*;
 // @@ACTUAL_PREPARE@@
 pub(super) fn invoke(o:&Arc<ControllerRuntime>,s:&ControllerState)->Result<bool>{progress_connection_cleanup(o,s)}
@@ -41,6 +39,6 @@ fn owner()->Arc<ControllerRuntime>{let o=Rc::new(ControllerRuntime{identity:Iden
  }
 }
 #[test] fn unsupported_controller_and_no_candidate_admit_no_operation(){
- let o=owner();let s=ControllerState{controller:sle_dli::ControllerBackend::Unsupported};assert_eq!(actual::invoke(&o,&s),Err(Error(-95)));assert!(o.host.lock().submissions.is_empty());
+ let o=owner();let s=ControllerState{controller:sle_dli::ControllerBackend::Native(Driver{scenario:3})};assert_eq!(actual::invoke(&o,&s),Err(Error(-95)));assert!(o.host.lock().submissions.is_empty());
  o.host.lock().candidate=None;assert_eq!(actual::invoke(&o,&s),Ok(false));assert!(o.host.lock().submissions.is_empty());
 }
