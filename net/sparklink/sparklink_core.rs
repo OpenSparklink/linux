@@ -1070,8 +1070,6 @@ fn ioctl_dispatch_conn(_context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: 
 /// AFH ioctl sub-dispatcher (channel map, RSSI, hopping).
 
 
-/// Security ioctl sub-dispatcher (pairing, encryption, crypto tests).
-#[inline(never)]
 /// Unqualified legacy security/AFH controls cannot publish local success.
 #[inline(never)]
 fn ioctl_dispatch_security(_context: &RuntimeContext, _cmd: u32, _arg: usize) -> Result<isize> {
