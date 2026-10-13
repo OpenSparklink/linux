@@ -2781,6 +2781,35 @@ const _: () = assert!(core::mem::size_of::<SleDiscoveryResult>() == 64);
 const _: () = assert!(core::mem::offset_of!(SleDiscoveryResult, dev_index) == 52);
 
 pub(crate) const SL_IOCTL_CONTROLLER_SNAPSHOT: u32 = _IOWR::<SleControllerSnapshot>(SL_MAGIC, 0x8a);
+/// Core registration observation, independent of fd affinity and Host Ready.
+pub(crate) const SL_IOCTL_REGISTRATION_SNAPSHOT: u32 = _IOWR::<SleRegistrationSnapshot>(SL_MAGIC, 0x9f);
+pub(crate) const REGISTRATION_PENDING: u32 = 1;
+pub(crate) const REGISTRATION_FAULT: u32 = 2;
+pub(crate) const REGISTRATION_INSTALLED: u32 = 3;
+pub(crate) const REGISTRATION_RETIRING: u32 = 4;
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleRegistrationSnapshot {
+    pub generation: u64,
+    pub version: u32,
+    pub state: u32,
+    pub profile: u32,
+    pub phase: u32,
+    pub error: i32,
+    pub dev_index: u16,
+    pub bus: u8,
+    pub reserved_byte: u8,
+    pub reserved: [u8; 8],
+}
+// SAFETY: integer-only repr(C) type; every bit pattern is valid.
+unsafe impl FromBytes for SleRegistrationSnapshot {}
+impl CheckReserved for SleRegistrationSnapshot {
+    fn check_reserved(&self) -> Result {
+        if self.reserved_byte != 0 || self.reserved != [0; 8] { Err(EINVAL) } else { Ok(()) }
+    }
+}
+const _: () = assert!(core::mem::size_of::<SleRegistrationSnapshot>() == 40);
+
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub(crate) struct SleControllerSnapshot {

@@ -19,6 +19,7 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_CONN_LIST
         | SL_IOCTL_CONTROLLER_EVENT_GET
         | SL_IOCTL_CONTROLLER_SNAPSHOT
+        | SL_IOCTL_REGISTRATION_SNAPSHOT
         | SL_IOCTL_DEV_COUNT
         | SL_IOCTL_DEV_INFO
         | SL_IOCTL_DEV_LIST

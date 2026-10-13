@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32,Ordering};
 use std::cell::Cell;
 type Result<T=()>=std::result::Result<T,i32>;
 const ENOSPC:i32=-28;const ENODEV:i32=-19;const EINVAL:i32=-22;const EBUSY:i32=-16;const ENOMEM:i32=-12;
+const EIO:i32=-5;
 type KBox<T>=Box<T>;
 macro_rules! pr_info{($($arg:tt)*)=>{let _=format_args!($($arg)*);}}
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]pub enum SleBus{#[default]None=0,Usb=4,Test=6}
@@ -53,6 +54,10 @@ static SUBSYSTEM:Lock<Option<Shared>>=Lock(Mutex::new(None));
 // @@VALIDATE@@
 // @@UPDATE_PENDING@@
 // @@QUERY_PENDING@@
+#[derive(Debug)]
+// @@SNAPSHOT_TYPE@@
+// @@SNAPSHOT_CONSTANTS@@
+// @@SNAPSHOT@@
 // @@RESERVE@@
 // @@INSTALL@@
 // @@CANCEL@@
@@ -129,4 +134,20 @@ fn failed(r:Result<Arc<ControllerRuntime>>,e:i32){assert!(matches!(r,Err(n) if n
  let id=setup();let o=install(id,0,false).unwrap();assert_eq!(update_backend_pending(id,10,-5),Err(EBUSY));assert_eq!(query_backend_pending(id),Err(EBUSY));assert_eq!(validate_backend_reservation(id,SleBus::None,0),Err(EBUSY));assert_eq!(o.identity,id);
  let pending=reserve_backend_identity(&SleControllerInfo::default()).unwrap();SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(pending.id).unwrap().begin_unregister();
  assert_eq!(update_backend_pending(pending,10,-5),Err(ENODEV));assert_eq!(query_backend_pending(pending),Err(ENODEV));assert_eq!(validate_backend_reservation(pending,SleBus::None,0),Err(ENODEV));
+}
+
+#[test]fn snapshot_pending_fault_and_exact_generation_are_authoritative(){
+ let id=setup();let s=snapshot_backend_registration(id.id,0).unwrap();assert_eq!(s.reserved_byte,0);assert_eq!((s.generation,s.dev_index,s.state,s.phase,s.error,s.reserved),(id.generation,id.id,REGISTRATION_PENDING,0,0,[0;8]));
+ update_backend_pending(id,3,-2).unwrap();let f=snapshot_backend_registration(id.id,id.generation).unwrap();assert_eq!((f.state,f.phase,f.error),(REGISTRATION_FAULT,3,-2));
+ assert_eq!(snapshot_backend_registration(id.id,id.generation+1).unwrap_err(),ENODEV);
+}
+#[test]fn snapshot_does_not_expose_pending_error_after_install_or_retirement(){
+ let id=setup();update_backend_pending(id,3,-2).unwrap();let _o=install(id,0,false).unwrap();let s=snapshot_backend_registration(id.id,0).unwrap();assert_eq!((s.state,s.phase,s.error),(REGISTRATION_INSTALLED,0,0));
+ SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(id.id).unwrap().begin_unregister();let s=snapshot_backend_registration(id.id,0).unwrap();assert_eq!((s.state,s.phase,s.error),(REGISTRATION_RETIRING,0,0));
+}
+#[test]fn snapshot_old_generation_is_rejected_without_retaining_cancelled_identity(){
+ let old=setup();cancel_backend_reservation(old);assert_eq!(snapshot_backend_registration(old.id,0).unwrap_err(),ENODEV);let new=reserve_backend_identity(&SleControllerInfo::default()).unwrap();assert_eq!(old.id,new.id);assert_eq!(snapshot_backend_registration(old.id,old.generation).unwrap_err(),ENODEV);assert_eq!(snapshot_backend_registration(new.id,new.generation).unwrap().generation,new.generation);
+}
+#[test]fn snapshot_keeps_fault_and_installed_peer_separate_and_rejects_missing_slot(){
+ let id=setup();update_backend_pending(id,3,-2).unwrap();let p=reserve_backend_identity_profile(&SleControllerInfo{bus:SleBus::Usb,..Default::default()},1).unwrap();let _o=install(p,0,false).unwrap();assert_eq!(snapshot_backend_registration(id.id,0).unwrap().error,-2);let s=snapshot_backend_registration(p.id,p.generation).unwrap();assert_eq!((s.bus,s.profile,s.state),(4,1,REGISTRATION_INSTALLED));assert_eq!(snapshot_backend_registration(16,0).unwrap_err(),ENODEV);
 }

@@ -556,6 +556,30 @@ struct sle_controller_snapshot {
 };
 #define SL_IOCTL_CONTROLLER_SNAPSHOT _IOWR(SL_MAGIC, 0x8a, struct sle_controller_snapshot)
 
+/* Core registration state, not Host Ready. Query without selecting a Runtime.
+ * Input: version=1, dev_index, generation (0 probes), all other fields zero.
+ * Snapshot linearizes under the registry lock; generation names that observation.
+ * Phase/error are raw provider diagnostics only while Pending/Fault.
+ */
+#define SLE_REGISTRATION_VERSION 1U
+#define SLE_REGISTRATION_PENDING 1U
+#define SLE_REGISTRATION_FAULT 2U
+#define SLE_REGISTRATION_INSTALLED 3U
+#define SLE_REGISTRATION_RETIRING 4U
+struct sle_registration_snapshot {
+	__aligned_u64 generation;
+	__u32 version;
+	__u32 state;
+	__u32 profile;
+	__u32 phase;
+	__s32 error;
+	__u16 dev_index;
+	__u8 bus;
+	__u8 reserved_byte;
+	__u8 reserved[8];
+};
+#define SL_IOCTL_REGISTRATION_SNAPSHOT _IOWR(SL_MAGIC, 0x9f, struct sle_registration_snapshot)
+
 
 /* Matched final Complete receipt in CLOCK_BOOTTIME ns. Zero until success.
  * Observational, explicit generation/request; does not consume event history.

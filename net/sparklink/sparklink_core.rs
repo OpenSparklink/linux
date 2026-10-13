@@ -759,6 +759,44 @@ pub(crate) fn query_backend_pending(identity: sle_dev::DeviceIdentity) -> Result
     Ok((dev.bus(), dev.pending_profile, dev.pending_phase, dev.pending_error))
 }
 
+/// Linearizes at the Core registry lock. No Host/driver lock, allocation or I/O
+/// is needed; Installed deliberately makes no statement about Host Ready.
+pub(crate) fn snapshot_backend_registration(id: u16, generation: u64) -> Result<SleRegistrationSnapshot> {
+    let registry = SUBSYSTEM.lock();
+    let shared = registry.as_ref().ok_or(ENODEV)?;
+    let dev = shared.dev_registry.get(id).ok_or(ENODEV)?;
+    if generation != 0 && generation != dev.identity().generation { return Err(ENODEV); }
+    let mut out: SleRegistrationSnapshot = unsafe { core::mem::zeroed() };
+    out.version = 1;
+    out.generation = dev.identity().generation;
+    out.dev_index = id;
+    out.bus = dev.bus() as u8;
+    out.profile = dev.pending_profile;
+    out.state = if dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) {
+        REGISTRATION_RETIRING
+    } else if let Some(owner) = shared.runtime(id) {
+        if owner.identity != dev.identity() { return Err(EIO); }
+        REGISTRATION_INSTALLED
+    } else {
+        out.phase = dev.pending_phase;
+        out.error = dev.pending_error;
+        if out.error < 0 { REGISTRATION_FAULT } else { REGISTRATION_PENDING }
+    };
+    Ok(out)
+}
+
+fn ioctl_registration_snapshot(arg: usize) -> Result<isize> {
+    let input: SleRegistrationSnapshot = read_user_struct(arg)?;
+    if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if input.dev_index >= 16 || input.state != 0 || input.profile != 0 || input.phase != 0
+        || input.error != 0 || input.bus != 0 { return Err(EINVAL); }
+    let out = snapshot_backend_registration(input.dev_index, input.generation)?;
+    // Copy outside the registry lock. The returned generation identifies the
+    // observation even if removal/reuse happens while copy_to_user sleeps.
+    write_user_struct(arg, &out)?;
+    Ok(0)
+}
+
 /// Cancel only an uninstalled exact reservation. Never discard an installed
 /// Runtime or release the identity of a concurrent retiring owner.
 pub(crate) fn cancel_backend_reservation(identity: sle_dev::DeviceIdentity) {
@@ -3876,6 +3914,7 @@ impl MiscDevice for SparkLinkCtl {
         match cmd {
             SL_IOCTL_DEV_SELECT => return ioctl_dev_select(me, arg),
             SL_IOCTL_DEV_GET_ACTIVE => return ioctl_dev_get_active(me, arg),
+            SL_IOCTL_REGISTRATION_SNAPSHOT => return ioctl_registration_snapshot(arg),
             _ => {}
         }
 
