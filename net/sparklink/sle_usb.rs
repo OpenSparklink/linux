@@ -41,6 +41,33 @@ use super::sle_ingress::{enqueue_rx, ingress_owner};
 #[repr(C)]
 pub(crate) struct UsbDeviceOpaque { _opaque: [u8; 0] }
 
+/// Internal C snapshot layout, copied once after complete bootstrap, before
+/// Runtime publication. Every field is queried; these are not policy limits.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UsbCapabilities {
+    command_max: u16,
+    acb_length: u16,
+    icb_length: u16,
+    acb_count: u8,
+    icb_count: u8,
+    features: [u8; 10],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UsbMetadata {
+    capabilities: UsbCapabilities,
+    version: [u8; 5],
+    address: [u8; 6],
+    command_credits: u8,
+}
+const _: () = assert!(core::mem::size_of::<UsbCapabilities>() == 18);
+const _: () = assert!(core::mem::size_of::<UsbMetadata>() == 30);
+const _: () = assert!(core::mem::align_of::<UsbMetadata>() == 2);
+const _: () = assert!(core::mem::offset_of!(UsbMetadata, version) == 18);
+const _: () = assert!(core::mem::offset_of!(UsbMetadata, address) == 23);
+const _: () = assert!(core::mem::offset_of!(UsbMetadata, command_credits) == 29);
+
 pub(crate) struct UsbDevice { context: *mut UsbDeviceOpaque }
 // SAFETY: owned reference pins C context; all process operations serialize in C.
 unsafe impl Send for UsbDevice {}
@@ -88,7 +115,7 @@ extern "C" {
     fn sle_usb_dev_stop_data(context: *mut UsbDeviceOpaque);
     fn sle_usb_dev_init_controller(context: *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_get_fw_version(context: *mut UsbDeviceOpaque) -> u32;
-    fn sle_usb_dev_get_version(context: *mut UsbDeviceOpaque, version: *mut u8) -> i32;
+    fn sle_usb_dev_get_metadata(context: *mut UsbDeviceOpaque, output: *mut UsbMetadata) -> i32;
     fn sle_usb_dev_get_command_credits(context: *mut UsbDeviceOpaque) -> u8;
     fn sle_usb_dev_get_mac(context: *mut UsbDeviceOpaque, mac: *mut u8) -> i32;
     fn sle_usb_dev_suspend(context: *mut UsbDeviceOpaque) -> i32;
@@ -817,8 +844,7 @@ fn raw_to_status(raw: u8) -> SleStatus {
 /// Runtime reference to a specific USB allocation, never an index lookup.
 #[derive(Clone)]
 pub(crate) struct UsbController {
-    addr: [u8; 6],
-    version: [u8; 5],
+    metadata: UsbMetadata,
     /// Owns the immutable USB allocation independently of registry reuse.
     device: UsbDevice,
     identity: super::sle_dev::DeviceIdentity,
@@ -830,24 +856,36 @@ impl UsbController {
     /// `addr` is the 6-byte SLE MAC address read from the controller
     /// during probe via the ReadMacAddr (0x0406) command.
     /// Identity comes from the pending reservation retained through USB cleanup.
-    pub(crate) fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: UsbDevice) -> Result<Self> {
-        let mut version = [0; 5];
-        // SAFETY: retained context and writable whole tuple. Probe completed
-        // matching Reset/version/MAC replies before constructing this Backend.
-        let ret = unsafe { sle_usb_dev_get_version(device.as_raw(), version.as_mut_ptr()) };
+    pub(crate) fn new(addr: [u8; 6], fw_version: u32, credits: u8, identity: super::sle_dev::DeviceIdentity, device: UsbDevice) -> Result<Self> {
+        let mut metadata = UsbMetadata::default();
+        // SAFETY: owned retained context and complete repr(C) writable snapshot;
+        // C observes all fields and validity together under its I/O mutex.
+        let ret = unsafe { sle_usb_dev_get_metadata(device.as_raw(), &mut metadata) };
         if ret != 0 { return Err(if ret < 0 { Error::from_errno(ret) } else { EIO }); }
-        Ok(Self {
-            addr,
-            version,
-            device,
-            identity,
-        })
+        // The caller's identity query must refer to this same observation.
+        if metadata.address != addr || metadata.command_credits != credits ||
+            u32::from_le_bytes(metadata.version[..4].try_into().unwrap()) != fw_version { return Err(EPROTO); }
+        Ok(Self { metadata, device, identity })
     }
-    pub(crate) fn version(&self) -> [u8; 5] { self.version }
+
+    pub(crate) fn fill_snapshot(&self, out: &mut super::sle_uapi::SleControllerSnapshot) {
+        // Immutable queried observation only, independent of Host readiness.
+        let metadata = &self.metadata;
+        out.valid_fields = 1;
+        out.version_tuple = metadata.version;
+        out.address = metadata.address;
+        out.features = metadata.capabilities.features;
+        out.acb_length = metadata.capabilities.acb_length;
+        out.icb_length = metadata.capabilities.icb_length;
+        out.acb_count = metadata.capabilities.acb_count;
+        out.icb_count = metadata.capabilities.icb_count;
+    }
 
     /// Only the owner's TX worker may call this transport operation after
     /// reserving its command slot and a controller credit.
     pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {
+        if params.len() > usize::from(self.metadata.capabilities.command_max) ||
+            params.len() > super::sle_uapi::DLI_PARAM_MAX { return Err(EINVAL); }
         // SAFETY: worker retains its registration owner; removal drains the
         // worker before unregistering/freeing the C transport. Data is live.
         let ret = unsafe {
@@ -872,11 +910,13 @@ impl SleController for UsbController {
         let name = b"sparklink-usb";
         info.name[..name.len()].copy_from_slice(name);
         info.bus = SleBus::Usb;
-        info.addr = self.addr;
+        info.addr = self.metadata.address;
         // Immutable queried tuple, no C I/O lock or transport wait in info().
-        info.fw_version = u32::from_le_bytes(self.version[..4].try_into().unwrap());
-        // Bootstrap queried identity only. Defaults advertise no unqueried
-        // features, connection/data limits, transport or crypto capabilities.
+        info.fw_version = u32::from_le_bytes(self.metadata.version[..4].try_into().unwrap());
+        info.features = u64::from_le_bytes(self.metadata.capabilities.features[..8].try_into().unwrap());
+        info.features_ext = u16::from_le_bytes(self.metadata.capabilities.features[8..].try_into().unwrap());
+        // ACB buffers are not SSAP MTU/MPS, DTAP modes, connection counts or
+        // security policy. Those still-unqueried fields remain unavailable.
 
         info
     }

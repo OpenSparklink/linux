@@ -48,13 +48,14 @@ static int sle_usb_send_cmd_sync(struct sle_usb_dev*d,u16 op,const u8*params,int
 /* @@VALIDATOR@@ */
 /* @@INIT@@ */
 /* @@GETTER@@ */
-/* @@CAPGETTER@@ */
+
 static struct usb_device usb;
 static struct sle_usb_dev reset(void){calls=fail_step=bad_step=zero_step=0;fail_code=malformation=0;return(struct sle_usb_dev){.active=true,.udev=&usb,.metadata_valid=true,.version={9,9,9,9,9},.fw_version=99,.mac_addr={8,8,8,8,8,8},.command_credits=7};}
 int main(void){
- struct sle_usb_dev d=reset();assert(!sle_usb_dev_init_controller_locked(&d));assert(d.metadata_valid&&calls==6&&d.fw_version==0xcd123421&&d.command_credits==2);u8 out[5]={0};assert(!sle_usb_dev_get_version(&d,out));assert(!memcmp(out,(u8[]){0x21,0x34,0x12,0xcd,0xab},5));cases++;
+ assert(sizeof(struct sle_usb_metadata)==30&&_Alignof(struct sle_usb_metadata)==2);
+ struct sle_usb_dev d=reset();assert(!sle_usb_dev_init_controller_locked(&d));assert(d.metadata_valid&&calls==6&&d.fw_version==0xcd123421&&d.command_credits==2);struct sle_usb_metadata out={0};assert(!sle_usb_dev_get_metadata(&d,&out));assert(!memcmp(out.version,(u8[]){0x21,0x34,0x12,0xcd,0xab},5));cases++;
  for(unsigned step=1;step<=6;step++){
-  d=reset();fail_step=step;fail_code=-ETIMEDOUT;assert(sle_usb_dev_init_controller_locked(&d)==-ETIMEDOUT&&!d.metadata_valid&&calls==step);memset(out,7,5);assert(sle_usb_dev_get_version(&d,out)==-ENODATA&&!memcmp(out,(u8[]){7,7,7,7,7},5));assert(d.fw_version==99);cases++;
+  d=reset();fail_step=step;fail_code=-ETIMEDOUT;assert(sle_usb_dev_init_controller_locked(&d)==-ETIMEDOUT&&!d.metadata_valid&&calls==step);memset(&out,7,sizeof(out));struct sle_usb_metadata untouched=out;assert(sle_usb_dev_get_metadata(&d,&out)==-ENODATA&&!memcmp(&out,&untouched,sizeof(out)));assert(d.fw_version==99);cases++;
   for(int wrong=1;wrong<=3;wrong++){d=reset();bad_step=step;malformation=wrong;assert(sle_usb_dev_init_controller_locked(&d)==(wrong==3?-EREMOTEIO:-EPROTO)&&!d.metadata_valid&&calls==step);cases++;}
  }
  for(unsigned step=1;step<=5;step++){d=reset();zero_step=step;assert(sle_usb_dev_init_controller_locked(&d)==-EAGAIN&&!d.metadata_valid&&calls==step);cases++;}
@@ -65,9 +66,9 @@ int main(void){
  d=reset();bad_step=3;malformation=11;assert(!sle_usb_dev_init_controller_locked(&d)&&d.capabilities.command_max==255);cases++;
  d=reset();bad_step=4;malformation=4;assert(!sle_usb_dev_init_controller_locked(&d)&&!d.capabilities.acb_count&&!d.capabilities.icb_count);cases++;
  d=reset();zero_step=6;assert(!sle_usb_dev_init_controller_locked(&d)&&d.metadata_valid&&!d.command_credits);cases++;
- d=reset();assert(!sle_usb_dev_init_controller_locked(&d));struct sle_usb_capabilities caps={0};assert(!sle_usb_dev_get_capabilities(&d,&caps));assert(caps.command_max==65535&&caps.acb_length==2047&&caps.acb_count==255&&caps.icb_length==1&&caps.icb_count==2&&caps.features[9]==10);cases++;
- memset(&caps,7,sizeof(caps));struct sle_usb_capabilities untouched=caps;d.metadata_valid=false;assert(sle_usb_dev_get_capabilities(&d,&caps)==-ENODATA&&!memcmp(&caps,&untouched,sizeof(caps)));d.active=false;assert(sle_usb_dev_get_capabilities(&d,&caps)==-ENODEV&&!memcmp(&caps,&untouched,sizeof(caps)));assert(sle_usb_dev_get_capabilities(NULL,&caps)==-EINVAL&&sle_usb_dev_get_capabilities(&d,NULL)==-EINVAL);cases++;
- d=reset();d.active=false;assert(sle_usb_dev_get_version(&d,out)==-ENODEV);assert(sle_usb_dev_init_controller_locked(&d)==-ENODEV&&calls==0);cases++;
- assert(sle_usb_dev_get_version(NULL,out)==-EINVAL);assert(sle_usb_dev_get_version(&d,NULL)==-EINVAL);cases++;
+ d=reset();assert(!sle_usb_dev_init_controller_locked(&d));struct sle_usb_metadata snapshot={0};assert(!sle_usb_dev_get_metadata(&d,&snapshot));assert(snapshot.capabilities.command_max==65535&&snapshot.capabilities.acb_length==2047&&snapshot.capabilities.acb_count==255&&snapshot.capabilities.icb_length==1&&snapshot.capabilities.icb_count==2&&snapshot.capabilities.features[9]==10);cases++;
+ memset(&snapshot,7,sizeof(snapshot));struct sle_usb_metadata untouched=snapshot;d.metadata_valid=false;assert(sle_usb_dev_get_metadata(&d,&snapshot)==-ENODATA&&!memcmp(&snapshot,&untouched,sizeof(snapshot)));d.active=false;assert(sle_usb_dev_get_metadata(&d,&snapshot)==-ENODEV&&!memcmp(&snapshot,&untouched,sizeof(snapshot)));assert(sle_usb_dev_get_metadata(NULL,&snapshot)==-EINVAL&&sle_usb_dev_get_metadata(&d,NULL)==-EINVAL);cases++;
+ d=reset();d.active=false;assert(sle_usb_dev_get_metadata(&d,&out)==-ENODEV);assert(sle_usb_dev_init_controller_locked(&d)==-ENODEV&&calls==0);cases++;
+ assert(sle_usb_dev_get_metadata(NULL,&out)==-EINVAL);assert(sle_usb_dev_get_metadata(&d,NULL)==-EINVAL);cases++;
  printf("{\"status\":\"ACTUAL_USB_BOOTSTRAP_TUPLE_PASS\",\"cases\":%u}\n",cases);return 0;
 }

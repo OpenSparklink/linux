@@ -17,11 +17,24 @@ unsafe fn sle_serdev_dev_get_fw_version(id: i32) -> u32 {
     assert_eq!(id, 8);
     FW.load(Ordering::Relaxed)
 }
-struct UsbController {
-    addr: [u8; 6],
-    version: [u8; 5],
-}
+// @@USB_METADATA_TYPES@@
+#[derive(Clone, Copy)]struct Identity;
+mod sle_dev { pub(crate) type DeviceIdentity=super::Identity; }
+#[derive(Clone)]struct UsbDevice;
+struct UsbDeviceOpaque;
+impl UsbDevice { fn as_raw(&self)->*mut UsbDeviceOpaque { std::ptr::null_mut() } }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]struct Error(i32);
+impl Error { fn from_errno(n:i32)->Self { Self(n) } }
+type Result<T> = std::result::Result<T,Error>;
+const EIO:Error=Error(-5);const EPROTO:Error=Error(-71);
+static INPUT:std::sync::Mutex<(i32,UsbMetadata)>=std::sync::Mutex::new((0,UsbMetadata{capabilities:UsbCapabilities{command_max:255,acb_length:0,icb_length:0,acb_count:0,icb_count:0,features:[0;10]},version:[0;5],address:[0;6],command_credits:0}));
+unsafe fn sle_usb_dev_get_metadata(_: *mut UsbDeviceOpaque,output:*mut UsbMetadata)->i32 { let input=INPUT.lock().unwrap();if input.0==0 { unsafe{*output=input.1;} }input.0 }
+// @@SNAPSHOT_TYPE@@
+mod sle_uapi { pub(crate) use super::SleControllerSnapshot; }
+struct UsbController { metadata:UsbMetadata,device:UsbDevice,identity:Identity }
 impl UsbController {
+    // @@USB_NEW@@
+    // @@USB_SNAPSHOT@@
     // @@USB_INFO@@
 }
 struct SerdevController {
@@ -73,8 +86,7 @@ fn usb_info_retains_only_queried_identity_and_firmware() {
     for fw in [0, 0x016c00a1, u32::MAX] {
         FW.store(fw, Ordering::Relaxed);
         let i = UsbController {
-            addr: [1; 6],
-            version: [fw.to_le_bytes()[0],fw.to_le_bytes()[1],fw.to_le_bytes()[2],fw.to_le_bytes()[3],0xab],
+            metadata: UsbMetadata {address:[1;6],version:[fw.to_le_bytes()[0],fw.to_le_bytes()[1],fw.to_le_bytes()[2],fw.to_le_bytes()[3],0xab],..Default::default()}, device:UsbDevice,identity:Identity,
         }
         .info();
         unavailable(&i);
@@ -168,4 +180,19 @@ fn reserve_projection()->SleControllerInfo {
 }
 #[test] fn unrelated_firmware_getter_does_not_backfill_pending_identity(){
  FW.store(0xffff,Ordering::Relaxed);let info=reserve_projection();assert_eq!(info.addr,[0;6]);assert_eq!(info.fw_version,0);unavailable(&info);
+}
+
+fn metadata()->UsbMetadata { UsbMetadata{capabilities:UsbCapabilities{command_max:65535,acb_length:2047,icb_length:1024,acb_count:255,icb_count:2,features:[1,2,3,4,5,6,7,8,9,0xab]},version:[1,2,3,4,5],address:[1,2,3,4,5,6],command_credits:2} }
+#[test]fn actual_constructor_keeps_one_observation_and_full_projection(){
+ let m=metadata();*INPUT.lock().unwrap()=(0,m);let c=UsbController::new(m.address,0x04030201,2,Identity,UsbDevice).unwrap();let i=c.info();assert_eq!(i.addr,m.address);assert_eq!(i.features,u64::from_le_bytes([1,2,3,4,5,6,7,8]));assert_eq!(i.features_ext,0xab09);assert_eq!((i.max_pdu_payload,i.max_connections,i.max_mtu,i.max_mps,i.transport_modes,i.security_cap),(0,0,0,0,0,0));let _=&c.device;let _=&c.identity;
+}
+#[test]fn actual_constructor_rejects_unknown_retired_and_positive_ffi(){
+ let m=metadata();for (ret,expected) in [(-61,-61),(-19,-19),(1,-5)]{*INPUT.lock().unwrap()=(ret,m);assert!(matches!(UsbController::new(m.address,0x04030201,2,Identity,UsbDevice),Err(e) if e==Error(expected)));}
+}
+#[test]fn actual_constructor_rejects_mixed_identity_version_and_credit_observations(){
+ let m=metadata();*INPUT.lock().unwrap()=(0,m);for (addr,fw,credits) in [([7;6],0x04030201,2),(m.address,0x05030201,2),(m.address,0x04030201,1)]{assert!(matches!(UsbController::new(addr,fw,credits,Identity,UsbDevice),Err(EPROTO)));}
+}
+#[test]fn actual_snapshot_layout_and_complete_fields_do_not_overwrite_host_state(){
+ assert_eq!(std::mem::size_of::<UsbMetadata>(),30);assert_eq!(std::mem::align_of::<UsbMetadata>(),2);assert_eq!(std::mem::offset_of!(UsbMetadata,version),18);assert_eq!(std::mem::offset_of!(UsbMetadata,address),23);assert_eq!(std::mem::offset_of!(UsbMetadata,command_credits),29);
+ let m=metadata();let c=UsbController{metadata:m,device:UsbDevice,identity:Identity};let mut s=SleControllerSnapshot{flags:4,command_credits:7,error:-5,..Default::default()};c.fill_snapshot(&mut s);assert_eq!(s.valid_fields,1);assert_eq!(s.features,m.capabilities.features);assert_eq!(s.address,m.address);assert_eq!(s.version_tuple,m.version);assert_eq!((s.acb_length,s.acb_count,s.icb_length,s.icb_count),(2047,255,1024,2));assert_eq!((s.flags,s.command_credits,s.error),(4,7,-5));assert_eq!((s.generation,s.version,s.profile,s.dev_index,s.bus,s.reserved_byte,s.reserved),(0,0,0,0,0,0,[0;4]));
 }

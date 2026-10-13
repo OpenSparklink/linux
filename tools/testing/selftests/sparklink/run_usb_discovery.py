@@ -38,6 +38,14 @@ def run(output):
         fixture = fixture.replace('/* @@'+marker+'@@ */', body)
     dli = inputs['sle_dli.rs']
     rust = (here/'usb-discovery/info_fixture.rs').read_text()
+    usb=inputs['sle_usb.rs']
+    declarations='\n'.join('#[repr(C)]\n#[derive(Clone,Copy,Default)]\n'+block(usb,usb.index('struct '+name+' {')) for name in ('UsbCapabilities','UsbMetadata'))
+    rust=rust.replace('// @@USB_METADATA_TYPES@@',declarations)
+    rust=rust.replace('// @@USB_NEW@@',function(usb[usb.index('impl UsbController {'):], 'new').replace('super::sle_dev::','crate::sle_dev::'))
+    rust=rust.replace('// @@USB_SNAPSHOT@@',function(usb,'fill_snapshot').replace('super::sle_uapi::','crate::sle_uapi::'))
+    uapi=(net/'sle_uapi.rs').read_text()
+    rust=rust.replace('// @@SNAPSHOT_TYPE@@','#[derive(Default)]\n'+block(uapi,uapi.index('pub(crate) struct SleControllerSnapshot {')))
+
     rust = rust.replace('// @@INFO_STRUCT@@', block(dli, dli.index('pub struct SleControllerInfo {')))
     rust = rust.replace('// @@DEFAULT@@', function(dli[dli.index('impl Default for SleControllerInfo'):], 'default'))
     for marker, source in [('USB_INFO', 'sle_usb.rs'), ('SERDEV_INFO', 'sle_serdev.rs')]:
@@ -66,7 +74,7 @@ def run(output):
     assert all((net/n).read_text() == s for n, s in inputs.items())
     assert archived.read_text()==serdev_source
     record = {'status': 'GENERIC_USB_DESCRIPTOR_CAPABILITY_SOURCE_BOUNDARIES_PASS',
-              'c_cases': c_record['c_cases'], 'rust_tests': 7,
+              'c_cases': c_record['c_cases'], 'rust_tests': 11,
               'scope': 'actual C register/unregister; actual Rust info structs/default, USB info/pending reservation metadata, archived attach and serdev info; descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
               'physical_acceptance': False, 'generic_dialect_acceptance': False,
               'full_capability_provenance_contract': False, 'natural_fault_root_cause_closed': False,

@@ -1200,8 +1200,8 @@ unsafe impl Send for ControllerBackend {}
 unsafe impl Sync for ControllerBackend {}
 
 impl ControllerBackend {
-    pub(crate) fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: super::sle_usb::UsbDevice) -> Result<Self> {
-        Ok(Self::Usb(super::sle_usb::UsbController::new(addr, identity, device)?))
+    pub(crate) fn new_usb(addr: [u8; 6], fw_version: u32, credits: u8, identity: super::sle_dev::DeviceIdentity, device: super::sle_usb::UsbDevice) -> Result<Self> {
+        Ok(Self::Usb(super::sle_usb::UsbController::new(addr, fw_version, credits, identity, device)?))
     }
 }
 

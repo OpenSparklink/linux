@@ -1076,8 +1076,7 @@ u32 sle_usb_dev_get_fw_version(struct sle_usb_dev *d)
 	return result;
 }
 
-int sle_usb_dev_get_capabilities(struct sle_usb_dev *d,
-				 struct sle_usb_capabilities *out)
+int sle_usb_dev_get_metadata(struct sle_usb_dev *d, struct sle_usb_metadata *out)
 {
 	int ret = 0;
 
@@ -1088,29 +1087,15 @@ int sle_usb_dev_get_capabilities(struct sle_usb_dev *d,
 		ret = -ENODEV;
 	else if (!d->metadata_valid)
 		ret = -ENODATA;
-	else
-		*out = d->capabilities;
+	else {
+		out->capabilities = d->capabilities;
+		memcpy(out->version, d->version, sizeof(out->version));
+		memcpy(out->address, d->mac_addr, sizeof(out->address));
+		out->command_credits = d->command_credits;
+	}
 	mutex_unlock(&d->io_lock);
 	return ret;
 }
-
-int sle_usb_dev_get_version(struct sle_usb_dev *d, u8 *version)
-{
-    int ret = 0;
-
-    if (!d || !version)
-        return -EINVAL;
-    mutex_lock(&d->io_lock);
-    if (!d->active)
-        ret = -ENODEV;
-    else if (!d->metadata_valid)
-        ret = -ENODATA;
-    else
-        memcpy(version, d->version, sizeof(d->version));
-    mutex_unlock(&d->io_lock);
-    return ret;
-}
-
 
 int sle_usb_dev_get_mac(struct sle_usb_dev *d, u8 *mac)
 {
