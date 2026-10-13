@@ -826,9 +826,10 @@ int sle_usb_dev_send_cmd(struct sle_usb_dev *d, u16 opcode, const u8 *params, in
 	result = !d->active ? -ENODEV : d->suspended ? -EHOSTDOWN :
 		sle_usb_dev_send_cmd_locked(d, opcode, params, plen);
 	mutex_unlock(&d->io_lock);
-    if (plen >= 0 && plen <= 65531 && (!plen || params))
-        sparklink_native_snoop_tx(d->id, d->generation, opcode,
-                                 params ? params : (const u8 *)"", plen, result);
+	if (plen >= 0 && plen <= 65531 && (!plen || params)) {
+		sparklink_native_snoop_tx(d->id, d->generation, opcode,
+				 params ? params : (const u8 *)"", plen, result);
+	}
 	return result;
 }
 
