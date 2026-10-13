@@ -70,6 +70,8 @@ fail() { echo VIRTUAL_VM_FAIL; busybox dmesg; busybox poweroff -f; exit 1; }
 busybox mount -t proc none /proc || fail
 busybox mount -t sysfs none /sys || fail
 busybox mount -t devtmpfs none /dev || fail
+busybox mkdir -p /sys/kernel/config || fail
+busybox mount -t configfs none /sys/kernel/config || fail
 '''
         init += '[ "$(busybox uname -r)" = "' + info['vermagic'].split()[0] + '" ] || fail\n'
         init += '''for round in 1 2; do
@@ -106,6 +108,8 @@ busybox poweroff -f
         if (result.returncode or log.count('VIRTUAL_RUNTIME_PASS:') != 2
                 or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
                 or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
+                or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
+                or log.count('VIRTUAL_GLOBAL_POWER_POLICY_PASS:') != 2
                 or log.count('GENL_REGISTRY_PASS:') != 10
                 or log.count('GENL_REGISTRY_PASS: uid=1000') != 2
                 or 'VIRTUAL_MODULE_ROUND_PASS:2' not in log or 'VIRTUAL_VM_PASS' not in log
@@ -117,6 +121,7 @@ busybox poweroff -f
             raise RuntimeError('input changed during VM')
         record.update(status='PASS_VIRTUAL_CORE_HOST_VM', module_rounds=2,
                       registry_results=[line for line in log.splitlines() if 'GENL_REGISTRY_PASS:' in line],
+                      power_results=[line for line in log.splitlines() if 'VIRTUAL_POWER_' in line or 'VIRTUAL_GLOBAL_POWER_' in line],
                       query_results=[line for line in log.splitlines() if 'VIRTUAL_RUNTIME_PASS:' in line],
                       diagnostic_fd_results=[line for line in log.splitlines()
                                              if 'VIRTUAL_DIAGNOSTIC_FD_PASS:' in line])

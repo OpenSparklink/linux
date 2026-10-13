@@ -1,0 +1,19 @@
+    fn sync_power_mode(context: &RuntimeContext) -> Result {
+        let configfs_mode = sle_configfs::power_mode();
+        let mut ss = context.lock()?;
+        if let Some(ref mut shared) = *ss {
+            let old_pct = shared.power.estimated_power_pct();
+            if shared.power.set_mode(configfs_mode) {
+                let new_pct = shared.power.estimated_power_pct();
+                pr_info!(
+                    "sparklink: power mode changed to {} ({}% -> {}%)\n",
+                    configfs_mode,
+                    old_pct,
+                    new_pct
+                );
+                // Push a power changed event through per-fd EventQueue path
+                // instead of broadcast ring (avoid pub visibility issue).
+            }
+        }
+        Ok(())
+    }

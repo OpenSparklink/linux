@@ -9,7 +9,7 @@
 //! - `max_connections` (read/write): maximum simultaneous connections (1..8)
 //! - `adv_interval_ms` (read/write): default advertising interval
 //! - `scan_window_ms` (read/write): default scan window
-//! - `power_mode` (read/write): power management mode (active/sniff/idle)
+//! - `power_mode`: unsupported retired global policy; no controller PM effect
 
 use kernel::configfs;
 use kernel::new_mutex;
@@ -24,7 +24,6 @@ const VERSION_STR: &[u8] = b"0.3.0\n";
 static MAX_CONNECTIONS: AtomicU8 = AtomicU8::new(8);
 static ADV_INTERVAL_MS: AtomicU16 = AtomicU16::new(100);
 static SCAN_WINDOW_MS: AtomicU16 = AtomicU16::new(200);
-static POWER_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// Get the configured maximum number of connections (1..8).
 pub(crate) fn max_connections() -> u8 {
@@ -39,12 +38,6 @@ pub(crate) fn adv_interval_ms() -> u16 {
 /// Get the configured default scan window in milliseconds.
 pub(crate) fn scan_window_ms() -> u16 {
     SCAN_WINDOW_MS.load(Ordering::Relaxed)
-}
-
-/// Get the configured power mode.
-/// 0 = active, 1 = sniff, 2 = idle.
-pub(crate) fn power_mode() -> u8 {
-    POWER_MODE.load(Ordering::Relaxed)
 }
 
 #[pin_data]
@@ -161,34 +154,16 @@ impl configfs::AttributeOperations<3> for SparkLinkConfig {
     }
 }
 
-// Attribute 4: power_mode (read/write, 0=active, 1=sniff, 2=idle)
+// Attribute 4: unsupported historical global policy; never affects controllers.
 #[vtable]
 impl configfs::AttributeOperations<4> for SparkLinkConfig {
     type Data = SparkLinkConfig;
-
-    fn show(_data: &SparkLinkConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
-        let mode = POWER_MODE.load(Ordering::Relaxed);
-        let label = match mode {
-            0 => b"active\n" as &[u8],
-            1 => b"sniff\n",
-            2 => b"idle\n",
-            _ => b"unknown\n",
-        };
-        page[..label.len()].copy_from_slice(label);
-        Ok(label.len())
+    fn show(_data: &SparkLinkConfig, _page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
-
-    fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+    fn store(_data: &SparkLinkConfig, _page: &[u8]) -> Result {
         super::sle_authorization::require_admin()?;
-        let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
-        let val = match s.trim() {
-            "active" | "0" => 0u8,
-            "sniff" | "1" => 1u8,
-            "idle" | "2" => 2u8,
-            _ => return Err(EINVAL),
-        };
-        POWER_MODE.store(val, Ordering::Relaxed);
-        Ok(())
+        Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))
     }
 }
 

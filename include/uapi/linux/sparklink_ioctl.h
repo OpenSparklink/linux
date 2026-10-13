@@ -658,7 +658,7 @@ struct sle_subsys_stats {
 	__u32 total_conn_completed;
 	__u32 total_mgmt_submitted;
 	__u32 total_mgmt_timeouts;
-	__u8  power_state;
+	__u8  power_state; /* 0xff: unavailable; not a hardware snapshot. */
 	__u8  _pad2[3];
 	__u32 power_transitions;
 	__u32 crc_errors;

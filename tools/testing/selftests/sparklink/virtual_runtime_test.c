@@ -250,15 +250,38 @@ static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
 	printf("VIRTUAL_FAULT: delay=%u drop=%u fail=%u peer_query=1 no_revive=1\n", delay, drop, fail);
 }
 
+static void rejected_power(int fd, int ordinary)
+{
+    const unsigned long commands[] = { SL_IOCTL_PM_INFO, SL_IOCTL_PM_SET_STATE,
+        SL_IOCTL_PM_SET_INTERVAL, SL_IOCTL_PM_FORCE_ACTIVE, SL_IOCTL_PM_TICK,
+        SL_IOCTL_PM_ACTIVITY };
+    for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        unsigned char data[64], original[64]; memset(data, 0xa5, sizeof(data));
+        memcpy(original, data, sizeof(data));
+        CHECK(ioctl(fd, commands[i], data) == -1);
+        CHECK(errno == (ordinary && i ? EPERM : EOPNOTSUPP));
+        CHECK(!memcmp(data, original, sizeof(data)));
+    }
+    printf("VIRTUAL_POWER_UNSUPPORTED_PASS: uid=%u commands=6 unchanged=6\n", getuid());
+}
+
 int main(void)
 {
 	struct controller a = create(), b = create();
 	CHECK(a.status.id != b.status.id && a.status.generation != b.status.generation);
 	CHECK(!registry_probe(2));
+	rejected_power(a.fd, 0);
+	int policy = open("/sys/kernel/config/sparklink/power_mode", O_RDWR);
+	CHECK(policy >= 0);
+	char mode[16]; CHECK(read(policy, mode, sizeof(mode)) == -1 && errno == EOPNOTSUPP);
+	CHECK(write(policy, "idle\n", 5) == -1 && errno == EOPNOTSUPP);
+	CHECK(!close(policy));
+	printf("VIRTUAL_GLOBAL_POWER_POLICY_PASS: show=EOPNOTSUPP store=EOPNOTSUPP\n");
 	fflush(NULL);
 	pid_t observer = fork(); CHECK(observer >= 0);
 	if (!observer) {
 		CHECK(!setgroups(0, NULL) && !setgid(1000) && !setuid(1000));
+		rejected_power(a.fd, 1);
 		int result = registry_probe(2); fflush(stdout); _exit(result);
 	}
 	int status; CHECK(waitpid(observer, &status, 0) == observer && WIFEXITED(status) && !WEXITSTATUS(status));

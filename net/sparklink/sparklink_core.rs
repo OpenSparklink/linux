@@ -40,7 +40,6 @@ mod sle_data_credit;
 mod sle_native_data;
 mod sle_pdu;
 mod sle_phy;
-mod sle_power;
 mod sle_security;
 mod sle_snoop;
 mod sle_uapi;
@@ -81,7 +80,6 @@ use sle_adv::{AdvParams, AdvScanInner, ScanParams};
 use sle_conn::{
     ConnManager, ConnState, GtRole, CONN_DATA_MAX,
 };
-use sle_power::PowerInner;
 use sle_security::{RalEntry, RpaManager, SecurityInner};
 
 // ---------------------------------------------------------------------------
@@ -223,7 +221,6 @@ pub(crate) struct ControllerState {
     pub(crate) security: SecurityInner,
     pub(crate) rpa: RpaManager,
     pub(crate) rpa_tick_accum: u16,
-    pub(crate) power: PowerInner,
     pub(crate) local_role: GtRole,
     pub(crate) cmd_pending: sle_mgmt::CmdPendingQueue,
     pub(crate) cmd_queue: sle_mgmt::CmdRequestQueue,
@@ -247,7 +244,6 @@ impl ControllerState {
                 security: SecurityInner::new(),
                 rpa: RpaManager::new(),
                 rpa_tick_accum: 0,
-                power: PowerInner::new(),
                 local_role: GtRole::TNode,
                 cmd_pending <- sle_mgmt::CmdPendingQueue::new_in_place(),
                 cmd_queue <- sle_mgmt::CmdRequestQueue::new_in_place(),
@@ -613,10 +609,6 @@ pub(crate) fn sle_detach_device(identity: sle_dev::DeviceIdentity) {
 
 /// Start advertising / broadcast with the given interval.
 fn do_start_adv(context: &RuntimeContext, interval_ms: u32, discovery_level: u8) -> Result<i32> {
-    let mode = sle_configfs::power_mode();
-    if mode >= 2 {
-        return Err(EPERM);
-    }
     let interval = if interval_ms == 0 {
         u32::from(sle_configfs::adv_interval_ms())
     } else {
@@ -661,10 +653,6 @@ fn do_stop_adv(context: &RuntimeContext) -> Result<i32> {
 
 /// Start scanning with the given window and interval.
 fn do_start_scan(context: &RuntimeContext, window_ms: u32, interval_ms: u32, filter_level: u8) -> Result<i32> {
-    let mode = sle_configfs::power_mode();
-    if mode >= 2 {
-        return Err(EPERM);
-    }
     let window = if window_ms == 0 {
         u32::from(sle_configfs::scan_window_ms())
     } else {
@@ -772,7 +760,7 @@ struct DebugfsHolder {
     _transport_info: File<Atomic<u32>>,
     _power_dir: Dir,
     #[pin]
-    _power_stats: File<Atomic<u32>>,
+    _power_stats: File<CString>,
     _conn_dir: Dir,
     #[pin]
     _conn_stats: File<Atomic<u32>>,
@@ -800,12 +788,12 @@ fn init_version_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_build_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security power event dli usb genl-C\nlanguage: Rust"))
+    CString::try_from_fmt(fmt!("sparklink subsystem\nstandard: T/XS 10002-2025, T/XS 20001-2025, T/XS 10003-2025\nmodules: core pdu adv conn crypto security dli; Native events; registry-only genl\nlanguage: Rust"))
 }
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
+    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nPM: unsupported hardware control\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
 }
 
 #[inline(never)]
@@ -813,6 +801,7 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
     let ver = init_version_string()?;
     let build = init_build_string()?;
     let subsys = init_subsys_string()?;
+    let unsupported_pm = CString::try_from_fmt(fmt!("unsupported: no qualified hardware PM snapshot\n"))?;
 
     let debugfs = Dir::new(c"sparklink");
     let mgmt_dir = debugfs.subdir(c"mgmt");
@@ -885,26 +874,7 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
                 },
             ),
             _transport_dir: transport_dir,
-            _power_stats <- power_dir.read_callback_file(
-                c"stats",
-                Atomic::<u32>::new(0),
-                &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
-                    let context = RuntimeContext::default_selection();
-                    if let Ok(guard) = context.lock() {
-                        let ss = guard.as_ref().expect("validated live Runtime");
-                        let p = &ss.power;
-                        writeln!(f, "state: {:?}", p.state)?;
-                        writeln!(f, "forced_active: {}", p.is_forced_active())?;
-                        writeln!(f, "active_events: {}", p.stats.active_events)?;
-                        writeln!(f, "sniff_events: {}", p.stats.sniff_events)?;
-                        writeln!(f, "idle_events: {}", p.stats.idle_events)?;
-                        writeln!(f, "transitions: {}", p.stats.transitions)?;
-                        writeln!(f, "force_active_count: {}", p.stats.force_active_count)?;
-                        writeln!(f, "supervision_warnings: {}", p.stats.supervision_warnings)?;
-                    }
-                    Ok(())
-                },
-            ),
+            _power_stats <- power_dir.read_only_file(c"stats", unsupported_pm),
             _power_dir: power_dir,
             _conn_stats <- conn_dir.read_callback_file(
                 c"stats",
@@ -1386,7 +1356,6 @@ fn ioctl_conn_recv(context: &RuntimeContext, arg: usize) -> Result<isize> {
 fn ioctl_dispatch_conn(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
         SL_IOCTL_CONNECT => {
-            SparkLinkCtl::check_power_active()?;
             let cp: SleConnectParams = read_user_struct(arg)?;
             let role = if cp.gt_role == 1 {
                 GtRole::GNode
@@ -2430,7 +2399,6 @@ fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         if !reference.valid() { return Err(EINVAL); }
         Some(reference)
     } else { None };
-    if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
     let plan = state.controller.provider().prepare_connection(&request)?;
@@ -2553,7 +2521,6 @@ fn ioctl_discovery_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
     let owner = discovery_owner(context, me)?;
     if request.generation != owner.identity.generation { return Err(ENODEV); }
     if request.profile != owner.protocol_profile { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
-    if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
     let plan = state.controller.provider().prepare_discovery(&request)?;
@@ -2816,81 +2783,10 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_DISCOVERY_RESULT => ioctl_discovery_result(context, me, arg),
         SL_IOCTL_DISCOVERY_TIMING => ioctl_discovery_timing(context, me, arg),
         SL_IOCTL_CONTROLLER_EVENT_GET => ioctl_controller_event_get(context, me, arg),
-        SL_IOCTL_PM_INFO => {
-            let info = {
-                let ss = context.lock()?;
-                let s = ss.as_ref().ok_or(ENODEV)?;
-                let mut info: SlePmInfo = unsafe { core::mem::zeroed() };
-                info.state = s.power.state as u8;
-                info.force_active = if s.power.is_forced_active() { 1 } else { 0 };
-                info.power_pct = s.power.estimated_power_pct();
-                info.current_interval = s.power.interval.current_interval;
-                info.supervision_timeout = s.power.interval.supervision_timeout;
-                info.latency = s.power.interval.latency;
-                info.idle_count = s.power.stats.active_events.min(u64::from(u16::MAX)) as u16;
-                info.transitions = s.power.stats.transitions;
-                info.active_events = s.power.stats.active_events;
-                info.sniff_events = s.power.stats.sniff_events;
-                info.idle_events = s.power.stats.idle_events;
-                info
-            };
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_PM_SET_STATE => {
-            let cmd_data: SlePmStateCmd = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            match cmd_data.target_state {
-                0 => {
-                    s.power.resume();
-                    Ok(0)
-                }
-                1 => {
-                    s.power.on_activity();
-                    s.power.force_active(false);
-                    Ok(0)
-                }
-                3 => {
-                    s.power.suspend()?;
-                    Ok(0)
-                }
-                _ => Err(EINVAL),
-            }
-        }
-        SL_IOCTL_PM_SET_INTERVAL => {
-            let params: SlePmInterval = read_user_struct(arg)?;
-            let interval = sle_power::ConnInterval {
-                min_interval: params.min_interval,
-                max_interval: params.max_interval,
-                current_interval: params.min_interval,
-                latency: params.latency,
-                supervision_timeout: params.supervision_timeout,
-            };
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.power.update_interval(interval)?;
-            Ok(0)
-        }
-        SL_IOCTL_PM_FORCE_ACTIVE => {
-            let enable: u8 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.power.force_active(enable != 0);
-            Ok(0)
-        }
-        SL_IOCTL_PM_TICK => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.power.on_tick();
-            Ok(0)
-        }
-        SL_IOCTL_PM_ACTIVITY => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.power.on_activity();
-            Ok(0)
-        }
+        // No qualified hardware PM transaction or snapshot is connected.
+        SL_IOCTL_PM_INFO | SL_IOCTL_PM_SET_STATE | SL_IOCTL_PM_SET_INTERVAL
+        | SL_IOCTL_PM_FORCE_ACTIVE | SL_IOCTL_PM_TICK | SL_IOCTL_PM_ACTIVITY
+            => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_SYNC_UCAST_PARAM
         | SL_IOCTL_SYNC_UCAST_CREATE
         | SL_IOCTL_SYNC_UCAST_REMOVE
@@ -2975,9 +2871,9 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
                 total_conn_completed: s.conn.total_completed as u32,
                 total_mgmt_submitted: s.cmd_pending.total_submitted as u32,
                 total_mgmt_timeouts: s.cmd_pending.total_timeouts as u32,
-                power_state: s.power.state as u8,
+                power_state: 0xff, // Unknown: no hardware PM snapshot.
                 _pad: [0; 3],
-                power_transitions: s.power.stats.transitions,
+                power_transitions: 0, // Unavailable, not a measured zero.
                 crc_errors: sle_pdu::crc_error_count(),
             };
             drop(ss);
@@ -3200,6 +3096,10 @@ impl MiscDevice for SparkLinkCtl {
         if matches!(cmd, SL_IOCTL_INJECT_ADV | SL_IOCTL_INJECT_RAW_ADV | SL_IOCTL_INJECT_CONN_RESP | SL_IOCTL_INJECT_CONN_DATA) {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
+        if matches!(cmd, SL_IOCTL_PM_INFO | SL_IOCTL_PM_SET_STATE | SL_IOCTL_PM_SET_INTERVAL
+            | SL_IOCTL_PM_FORCE_ACTIVE | SL_IOCTL_PM_TICK | SL_IOCTL_PM_ACTIVITY) {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
         // Per-fd device routing: DEV_SELECT and DEV_GET_ACTIVE are handled
         // before capturing a RuntimeContext so they can query/set affinity.
         match cmd {
@@ -3244,10 +3144,6 @@ impl MiscDevice for SparkLinkCtl {
                 sle_management::DIAGNOSTIC
             } else { sle_management::MANAGED };
             gate.authorize(me.file_id, required_mode).map_err(management_error)?;
-        }
-        // Observation never applies global policy or modifies Runtime state.
-        if !registry_operation && access == sle_authorization::Access::Protected {
-            Self::sync_power_mode(context)?;
         }
 
         match cmd {
@@ -3381,41 +3277,6 @@ impl MiscDevice for SparkLinkCtl {
     }
 }
 
-impl SparkLinkCtl {
-    /// Synchronize configfs power_mode into SubsystemShared.
-    /// Called at the beginning of ioctls that initiate active operations.
-    fn sync_power_mode(context: &RuntimeContext) -> Result {
-        let configfs_mode = sle_configfs::power_mode();
-        let mut ss = context.lock()?;
-        if let Some(ref mut shared) = *ss {
-            let old_pct = shared.power.estimated_power_pct();
-            if shared.power.set_mode(configfs_mode) {
-                let new_pct = shared.power.estimated_power_pct();
-                pr_info!(
-                    "sparklink: power mode changed to {} ({}% -> {}%)\n",
-                    configfs_mode,
-                    old_pct,
-                    new_pct
-                );
-                // Push a power changed event through per-fd EventQueue path
-                // instead of broadcast ring (avoid pub visibility issue).
-            }
-        }
-        Ok(())
-    }
-
-    /// Check if the subsystem power mode allows active operations.
-    /// Returns Err(EPERM) if in idle mode.
-    fn check_power_active() -> Result {
-        let mode = sle_configfs::power_mode();
-        if mode >= 2 {
-            // Idle or suspended — reject active operations.
-            return Err(EPERM);
-        }
-        Ok(())
-    }
-
-}
 
 #[pinned_drop]
 impl PinnedDrop for SparkLinkCtl {
