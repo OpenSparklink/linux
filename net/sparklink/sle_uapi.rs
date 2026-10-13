@@ -9,7 +9,6 @@ use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
 use kernel::prelude::*;
 use kernel::transmute::FromBytes;
 
-use super::sle_dli;
 
 // ---------------------------------------------------------------------------
 // Padding / reserved field validation (per botching-up-ioctls.rst)
@@ -71,7 +70,6 @@ impl CheckReserved for i16 {}
 // ---------------------------------------------------------------------------
 
 /// Maximum name length in SleInjectAdv / SleAdvParams.
-pub(crate) const ADV_NAME_MAX: usize = 32;
 /// Maximum advertising/scan data payload.
 pub(crate) const ADV_DATA_MAX: usize = 252;
 /// Maximum DLI command parameter length.
@@ -341,12 +339,6 @@ pub(crate) const SL_IOCTL_SYNC_MCAST_REJECT: u32 = _IOW::<SleSyncRejectCmd>(SL_M
 
 /// Send isochronous data on a sync link (§7.5).
 pub(crate) const SL_IOCTL_SYNC_DATA_SEND: u32 = _IOW::<SleSyncDataCmd>(SL_MAGIC, 0x77);
-
-/// Get number of pending events in the event queue.
-pub(crate) const SL_IOCTL_EVENT_COUNT: u32 = _IO(SL_MAGIC, 0x70);
-
-/// Get event queue lifetime statistics.
-pub(crate) const SL_IOCTL_EVENT_STATS: u32 = _IOR::<SleEventStats>(SL_MAGIC, 0x71);
 
 /// Get DLI controller information.
 pub(crate) const SL_IOCTL_DLI_INFO: u32 = _IOR::<SleDliInfo>(SL_MAGIC, 0x80);
@@ -1489,25 +1481,6 @@ pub(crate) struct SlePmInterval {
 unsafe impl FromBytes for SlePmInterval {}
 
 // ---------------------------------------------------------------------------
-// Event queue statistics
-// ---------------------------------------------------------------------------
-
-/// Lifetime statistics for the event queue.
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub(crate) struct SleEventStats {
-    /// Number of events currently pending.
-    pub pending: u32,
-    pub(crate) _pad: u32,
-    /// Total events enqueued (lifetime).
-    pub total_enqueued: u64,
-    /// Total events dropped (queue full).
-    pub total_dropped: u64,
-    /// Total events delivered to userspace.
-    pub total_delivered: u64,
-}
-
-// ---------------------------------------------------------------------------
 // DLI controller information
 // ---------------------------------------------------------------------------
 
@@ -1964,7 +1937,6 @@ impl_check_reserved!(SleHashTest, [_pad]);
 impl_check_reserved!(SleSm4BlockTest, [_pad]);
 impl_check_reserved!(SlePmInfo, [_pad, _reserved]);
 impl_check_reserved!(SlePmStateCmd, [_reserved]);
-impl_check_reserved!(SleEventStats, [_pad]);
 impl_check_reserved!(SleDliInfo, [_pad, _reserved]);
 impl_check_reserved!(SleMgmtStats, [_pad]);
 impl_check_reserved!(SleSubsysStats, [_pad]);

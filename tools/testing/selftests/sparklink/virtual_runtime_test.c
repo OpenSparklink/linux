@@ -46,6 +46,12 @@ static struct controller create(void)
 	uint16_t id = c.status.id;
 	CHECK(!ioctl(c.fd, SL_IOCTL_DEV_SELECT, &id));
 	CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
+	unsigned char legacy_read[64]; memset(legacy_read, 0xa5, sizeof(legacy_read));
+	CHECK(read(c.fd, legacy_read, sizeof(legacy_read)) == -1 && errno == EOPNOTSUPP);
+	CHECK(ioctl(c.fd, 0x5370U, NULL) == -1 && errno == ENOTTY);
+	CHECK(ioctl(c.fd, 0x80205371U, legacy_read) == -1 && errno == ENOTTY);
+	for (unsigned n = 0; n < sizeof(legacy_read); n++) CHECK(legacy_read[n] == 0xa5);
+
 	/* Unpublished legacy poll was deleted; it cannot consume any reply. */
 	unsigned char retired[256];
 	memset(retired, 0xa5, sizeof(retired));

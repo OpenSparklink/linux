@@ -28,8 +28,6 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_DISCOVERY_RESULT
         | SL_IOCTL_DISCOVERY_TIMING
         | SL_IOCTL_DLI_INFO
-        | SL_IOCTL_EVENT_COUNT
-        | SL_IOCTL_EVENT_STATS
         | SL_IOCTL_EXT_ADV_INFO
         | SL_IOCTL_GET_ROLE
         | SL_IOCTL_MEAS_READ_CAP

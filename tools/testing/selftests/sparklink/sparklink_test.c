@@ -42,6 +42,7 @@
 /* ------------------------------------------------------------------ */
 
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "retired-read/legacy_abi.h"
 #include "retired-event-poll/legacy_abi.h"
 #include "../../../../include/uapi/linux/sparklink.h"
 

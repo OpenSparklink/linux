@@ -20,13 +20,13 @@ def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
     inputs = {name: (net / name).read_bytes()
-              for name in ['sle_event.rs', 'sparklink_core.rs', 'sle_uapi.rs']}
+              for name in ['sparklink_core.rs', 'sle_uapi.rs']}
     with tempfile.TemporaryDirectory(prefix='sparklink-event-copy-') as tmp:
         tmp = Path(tmp)
-        (tmp / 'sle_event.rs').write_bytes(inputs['sle_event.rs'])
+        (tmp / 'sle_event.rs').write_bytes((here / 'retired-read/sle_event.rs').read_bytes())
         source = (here / 'event-copy/fixture.rs').read_text()
         source = source.replace('// @@READ_ITER@@',
-                                function(inputs['sparklink_core.rs'].decode(), 'read_iter'))
+                                (here / 'retired-read/read_iter.rs').read_text())
         (tmp / 'fixture.rs').write_text(source)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'),
@@ -49,13 +49,13 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / name).read_bytes() == data for name, data in inputs.items())
     record = {'status': 'EVENT_RECORD_COPY_BOUNDARY_PASS', 'rust_tests': 15,
-              'read_iter_tests': 9, 'historical_legacy_dli_poll_tests': 6,
+              'historical_read_iter_tests': 9, 'historical_legacy_dli_poll_tests': 6,
               'retired_poll_sources': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (here / 'retired-event-poll').glob('*.rs')},
-              'scope': 'actual event/read_iter plus archived K4ea legacy DLI declaration/ring/poll; archived cases are not production qualification; copy/lock/controller-codec dependencies are fixtures',
+              'scope': 'archived K46f read/queue and K4ea legacy DLI declaration/ring/poll; archived cases are not production qualification; copy/lock/controller-codec dependencies are fixtures',
               'live_vfs_fault_acceptance': False, 'physical_acceptance': False,
               'sources': {name: hashlib.sha256(data).hexdigest()
                           for name, data in inputs.items()},
-              'remaining': ['Remaining legacy read/broadcast migration',
+              'remaining': ['Canonical event snapshot/loss/ownership gates',
                             'Removal wakeup, actual kernel concurrency/locks and complete event ownership gates']}
     if output:
         output.write_text(json.dumps(record, indent=2) + '\n')

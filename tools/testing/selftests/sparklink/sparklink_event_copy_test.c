@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "retired-read/legacy_abi.h"
 
 #define RECORD sizeof(struct sle_wire_event)
 #define MAX_RECORDS 64

@@ -666,13 +666,6 @@ struct sle_subsys_stats {
 
 /* --- Event wire format -------------------------------------------------- */
 
-struct sle_wire_event {
-	__u8  event_type;
-	__u8  payload_len;
-	__u8  payload[40];
-	__u8  _pad[2];
-};
-
 /* Versioned, non-destructive native controller event stream. All integer
  * fields use the same native-endian convention as existing SparkLink ioctls.
  * payload contains exact validated controller parameters, not USB/HCC headers.
@@ -708,18 +701,12 @@ struct sle_controller_event_query {
  * registration, EINVAL a future cursor/flags, EOPNOTSUPP an unknown version.
  * No shared dequeue: independent readers can request the same sequence.
  * GET subscribes this fd's poll to this registration's native stream, even
- * on EAGAIN. In that mode poll excludes the legacy 44-byte event queue.
+ * on EAGAIN. read(2) is unsupported; use GET for complete records. Poll without a selected
+ * subscription reports POLLERR.
  * DEV_SELECT resets this poll subscription. Errors never advance the cursor.
  * Management replies continue through their dedicated transaction path.
  */
 
-struct sle_event_stats {
-	__u32 pending;
-	__u32 _pad;
-	__u64 total_enqueued;
-	__u64 total_dropped;
-	__u64 total_delivered;
-};
 
 /* =========================================================================
  * IOCTL magic and command definitions
@@ -858,8 +845,6 @@ struct sle_event_stats {
 
 /* --- Event notification ------------------------------------------------- */
 
-#define SL_IOCTL_EVENT_COUNT		_IO(SL_MAGIC, 0x70)
-#define SL_IOCTL_EVENT_STATS		_IOR(SL_MAGIC, 0x71, struct sle_event_stats)
 
 /* --- DLI controller ----------------------------------------------------- */
 

@@ -29,7 +29,6 @@ mod sle_controller_event;
 mod sle_crypto;
 mod sle_dev;
 mod sle_dli;
-mod sle_event;
 mod sle_host;
 mod sle_irq_lock;
 mod sle_ingress;
@@ -80,9 +79,8 @@ use kernel::{
 
 use sle_adv::{AdvParams, AdvScanInner, ScanParams};
 use sle_conn::{
-    AccessResponseType, ConnManager, ConnState, GtRole, NegotiatedParams, CONN_DATA_MAX,
+    ConnManager, ConnState, GtRole, CONN_DATA_MAX,
 };
-use sle_event::EventQueue;
 use sle_power::PowerInner;
 use sle_security::{RalEntry, RpaManager, SecurityInner};
 
@@ -448,7 +446,6 @@ pub(crate) struct ControllerState {
     pub(crate) rpa_tick_accum: u16,
     pub(crate) power: PowerInner,
     pub(crate) local_role: GtRole,
-    pub(crate) broadcast: sle_event::BroadcastRing,
     pub(crate) cmd_pending: sle_mgmt::CmdPendingQueue,
     pub(crate) cmd_queue: sle_mgmt::CmdRequestQueue,
     pub(crate) command_credits: u8,
@@ -473,7 +470,6 @@ impl ControllerState {
                 rpa_tick_accum: 0,
                 power: PowerInner::new(),
                 local_role: GtRole::TNode,
-                broadcast <- sle_event::BroadcastRing::new_in_place(),
                 cmd_pending <- sle_mgmt::CmdPendingQueue::new_in_place(),
                 cmd_queue <- sle_mgmt::CmdRequestQueue::new_in_place(),
                 command_credits: 1,
@@ -1090,7 +1086,7 @@ fn init_build_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
+    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
 }
 
 #[inline(never)]
@@ -1342,13 +1338,7 @@ struct SparkLinkCtl {
     operation: Mutex<()>,
     #[pin]
     owned_target: Mutex<Option<Arc<ControllerRuntime>>>,
-    #[pin]
-    events: Mutex<EventQueue>,
-    #[pin]
-    event_poll: PollCondVar,
     dev: ARef<Device>,
-    /// Broadcast ring cursor: sequence number of the last event this fd has seen.
-    last_seq: core::sync::atomic::AtomicU64,
     /// None follows legacy selection; Some pins a registration identity.
     /// Removal leaves the binding stale, so a reused index cannot retarget it.
     #[pin]
@@ -1361,7 +1351,7 @@ struct SparkLinkCtl {
 
 /// Advertising, scanning, device management ioctl sub-dispatcher.
 #[inline(never)]
-fn ioctl_dispatch_adv(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
+fn ioctl_dispatch_adv(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
         SL_IOCTL_START_ADV
         | SL_IOCTL_STOP_ADV
@@ -1383,8 +1373,7 @@ fn ioctl_dispatch_adv(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32
         | SL_IOCTL_EXT_ADV_INFO
         | SL_IOCTL_EXT_ADV_ENABLE_EX
         | SL_IOCTL_EXT_ADV_TICK => ioctl_dispatch_ext_adv(context, cmd, arg),
-        SL_IOCTL_INJECT_ADV => ioctl_inject_adv(context, me, arg),
-        SL_IOCTL_INJECT_RAW_ADV => ioctl_inject_raw_adv(context, arg),
+        SL_IOCTL_INJECT_ADV | SL_IOCTL_INJECT_RAW_ADV => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         _ => Err(EINVAL),
     }
 }
@@ -1425,9 +1414,6 @@ fn ioctl_dev_select(me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     *me.target.lock() = identity;
     *me.controller_subscription.lock() = None;
     *me.snoop_subscription.lock() = None;
-    // Events queued for a previous selection must not masquerade as the new one.
-    *me.events.lock() = EventQueue::new();
-    me.last_seq.store(sle_event::BroadcastRing::current_seq(), core::sync::atomic::Ordering::Relaxed);
     Ok(0)
 }
 
@@ -1636,71 +1622,6 @@ fn ioctl_dispatch_ext_adv(context: &RuntimeContext, cmd: u32, arg: usize) -> Res
     }
 }
 
-/// INJECT_ADV — large structs (AdvDataBuilder, AdvPdu), isolated for stack safety.
-#[inline(never)]
-fn ioctl_inject_adv(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
-    let inject: SleInjectAdv = read_user_struct(arg)?;
-    let mut builder = sle_pdu::AdvDataBuilder::new();
-    let _ = builder.push_discovery_level(inject.discovery_level);
-    let _ = builder.push_sle_addr(&inject.addr);
-    let name_len = (inject.name_len as usize).min(ADV_NAME_MAX);
-    if name_len > 0 {
-        let _ = builder.push_complete_name(&inject.name[..name_len]);
-    }
-    let pdu = sle_pdu::AdvPdu::build(
-        sle_pdu::BroadcastType::AccessibleScannable,
-        sle_pdu::PacketType::BasicAdv,
-        0,
-        &builder,
-    );
-    {
-        let mut ss = context.lock()?;
-        let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-        s.adv_scan.process_adv_pdu(&pdu, inject.rssi)?;
-    }
-    let name_len = (inject.name_len as usize).min(31);
-    SparkLinkCtl::broadcast_event(
-                context,
-        me.as_ref(),
-        sle_event::SleWireEvent::adv_report(
-            inject.addr,
-            inject.rssi,
-            inject.discovery_level,
-            &inject.name[..name_len],
-        ),
-    )?;
-    genl_bridge::notify_event(0x02, 0, &inject.addr);
-    dev_info!(
-        me.dev,
-        "sparklink: injected ADV from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}\n",
-        inject.addr[0],
-        inject.addr[1],
-        inject.addr[2],
-        inject.addr[3],
-        inject.addr[4],
-        inject.addr[5],
-        inject.rssi
-    );
-    Ok(0)
-}
-
-/// INJECT_RAW_ADV — large SleInjectRawAdv struct, isolated for stack safety.
-#[inline(never)]
-fn ioctl_inject_raw_adv(context: &RuntimeContext, arg: usize) -> Result<isize> {
-    let inject: SleInjectRawAdv = read_user_struct(arg)?;
-    let len = inject.pdu_len as usize;
-    if !(6..=264).contains(&len) {
-        return Err(EINVAL);
-    }
-    let pdu = sle_pdu::AdvPdu::deserialize(&inject.pdu_data[..len]).ok_or(EINVAL)?;
-    {
-        let mut ss = context.lock()?;
-        let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-        s.adv_scan.process_adv_pdu(&pdu, inject.rssi)?;
-    }
-    Ok(0)
-}
-
 /// Connection data send — isolated for stack safety (SleConnData = 260B + tx_buf = 256B).
 #[inline(never)]
 fn ioctl_conn_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
@@ -1743,7 +1664,7 @@ fn ioctl_conn_recv(context: &RuntimeContext, arg: usize) -> Result<isize> {
     Ok(0)
 }
 
-fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
+fn ioctl_dispatch_conn(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
     match cmd {
         SL_IOCTL_CONNECT => {
             SparkLinkCtl::check_power_active()?;
@@ -1769,16 +1690,11 @@ fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u3
                 }
                 handle
             };
-            SparkLinkCtl::broadcast_event(
-                context,
-                me.as_ref(),
-                sle_event::SleWireEvent::conn_state(handle, 0, 1, cp.peer_addr, 0),
-            )?;
             Ok(handle as isize)
         }
         SL_IOCTL_DISCONNECT => {
             let handle: u16 = read_user_struct(arg)?;
-            let (handle, peer_addr, old_state, new_state) = {
+            let (_handle, _peer_addr, _old_state, _new_state) = {
                 let mut ss = context.lock()?;
                 let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
                 let handle = s.conn.resolve_handle(handle)?;
@@ -1815,11 +1731,6 @@ fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u3
                 let new_state = s.conn.info(handle).map(|e| e.state as u8).unwrap_or(0);
                 (handle, peer_addr, old_state, new_state)
             };
-            SparkLinkCtl::broadcast_event(
-                context,
-                me.as_ref(),
-                sle_event::SleWireEvent::conn_state(handle, old_state, new_state, peer_addr, 0),
-            )?;
             Ok(0)
         }
         SL_IOCTL_CONN_INFO => {
@@ -1867,61 +1778,8 @@ fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u3
         }
         SL_IOCTL_CONN_SEND => ioctl_conn_send(context, arg),
         SL_IOCTL_CONN_RECV => ioctl_conn_recv(context, arg),
-        SL_IOCTL_INJECT_CONN_RESP => {
-            let resp: SleInjectConnResp = read_user_struct(arg)?;
-            let resp_type = AccessResponseType::from_raw(resp.response_type).ok_or(EINVAL)?;
-            let params = NegotiatedParams {
-                bandwidth_mhz: resp.bandwidth_mhz,
-                mcs_index: resp.mcs_index,
-                supervision_timeout: resp.supervision_timeout,
-                ..Default::default()
-            };
-            let (handle, peer_addr, result) = {
-                let mut ss = context.lock()?;
-                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-                let handle = s.conn.resolve_handle(resp.handle)?;
-                let peer_addr = s.conn.info(handle).map(|e| e.peer_addr).unwrap_or([0u8; 6]);
-                let result = s.conn.process_access_response(handle, resp_type, params);
-                if result.is_err() && s.controller.uses_command_host() {
-                    if let Some(wire_handle) = s.conn.retire_rejected_link(handle) {
-                        s.controller.disconnect(wire_handle)?;
-                    }
-                }
-                if result.is_ok() && resp.data_mtu > 0 {
-                    let mps = if resp.data_mps > 0 {
-                        Some(resp.data_mps)
-                    } else {
-                        None
-                    };
-                    let _ = s.conn.set_data_mtu(handle, resp.data_mtu, mps);
-                }
-                (handle, peer_addr, result)
-            };
-            match &result {
-                Ok(()) => {
-                    SparkLinkCtl::broadcast_event(
-                context,
-                        me.as_ref(),
-                        sle_event::SleWireEvent::conn_state(handle, 1, 2, peer_addr, 0),
-                    )?;
-                }
-                Err(_) => {
-                    SparkLinkCtl::broadcast_event(
-                context,
-                        me.as_ref(),
-                        sle_event::SleWireEvent::conn_state(
-                            handle,
-                            1,
-                            0,
-                            peer_addr,
-                            resp.response_type,
-                        ),
-                    )?;
-                }
-            }
-            result.map(|()| 0isize)
-        }
-        SL_IOCTL_INJECT_CONN_DATA => ioctl_inject_conn_data(context, me, arg),
+        SL_IOCTL_INJECT_CONN_RESP => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        SL_IOCTL_INJECT_CONN_DATA => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_CONN_COUNT => {
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
@@ -2050,94 +1908,6 @@ fn ioctl_dispatch_conn(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u3
         }
         _ => Err(EINVAL),
     }
-}
-
-/// INJECT_CONN_DATA — largest single ioctl, isolated for stack safety.
-#[inline(never)]
-fn ioctl_inject_conn_data(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
-    let cd: SleConnData = read_user_struct(arg)?;
-    let len = cd.length as usize;
-    // An injected transport frame must contain data. Validate before handle
-    // lookup or any TCID/SSAP access; oversized input must not be truncated.
-    if len == 0 || len > CONN_DATA_MAX {
-        return Err(EINVAL);
-    }
-    let raw = &cd.data[..len];
-    {
-        let mut ss = context.lock()?;
-        let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-        let s = &mut **s;
-        let handle = s.conn.resolve_handle(cd.handle)?;
-        if !raw.is_empty()
-            && u16::from(raw[0]) == sle_conn::tcid::MANAGEMENT
-            && raw.len() >= sle_conn::CREDIT_GRANT_PDU_SIZE
-            && raw[1] == sle_conn::CREDIT_GRANT_PDU_TYPE
-        {
-            // Credit grant signaling (T/XS 20002-2025 §7.3.3):
-            // [TCID 0x02] [code 0xFC] [identifier] [length LE16] [target_tcid] [credits LE16]
-            let target_tcid = u16::from(raw[5]);
-            let credits = u16::from_le_bytes([raw[6], raw[7]]);
-            let _ = s.conn.receive_credits(handle, target_tcid, credits);
-        } else if !raw.is_empty()
-            && u16::from(raw[0]) == sle_conn::tcid::MANAGEMENT
-            && raw.len() >= 5
-            && raw[1] != sle_conn::CREDIT_GRANT_PDU_TYPE
-        {
-            // Transport control signaling (T/XS 20002-2025 §7.3.4).
-            let sig_data = &raw[1..];
-            let mut resp_buf = [0u8; 32];
-            let resp_len = s
-                .conn
-                .handle_transport_signaling(handle, sig_data, &mut resp_buf)?;
-            if resp_len > 0 {
-                let _ = s.controller.send_data(handle, &resp_buf[..resp_len]);
-            }
-        } else if !raw.is_empty()
-            && u16::from(raw[0]) == sle_conn::tcid::SERVICE_MGMT
-        {
-            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
-        } else {
-            // Unqualified dynamic reliable input has no production consumer.
-            let first_byte_tcid = u16::from(raw[0]);
-            let is_dynamic_reliable = raw.len() > 1
-                && s.conn
-                    .dynamic_reliable_tcid(handle)
-                    .map(|t| t == first_byte_tcid)
-                    .unwrap_or(false);
-            if is_dynamic_reliable {
-                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
-            } else {
-                let payload = if !raw.is_empty()
-                    && u16::from(raw[0]) == sle_conn::tcid::DEFAULT_DATA
-                    && raw.len() > 1
-                {
-                    let _ = s
-                        .conn
-                        .consume_rx_credit(handle, sle_conn::tcid::DEFAULT_DATA);
-                    &raw[1..]
-                } else {
-                    raw
-                };
-                let seq = {
-                    let entry = s.conn.info(handle)?;
-                    entry.seq.rx_seq
-                };
-                s.conn.receive_data(handle, payload, seq)?;
-            }
-        }
-    }
-    SparkLinkCtl::broadcast_event(
-                context,
-        me.as_ref(),
-        sle_event::SleWireEvent::data_received(cd.handle, len as u16),
-    )?;
-    dev_info!(
-        me.dev,
-        "sparklink: injected {} bytes connection data (handle={})\n",
-        len,
-        cd.handle
-    );
-    Ok(0)
 }
 
 /// AFH ioctl sub-dispatcher (channel map, RSSI, hopping).
@@ -3416,23 +3186,6 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         | SL_IOCTL_SYNC_MCAST_ACCEPT
         | SL_IOCTL_SYNC_MCAST_REJECT => ioctl_sync_link(context, cmd, arg),
         SL_IOCTL_SYNC_DATA_SEND => ioctl_sync_data_send(context, arg),
-        SL_IOCTL_EVENT_COUNT => {
-            let count = me.events.lock().pending();
-            Ok(count as isize)
-        }
-        SL_IOCTL_EVENT_STATS => {
-            let guard = me.events.lock();
-            let stats = SleEventStats {
-                pending: guard.pending() as u32,
-                _pad: 0,
-                total_enqueued: guard.total_enqueued,
-                total_dropped: guard.total_dropped,
-                total_delivered: guard.total_delivered,
-            };
-            drop(guard);
-            write_user_struct(arg, &stats)?;
-            Ok(0)
-        }
         SL_IOCTL_DLI_INFO => {
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
@@ -3675,12 +3428,7 @@ impl MiscDevice for SparkLinkCtl {
                     connection_request_id <- new_mutex!(0),
                     operation <- new_mutex!(()),
                     owned_target <- new_mutex!(None),
-                    events <- new_mutex!(EventQueue::new()),
-                    event_poll <- new_poll_condvar!("sparklink_event"),
                     dev: dev,
-                    last_seq: core::sync::atomic::AtomicU64::new(
-                        sle_event::BroadcastRing::current_seq()
-                    ),
                     target <- new_mutex!(None),
                     controller_subscription <- new_mutex!(None),
                     snoop_subscription <- new_mutex!(None),
@@ -3690,12 +3438,8 @@ impl MiscDevice for SparkLinkCtl {
         )
     }
 
-    fn read_iter(kiocb: Kiocb<'_, Self::Ptr>, iov: &mut IovIterDest<'_>) -> Result<usize> {
-        let me = kiocb.file();
-        // Sync broadcast events into per-fd queue before reading.
-        Self::sync_broadcast(me.as_ref());
-        let mut guard = me.events.lock();
-        guard.copy_records(iov.len(), |bytes| iov.copy_to_iter(bytes))
+    fn read_iter(_kiocb: Kiocb<'_, Self::Ptr>, _iov: &mut IovIterDest<'_>) -> Result<usize> {
+        Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
     }
 
     fn poll(me: Pin<&SparkLinkCtl>, file: &FsFile, table: &PollTable<'_>) -> u32 {
@@ -3724,15 +3468,8 @@ impl MiscDevice for SparkLinkCtl {
                 bindings::POLLIN | bindings::POLLRDNORM
             } else { 0 };
         }
-        table.register_wait(file, &me.event_poll);
-        // Sync broadcast events into per-fd queue before checking.
-        Self::sync_broadcast(me.as_ref());
-        let guard = me.events.lock();
-        let mut mask = 0u32;
-        if guard.has_events() {
-            mask |= bindings::POLLIN | bindings::POLLRDNORM;
-        }
-        mask
+        // Activate a canonical ControllerEvent or privileged snoop subscription first.
+        bindings::POLLERR
     }
 
     fn ioctl(me: Pin<&SparkLinkCtl>, _file: &FsFile, cmd: u32, arg: usize) -> Result<isize> {
@@ -3740,6 +3477,9 @@ impl MiscDevice for SparkLinkCtl {
         let access = sle_authorization::classify(cmd)?;
         if matches!(access, sle_authorization::Access::Protected | sle_authorization::Access::PrivilegedObserve) {
             sle_authorization::require_admin()?;
+        }
+        if matches!(cmd, SL_IOCTL_INJECT_ADV | SL_IOCTL_INJECT_RAW_ADV | SL_IOCTL_INJECT_CONN_RESP | SL_IOCTL_INJECT_CONN_DATA) {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
         // Per-fd device routing: DEV_SELECT and DEV_GET_ACTIVE are handled
         // before capturing a RuntimeContext so they can query/set affinity.
@@ -3874,8 +3614,6 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_SYNC_MCAST_ACCEPT
             | SL_IOCTL_SYNC_MCAST_REJECT
             | SL_IOCTL_SYNC_DATA_SEND
-            | SL_IOCTL_EVENT_COUNT
-            | SL_IOCTL_EVENT_STATS
             | SL_IOCTL_DLI_INFO
             | SL_IOCTL_CONTROLLER_EVENT_GET
             | SL_IOCTL_DIAGNOSTIC_RESULT
@@ -3958,47 +3696,6 @@ impl SparkLinkCtl {
         Ok(())
     }
 
-    /// Synchronize events from the global broadcast ring into this fd's
-    /// per-listener event queue. Called before read() and poll() so that
-    /// all open fds see the same event stream regardless of which fd
-    /// triggered the operation that produced the event.
-    fn sync_broadcast(me: Pin<&SparkLinkCtl>) {
-        let cur = sle_event::BroadcastRing::current_seq();
-        let my_seq = me.last_seq.load(core::sync::atomic::Ordering::Relaxed);
-        if cur <= my_seq {
-            return; // no new events
-        }
-        let target = me.target.lock().clone();
-        let context = match target {
-            Some(owner) => RuntimeContext { owner: Some(owner) },
-            None => RuntimeContext::default_selection(),
-        };
-        let Ok(guard) = context.lock() else { return };
-        let Some(runtime) = guard.as_ref() else { return };
-        let mut eq = me.events.lock();
-        let (copied, new_seq) = runtime.broadcast.drain_since(my_seq, &mut eq);
-        if copied > 0 {
-            me.last_seq.store(new_seq, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    /// Publish an event to the global broadcast ring (visible to all fds)
-    /// and also push it into this fd's local queue for immediate reads.
-    fn broadcast_event(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, event: sle_event::SleWireEvent) -> Result {
-        {
-            let mut ss = context.lock()?;
-            if let Some(ref mut shared) = *ss {
-                shared.broadcast.publish(event);
-            }
-        }
-        // Also push directly to this fd so the caller gets immediate read.
-        me.events.lock().push_raw(event);
-        let new_seq = sle_event::BroadcastRing::current_seq();
-        me.last_seq
-            .store(new_seq, core::sync::atomic::Ordering::Relaxed);
-        me.event_poll.notify_all();
-        Ok(())
-    }
 }
 
 #[pinned_drop]
