@@ -23,8 +23,8 @@ menuconfig SPARKLINK
 	  This option enables the SparkLink protocol stack, providing:
 	    - SCI (SparkLink Controller Interface) device management
 	    - SLE (Synchronous Low Energy) air interface support
-	    - Device discovery and service management
-	    - Security management (SM2/SM3/SM4)
+	    - Native discovery, physical links and application channels
+	    - Security mechanisms planned; legacy local models are unsupported
 
 	  Say Y here to compile SparkLink support into the kernel or say M
 	  to compile it as a module.

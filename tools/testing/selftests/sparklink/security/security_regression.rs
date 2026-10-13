@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Appended as child tests of the unmodified production sle_security.rs.
+// Appended as child tests of the exact retired sle_security.rs; crypto wrappers remain source-identical.
 #[cfg(test)]
 mod remediation_tests {
     use super::*;

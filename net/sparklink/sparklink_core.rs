@@ -24,7 +24,6 @@ mod sle_discovery_operation;
 mod sle_connection_operation;
 mod sle_command_queue;
 mod sle_controller_event;
-mod sle_crypto;
 mod sle_dev;
 mod sle_dli;
 mod sle_host;
@@ -36,7 +35,6 @@ mod sle_native;
 mod sle_sessions;
 mod sle_data_credit;
 mod sle_native_data;
-mod sle_security;
 mod sle_snoop;
 mod sle_uapi;
 mod sle_standard_dli;
@@ -71,7 +69,6 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-use sle_security::{RalEntry, RpaManager, SecurityInner};
 
 // ---------------------------------------------------------------------------
 // Userspace read/write helpers for repr(C) ioctl structures
@@ -207,9 +204,6 @@ pub(crate) struct ControllerState {
     pub(crate) identity: sle_dev::DeviceIdentity,
     pub(crate) dev_info: SciDevInfo,
     pub(crate) controller: sle_dli::ControllerBackend,
-    pub(crate) security: SecurityInner,
-    pub(crate) rpa: RpaManager,
-    pub(crate) rpa_tick_accum: u16,
     pub(crate) cmd_pending: sle_mgmt::CmdPendingQueue,
     pub(crate) cmd_queue: sle_mgmt::CmdRequestQueue,
     pub(crate) command_credits: u8,
@@ -223,9 +217,6 @@ impl ControllerState {
                 identity: sle_dev::DeviceIdentity { id: u16::MAX, generation: 0 },
                 dev_info: unsafe { core::mem::zeroed() },
                 controller: backend,
-                security: SecurityInner::new(),
-                rpa: RpaManager::new(),
-                rpa_tick_accum: 0,
                 cmd_pending <- sle_mgmt::CmdPendingQueue::new_in_place(),
                 cmd_queue <- sle_mgmt::CmdRequestQueue::new_in_place(),
                 command_credits: 1,
@@ -696,7 +687,7 @@ fn init_build_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("Native Host/Session/Channel: discovery, physical links, data\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nPM: unsupported hardware control\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
+    CString::try_from_fmt(fmt!("Native Host/Session/Channel: discovery, physical links, data\nSecurity/RPA: unsupported pending per-connection mechanism\nPM: unsupported hardware control\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
 }
 
 #[inline(never)]
@@ -1081,168 +1072,10 @@ fn ioctl_dispatch_conn(_context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: 
 
 /// Security ioctl sub-dispatcher (pairing, encryption, crypto tests).
 #[inline(never)]
-fn ioctl_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_SEC_SET_PSK => {
-            let params: SlePskParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.set_psk(params.psk);
-            Ok(0)
-        }
-        SL_IOCTL_SEC_PAIR => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_SEC_INFO => {
-            let info = {
-                let ss = context.lock()?;
-                let s = ss.as_ref().ok_or(ENODEV)?;
-                let mut info: SleSecInfo = unsafe { core::mem::zeroed() };
-                info.state = s.security.state as u8;
-                info.method = s.security.method as u8;
-                info.mode = s.security.mode as u8;
-                info.enc_enabled = if s.security.is_encrypted() { 1 } else { 0 };
-                info.enc_key_fingerprint = s.security.enc_key_fingerprint()?;
-                info
-            };
-            write_user_struct(arg, &info)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_ENCRYPT_ON => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.enable_encryption()?;
-            Ok(0)
-        }
-        // Legacy test ioctls are not a production crypto interface. Algorithm
-        // and failure tests exercise the wrappers in dedicated selftests.
-        SL_IOCTL_SEC_SM3_TEST
-        | SL_IOCTL_SEC_SM4_ENC_TEST
-        | SL_IOCTL_SEC_SM4_DEC_TEST
-        | SL_IOCTL_SEC_SM4_BLOCK_TEST
-        | SL_IOCTL_SEC_HMAC_TEST => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_SEC_RESET => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.reset();
-            Ok(0)
-        }
-        SL_IOCTL_SEC_GET_PASSKEY => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let passkey = s.security.get_passkey()?;
-            drop(ss);
-            write_user_struct(arg, &passkey)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_CONFIRM_PASSKEY => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.confirm_passkey()?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_REJECT_PASSKEY => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.reject_passkey();
-            Ok(0)
-        }
-        SL_IOCTL_SEC_SET_OOB => {
-            ioctl_set_oob(context, arg)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_INPUT_PASSKEY => {
-            let params: SlePasskeyInput = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.input_passkey(params.passkey)?;
-            Ok(0)
-        }
-        SL_IOCTL_SEC_SET_PASSWORD => {
-            let params: SlePasswordParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.security.set_password(&params.data, params.len)?;
-            Ok(0)
-        }
-        _ => Err(EINVAL),
-    }
-}
-
-/// AFH and security ioctl router — delegates to domain-specific handlers.
+/// Unqualified legacy security/AFH controls cannot publish local success.
 #[inline(never)]
-fn ioctl_dispatch_security(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
-    match cmd {
-        SL_IOCTL_AFH_SET_MAP
-        | SL_IOCTL_AFH_GET_MAP
-        | SL_IOCTL_AFH_REPORT_RSSI
-        | SL_IOCTL_AFH_CLASSIFY
-        | SL_IOCTL_AFH_HOP_NEXT
-        | SL_IOCTL_AFH_REPORT_RETX => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-
-        SL_IOCTL_SEC_SET_PSK
-        | SL_IOCTL_SEC_PAIR
-        | SL_IOCTL_SEC_INFO
-        | SL_IOCTL_SEC_ENCRYPT_ON
-        | SL_IOCTL_SEC_SM3_TEST
-        | SL_IOCTL_SEC_SM4_ENC_TEST
-        | SL_IOCTL_SEC_SM4_DEC_TEST
-        | SL_IOCTL_SEC_SM4_BLOCK_TEST
-        | SL_IOCTL_SEC_HMAC_TEST
-        | SL_IOCTL_SEC_RESET
-        | SL_IOCTL_SEC_GET_PASSKEY
-        | SL_IOCTL_SEC_CONFIRM_PASSKEY
-        | SL_IOCTL_SEC_REJECT_PASSKEY
-        | SL_IOCTL_SEC_SET_OOB
-        | SL_IOCTL_SEC_INPUT_PASSKEY
-        | SL_IOCTL_SEC_SET_PASSWORD => ioctl_security(context, cmd, arg),
-
-        _ => Err(EINVAL),
-    }
-}
-
-/// Handle SEC_SET_OOB ioctl in a separate stack frame to avoid
-/// bloating the main ioctl function's stack usage.
-#[inline(never)]
-fn ioctl_set_oob(context: &RuntimeContext, arg: usize) -> Result {
-    let params: SleOobData = read_user_struct(arg)?;
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    s.security.set_oob_data(&params.data)?;
-    Ok(())
-}
-
-/// Handle RAL_ADD ioctl in a separate stack frame (SleRalAddParams is 44 bytes).
-#[inline(never)]
-fn ioctl_ral_add(context: &RuntimeContext, arg: usize) -> Result {
-    let params: SleRalAddParams = read_user_struct(arg)?;
-    let entry = RalEntry {
-        peer_id_type: params.peer_id_type,
-        resolve_algo: params.resolve_algo,
-        peer_irkid: params.peer_irkid,
-        local_irkid: params.local_irkid,
-        peer_id: params.peer_id,
-        peer_irk: params.peer_irk,
-        local_irk: params.local_irk,
-    };
-    let mut ss = context.lock()?;
-    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-    s.rpa.ral_add(entry)
-}
-
-/// Handle RAL_READ_PEER_RPA / RAL_READ_LOCAL_RPA ioctls.
-#[inline(never)]
-fn ioctl_ral_read_rpa(context: &RuntimeContext, arg: usize, is_local: bool) -> Result {
-    let mut params: SleRalQueryParams = read_user_struct(arg)?;
-    let rpa = {
-        let ss = context.lock()?;
-        let s = ss.as_ref().ok_or(ENODEV)?;
-        if is_local {
-            s.rpa.read_local_rpa(params.id_type, &params.id)?
-        } else {
-            s.rpa.read_peer_rpa(params.id_type, &params.id)?
-        }
-    };
-    params.rpa = rpa;
-    write_user_struct(arg, &params)
+fn ioctl_dispatch_security(_context: &RuntimeContext, _cmd: u32, _arg: usize) -> Result<isize> {
+    Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
 }
 
 /// Sync link ioctl sub-dispatcher (separate stack frame for large structs).
@@ -1981,52 +1814,10 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         | SL_IOCTL_PHY_SET_SINR => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         SL_IOCTL_SET_ROLE | SL_IOCTL_GET_ROLE
             => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        SL_IOCTL_RAL_ADD => {
-            ioctl_ral_add(context, arg)?;
-            Ok(0)
-        }
-        SL_IOCTL_RAL_REMOVE => {
-            let params: SleRalRemoveParams = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.rpa.ral_remove(params.peer_id_type, &params.peer_id)?;
-            Ok(0)
-        }
-        SL_IOCTL_RAL_CLEAR => {
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.rpa.ral_clear()?;
-            Ok(0)
-        }
-        SL_IOCTL_RAL_SIZE => {
-            let ss = context.lock()?;
-            let s = ss.as_ref().ok_or(ENODEV)?;
-            let count = s.rpa.ral_size();
-            write_user_struct(arg, &count)?;
-            Ok(0)
-        }
-        SL_IOCTL_RAL_READ_PEER_RPA => {
-            ioctl_ral_read_rpa(context, arg, false)?;
-            Ok(0)
-        }
-        SL_IOCTL_RAL_READ_LOCAL_RPA => {
-            ioctl_ral_read_rpa(context, arg, true)?;
-            Ok(0)
-        }
-        SL_IOCTL_RPA_ENABLE => {
-            let enable: u8 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.rpa.set_enabled(enable != 0);
-            Ok(0)
-        }
-        SL_IOCTL_RPA_SET_TIMEOUT => {
-            let secs: u16 = read_user_struct(arg)?;
-            let mut ss = context.lock()?;
-            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-            s.rpa.set_timeout(secs);
-            Ok(0)
-        }
+        SL_IOCTL_RAL_ADD | SL_IOCTL_RAL_REMOVE | SL_IOCTL_RAL_CLEAR | SL_IOCTL_RAL_SIZE
+        | SL_IOCTL_RAL_READ_PEER_RPA | SL_IOCTL_RAL_READ_LOCAL_RPA
+        | SL_IOCTL_RPA_ENABLE | SL_IOCTL_RPA_SET_TIMEOUT
+            => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         // -- Narrowband AFH measurement (T/XS 10003-2025 §8.7) --
         SL_IOCTL_MEAS_READ_CAP => {
             let ss = context.lock()?;
@@ -2197,7 +1988,30 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_INJECT_CONN_DATA
             | SL_IOCTL_INJECT_CONN_RESP
             | SL_IOCTL_SCAN_RESULT_COUNT
+            | SL_IOCTL_RAL_ADD
+            | SL_IOCTL_RAL_CLEAR
+            | SL_IOCTL_RAL_READ_LOCAL_RPA
+            | SL_IOCTL_RAL_READ_PEER_RPA
+            | SL_IOCTL_RAL_REMOVE
+            | SL_IOCTL_RAL_SIZE
+            | SL_IOCTL_RPA_ENABLE
+            | SL_IOCTL_RPA_SET_TIMEOUT
+            | SL_IOCTL_SEC_CONFIRM_PASSKEY
+            | SL_IOCTL_SEC_ENCRYPT_ON
+            | SL_IOCTL_SEC_GET_PASSKEY
+            | SL_IOCTL_SEC_HMAC_TEST
+            | SL_IOCTL_SEC_INFO
+            | SL_IOCTL_SEC_INPUT_PASSKEY
             | SL_IOCTL_SEC_PAIR
+            | SL_IOCTL_SEC_REJECT_PASSKEY
+            | SL_IOCTL_SEC_RESET
+            | SL_IOCTL_SEC_SET_OOB
+            | SL_IOCTL_SEC_SET_PASSWORD
+            | SL_IOCTL_SEC_SET_PSK
+            | SL_IOCTL_SEC_SM3_TEST
+            | SL_IOCTL_SEC_SM4_BLOCK_TEST
+            | SL_IOCTL_SEC_SM4_DEC_TEST
+            | SL_IOCTL_SEC_SM4_ENC_TEST
             | SL_IOCTL_SET_CONN_MTU
             | SL_IOCTL_SET_ROLE
             | SL_IOCTL_SET_SCAN_FILTER

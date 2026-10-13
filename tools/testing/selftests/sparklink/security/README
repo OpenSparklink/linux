@@ -8,7 +8,7 @@ ASan/UBSan runtimes. LeakSanitizer requires an environment without ptrace.
 Missing tools/runtimes or failed assertions fail the test; there is no fallback
 PASS or skipped assertion. No production fault switches are introduced.
 
-The runner copies the exact production Rust crypto/security sources to a private
+The runner copies the unchanged retained kernel crypto source and exact archived security model to a private
 build directory, appends child tests for private state, and links controllable FFI
 dependencies. It compiles the exact production C CTR function against counted
 allocation/crypto dependencies. These verify errno propagation, fail-closed legacy
@@ -17,6 +17,6 @@ are not real crypto algorithms, standard vectors, peer interoperability or RF.
 
 Pairing is deliberately unavailable pending authenticated per-connection state.
 Unpublished legacy test ioctl numbers still exist for caller migration, but their
-production handlers return EOPNOTSUPP. Tests call actual wrappers instead.
+production handlers return EOPNOTSUPP. Tests call retained actual wrappers instead. Model tests are historical; the default runtime has no SecurityInner/RpaManager.
 The real WS73 Native discovery implementation is untouched and needs regression
 on each new kernel in a VM with real devices before hardware preservation claims.

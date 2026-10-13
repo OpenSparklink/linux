@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Compile actual crypto/security code with fault dependencies; no hardware access."""
+"""Compile retained crypto mechanisms and archived security model with fault dependencies; no hardware access."""
 import argparse
 import hashlib
 import json
@@ -27,8 +27,8 @@ def function(text, name):
 def run(output):
     here = Path(__file__).resolve().parent
     root = here.parents[3]
-    paths = [root/'net/sparklink'/name for name in
-             ('sle_crypto.rs', 'sle_security.rs', 'sle_crypto_ffi.c')]
+    paths = [root/'net/sparklink'/name for name in ('sle_crypto.rs', 'sle_crypto_ffi.c')]
+    paths.append(here/'retired-security-state/sle_security.rs')
     contents = {p.name: p.read_bytes() for p in paths}
     with tempfile.TemporaryDirectory(prefix='sparklink-security-') as temp:
         tmp = Path(temp)
@@ -51,8 +51,8 @@ def run(output):
     for path in paths:
         if path.read_bytes() != contents[path.name]:
             raise RuntimeError('production input changed during test')
-    record = {'status': 'SECURITY_FAILURE_BOUNDARY_PASS', 'physical_acceptance': False,
-              'scope': 'actual Rust wrappers/security + C CTR body; mocked dependencies, not crypto vectors or RF',
+    record = {'status': 'HISTORICAL_SECURITY_FAILURE_BOUNDARY_PASS', 'physical_acceptance': False,
+              'scope': 'retained kernel Rust crypto wrappers + C CTR body and exact retired security model; mocked dependencies, not current runtime, crypto vectors or RF',
               'sources': {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()},
               'ctr_body_sha256': hashlib.sha256(ctr.encode()).hexdigest(),
               'rust_tests': 7, 'c_fault_stages': 5,

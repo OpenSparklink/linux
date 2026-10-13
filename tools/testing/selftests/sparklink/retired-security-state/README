@@ -1,0 +1,15 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Exact security/RPA model retired from default production at K5582a10c5ec8.
+The pre-removal hashes and caller/three-class audit are in the userspace
+security-state-retirement-audit-20261014.json. legacy_ioctls.rs,
+legacy_ral_dispatch.rs and legacy_pairing_worker.rs retain original bodies.
+
+Only run_security_remediation.py includes this model. Its 7 tests are historical
+state/semantic/failure regression, not current Runtime or hardware security.
+It separately compiles unchanged net/sparklink/sle_crypto.rs wrappers and actual
+sle_crypto_ffi.c CTR body against counted fault dependencies (5 C stages).
+The kernel mechanism sources remain in net/sparklink for future authenticated
+per-session security, but have no default object/module consumer. Do not restore
+controller-global state or wire responders. Real key installation, standard
+vectors, authentication, zeroization and VM peer security gates remain missing.
