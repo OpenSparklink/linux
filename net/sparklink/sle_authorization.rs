@@ -68,7 +68,6 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_DISCONNECT
         | SL_IOCTL_CONNECTION_SUBMIT
         | SL_IOCTL_DISCOVERY_SUBMIT
-        | SL_IOCTL_DLI_POLL_EVENT
         | SL_IOCTL_DLI_RESET
         | SL_IOCTL_DLI_SEND_CMD
         | SL_IOCTL_EXT_ADV_CONFIGURE

@@ -497,17 +497,6 @@ struct sle_dli_info {
 	__u8  _reserved[4];
 };
 
-struct sle_dli_event {
-	__u8  event_type;
-	__u8  status;
-	__u16 handle;
-	__u16 opcode;
-	__u16 data_len;
-	__u8  data[240];
-	__u8  addr[6];
-	__u8  _pad[2];
-};
-
 struct sle_dli_cmd {
 	__u16 opcode;
 	__u16 param_len;
@@ -876,7 +865,6 @@ struct sle_event_stats {
 
 #define SL_IOCTL_DLI_INFO		_IOR(SL_MAGIC, 0x80, struct sle_dli_info)
 #define SL_IOCTL_USB_DEV_COUNT		_IO(SL_MAGIC, 0x81)
-#define SL_IOCTL_DLI_POLL_EVENT		_IOR(SL_MAGIC, 0x82, struct sle_dli_event)
 #define SL_IOCTL_DLI_RESET		_IO(SL_MAGIC, 0x83)
 #define SL_IOCTL_DLI_SEND_CMD		_IOWR(SL_MAGIC, 0x84, struct sle_dli_cmd)
 #define SL_IOCTL_MGMT_STATS		_IOR(SL_MAGIC, 0x85, struct sle_mgmt_stats)

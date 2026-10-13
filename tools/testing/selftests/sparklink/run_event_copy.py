@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Actual event/read_iter and legacy poll with dependency fixtures.
+"""Actual event/read_iter plus retired legacy poll history with dependency fixtures.
 
 This is not a live VFS fault, lockdep, broadcast routing or RF qualification.
 """
@@ -34,19 +34,13 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     with tempfile.TemporaryDirectory(prefix='sparklink-legacy-dli-copy-') as tmp:
         tmp = Path(tmp)
-        core = inputs['sparklink_core.rs'].decode()
-        uapi = inputs['sle_uapi.rs'].decode()
-        declaration = uapi[uapi.index('/// DLI event returned to userspace via DLI_POLL_EVENT ioctl.'):
-                           uapi.index('/// DLI command sent to the controller via DLI_SEND_CMD ioctl.')]
+        archive = here / 'retired-event-poll'
         fixture = (here / 'event-copy/legacy_poll_fixture.rs').read_text()
-        for marker, body in {
-            '// @@WIRE@@': declaration,
-            '// @@SIZE@@': re.search(r'(?m)^pub\(crate\) const DLI_RING_SIZE:.*$', core).group(),
-            '// @@RING@@': '\n'.join(function(core, name) for name in ['push_dli_event',
-                                                                        'peek_dli_event',
-                                                                        'pop_dli_event']),
-            '// @@HANDLER@@': function(core, 'ioctl_legacy_dli_poll'),
-        }.items():
+        for marker, path in {'// @@WIRE@@': 'wire.rs', '// @@SIZE@@': None,
+                             '// @@RING@@': 'ring.rs', '// @@HANDLER@@': 'handler.rs'}.items():
+            body = (archive / path).read_text() if path else 'pub(crate) const DLI_RING_SIZE: usize = 32;'
+            if path == 'ring.rs':
+                body = body.replace('pub(crate) const DLI_RING_SIZE: usize = 32;', '')
             fixture = fixture.replace(marker, body)
         (tmp / 'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
@@ -55,13 +49,13 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / name).read_bytes() == data for name, data in inputs.items())
     record = {'status': 'EVENT_RECORD_COPY_BOUNDARY_PASS', 'rust_tests': 15,
-              'read_iter_tests': 9, 'legacy_dli_poll_tests': 6,
-              'scope': 'actual complete event/read_iter, canonical legacy DLI event and ring/poll handler; copy/lock/controller-codec dependencies are fixtures',
+              'read_iter_tests': 9, 'historical_legacy_dli_poll_tests': 6,
+              'retired_poll_sources': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (here / 'retired-event-poll').glob('*.rs')},
+              'scope': 'actual event/read_iter plus archived K4ea legacy DLI declaration/ring/poll; archived cases are not production qualification; copy/lock/controller-codec dependencies are fixtures',
               'live_vfs_fault_acceptance': False, 'physical_acceptance': False,
               'sources': {name: hashlib.sha256(data).hexdigest()
                           for name, data in inputs.items()},
-              'remaining': ['Legacy DLI_POLL_EVENT consumer migration and shared projection deletion',
-                            'Live legacy poll usercopy and qualified backend fallback gates',
+              'remaining': ['Remaining legacy read/broadcast migration',
                             'Removal wakeup, actual kernel concurrency/locks and complete event ownership gates']}
     if output:
         output.write_text(json.dumps(record, indent=2) + '\n')

@@ -165,7 +165,7 @@ fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error:
 
 
 /// Process a single controller event: resolve pending commands, drive
-/// state machine transitions, and publish to broadcast ring / DLI ring.
+/// state machine transitions, and publish the remaining legacy read projection.
 ///
 /// Called from both `EventPump` (periodic background) and inline after
 /// ioctl commands (immediate drain for synchronous controller backends).
@@ -445,18 +445,15 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
         _ => {}
     }
 
-    // 3. Publish to broadcast ring and DLI event ring.
+    // 3. Publish the remaining legacy read projection (not an RX consumer).
     let wire = sle_dli_event_to_broadcast(ev);
     shared.broadcast.publish(wire);
-    let dli_ev = sle_dli_event_to_wire(ev);
-    shared.push_dli_event(dli_ev);
 }
 
 /// Drain all immediately available controller events and process them.
 ///
 /// Drain the selected owner's reserved Host replies and bounded ingress.
 /// Bus callbacks publish real events; this helper does not generate replies.
-/// The remaining legacy poll hook is empty for both registered Backends.
 pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
     let mut tagged = match new_event_batch() {
         Ok(batch) => batch,
@@ -477,16 +474,6 @@ pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
             if process_host_reply(&owner, shared) {
                 drained_this_round += 1;
                 total += 1;
-            }
-        }
-
-        // 1. Remaining legacy poll hook (empty for registered USB/Native).
-        while let Some(ev) = shared.controller.poll_event() {
-            process_controller_event(shared, &ev);
-            drained_this_round += 1;
-            total += 1;
-            if total >= 32 {
-                return;
             }
         }
 
@@ -595,14 +582,6 @@ impl WorkItem<0> for ControllerRuntime {
                 if process_host_reply(&this, runtime) {
                     pumped += 1;
                     drained += 1;
-                }
-                while let Some(ev) = runtime.controller.poll_event() {
-                    process_controller_event(runtime, &ev);
-                    pumped += 1;
-                    drained += 1;
-                    if pumped >= 256 {
-                        break;
-                    }
                 }
                 // Inline and worker drains share this owner's state lock. Do
                 // not prefetch older events before waiting for that lock: an

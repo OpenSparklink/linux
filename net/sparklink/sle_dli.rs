@@ -37,7 +37,7 @@ pub(crate) const CTRL_EVENT_RING_SIZE: usize = 32;
 
 /// Thread-safe event ring buffer used by the remaining generic USB controller to
 /// buffer asynchronous events received from hardware completion callbacks
-/// until `EventPump` polls them via `SleController::poll_event()`.
+/// through the registration-owned ingress; the owner RX worker drains them.
 pub(crate) struct ControllerEventRing {
     events: [(Option<u16>, Option<SleEvent>); CTRL_EVENT_RING_SIZE],
     head: usize,
@@ -1158,7 +1158,7 @@ pub trait SleController: Send + Sync {
     ///
     /// `opcode` uses the TXS-10003-2025 encoding. `params` carries the
     /// command-specific payload bytes. Returns `Ok(())` once the command
-    /// is accepted; results arrive via [`SleController::poll_event`].
+    /// is accepted; results arrive through the registration-owned Host/ingress.
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result;
 
     /// Send asynchronous unicast data on a connection.
@@ -1166,12 +1166,6 @@ pub trait SleController: Send + Sync {
     /// `handle` identifies the connection. The driver queues the data
     /// for transmission and returns immediately.
     fn send_data(&self, handle: u16, data: &[u8]) -> Result;
-
-    /// Poll for the next pending event from the controller.
-    ///
-    /// Returns `None` if no event is available. The core calls this from
-    /// a workqueue context or in response to an IRQ notification.
-    fn poll_event(&self) -> Option<SleEvent>;
 
     /// Reset the controller to a known-good state.
     fn reset(&self) -> Result;
@@ -1457,12 +1451,6 @@ impl SleController for ControllerBackend {
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {
         match self {
             Self::Native(c) => c.send_data(handle, data),
-        }
-    }
-
-    fn poll_event(&self) -> Option<SleEvent> {
-        match self {
-            Self::Native(c) => c.poll_event(),
         }
     }
 

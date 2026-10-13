@@ -364,7 +364,6 @@ impl SleController for NativeController {
     }
 
     fn send_data(&self, _handle: u16, _data: &[u8]) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
-    fn poll_event(&self) -> Option<SleEvent> { None }
     fn reset(&self) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
 }
 

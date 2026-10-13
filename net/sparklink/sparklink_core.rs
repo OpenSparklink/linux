@@ -432,7 +432,6 @@ kernel::sync::global_lock! {
 static OPEN_FD_COUNT: kernel::sync::atomic::Atomic<u32> = kernel::sync::atomic::Atomic::new(0);
 
 /// DLI event ring size (events consumed from controller by EventPump).
-pub(crate) const DLI_RING_SIZE: usize = 32;
 
 /// Protocol state owned by one controller for its entire registration lifetime.
 ///
@@ -450,9 +449,6 @@ pub(crate) struct ControllerState {
     pub(crate) power: PowerInner,
     pub(crate) local_role: GtRole,
     pub(crate) broadcast: sle_event::BroadcastRing,
-    pub(crate) dli_ring: [SleDliEvent; DLI_RING_SIZE],
-    pub(crate) dli_head: usize,
-    pub(crate) dli_tail: usize,
     pub(crate) cmd_pending: sle_mgmt::CmdPendingQueue,
     pub(crate) cmd_queue: sle_mgmt::CmdRequestQueue,
     pub(crate) command_credits: u8,
@@ -478,11 +474,6 @@ impl ControllerState {
                 power: PowerInner::new(),
                 local_role: GtRole::TNode,
                 broadcast <- sle_event::BroadcastRing::new_in_place(),
-                // Initialize slots at their final address. A by-value zeroed
-                // array can create a 16-KiB temporary after layout changes.
-                dli_ring <- pin_init::init_array_from_fn(|_| SleDliEvent::default()),
-                dli_head: 0,
-                dli_tail: 0,
                 cmd_pending <- sle_mgmt::CmdPendingQueue::new_in_place(),
                 cmd_queue <- sle_mgmt::CmdRequestQueue::new_in_place(),
                 command_credits: 1,
@@ -492,26 +483,9 @@ impl ControllerState {
     }
 
 
-    pub(crate) fn push_dli_event(&mut self, ev: SleDliEvent) {
-        self.dli_ring[self.dli_tail] = ev;
-        self.dli_tail = (self.dli_tail + 1) % DLI_RING_SIZE;
-        if self.dli_tail == self.dli_head {
-            self.dli_head = (self.dli_head + 1) % DLI_RING_SIZE;
-        }
-    }
 
-    pub(crate) fn peek_dli_event(&self) -> Option<SleDliEvent> {
-        if self.dli_head == self.dli_tail {
-            return None;
-        }
-        Some(self.dli_ring[self.dli_head])
-    }
 
-    pub(crate) fn pop_dli_event(&mut self) -> Option<SleDliEvent> {
-        let ev = self.peek_dli_event()?;
-        self.dli_head = (self.dli_head + 1) % DLI_RING_SIZE;
-        Some(ev)
-    }
+
 }
 
 /// Stable registration owner. Registry lookup clones this Arc and releases the
@@ -682,7 +656,6 @@ impl SubsystemShared {
         Ok(())
     }
 
-
 }
 
 pub(crate) fn runtime_snapshot() -> [Option<Arc<ControllerRuntime>>; sle_dev::SLE_DEV_MAX] {
@@ -691,10 +664,8 @@ pub(crate) fn runtime_snapshot() -> [Option<Arc<ControllerRuntime>>; sle_dev::SL
 }
 
 
-
 /// Stop protocol operations and workers before the transport frees resources.
 /// The registry keeps the index reserved until the transport joins its URBs.
-
 
 // ---------------------------------------------------------------------------
 // Transport device attach / detach (called from driver probe/remove)
@@ -702,7 +673,6 @@ pub(crate) fn runtime_snapshot() -> [Option<Arc<ControllerRuntime>>; sle_dev::SL
 
 /// One reservation allocator for actual providers. Metadata may be unknown;
 /// registration reserves identity only, never Runtime/open/Ready.
-
 
 pub(crate) fn reserve_backend_identity_profile(info: &sle_dli::SleControllerInfo, profile: u32) -> Result<sle_dev::DeviceIdentity> {
     let mut registry = SUBSYSTEM.lock();
@@ -832,7 +802,6 @@ pub(crate) fn install_backend_runtime(
 
 /// Reserve one exact identity before standard USB resources/bootstrap exist.
 /// Unknown address/capabilities stay zero; no Runtime or Ready is published.
-
 
 /// Detach a device from the subsystem.
 ///
@@ -1024,9 +993,6 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
         Err(e) => e.to_errno(),
     }
 }
-
-
-
 
 
 
@@ -3214,29 +3180,6 @@ fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, 
     Ok(0)
 }
 
-/// Transitional legacy delivery. Keep the selected controller's state lock
-/// through copy and commit, so neither a competing consumer nor ring overflow
-/// can replace the copied head. A backend event is staged in the same ring
-/// before usercopy; EFAULT must not lose an already-consumed backend reply.
-/// This shared projection still needs removal after subscriber migration.
-#[inline(never)]
-fn ioctl_legacy_dli_poll(context: &RuntimeContext, arg: usize) -> Result<isize> {
-    let mut guard = context.lock()?;
-    let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
-    let event = match state.peek_dli_event() {
-        Some(event) => event,
-        None => {
-            let event = state.controller.poll_event().ok_or(EAGAIN)?;
-            let wire = sle_dli_event_to_wire(&event);
-            state.push_dli_event(wire);
-            wire
-        }
-    };
-    write_user_struct(arg, &event)?;
-    let _ = state.pop_dli_event();
-    Ok(0)
-}
-
 #[inline(never)]
 fn ioctl_snoop_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     let mut query: SleSnoopQuery = read_user_struct(arg)?;
@@ -3517,7 +3460,6 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             write_user_struct(arg, &info)?;
             Ok(0)
         }
-        SL_IOCTL_DLI_POLL_EVENT => ioctl_legacy_dli_poll(context, arg),
         SL_IOCTL_DLI_RESET => {
             let mut ss = context.lock()?;
             let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
@@ -3839,7 +3781,7 @@ impl MiscDevice for SparkLinkCtl {
         } else { None };
         if let Some(gate) = management_guard.as_mut() {
             if *context.owner.as_ref().ok_or(ENODEV)?.schedule_gate.lock() { return Err(ENODEV); }
-            let required_mode = if matches!(cmd, SL_IOCTL_DLI_SEND_CMD | SL_IOCTL_DLI_POLL_EVENT | SL_IOCTL_DLI_RESET) {
+            let required_mode = if matches!(cmd, SL_IOCTL_DLI_SEND_CMD | SL_IOCTL_DLI_RESET) {
                 sle_management::DIAGNOSTIC
             } else { sle_management::MANAGED };
             gate.authorize(me.file_id, required_mode).map_err(management_error)?;
@@ -3945,7 +3887,6 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_DISCOVERY_SUBMIT
             | SL_IOCTL_DISCOVERY_RESULT
             | SL_IOCTL_DISCOVERY_TIMING
-            | SL_IOCTL_DLI_POLL_EVENT
             | SL_IOCTL_DLI_RESET
             | SL_IOCTL_DLI_SEND_CMD
             | SL_IOCTL_MGMT_STATS

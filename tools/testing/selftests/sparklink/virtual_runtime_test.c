@@ -46,6 +46,11 @@ static struct controller create(void)
 	uint16_t id = c.status.id;
 	CHECK(!ioctl(c.fd, SL_IOCTL_DEV_SELECT, &id));
 	CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
+	/* Unpublished legacy poll was deleted; it cannot consume any reply. */
+	unsigned char retired[256];
+	memset(retired, 0xa5, sizeof(retired));
+	CHECK(ioctl(c.fd, 0x81005382U, retired) == -1 && errno == ENOTTY);
+	for (unsigned int i = 0; i < sizeof(retired); i++) CHECK(retired[i] == 0xa5);
 	struct sle_management_request managed = { .version = 1,
 		.generation = c.status.generation, .mode = SLE_MANAGEMENT_MANAGED };
 	CHECK(ioctl(c.fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &managed) == -1 && errno == EOPNOTSUPP);
