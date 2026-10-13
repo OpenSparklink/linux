@@ -38,7 +38,7 @@ fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{identity:DeviceIdentity{id,
  host:Lock::new("host",Host{links:LinkObservation::new()}),data:Lock::new("data",Data),data_poll:Poll("data_notify"),schedule_gate:Lock::new("gate",false),controller_events:Lock::new("log",Log{records:vec![],fail:false}),controller_event_poll:Poll("notify")})}}
 thread_local! {static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(vec![])};static TRACE:RefCell<Vec<String>>=const{RefCell::new(vec![])};}
 fn trace(v:String){TRACE.with(|t|t.borrow_mut().push(v));}
-mod sle_usb {use super::*;pub fn ingress_owner(id:DeviceIdentity)->Option<Rc<Owner>>{OWNERS.with(|o|o.borrow().iter().find(|o|o.identity==id).cloned())}}
+mod sle_ingress {use super::*;pub fn ingress_owner(id:DeviceIdentity)->Option<Rc<Owner>>{OWNERS.with(|o|o.borrow().iter().find(|o|o.identity==id).cloned())}}
 struct NativeController;
 impl NativeController {fn result_to_errno(v:Result<(),Error>)->i32{v.err().map_or(0,|e|e.0)}}
 mod under_test {

@@ -232,7 +232,7 @@ impl super::ControllerRuntime {
         };
         // Publish ingress before open submits RX. Invalidation closes its
         // gate immediately, then joins this lifecycle before unpublishing.
-        super::sle_usb::publish_runtime(self);
+        super::sle_ingress::publish_runtime(self)?;
         // SAFETY: independent reference retains the driver; lifecycle excludes
         // close. No registry, management, Runtime state or IRQ lock spans I/O.
         NativeController::result(unsafe {
@@ -341,7 +341,7 @@ impl SleController for NativeController {
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
         if !self.opened.load(Ordering::Acquire) { return Err(EAGAIN); }
         self.validate_command(opcode as u16, params)?;
-        let owner = super::sle_usb::ingress_owner(self.identity).ok_or(ENODEV)?;
+        let owner = super::sle_ingress::ingress_owner(self.identity).ok_or(ENODEV)?;
         let gate = owner.schedule_gate.lock();
         if *gate { return Err(ENODEV); }
         owner.host.lock().enqueue(opcode as u16, params, 0)?;
@@ -454,7 +454,7 @@ pub(crate) extern "C" fn sparklink_native_unregister_rust(id: u16, generation: u
 /// Host is sampled; no Runtime/Host state or readiness is changed here.
 #[no_mangle]
 pub(crate) extern "C" fn sparklink_native_health_rust(id: u16, generation: u64) -> i32 {
-    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
+    let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else {
         return ENODEV.to_errno();
     };
     let gate = owner.schedule_gate.lock();
@@ -478,7 +478,7 @@ pub(crate) extern "C" fn sparklink_native_health_rust(id: u16, generation: u64) 
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_snoop_rx_rust(id:u16, generation:u64, data:*const u8, length:usize) {
     if data.is_null() || length==0 || length>20*1024 { return; }
-    let Some(owner)=super::sle_usb::ingress_owner(DeviceIdentity {id,generation}) else { return; };
+    let Some(owner)=super::sle_ingress::ingress_owner(DeviceIdentity {id,generation}) else { return; };
     if owner.protocol_profile!=1 { return; }
     // SAFETY: driver retains its validated HCC slot until the callback returns.
     let data=unsafe {core::slice::from_raw_parts(data,length)};
@@ -491,7 +491,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_snoop_rx_rust(id:u16, generatio
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_snoop_tx_rust(id:u16, generation:u64, opcode:u16, params:*const u8, length:usize, status:i32) {
     if params.is_null() || length>u16::MAX as usize {return;}
-    let Some(owner)=super::sle_usb::ingress_owner(DeviceIdentity {id,generation}) else {return;};
+    let Some(owner)=super::sle_ingress::ingress_owner(DeviceIdentity {id,generation}) else {return;};
     if owner.protocol_profile!=1 {return;}
     // SAFETY: driver retains the command parameter buffer for this callback.
     let params=unsafe {core::slice::from_raw_parts(params,length)};
@@ -530,7 +530,7 @@ unsafe fn publish_native_event(
 ) -> i32 {
     if params.is_null() { return EINVAL.to_errno(); }
     if length > super::sle_uapi::CONTROLLER_EVENT_PAYLOAD_MAX { return -(kernel::bindings::EMSGSIZE as i32); }
-    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
+    let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else {
         return ENODEV.to_errno();
     };
     if profile == 0 || profile != owner.protocol_profile { return PROTOCOL_ERROR; }
@@ -568,7 +568,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
     id: u16, generation: u64, data: *const u8, length: usize,
 ) -> i32 {
     if data.is_null() || !(5..=super::sle_native_data::MAXIMUM + 5).contains(&length) { return PROTOCOL_ERROR; }
-    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else {
+    let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else {
         return ENODEV.to_errno();
     };
     // SAFETY: transport retains a live buffer throughout this callback.
@@ -645,7 +645,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         }
         _ => return UNSUPPORTED,
     };
-    super::sle_usb::enqueue_rx(&owner, event);
+    super::sle_ingress::enqueue_rx(&owner, event);
     0
 }
 
@@ -655,7 +655,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_limits_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, maximum: *mut u16,
 ) -> i32 {
     if maximum.is_null() { return EINVAL.to_errno(); }
-    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     let host = owner.host.lock();
     let (_, known, links) = host.link_snapshot();
     let data = owner.data.lock();
@@ -757,7 +757,7 @@ unsafe fn native_acb_send(
     epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
 ) -> i32 {
     if data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
-    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     let _lifecycle = owner.native_lifecycle.lock();
     let transport = {
         let state = owner.state.lock();
@@ -803,7 +803,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_take_rust(
     data: *mut u8, capacity: usize, length: *mut usize,
 ) -> i32 {
     if data.is_null() || length.is_null() { return EINVAL.to_errno(); }
-    let Some(owner) = super::sle_usb::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     let host = owner.host.lock();
     let (_, known, links) = host.link_snapshot();
     let mut queue = owner.data.lock();

@@ -33,133 +33,7 @@ use super::sle_dli::{
 };
 use super::sle_transport::{SleAttachInfo, SleProtoId};
 
-// ---------------------------------------------------------------------------
-// IRQ-safe route lookup; ingress storage and work belong to the retained owner.
-// ---------------------------------------------------------------------------
-
-super::sle_irq_lock::irq_global_lock!(RUNTIME_ROUTES: [Option<kernel::sync::Arc<super::ControllerRuntime>>; super::sle_dev::SLE_DEV_MAX] = [const { None }; super::sle_dev::SLE_DEV_MAX]);
-
-/// # Safety
-/// Call exactly once before publishing any transport owner.
-pub(crate) unsafe fn init_usb_event_ring() {
-    // SAFETY: module initialization is single-threaded.
-    unsafe { RUNTIME_ROUTES.init() };
-}
-
-pub(crate) fn publish_runtime(owner: &kernel::sync::Arc<super::ControllerRuntime>) {
-    let previous = {
-        let mut routes = RUNTIME_ROUTES.lock();
-        routes[owner.identity.id as usize].replace(owner.clone())
-    };
-    drop(previous);
-}
-
-pub(crate) fn unpublish_runtime(owner: &kernel::sync::Arc<super::ControllerRuntime>) {
-    let previous = {
-        let mut routes = RUNTIME_ROUTES.lock();
-        let slot = &mut routes[owner.identity.id as usize];
-        if slot.as_ref().is_some_and(|r| r.identity == owner.identity) {
-            slot.take()
-        } else {
-            None
-        }
-    };
-    drop(previous);
-}
-
-pub(crate) fn ingress_owner(
-    identity: super::sle_dev::DeviceIdentity,
-) -> Option<kernel::sync::Arc<super::ControllerRuntime>> {
-    RUNTIME_ROUTES
-        .lock()
-        .get(identity.id as usize)
-        .and_then(|slot| {
-            slot.as_ref()
-                .filter(|owner| owner.identity == identity)
-                .cloned()
-        })
-}
-
-pub(crate) fn drain_runtime_events(
-    owner: &super::ControllerRuntime,
-    out: &mut [(Option<u16>, Option<SleEvent>)],
-) -> usize {
-    let mut count = 0;
-    let mut ring = owner.ingress.lock();
-    while count < out.len() {
-        let Some((id, event)) = ring.pop_tagged() else {
-            break;
-        };
-        out[count] = (id, Some(event));
-        count += 1;
-    }
-    count
-}
-
-/// Inline draining never removes events belonging to another device.
-pub(crate) fn drain_usb_events_for(
-    identity: super::sle_dev::DeviceIdentity,
-    out: &mut [(Option<u16>, Option<SleEvent>)],
-) -> usize {
-    ingress_owner(identity).map_or(0, |owner| drain_runtime_events(&owner, out))
-}
-
-static DECODE_DROPS: AtomicU32 = AtomicU32::new(0);
-
-pub(crate) struct RxDropStats {
-    pub(crate) ring: u32,
-    pub(crate) command_complete: u32,
-    pub(crate) mac_complete: u32,
-    pub(crate) decode: u32,
-}
-
-pub(crate) fn take_dropped_stats(owner: &super::ControllerRuntime) -> RxDropStats {
-    let ring = core::mem::take(&mut owner.ingress.lock().dropped);
-    RxDropStats {
-        ring,
-        command_complete: owner.dropped_commands.swap(0, Ordering::Relaxed),
-        mac_complete: owner.dropped_mac.swap(0, Ordering::Relaxed),
-        // Decode failures before attribution remain a transport diagnostic.
-        decode: DECODE_DROPS.swap(0, Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn enqueue_rx(owner: &kernel::sync::Arc<super::ControllerRuntime>, event: SleEvent) {
-    let command = matches!(&event, SleEvent::CommandComplete { .. } | SleEvent::NativeCommandReply { .. });
-    let mac = matches!(
-        &event,
-        SleEvent::CommandComplete {
-            opcode: SleOpcode::ReadMacAddr,
-            ..
-        }
-    );
-    let stopping = owner.schedule_gate.lock();
-    if *stopping {
-        return;
-    }
-    let event = owner.host.lock().receive(event);
-    let Some(event) = event else {
-        // A matching reply is retained in the Host's reserved slot. It
-        // cannot be lost when discovery/data fill the ordinary RX ring.
-        drop(stopping);
-        owner.schedule_rx(0);
-        return;
-    };
-    let accepted = owner
-        .ingress
-        .lock()
-        .push_tagged(Some(owner.identity.id), event);
-    if !accepted {
-        if command {
-            owner.dropped_commands.fetch_add(1, Ordering::Relaxed);
-        }
-        if mac {
-            owner.dropped_mac.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    drop(stopping);
-    owner.schedule_rx(0);
-}
+use super::sle_ingress::{enqueue_rx, ingress_owner};
 
 // ---------------------------------------------------------------------------
 // USB FFI — C wrapper functions from sle_usb_ffi.c
@@ -445,7 +319,7 @@ pub(crate) extern "C" fn sparklink_usb_registered_complete(
         let payload = &slice[5..];
         let mut data_vec = KVec::new();
         if data_vec.extend_from_slice(payload, GFP_ATOMIC).is_err() {
-            DECODE_DROPS.fetch_add(1, Ordering::Relaxed);
+            owner.dropped_decode.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let sle_evt = SleEvent::DataReceived {
@@ -462,7 +336,7 @@ pub(crate) extern "C" fn sparklink_usb_registered_complete(
             if let Some(sle_evt) = event_to_sle(&evt) {
                 enqueue_rx(&owner, sle_evt);
             } else {
-                DECODE_DROPS.fetch_add(1, Ordering::Relaxed);
+                owner.dropped_decode.fetch_add(1, Ordering::Relaxed);
                 pr_debug!(
                     "sparklink-usb: unknown event code=0x{:04x} len={}\n",
                     evt.event_code,
@@ -471,7 +345,7 @@ pub(crate) extern "C" fn sparklink_usb_registered_complete(
             }
         }
         Err(_) => {
-            DECODE_DROPS.fetch_add(1, Ordering::Relaxed);
+            owner.dropped_decode.fetch_add(1, Ordering::Relaxed);
             pr_debug!(
                 "sparklink-usb: parse failed len={} first={:02x}\n",
                 len,

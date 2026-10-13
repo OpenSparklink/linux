@@ -17,7 +17,7 @@ use super::sle_dli;
 use super::sle_dli::SleController;
 use super::sle_event;
 use super::sle_uapi::*;
-use super::sle_usb;
+use super::sle_ingress;
 use super::{ControllerRuntime, ControllerState};
 
 /// Flush executes the callback so Rust reclaims the queue-owned Arc. Call only
@@ -457,16 +457,14 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
 
 /// Drain all immediately available controller events and process them.
 ///
-/// Used after ioctl commands to handle synchronous controller responses
-/// (UartController, SpiController) inline without waiting for the
-/// next EventPump cycle. Also drains USB event ring entries so that
-/// multi-step protocol exchanges (e.g. pairing) can complete within
-/// a single ioctl call.
+/// Drain the selected owner's reserved Host replies and bounded ingress.
+/// Bus callbacks publish real events; this helper does not generate replies.
+/// The remaining legacy poll hook is empty for both registered Backends.
 pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
     let mut tagged = match new_event_batch() {
         Ok(batch) => batch,
         Err(_) => {
-            // Leave USB events in their queue for the background worker.
+            // Leave attributed events queued for the owner worker.
             pr_err!("sparklink: cannot allocate inline RX staging\n");
             return;
         }
@@ -478,14 +476,14 @@ pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
     for _round in 0..4 {
         let mut drained_this_round = 0u32;
 
-        if let Some(owner) = sle_usb::ingress_owner(shared.identity) {
+        if let Some(owner) = sle_ingress::ingress_owner(shared.identity) {
             if process_host_reply(&owner, shared) {
                 drained_this_round += 1;
                 total += 1;
             }
         }
 
-        // 1. Inline controller events (UART/SPI synchronous responses)
+        // 1. Remaining legacy poll hook (empty for registered USB/Native).
         while let Some(ev) = shared.controller.poll_event() {
             process_controller_event(shared, &ev);
             drained_this_round += 1;
@@ -495,10 +493,10 @@ pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
             }
         }
 
-        // 2. USB event ring entries (with device-ID filtering)
+        // 2. This registration's bounded ingress (exact identity).
         // Do not dequeue more events than this invocation can process.
         let count =
-            sle_usb::drain_usb_events_for(shared.identity, &mut tagged[..(32 - total) as usize]);
+            sle_ingress::drain_events_for(shared.identity, &mut tagged[..(32 - total) as usize]);
         for item in tagged.iter_mut().take(count) {
             let (dev_id, ev_opt) = core::mem::take(item);
             if let Some(ev) = ev_opt {
@@ -520,7 +518,6 @@ pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
 
 impl ControllerRuntime {
     pub(crate) fn start_workers(self: &Arc<Self>) {
-        sle_usb::publish_runtime(self);
         self.schedule_rx(msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS));
     }
 
@@ -582,9 +579,9 @@ impl WorkItem<0> for ControllerRuntime {
         this.data.lock().expire(unsafe { kernel::bindings::ktime_get_boottime() } as u64);
         let mut rearm_jiffies = msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS) as u64;
         let mut batch = new_event_batch().ok();
-        let drops = sle_usb::take_dropped_stats(&this);
+        let drops = sle_ingress::take_dropped_stats(&this);
         if drops.ring > 0 || drops.command_complete > 0 || drops.decode > 0 {
-            pr_warn!("sparklink: sle{} USB RX loss: ring={} command_complete={} mac_complete={} decode={}\n",
+            pr_warn!("sparklink: sle{} RX loss: ring={} command_complete={} mac_complete={} decode={}\n",
                 this.identity.id, drops.ring, drops.command_complete, drops.mac_complete, drops.decode);
         }
         for _pass in 0..16 {
@@ -614,7 +611,7 @@ impl WorkItem<0> for ControllerRuntime {
                 // not prefetch older events before waiting for that lock: an
                 // ioctl could otherwise process newer events ahead of them.
                 let budget = tagged.len().min((256 - pumped) as usize);
-                let count = sle_usb::drain_runtime_events(&this, &mut tagged[..budget]);
+                let count = sle_ingress::drain_runtime_events(&this, &mut tagged[..budget]);
                 for item in tagged.iter_mut().take(count) {
                     let (id, event) = core::mem::take(item);
                     if let Some(ev) = event {

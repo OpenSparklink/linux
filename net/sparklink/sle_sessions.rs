@@ -95,7 +95,7 @@ impl super::ControllerRuntime {
 pub(crate) unsafe extern "C" fn sparklink_native_session_status_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, epoch: u64,
 ) -> i32 {
-    let Some(owner) = super::sle_usb::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let Some(owner) = super::sle_ingress::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     owner.session_limits(lifetime, handle, epoch, None).map_or_else(|error| error.to_errno(), |_| 0)
 }
 #[no_mangle]
@@ -104,7 +104,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_session_get_rust(
 ) -> *mut c_void {
     if error.is_null() { return core::ptr::null_mut(); }
     let result = (|| -> Result<*mut c_void> {
-        let owner = super::sle_usb::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }).ok_or(ENODEV)?;
+        let owner = super::sle_ingress::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }).ok_or(ENODEV)?;
         let maximum = owner.session_limits(lifetime, handle, epoch, None)?;
         if maximum <= 5 { return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))); }
         // SAFETY: constructor allocates outside any table/IRQ locks; reference
@@ -144,6 +144,6 @@ pub(crate) unsafe extern "C" fn sparklink_native_session_admit_rust(
 ) -> i32 {
     let Some(admit) = admit else { return EINVAL.to_errno(); };
     if context.is_null() { return EINVAL.to_errno(); }
-    let Some(owner) = super::sle_usb::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
+    let Some(owner) = super::sle_ingress::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     owner.session_limits(lifetime, handle, epoch, Some((admit, context))).map_or_else(|error| error.to_errno(), |_| 0)
 }

@@ -16,7 +16,7 @@ TEST_GEN_PROGS_EXTENDED += sparklink_setup_release_test
 
 TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containment.py
 TEST_PROGS += run_connection_tx.py run_ssap_containment.py run_native_connection_contract.py
-TEST_PROGS += run_event_copy.py
+TEST_PROGS += run_event_copy.py run_runtime_ingress.py
 TEST_PROGS += run_phy_model.py
 TEST_PROGS += run_diagnostic_result.py
 TEST_PROGS += run_management_release.py run_link_observation.py

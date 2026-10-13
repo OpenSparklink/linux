@@ -32,6 +32,7 @@ mod sle_event;
 mod sle_fw;
 mod sle_host;
 mod sle_irq_lock;
+mod sle_ingress;
 mod sle_mgmt;
 mod sle_link_observation;
 mod sle_native;
@@ -556,6 +557,7 @@ pub(crate) struct ControllerRuntime {
     pub(crate) fast_poll_remaining: core::sync::atomic::AtomicU32,
     pub(crate) dropped_commands: core::sync::atomic::AtomicU32,
     pub(crate) dropped_mac: core::sync::atomic::AtomicU32,
+    pub(crate) dropped_decode: core::sync::atomic::AtomicU32,
 }
 
 impl ControllerRuntime {
@@ -601,6 +603,7 @@ impl ControllerRuntime {
             fast_poll_remaining: core::sync::atomic::AtomicU32::new(0),
             dropped_commands: core::sync::atomic::AtomicU32::new(0),
             dropped_mac: core::sync::atomic::AtomicU32::new(0),
+            dropped_decode: core::sync::atomic::AtomicU32::new(0),
         }), GFP_KERNEL)
     }
 
@@ -622,7 +625,7 @@ impl ControllerRuntime {
         // Session workers can wait for native_lifecycle. Join BEFORE taking it.
         self.stop_sessions(ENODEV.to_errno());
         let _lifecycle = self.native_lifecycle.lock();
-        sle_usb::unpublish_runtime(self);
+        sle_ingress::unpublish_runtime(self);
         self.stop_workers();
         let state = self.state.lock().take();
         if let Some(state) = state {
@@ -980,7 +983,7 @@ pub(crate) fn sle_switch_controller_usb(dev_id: u16, addr: [u8; 6], fw_version: 
     })();
     match result {
         Ok(owner) => {
-            sle_usb::publish_runtime(&owner);
+            sle_ingress::publish_runtime(&owner)?;
             let mut guard = owner.state.lock();
             if let Some(state) = Option::as_mut(&mut *guard) {
                 if let Err(e) = state.controller.open() {
@@ -1285,7 +1288,7 @@ impl kernel::InPlaceModule for SparkLinkModule {
         // SAFETY: Called exactly once during module init.
         unsafe { SUBSYSTEM.init() };
         // SAFETY: Called exactly once during module init.
-        unsafe { sle_usb::init_usb_event_ring() };
+        unsafe { sle_ingress::init_ingress_routes() };
 
         let options = MiscDeviceOptions { name: c"sparklink" };
 

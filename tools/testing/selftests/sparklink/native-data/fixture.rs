@@ -74,7 +74,7 @@ thread_local!{
  static EARLY_COMPLETE:RefCell<bool>=const{RefCell::new(false)};
  static NOW:RefCell<u64>=const{RefCell::new(1)};
 }
-mod sle_usb{use super::*;
+mod sle_ingress{use super::*;
  pub fn ingress_owner(id:DeviceIdentity)->Option<Rc<Owner>>{OWNERS.with(|o|o.borrow().iter().find(|o|o.identity==id).cloned())}
  pub fn enqueue_rx(owner:&Owner,event:SleEvent){owner.commands.borrow_mut().push(event);}
 }
@@ -281,7 +281,7 @@ struct FakeSession {refs:usize, stopped:bool, id:u16, generation:u64, lifetime:u
 }}
 #[no_mangle] unsafe extern "C" fn sl_connection_session_stop(p:*mut c_void,error:i32){unsafe{
  let s=&mut *p.cast::<FakeSession>();assert!(error<0);s.stopped=true;
- let owner=sle_usb::ingress_owner(DeviceIdentity{id:s.id,generation:s.generation}).unwrap();
+ let owner=sle_ingress::ingress_owner(DeviceIdentity{id:s.id,generation:s.generation}).unwrap();
  assert!(owner.sessions.0.try_borrow_mut().is_ok());
  assert!(owner.host.0.try_borrow_mut().is_ok());
  assert!(owner.native_lifecycle.0.try_borrow_mut().is_ok());
