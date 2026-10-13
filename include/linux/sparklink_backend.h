@@ -66,4 +66,19 @@ static inline int sparklink_backend_validate(const struct sparklink_backend_desc
 int sparklink_backend_register(const struct sparklink_backend_descriptor *descriptor,
 			      struct sparklink_native_identity *identity);
 
+/* Pending diagnostics have no Ready/credit assertion. bus is the public bus
+ * value (USB=4, TEST=6), profile identifies the phase namespace, phase is raw
+ * provider diagnostic data, error is zero or a negative errno. */
+struct sparklink_backend_pending { u32 bus, profile, phase; int error; };
+int sparklink_backend_reserve(u32 bus, u32 profile, struct sparklink_native_identity *identity);
+int sparklink_backend_register_reserved(const struct sparklink_backend_descriptor *descriptor,
+                                       const struct sparklink_native_identity *reserved,
+                                       struct sparklink_native_identity *identity);
+int sparklink_backend_pending_update(u16 id, u64 generation, u32 phase, int error);
+int sparklink_backend_pending_query(u16 id, u64 generation, struct sparklink_backend_pending *status);
+/* Cancel only an uninstalled reservation; a successful install is removed via
+ * sparklink_native_unregister. Failed install may retire identity if open was
+ * reached: caller must re-query validity before keeping a diagnostic record. */
+void sparklink_backend_cancel(u16 id, u64 generation);
+
 #endif

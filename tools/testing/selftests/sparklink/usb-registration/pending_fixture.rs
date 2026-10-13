@@ -29,6 +29,7 @@ impl SleDevRegistry {
  // @@REG_NEW@@
  // @@REGISTER_PENDING@@
  // @@GET@@
+ // @@GET_MUT@@
  // @@UNREGISTER@@
 }
 mod sle_dev {pub(crate) use super::{DeviceIdentity,SLE_DEV_UNREGISTERING};}
@@ -36,6 +37,7 @@ struct Shared{dev_registry:SleDevRegistry,runtimes:[Option<Arc<Runtime>>;SLE_DEV
 impl Shared{fn runtime(&self,id:u16)->Option<Arc<Runtime>>{self.runtimes.get(id as usize).and_then(Clone::clone)} fn new()->Self{Self{dev_registry:SleDevRegistry::new(),runtimes:std::array::from_fn(|_|None),active_dev_id:None}}}
 struct Lock<T>(Mutex<T>);impl<T> Lock<T>{fn lock(&self)->MutexGuard<'_,T>{self.0.lock().unwrap()}}
 static SUBSYSTEM:Lock<Option<Shared>>=Lock(Mutex::new(None));
+// @@RESERVE_PROFILE@@
 // @@RESERVE_BACKEND@@
 // @@CANCEL@@
 // @@RESERVE@@
@@ -53,7 +55,7 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
 
 #[test]fn constructor_has_only_setup_and_preserves_explicit_metadata(){
  let info=SleControllerInfo{addr:[3;6],fw_version:7,features:11,max_connections:2,bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);assert_eq!((info.features_ext,info.max_pdu_payload,info.max_mtu,info.max_mps,info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0,0,0,0,0));
- assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.id,d.generation,d.addr,d.fw_version,d.features,d.max_connections,d.bus),(4,5,[3;6],7,11,2,SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");let _=&d.stats;
+ assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.pending_profile,d.pending_phase,d.pending_error),(0,0,0));assert_eq!((d.id,d.generation,d.addr,d.fw_version,d.features,d.max_connections,d.bus),(4,5,[3;6],7,11,2,SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");let _=&d.stats;
 }
 #[test]fn full_registry_cannot_invent_ready_or_extra_slot(){
  let mut r=SleDevRegistry::new();for id in 0..SLE_DEV_MAX{let got=r.register_pending(&SleControllerInfo::default()).unwrap();assert_eq!(got as usize,id);assert_eq!(r.get(got).unwrap().flags.load(Ordering::Acquire),SLE_DEV_SETUP);}

@@ -44,6 +44,10 @@ pub(crate) struct NativeIdentity {
 }
 
 #[repr(C)]
+pub(crate) struct BackendPending { bus: u32, profile: u32, phase: u32, error: i32 }
+const _: () = assert!(core::mem::size_of::<BackendPending>() == 16);
+
+#[repr(C)]
 struct NativeDiscoveryRequest {
     operation: u32,
     advertising: *const SleDiscoveryAdvConfig,
@@ -363,11 +367,50 @@ impl SleController for NativeController {
     fn reset(&self) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
 }
 
+/// Caller owns the reservation until successful install, cancellation or removal.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_backend_reserve_rust(bus: u32, profile: u32, out: *mut NativeIdentity) -> i32 {
+    let result = (|| -> Result {
+        if out.is_null() { return Err(EINVAL); }
+        if profile != 1 { return Err(Error::from_errno(UNSUPPORTED)); }
+        let mut info = SleControllerInfo::default();
+        info.bus = backend_bus(bus)?;
+        let identity = super::reserve_backend_identity_profile(&info, profile)?;
+        // SAFETY: checked live C output, written only on success.
+        unsafe { *out = NativeIdentity { id: identity.id, generation: identity.generation } };
+        Ok(())
+    })();
+    NativeController::result_to_errno(result)
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn sparklink_backend_cancel_rust(id: u16, generation: u64) {
+    super::cancel_backend_reservation(DeviceIdentity { id, generation });
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn sparklink_backend_pending_update_rust(id: u16, generation: u64, phase: u32, error: i32) -> i32 {
+    NativeController::result_to_errno(super::update_backend_pending(DeviceIdentity { id, generation }, phase, error))
+}
+
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_backend_pending_query_rust(id: u16, generation: u64, out: *mut BackendPending) -> i32 {
+    if out.is_null() { return EINVAL.to_errno(); }
+    match super::query_backend_pending(DeviceIdentity { id, generation }) {
+        Ok((bus, profile, phase, error)) => {
+            // SAFETY: C requires a live output. Returned bus is the public value.
+            unsafe { *out = BackendPending { bus: bus as u32, profile, phase, error } };
+            0
+        }
+        Err(error) => error.to_errno(),
+    }
+}
+
 /// C wrapper validates pointers and transfers its retained transport on every
 /// return path. Register actual metadata without synthesizing capabilities.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
-    info: *const NativeInfo, transport: *mut c_void, out: *mut NativeIdentity,
+    info: *const NativeInfo, transport: *mut c_void, reserved: *const NativeIdentity, out: *mut NativeIdentity,
 ) -> i32 {
     // SAFETY: C wrapper requires live metadata/out and an owned transport.
     let metadata = unsafe { *info };
@@ -386,7 +429,14 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
             || (metadata.icb_length == 0) != (metadata.icb_count == 0)
         { return Err(Error::from_errno(PROTOCOL_ERROR)); }
         let ctrl_info = controller.info();
-        let identity = super::reserve_backend_identity(&ctrl_info)?;
+        let borrowed = !reserved.is_null();
+        let identity = if borrowed {
+            // SAFETY: C copied the live caller reservation for this call.
+            let input = unsafe { &*reserved };
+            let identity = DeviceIdentity { id: input.id, generation: input.generation };
+            super::validate_backend_reservation(identity, controller.bus, metadata.profile)?;
+            identity
+        } else { super::reserve_backend_identity_profile(&ctrl_info, metadata.profile)? };
         let id = identity.id;
         controller.identity = identity;
         // Candidate construction and driver put/drop are outside the registry.
@@ -395,12 +445,12 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
                 metadata.address, super::sle_dli::ControllerBackend::Native(controller),
             )?;
             state.command_credits = metadata.command_credits;
-            super::install_backend_runtime(identity, state, false, None)
+            super::install_backend_runtime(identity, state, false, Some((metadata.address, ctrl_info.fw_version)))
         })();
         let owner = match installed {
             Ok(owner) => owner,
             Err(error) => {
-                super::cancel_backend_reservation(identity);
+                if !borrowed { super::cancel_backend_reservation(identity); }
                 return Err(error);
             }
         };

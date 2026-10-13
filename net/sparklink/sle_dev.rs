@@ -90,6 +90,10 @@ pub(crate) struct SleDev {
     pub(crate) name: [u8; SLE_DEV_NAME_LEN],
     /// Transport bus type.
     pub(crate) bus: SleBus,
+    /// Core pending diagnostics; never transport/Host Ready.
+    pub(crate) pending_profile: u32,
+    pub(crate) pending_phase: u32,
+    pub(crate) pending_error: i32,
     /// 6-byte SLE MAC address.
     pub(crate) addr: [u8; 6],
     /// Lifecycle and operational state flags (see `SLE_DEV_*` constants).
@@ -130,6 +134,7 @@ impl SleDev {
             generation,
             name,
             bus: info.bus,
+            pending_profile: 0, pending_phase: 0, pending_error: 0,
             addr: info.addr,
             flags: AtomicU32::new(SLE_DEV_SETUP),
             fw_version: info.fw_version,

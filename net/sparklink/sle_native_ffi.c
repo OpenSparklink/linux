@@ -11,6 +11,7 @@
 #include <uapi/linux/sparklink_ioctl.h>
 
 static_assert(sizeof(struct sparklink_native_info) == 32);
+static_assert(sizeof(struct sparklink_backend_pending) == 16);
 static_assert(sizeof(struct sparklink_native_link_evidence) == 28);
 static_assert(offsetof(struct sparklink_native_link_evidence, address) == 20);
 static_assert(offsetof(struct sparklink_native_info, features) == 9);
@@ -81,7 +82,8 @@ struct sparklink_native_transport {
 
 #include "sle_native_ffi.h"
 
-int sparklink_backend_register(const struct sparklink_backend_descriptor *descriptor,
+static int sparklink_backend_register_identity(const struct sparklink_backend_descriptor *descriptor,
+                                  const struct sparklink_native_identity *reserved,
 			      struct sparklink_native_identity *identity)
 {
 	struct sparklink_native_transport *transport;
@@ -116,9 +118,54 @@ int sparklink_backend_register(const struct sparklink_backend_descriptor *descri
 	transport->context = snapshot.context;
 	operations.get(snapshot.context);
 	/* Rust consumes this reference on both success and failure. */
-	return sparklink_native_register_rust(&snapshot.info, transport, identity);
+	return sparklink_native_register_rust(&snapshot.info, transport, reserved, identity);
+}
+int sparklink_backend_register(const struct sparklink_backend_descriptor *descriptor,
+                              struct sparklink_native_identity *identity)
+{
+    return sparklink_backend_register_identity(descriptor, NULL, identity);
 }
 EXPORT_SYMBOL_GPL(sparklink_backend_register);
+
+int sparklink_backend_register_reserved(const struct sparklink_backend_descriptor *descriptor,
+                              const struct sparklink_native_identity *reserved,
+                              struct sparklink_native_identity *identity)
+{
+    struct sparklink_native_identity snapshot;
+
+    if (!reserved || !reserved->generation || reserved->id >= 16)
+        return -EINVAL;
+    snapshot = *reserved;
+    return sparklink_backend_register_identity(descriptor, &snapshot, identity);
+}
+EXPORT_SYMBOL_GPL(sparklink_backend_register_reserved);
+
+int sparklink_backend_reserve(u32 bus, u32 profile, struct sparklink_native_identity *identity)
+{
+    if (!identity || (bus != SPARKLINK_BACKEND_USB && bus != SPARKLINK_BACKEND_TEST) ||
+        profile != SPARKLINK_NATIVE_WS73_HCC)
+        return -EINVAL;
+    return sparklink_backend_reserve_rust(bus, profile, identity);
+}
+EXPORT_SYMBOL_GPL(sparklink_backend_reserve);
+
+void sparklink_backend_cancel(u16 id, u64 generation)
+{
+    sparklink_backend_cancel_rust(id, generation);
+}
+EXPORT_SYMBOL_GPL(sparklink_backend_cancel);
+
+int sparklink_backend_pending_update(u16 id, u64 generation, u32 phase, int error)
+{
+    return sparklink_backend_pending_update_rust(id, generation, phase, error);
+}
+EXPORT_SYMBOL_GPL(sparklink_backend_pending_update);
+
+int sparklink_backend_pending_query(u16 id, u64 generation, struct sparklink_backend_pending *status)
+{
+    return sparklink_backend_pending_query_rust(id, generation, status);
+}
+EXPORT_SYMBOL_GPL(sparklink_backend_pending_query);
 
 u32 sparklink_native_transport_bus(const struct sparklink_native_transport *transport)
 {

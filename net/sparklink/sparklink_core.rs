@@ -713,10 +713,50 @@ pub(crate) fn sle_quiesce_device(identity: sle_dev::DeviceIdentity) {
 /// One reservation allocator for actual providers. Metadata may be unknown;
 /// registration reserves identity only, never Runtime/open/Ready.
 pub(crate) fn reserve_backend_identity(info: &sle_dli::SleControllerInfo) -> Result<sle_dev::DeviceIdentity> {
+    reserve_backend_identity_profile(info, 0)
+}
+
+pub(crate) fn reserve_backend_identity_profile(info: &sle_dli::SleControllerInfo, profile: u32) -> Result<sle_dev::DeviceIdentity> {
     let mut registry = SUBSYSTEM.lock();
     let shared = registry.as_mut().ok_or(ENODEV)?;
     let id = shared.dev_registry.register_pending(info)?;
-    Ok(shared.dev_registry.get(id).ok_or(ENODEV)?.identity())
+    let dev = shared.dev_registry.get_mut(id).ok_or(ENODEV)?;
+    dev.pending_profile = profile;
+    Ok(dev.identity())
+}
+
+/// Validate a borrowed pending identity before adopting queried metadata.
+/// Bus/profile are reservation provenance, not inferred from a reusable index.
+pub(crate) fn validate_backend_reservation(identity: sle_dev::DeviceIdentity, bus: sle_dli::SleBus, profile: u32) -> Result {
+    let registry = SUBSYSTEM.lock();
+    let shared = registry.as_ref().ok_or(ENODEV)?;
+    let dev = shared.dev_registry.get(identity.id).ok_or(ENODEV)?;
+    if dev.identity() != identity || dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) { return Err(ENODEV); }
+    if dev.bus() != bus || dev.pending_profile != profile { return Err(EINVAL); }
+    if shared.runtime(identity.id).is_some() { return Err(EBUSY); }
+    Ok(())
+}
+
+pub(crate) fn update_backend_pending(identity: sle_dev::DeviceIdentity, phase: u32, error: i32) -> Result {
+    if error > 0 { return Err(EINVAL); }
+    let mut registry = SUBSYSTEM.lock();
+    let shared = registry.as_mut().ok_or(ENODEV)?;
+    let dev = shared.dev_registry.get(identity.id).ok_or(ENODEV)?;
+    if dev.identity() != identity || dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) { return Err(ENODEV); }
+    if shared.runtime(identity.id).is_some() { return Err(EBUSY); }
+    let dev = shared.dev_registry.get_mut(identity.id).ok_or(ENODEV)?;
+    dev.pending_phase = phase;
+    dev.pending_error = error;
+    Ok(())
+}
+
+pub(crate) fn query_backend_pending(identity: sle_dev::DeviceIdentity) -> Result<(sle_dli::SleBus, u32, u32, i32)> {
+    let registry = SUBSYSTEM.lock();
+    let shared = registry.as_ref().ok_or(ENODEV)?;
+    let dev = shared.dev_registry.get(identity.id).ok_or(ENODEV)?;
+    if dev.identity() != identity || dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) { return Err(ENODEV); }
+    if shared.runtime(identity.id).is_some() { return Err(EBUSY); }
+    Ok((dev.bus(), dev.pending_profile, dev.pending_phase, dev.pending_error))
 }
 
 /// Cancel only an uninstalled exact reservation. Never discard an installed

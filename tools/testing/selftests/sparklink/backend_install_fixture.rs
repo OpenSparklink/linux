@@ -49,6 +49,10 @@ struct Lock<T>(Mutex<T>);impl<T> Lock<T>{fn lock(&self)->MutexGuard<'_,T>{self.0
 static SUBSYSTEM:Lock<Option<Shared>>=Lock(Mutex::new(None));
 #[derive(Clone,Copy)]
 // @@REGISTRATION@@
+// @@RESERVE_PROFILE@@
+// @@VALIDATE@@
+// @@UPDATE_PENDING@@
+// @@QUERY_PENDING@@
 // @@RESERVE@@
 // @@INSTALL@@
 // @@CANCEL@@
@@ -105,3 +109,24 @@ fn failed(r:Result<Arc<ControllerRuntime>>,e:i32){assert!(matches!(r,Err(n) if n
 #[test]fn retiring_identity_is_not_published_or_cancelled(){let id=setup();failed(install(id,6,true),ENODEV);cancel_backend_reservation(id);assert!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(id.id).unwrap().test_flag(SLE_DEV_UNREGISTERING));}
 #[test]fn stale_and_busy_prechecks_do_not_allocate_or_drop_under_lock(){let id=setup();failed(install(DeviceIdentity{id:id.id,generation:id.generation+1},0,true),ENODEV);assert_eq!(CONSTRUCTIONS.load(Ordering::Relaxed),0);let o=install(id,0,false).unwrap();failed(install(id,0,true),EBUSY);assert_eq!(CONSTRUCTIONS.load(Ordering::Relaxed),1);assert_eq!(o.identity,id);}
 #[test]fn construction_failure_cancellation_preserves_other_owner(){let id=setup();let peer=reserve_backend_identity(&SleControllerInfo::default()).unwrap();let p=install(peer,0,true).unwrap();failed(install(id,1,false),ENOMEM);cancel_backend_reservation(id);let s=SUBSYSTEM.lock();assert!(s.as_ref().unwrap().dev_registry.get(id.id).is_none());assert!(Arc::ptr_eq(&p,&s.as_ref().unwrap().runtime(peer.id).unwrap()));assert_eq!(s.as_ref().unwrap().active_dev_id,Some(peer.id));}
+
+#[test]fn early_pending_identity_preserves_unknown_metadata_and_profile(){
+ let _=setup();let id=reserve_backend_identity_profile(&SleControllerInfo{bus:SleBus::Usb,..Default::default()},1).unwrap();
+ assert_eq!(query_backend_pending(id),Ok((SleBus::Usb,1,0,0)));assert_eq!(validate_backend_reservation(id,SleBus::Usb,1),Ok(()));
+ assert_eq!(validate_backend_reservation(id,SleBus::Test,1),Err(EINVAL));assert_eq!(validate_backend_reservation(id,SleBus::Usb,0),Err(EINVAL));
+ let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_eq!((d.addr,d.fw_version,d.features,d.max_connections),([0;6],0,0,0));assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);
+}
+#[test]fn pending_fault_is_core_owned_and_positive_errors_rejected(){
+ let id=setup();assert_eq!(update_backend_pending(id,10,-110),Ok(()));assert_eq!(query_backend_pending(id),Ok((SleBus::None,0,10,-110)));
+ assert_eq!(update_backend_pending(id,11,1),Err(EINVAL));assert_eq!(query_backend_pending(id),Ok((SleBus::None,0,10,-110)));
+ assert_eq!(update_backend_pending(id,12,0),Ok(()));assert_eq!(query_backend_pending(id),Ok((SleBus::None,0,12,0)));
+}
+#[test]fn late_pending_callback_cannot_touch_reused_generation(){
+ let old=setup();cancel_backend_reservation(old);let fresh=reserve_backend_identity(&SleControllerInfo::default()).unwrap();assert_eq!(old.id,fresh.id);
+ assert_eq!(update_backend_pending(old,10,-5),Err(ENODEV));assert_eq!(query_backend_pending(old),Err(ENODEV));assert_eq!(validate_backend_reservation(old,SleBus::None,0),Err(ENODEV));assert_eq!(query_backend_pending(fresh),Ok((SleBus::None,0,0,0)));
+}
+#[test]fn pending_diagnostics_and_adoption_cannot_change_installed_or_retiring_owner(){
+ let id=setup();let o=install(id,0,false).unwrap();assert_eq!(update_backend_pending(id,10,-5),Err(EBUSY));assert_eq!(query_backend_pending(id),Err(EBUSY));assert_eq!(validate_backend_reservation(id,SleBus::None,0),Err(EBUSY));assert_eq!(o.identity,id);
+ let pending=reserve_backend_identity(&SleControllerInfo::default()).unwrap();SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(pending.id).unwrap().begin_unregister();
+ assert_eq!(update_backend_pending(pending,10,-5),Err(ENODEV));assert_eq!(query_backend_pending(pending),Err(ENODEV));assert_eq!(validate_backend_reservation(pending,SleBus::None,0),Err(ENODEV));
+}
