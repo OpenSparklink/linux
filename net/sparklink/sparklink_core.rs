@@ -681,14 +681,16 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
     let transport_dir = debugfs.subdir(c"transport");
     let power_dir = debugfs.subdir(c"power");
     let conn_dir = debugfs.subdir(c"connections");
+    let unavailable_default_dli = CString::try_from_fmt(fmt!("legacy default projection retired: use selected ControllerSnapshot\n"))?;
+    let unavailable_default_mgmt = CString::try_from_fmt(fmt!("legacy queue projection retired: use selected Native diagnostic result\n"))?;
 
     KBox::pin_init(
         pin_init!(DebugfsHolder {
             _version <- debugfs.read_only_file(c"version", ver),
             _build_info <- debugfs.read_only_file(c"build_info", build),
             _subsystems <- debugfs.read_only_file(c"subsystems", subsys),
-            _dli_info <- debugfs.read_only_file(c"dli_controller", CString::try_from_fmt(fmt!("legacy default projection retired: use selected ControllerSnapshot\n"))?),
-            _mgmt_stats <- mgmt_dir.read_only_file(c"stats", CString::try_from_fmt(fmt!("legacy queue projection retired: use selected Native diagnostic result\n"))?),
+            _dli_info <- debugfs.read_only_file(c"dli_controller", unavailable_default_dli),
+            _mgmt_stats <- mgmt_dir.read_only_file(c"stats", unavailable_default_mgmt),
             _mgmt_dir: mgmt_dir,
             _transport_info <- transport_dir.read_callback_file(
                 c"info",
