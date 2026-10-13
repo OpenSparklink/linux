@@ -2,7 +2,7 @@
 
 //! SparkLink USB transport for SLE DLI controllers.
 //!
-//! Implements DLI packet framing over USB and provides [`UsbController`]
+//! Implements standard EP0-command/interrupt-event USB framing and provides [`UsbController`]
 //! which implements the [`SleController`] trait for USB-attached
 //! SparkLink radio controllers.
 //!
@@ -17,7 +17,7 @@
 //!   EP0  Control           DLI instructions (standard path)
 //!   INT  Interrupt IN 0x91 DLI events from controller (64B)
 //!   BLK  Bulk IN      0x92 Async data from controller
-//!   BLK  Bulk OUT     0x12 Async data and commands to controller
+//!   BLK  Bulk OUT     0x12 Async data to controller; no commands
 
 use kernel::alloc::KVec;
 use kernel::device;
@@ -130,6 +130,7 @@ pub(crate) extern "C" fn sparklink_usb_registered_complete(
     generation: u64,
     data: *const u8,
     length: i32,
+    lane: u8,
     status: i32,
 ) {
     if status != 0 || length <= 0 || data.is_null() {
@@ -148,30 +149,16 @@ pub(crate) extern "C" fn sparklink_usb_registered_complete(
         return;
     };
 
-    let len = length as usize;
-    // SAFETY: data points to the URB transfer buffer which is valid
-    // during the completion callback. length is the actual bytes
-    // transferred, guaranteed <= buffer size by USB core.
-    let slice = unsafe { core::slice::from_raw_parts(data, len) };
-
-    // Check if this is a DLI async data packet (0xA3 prefix, from Bulk IN)
-    if len >= 5 && slice[0] == 0xA3 {
-        // Parse DLI async data: [0xA3][link_id_seg:2][plen:2][payload...]
-        let link_id_seg = u16::from_le_bytes([slice[1], slice[2]]);
-        let handle = (link_id_seg >> 4) & 0x0FFF;
-        let payload = &slice[5..];
-        let mut data_vec = KVec::new();
-        if data_vec.extend_from_slice(payload, GFP_ATOMIC).is_err() {
-            owner.dropped_decode.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let sle_evt = SleEvent::DataReceived {
-            handle,
-            data: data_vec,
-        };
-        enqueue_rx(&owner, sle_evt);
+    // Standard USB types are implicit in endpoint lanes. The unqualified old
+    // handle-only bulk data route has no canonical Session/ticket owner yet.
+    if lane != 1 {
+        owner.dropped_decode.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let len = length as usize;
+    // SAFETY: C's registered event URB retains the immutable owner and supplies
+    // its live transfer buffer with USB-core-validated actual_length.
+    let slice = unsafe { core::slice::from_raw_parts(data, len) };
 
     // Try to parse as a DLI event packet
     match parse_event_packet(slice) {
@@ -868,6 +855,18 @@ impl UsbController {
         Ok(Self { metadata, device, identity })
     }
 
+    pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
+        if params.len() > super::sle_uapi::DLI_PARAM_MAX { return Err(EINVAL); }
+        // Only locally verified standard query schemas until typed standard
+        // policy recipes are connected; raw input grants no mutation permission.
+        match opcode {
+            0x0401..=0x0404 if params.is_empty() => Ok(()),
+            0x0406 if params.len() == 1 && matches!(params[0], 0 | 2..=6) => Ok(()),
+            0x0401..=0x0404 | 0x0406 => Err(EINVAL),
+            _ => Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
+        }
+    }
+
     pub(crate) fn fill_snapshot(&self, out: &mut super::sle_uapi::SleControllerSnapshot) {
         // Immutable queried observation only, independent of Host readiness.
         let metadata = &self.metadata;
@@ -949,16 +948,9 @@ impl SleController for UsbController {
     }
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
+        self.validate_command(opcode as u16, params)?;
         let owner = ingress_owner(self.identity).ok_or(ENODEV)?;
-        use super::sle_command_plan::DiscoveryIntent;
-        let intent = if params.len() == 1 && params[0] <= 1 {
-            if opcode == SleOpcode::EnableBroadcast {
-                Some(DiscoveryIntent::Advertising(params[0] == 1))
-            } else if opcode == SleOpcode::EnableScan {
-                Some(DiscoveryIntent::Scanning(params[0] == 1))
-            } else { None }
-        } else { None };
-        super::sle_ingress::enqueue_command(&owner, opcode as u16, params, intent)
+        super::sle_ingress::enqueue_command(&owner, opcode as u16, params, None)
     }
 
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {
@@ -996,22 +988,10 @@ impl SleController for UsbController {
 
 impl super::sle_backend::CommandPort for UsbController {
     fn submit(&self, opcode: u16, params: &[u8], recipe: Option<super::sle_command_plan::RecipeTag>, connection: Option<u32>) -> Result {
-        // No typed connection or WS73 multi-step recipe implementation exists
-        // for this standard provider yet; never silently drop those obligations.
-        if connection.is_some() { return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))); }
-        if params.len() > super::sle_uapi::DLI_PARAM_MAX { return Err(EINVAL); }
-        if let Some(tag) = recipe {
-            use super::sle_command_plan::DiscoveryIntent;
-            if tag.step != 0 || tag.count != 1 || tag.recreate {
-                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
-            }
-            let (expected, enabled) = match tag.intent {
-                DiscoveryIntent::Advertising(enabled) => (SleOpcode::EnableBroadcast as u16, enabled),
-                DiscoveryIntent::Scanning(enabled) => (SleOpcode::EnableScan as u16, enabled),
-                _ => return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
-            };
-            if opcode != expected || params != [u8::from(enabled)] { return Err(EINVAL); }
+        if recipe.is_some() || connection.is_some() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         }
+        self.validate_command(opcode, params)?;
         self.send_command_transport(opcode, params)
     }
 }
@@ -1049,25 +1029,13 @@ kernel::usb_device_table!(
 pub(crate) struct SleUsbDriver { binding: UsbBinding }
 struct UsbBinding { identity: DeviceIdentity, device: UsbDevice }
 
-/// Require bootstrap and optional firmware before reading publishable identity.
+/// Query a running standard controller; boot-ROM/firmware protocols are vendor-owned.
 fn prepare_usb_controller(
     device: &UsbDevice,
-    dev: &kernel::device::Device,
+    _dev: &kernel::device::Device,
 ) -> Result<([u8; 6], u32)> {
-    // Bootstrap must establish a real controller before optional firmware.
+    // A standard DLI descriptor does not specify a vendor boot-ROM protocol.
     initialize_usb_controller(device)?;
-    let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
-    match super::sle_fw::load_usb_firmware(device, fw_name, dev) {
-        Ok(size) => {
-            pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", size);
-            // Cached identity predates the download. Require fresh successful
-            // Reset/version/MAC replies before publishing this binding.
-            initialize_usb_controller(device)?;
-        }
-        Err(ENOENT) => pr_debug!("sparklink-usb: optional firmware absent\n"),
-        Err(error) => return Err(error),
-    }
-
     let mut addr = [0u8; 6];
     // SAFETY: probe owns a live registered binding; addr has six bytes.
     let ret = unsafe { sle_usb_dev_get_mac(device.as_raw(), addr.as_mut_ptr()) };

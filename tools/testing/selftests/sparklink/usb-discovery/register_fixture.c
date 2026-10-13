@@ -21,9 +21,14 @@ static void refcount_set(refcount_t*r,unsigned n){atomic_init(r,n);}
 static void refcount_inc(refcount_t*r){atomic_fetch_add(r,1);}
 static bool refcount_dec_and_test(refcount_t*r){return atomic_fetch_sub(r,1)==1;}
 #define GFP_KERNEL 0
-struct usb_device{int refs;};
+#define USB_TYPE_CLASS 0x20
+#define USB_RECIP_DEVICE 0
+#define USB_RECIP_INTERFACE 1
+struct usb_device_descriptor{u8 bDeviceClass,bDeviceSubClass,bDeviceProtocol;};
+struct usb_device{int refs;struct usb_device_descriptor descriptor;};
 struct usb_endpoint_descriptor{u8 bEndpointAddress,bInterval;u16 maxp;};
-struct usb_host_interface{int unused;};
+struct usb_interface_descriptor{u8 bInterfaceNumber;};
+struct usb_host_interface{struct usb_interface_descriptor desc;};
 struct usb_interface{struct usb_host_interface*cur_altsetting;struct usb_device*device;int refs;};
 struct sle_urb_ctx{u32 registration_id;u64 registration_generation;};
 static struct usb_device device;
@@ -59,7 +64,7 @@ static u32 sle_usb_dev_get_fw_version_locked(struct sle_usb_dev*d){assert(d->act
  return d->fw_version;
 }
 /* @@GET_VERSION@@ */
-static void reset(void){assert(!contexts&&!device.refs&&!intf.refs);find_ret=find_calls=allocs=fail_alloc=frees=kills=fail_context=transfers=0;endpoints[0]=(struct usb_endpoint_descriptor){0x92,0,512};endpoints[1]=(struct usb_endpoint_descriptor){0x12,0,512};endpoints[2]=(struct usb_endpoint_descriptor){0x91,1,64};}
+static void reset(void){device.descriptor=(struct usb_device_descriptor){0};alt.desc.bInterfaceNumber=2;assert(!contexts&&!device.refs&&!intf.refs);find_ret=find_calls=allocs=fail_alloc=frees=kills=fail_context=transfers=0;endpoints[0]=(struct usb_endpoint_descriptor){0x92,0,512};endpoints[1]=(struct usb_endpoint_descriptor){0x12,0,512};endpoints[2]=(struct usb_endpoint_descriptor){0x91,1,64};}
 static void rejected(int id,void*i,u64 gen,int error){struct sle_usb_dev*out=NULL;assert(sle_usb_dev_register(id,i,gen,&out)==error&&!out);assert(!contexts&&!device.refs&&!intf.refs);cases++;}
 static void*getter_thread(void*p){assert(sle_usb_dev_get_fw_version(p)==33);return NULL;}
 static void*retire_thread(void*p){sle_usb_dev_unregister(p);return NULL;}
@@ -70,8 +75,9 @@ int main(void){
  reset();endpoints[2].bInterval=0;rejected(0,&intf,1,-EPROTO);
  for(int n=1;n<=2;n++){reset();fail_alloc=n;rejected(0,&intf,1,-ENOMEM);assert(frees==n-1&&kills==0);}
  reset();fail_context=1;rejected(0,&intf,1,-ENOMEM);assert(frees==2);
- reset();struct sle_usb_dev*a=NULL,*b=NULL;assert(!sle_usb_dev_register(0,&intf,1,&a));assert(!sle_usb_dev_register(0,&intf,2,&b));assert(a!=b&&a->generation==1&&b->generation==2);assert(a->evt_urb->registration_generation==1&&b->rx_urb->registration_generation==2);a->fw_version=11;b->fw_version=22;
+ reset();struct sle_usb_dev*a=NULL,*b=NULL;assert(!sle_usb_dev_register(0,&intf,1,&a));assert(!sle_usb_dev_register(0,&intf,2,&b));assert(a!=b&&a->generation==1&&b->generation==2);assert(a->evt_urb->registration_generation==1&&b->rx_urb->registration_generation==2);assert(a->command_request_type==0x21&&a->command_index==2);a->fw_version=11;b->fw_version=22;
  sle_usb_dev_get(a);assert(sle_usb_dev_get_fw_version(a)==11);sle_usb_dev_unregister(a);assert(!a->active&&b->active&&kills==2);sle_usb_dev_unregister(a);assert(kills==2);sle_usb_dev_put(a);assert(sle_usb_dev_get_fw_version(a)==0&&transfers==0);assert(sle_usb_dev_get_fw_version(b)==22);assert(contexts==2&&device.refs==2&&intf.refs==2);sle_usb_dev_put(a);assert(contexts==1);sle_usb_dev_unregister(b);sle_usb_dev_put(b);assert(!contexts&&!device.refs&&!intf.refs&&kills==4&&frees==4);cases++;
+ reset();device.descriptor=(struct usb_device_descriptor){0xe0,1,5};assert(!sle_usb_dev_register(0,&intf,99,&a));assert(a->command_request_type==0x20&&a->command_index==0);sle_usb_dev_put(a);cases++;
  reset();assert(!sle_usb_dev_register(0,&intf,UINT64_MAX,&a));sle_usb_dev_put(a);assert(kills==2&&frees==2&&!contexts);cases++;
  reset();assert(!sle_usb_dev_register(0,&intf,3,&a));assert(!sle_usb_dev_register(0,&intf,4,&b));a->fw_version=33;b->fw_version=44;blocked_context=a;entered=release_io=false;atomic_store(&mutex_waits,0);
  pthread_t reader,retirer;assert(!pthread_create(&reader,NULL,getter_thread,a));pthread_mutex_lock(&barrier_lock);while(!entered)pthread_cond_wait(&barrier_cond,&barrier_lock);pthread_mutex_unlock(&barrier_lock);

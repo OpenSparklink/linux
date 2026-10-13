@@ -104,5 +104,5 @@ int main(void) {
  reset(data);assert(sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,NULL,1,reply,sizeof(reply),&reply_length)==-EINVAL&&allocs==0);cases++;
  reset(data);assert(sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,data,-1,reply,sizeof(reply),&reply_length)==-EINVAL&&allocs==0);cases++;
  reset(data);assert(sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,data,65536,reply,sizeof(reply),&reply_length)==-EINVAL&&allocs==0);cases++;
- free(data);printf("{\"c_cases\":%d,\"status\":\"PASS_ACTUAL_FW_C_BOUNDARIES\"}\n",cases);return 0;
+ free(data);printf("{\"c_cases\":%d,\"status\":\"PASS_RETIRED_FW_C_BOUNDARIES\"}\n",cases);return 0;
 }

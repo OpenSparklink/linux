@@ -36,5 +36,5 @@ int main(void) {
  completed_length=-1;assert(sle_usb_dev_send_data_locked(&context,0x123,payload,4)==0 && frame_len==9 && allocations==0);
  assert(frame[0]==DLI_PKT_ASYNC_DATA && frame[1]==0x30 && frame[2]==0x12 && frame[3]==4 && frame[4]==0 && !memcmp(frame+5,payload,4));
  assert(sle_usb_dev_send_data_locked(&context,0xfff,payload,511)==0 && frame_len==516 && allocations==0);
- puts("ACTUAL_USB_TX_BOUNDARY_PASS: range/allocation/errno/short/exact/max-length");return 0;
+ puts("RETIRED_USB_TX_BOUNDARY_PASS: range/allocation/errno/short/exact/max-length");return 0;
 }

@@ -12,6 +12,7 @@ def run(output):
  s=(here/'backend_command_port_fixture.rs').read_text();trait=block(sources['sle_backend.rs'],sources['sle_backend.rs'].index('pub(crate) trait CommandPort'))
  selector=function(sources['sle_dli.rs'],'command_port').replace('use kernel::alloc::KBox;','use kernel::alloc::KBox; use crate::FallibleBox;').replace('KBox::new(','FallibleBox::new(')
  for marker,text in [('TRAIT',trait),('SELECTOR',selector),('USB_PORT',block(sources['sle_usb.rs'],sources['sle_usb.rs'].index('impl super::sle_backend::CommandPort'))),('NATIVE_PORT',block(sources['sle_native.rs'],sources['sle_native.rs'].index('impl super::sle_backend::CommandPort')))]:s=s.replace('// @@'+marker+'@@',text)
+ s=s.replace('// @@USB_VALIDATE@@',function(sources['sle_usb.rs'][sources['sle_usb.rs'].index('impl UsbController {'):],'validate_command'))
  s=s.replace('super::sle_backend','crate::sle_backend').replace('super::sle_command_plan','crate::sle_command_plan').replace('super::sle_uapi','crate::sle_uapi')
  with tempfile.TemporaryDirectory(prefix='sparklink-command-port-') as tmp:
   p=Path(tmp);(p/'actual.rs').write_text(s);subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(p/'actual.rs'),'-o',str(p/'test')],check=True);log=subprocess.check_output([str(p/'test')],text=True);print(log)

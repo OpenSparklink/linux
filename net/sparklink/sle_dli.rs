@@ -1354,7 +1354,7 @@ impl ControllerBackend {
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
         match self {
             Self::Native(c) => c.validate_command(opcode, params),
-            _ => Ok(()),
+            Self::Usb(c) => c.validate_command(opcode, params),
         }
     }
 

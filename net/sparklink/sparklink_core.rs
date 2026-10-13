@@ -30,7 +30,6 @@ mod sle_crypto;
 mod sle_dev;
 mod sle_dli;
 mod sle_event;
-mod sle_fw;
 mod sle_host;
 mod sle_irq_lock;
 mod sle_ingress;

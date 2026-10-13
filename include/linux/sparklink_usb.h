@@ -43,7 +43,6 @@ u8 sle_usb_dev_get_command_credits(struct sle_usb_dev *context);
 u32 sle_usb_dev_get_fw_version(struct sle_usb_dev *context);
 int sle_usb_dev_get_metadata(struct sle_usb_dev *context, struct sle_usb_metadata *out);
 int sle_usb_dev_get_mac(struct sle_usb_dev *context, u8 *mac);
-int sle_usb_dev_download_fw(struct sle_usb_dev *context, const u8 *data, int size, int chunk_size);
 int sle_usb_dev_suspend(struct sle_usb_dev *context);
 int sle_usb_dev_resume(struct sle_usb_dev *context);
 #endif

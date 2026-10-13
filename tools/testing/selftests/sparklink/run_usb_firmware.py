@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Actual legacy USB firmware/prepare/probe source; dependency fixtures, no USB I/O."""
+"""Retired experimental firmware/prepare/probe source; historical regressions only, never production or standard USB proof."""
 import argparse
 import hashlib
 import json
@@ -15,8 +15,8 @@ from run_connection_tx import function
 
 def run(output):
     here = Path(__file__).resolve().parent
-    net = here.parents[3] / 'net/sparklink'
-    inputs = {n: (net/n).read_text() for n in ['sle_usb_ffi.c', 'sle_fw.rs', 'sle_usb.rs']}
+    net = here / 'retired-usb-firmware'
+    inputs = {n: (net/n).read_text() for n in ['sle_usb_ffi.c', 'sle_fw.rs', 'bootstrap_and_probe.rs']}
     c = inputs['sle_usb_ffi.c'].replace('static int sle_usb_dev_download_fw_locked', 'int sle_usb_dev_download_fw_locked').replace('static int sle_usb_send_cmd_sync', 'int sle_usb_send_cmd_sync').replace('static int sle_usb_validate_init_reply', 'int sle_usb_validate_init_reply')
     defines = '\n'.join(re.search(r'(?m)^#define '+n+r' .+$', c).group() for n in
                         ['SLE_USB_MAX_DEVS', 'DLI_PKT_COMMAND', 'SLE_EVT_CMD_COMPLETE',
@@ -32,7 +32,7 @@ def run(output):
     constants = '\n'.join(re.search(r'(?m)^const '+n+r'.+$', inputs['sle_fw.rs']).group() for n in
                           ['FW_DEFAULT_CHUNK_SIZE', 'FW_MAX_SIZE'])
     rust = rust.replace('// @@LOADER@@', constants+'\n'+loader)
-    rust = rust.replace('// @@PREPARE@@', '\n'.join(function(inputs['sle_usb.rs'], n) for n in
+    rust = rust.replace('// @@PREPARE@@', '\n'.join(function(inputs['bootstrap_and_probe.rs'], n) for n in
                         ['initialize_usb_controller', 'prepare_usb_controller', 'probe_usb_device']))
     with tempfile.TemporaryDirectory(prefix='sparklink-usb-fw-') as tmp:
         tmp = Path(tmp)
@@ -50,8 +50,8 @@ def run(output):
                         str(tmp/'rust.rs'), '-o', str(tmp/'rust-test')], check=True)
         subprocess.run([str(tmp/'rust-test'), '--test-threads=1'], check=True)
     assert all((net/n).read_text() == s for n, s in inputs.items())
-    record = {'status': 'GENERIC_USB_FIRMWARE_SOURCE_BOUNDARIES_PASS', 'c_cases': c_record['c_cases'],
-              'rust_tests': 12, 'scope': 'actual C download/sync/validator and Rust loader/prepare/probe bodies; fixture USB, allocation, request_firmware and registry dependencies; C static linkage only lifted for extraction',
+    record = {'status': 'RETIRED_GENERIC_USB_FIRMWARE_REGRESSION_PASS', 'c_cases': c_record['c_cases'],
+              'rust_tests': 12, 'scope': 'retired archived experimental C download/sync/validator and Rust loader/prepare/probe bodies; never compiled into production; fixture USB, allocation, request_firmware and registry dependencies; C static linkage only lifted for extraction',
               'generic_firmware_wire_acceptance': False, 'native_ws73_firmware_acceptance': False,
               'natural_fault_root_cause_closed': False,
               'sources': {n: hashlib.sha256(s.encode()).hexdigest() for n, s in inputs.items()}}

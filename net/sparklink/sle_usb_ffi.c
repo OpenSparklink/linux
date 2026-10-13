@@ -30,7 +30,7 @@
  *   status   — URB completion status (0 = success, negative = error)
  */
 extern void sparklink_usb_registered_complete(u32 dev_id, u64 generation,
-					      const u8 *data, int length,
+					      const u8 *data, int length, u8 lane,
 					      int status);
 
 /* Private RX lifecycle helpers. */
@@ -61,12 +61,12 @@ struct sle_urb_ctx {
  * Completion handler: called by USB core when transfer finishes
  * -----------------------------------------------------------------------
  */
-static void sle_usb_receive_complete(struct sle_urb_ctx *ctx, struct urb *urb)
+static void sle_usb_receive_complete(struct sle_urb_ctx *ctx, struct urb *urb, u8 lane)
 {
 	/* All live RX URBs belong to a registered immutable identity. */
 	sparklink_usb_registered_complete(ctx->registration_id,
 					  ctx->registration_generation,
-					  ctx->buf, urb->actual_length,
+					  ctx->buf, urb->actual_length, lane,
 					  urb->status);
 }
 
@@ -75,7 +75,7 @@ static void sle_usb_bulk_in_cb(struct urb *urb)
 {
 	struct sle_urb_ctx *ctx = urb->context;
 
-	sle_usb_receive_complete(ctx, urb);
+	sle_usb_receive_complete(ctx, urb, 2);
 
 	/* Auto-resubmit unless cancelled or device disconnected */
 	if (urb->status == 0 || urb->status == -EOVERFLOW) {
@@ -90,7 +90,7 @@ static void sle_usb_intr_cb(struct urb *urb)
 {
 	struct sle_urb_ctx *ctx = urb->context;
 
-	sle_usb_receive_complete(ctx, urb);
+	sle_usb_receive_complete(ctx, urb, 1);
 
 	/* For interrupt IN endpoints: auto-resubmit unless cancelled */
 	if (urb->status == 0 || urb->status == -EOVERFLOW) {
@@ -226,10 +226,9 @@ static void sle_usb_kill_ctx(struct sle_urb_ctx *ctx)
  * ======================================================================= */
 
 #define SLE_USB_MAX_DEVS 16
+#define SLE_USB_EVENT_MAX 65539 /* four-byte header + u16 event parameters */
 
-/* DLI packet type bytes (T/XS 10003-2025 section 5.2) */
-#define DLI_PKT_COMMAND    0xA1
-#define DLI_PKT_ASYNC_DATA 0xA3
+/* USB types are implicit in EP0, interrupt and bulk endpoint lanes. */
 
 /* Timeout for synchronous command transfers (ms) */
 #define SLE_CMD_TIMEOUT_MS 5000
@@ -251,6 +250,8 @@ struct sle_usb_dev {
 	u8 ep_intr_in;                /* 0x91 per T/XS 10003 */
 	u16 ep_bulk_in_size;          /* wMaxPacketSize */
 	u16 ep_intr_in_size;
+	u8 command_request_type;
+	u16 command_index;
 	u8 ep_intr_in_interval;       /* bInterval */
 	/* Read-back from controller during init */
 	u8 mac_addr[6];
@@ -314,7 +315,7 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation,
 	    !usb_endpoint_maxp(int_in) || !int_in->bInterval)
 		return -EPROTO;
 
-	evt_urb = sle_usb_alloc_ctx(usb_endpoint_maxp(int_in));
+	evt_urb = sle_usb_alloc_ctx(SLE_USB_EVENT_MAX);
 	if (!evt_urb)
 		return -ENOMEM;
 	rx_urb = sle_usb_alloc_ctx(usb_endpoint_maxp(bulk_in));
@@ -335,6 +336,18 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation,
 	d->generation = generation;
 	d->intf = usb_get_intf(intf);
 	d->udev = usb_get_dev(interface_to_usbdev(intf));
+	/* Standard section6.2.2: device recipient for a single DLI function,
+	 * interface recipient otherwise; addressing is immutable per binding.
+	 */
+	if (d->udev->descriptor.bDeviceClass == 0xe0 &&
+	    d->udev->descriptor.bDeviceSubClass == 0x01 &&
+	    d->udev->descriptor.bDeviceProtocol == 0x05) {
+		d->command_request_type = USB_TYPE_CLASS | USB_RECIP_DEVICE;
+		d->command_index = 0;
+	} else {
+		d->command_request_type = USB_TYPE_CLASS | USB_RECIP_INTERFACE;
+		d->command_index = intf->cur_altsetting->desc.bInterfaceNumber;
+	}
 	d->ep_bulk_in = bulk_in->bEndpointAddress;
 	d->ep_bulk_out = bulk_out->bEndpointAddress;
 	d->ep_intr_in = int_in->bEndpointAddress;
@@ -389,7 +402,7 @@ void sle_usb_dev_unregister(struct sle_usb_dev *d)
 }
 
 /**
- * sle_usb_dev_send_cmd - Send a DLI command via USB bulk OUT.
+ * sle_usb_dev_send_cmd - Send a standard DLI command via USB EP0.
  * @d: retained USB context
  * @opcode: DLI opcode (host byte order)
  * @params: parameter bytes
@@ -398,45 +411,48 @@ void sle_usb_dev_unregister(struct sle_usb_dev *d)
  * Builds a DLI command packet and sends synchronously.
  * Returns 0 on success, negative errno on failure.
  */
-static int sle_usb_dev_send_cmd_locked(struct sle_usb_dev *d, u16 opcode, const u8 *params, int plen)
+/* Standard USB has no UART/H4 packet marker. One complete DLI command
+ * uses EP0, bRequest/wValue zero and the binding's descriptor-selected target.
+ * wLength is u16 including the four-byte DLI header, not the parameter limit.
+ */
+static int sle_usb_write_command_locked(struct sle_usb_dev *d, u16 opcode,
+				 const u8 *params, int plen, int timeout)
 {
 	u8 *pkt;
-	int total;
-	int actual_len;
-	unsigned int pipe;
-	int ret;
-
+	int total, ret;
 
 	if (!d->active || !d->udev)
 		return -ENODEV;
-
-	if (plen < 0) return -EINVAL;
-	if (plen > 255) return -EMSGSIZE;
-
-	if (plen > 0 && !params)
+	if (plen < 0 || (plen && !params))
 		return -EINVAL;
-
-	total = 5 + plen;
+	if (plen > 65531)
+		return -EMSGSIZE;
+	total = 4 + plen;
 	pkt = kmalloc(total, GFP_KERNEL);
 	if (!pkt)
 		return -ENOMEM;
-
-	/* Build DLI command packet: [type:1][opcode:2][param_len:2][params...] */
-	pkt[0] = DLI_PKT_COMMAND;
-	pkt[1] = (u8)(opcode & 0xFF);
-	pkt[2] = (u8)(opcode >> 8);
-	pkt[3] = (u8)(plen & 0xFF);
-	pkt[4] = (u8)(plen >> 8);
-	if (plen > 0 && params)
-		memcpy(&pkt[5], params, plen);
-
-	pipe = usb_sndbulkpipe(d->udev, d->ep_bulk_out);
-	ret = usb_bulk_msg(d->udev, pipe, pkt, total,
-			   &actual_len, SLE_CMD_TIMEOUT_MS);
+	put_unaligned_le16(opcode, pkt);
+	put_unaligned_le16(plen, pkt + 2);
+	if (plen)
+		memcpy(pkt + 4, params, plen);
+	ret = usb_control_msg(d->udev, usb_sndctrlpipe(d->udev, 0),
+		0, d->command_request_type, 0, d->command_index,
+		pkt, total, timeout);
 	kfree(pkt);
-	if (ret)
+	if (ret < 0)
 		return ret;
-	return actual_len == total ? 0 : -EREMOTEIO;
+	return ret == total ? 0 : -EREMOTEIO;
+}
+
+static int sle_usb_dev_send_cmd_locked(struct sle_usb_dev *d, u16 opcode,
+				     const u8 *params, int plen)
+{
+	/* Current Host queue supports255 parameter bytes. A codec bound is not
+	 * an advertised controller limit or permission to mutate its state.
+	 */
+	if (plen > 255)
+		return -EMSGSIZE;
+	return sle_usb_write_command_locked(d, opcode, params, plen, SLE_CMD_TIMEOUT_MS);
 }
 
 /**
@@ -448,49 +464,14 @@ static int sle_usb_dev_send_cmd_locked(struct sle_usb_dev *d, u16 opcode, const 
  *
  * Returns 0 on success, negative errno on failure.
  */
-static int sle_usb_dev_send_data_locked(struct sle_usb_dev *d, u16 handle, const u8 *data, int len)
+static int sle_usb_dev_send_data_locked(struct sle_usb_dev *d, u16 handle,
+				       const u8 *data, int len)
 {
-	u8 *pkt;
-	int total;
-	int actual_len;
-	unsigned int pipe;
-	u16 link_id_seg;
-	u16 data_len_field;
-	int ret;
-
-
-	if (!d->active || !d->udev)
-		return -ENODEV;
-
-	if (len <= 0 || !data || handle > 0x0fff)
-		return -EINVAL;
-	if (len > 511)
-		return -EMSGSIZE;
-
-	total = 5 + len;
-	pkt = kmalloc(total, GFP_KERNEL);
-	if (!pkt)
-		return -ENOMEM;
-
-	/* Build DLI async unicast data packet */
-	link_id_seg = ((handle & 0x0FFF) << 4);
-	data_len_field = (u16)(len & 0x01FF);
-
-	pkt[0] = DLI_PKT_ASYNC_DATA;
-	pkt[1] = (u8)(link_id_seg & 0xFF);
-	pkt[2] = (u8)(link_id_seg >> 8);
-	pkt[3] = (u8)(data_len_field & 0xFF);
-	pkt[4] = (u8)(data_len_field >> 8);
-	if (len > 0 && data)
-		memcpy(&pkt[5], data, len);
-
-	pipe = usb_sndbulkpipe(d->udev, d->ep_bulk_out);
-	ret = usb_bulk_msg(d->udev, pipe, pkt, total,
-			   &actual_len, SLE_CMD_TIMEOUT_MS);
-	kfree(pkt);
-	if (!ret && actual_len != total)
-		return -EIO;
-	return ret;
+	/* No qualified standard Session/ticket/credit path yet. */
+	(void)handle;
+	(void)data;
+	(void)len;
+	return d->active ? -EOPNOTSUPP : -ENODEV;
 }
 
 /**
@@ -596,53 +577,32 @@ static void sle_usb_dev_stop_data_locked(struct sle_usb_dev *d)
 #define SLE_INIT_TIMEOUT_MS       3000
 
 static int sle_usb_send_cmd_sync(struct sle_usb_dev *d, u16 opcode,
-				 const u8 *params, int plen, u8 *resp, int resp_size, int *resp_len)
+				 const u8 *params, int plen, u8 *resp,
+				 int resp_size, int *resp_len)
 {
-	u8 *cmd;
-	u8 *rbuf;
-	int actual_len;
-	unsigned int pipe_out, pipe_in;
+	u8 *buffer;
 	int ret;
 
-	if (plen < 0 || plen > 65535 || (plen && !params) ||
-	    !resp || !resp_len || resp_size <= 0)
+	if (!resp || !resp_len || resp_size <= 0)
 		return -EINVAL;
-	cmd = kmalloc(5 + plen, GFP_KERNEL);
-	if (!cmd)
-		return -ENOMEM;
-
-	cmd[0] = DLI_PKT_COMMAND;
-	cmd[1] = (u8)(opcode & 0xFF);
-	cmd[2] = (u8)(opcode >> 8);
-	cmd[3] = (u8)plen;
-	cmd[4] = (u8)(plen >> 8);
-	if (plen)
-		memcpy(cmd + 5, params, plen);
-
-	pipe_out = usb_sndbulkpipe(d->udev, d->ep_bulk_out);
-	ret = usb_bulk_msg(d->udev, pipe_out, cmd, 5 + plen,
-			   &actual_len, SLE_INIT_TIMEOUT_MS);
-	kfree(cmd);
+	ret = sle_usb_write_command_locked(d, opcode, params, plen, SLE_INIT_TIMEOUT_MS);
 	if (ret)
 		return ret;
-	if (actual_len != 5 + plen)
-		return -EIO;
-
-	/* Read response from bulk IN using heap buffer */
-	rbuf = kmalloc(resp_size, GFP_KERNEL);
-	if (!rbuf)
+	buffer = kmalloc(resp_size, GFP_KERNEL);
+	if (!buffer)
 		return -ENOMEM;
-
-	pipe_in = usb_rcvbulkpipe(d->udev, d->ep_bulk_in);
-	ret = usb_bulk_msg(d->udev, pipe_in, rbuf, resp_size,
-			   resp_len, SLE_INIT_TIMEOUT_MS);
+	/* Events use interrupt IN; never steal ACB data from bulk IN. Probe
+	 * bootstrap runs before the asynchronous event listener starts.
+	 */
+	ret = usb_interrupt_msg(d->udev, usb_rcvintpipe(d->udev, d->ep_intr_in),
+		buffer, resp_size, resp_len, SLE_INIT_TIMEOUT_MS);
 	if (!ret) {
 		if (*resp_len < 0 || *resp_len > resp_size)
 			ret = -EPROTO;
-		else if (*resp_len > 0)
-			memcpy(resp, rbuf, *resp_len);
+		else if (*resp_len)
+			memcpy(resp, buffer, *resp_len);
 	}
-	kfree(rbuf);
+	kfree(buffer);
 	return ret;
 }
 
@@ -773,139 +733,6 @@ static int sle_usb_dev_get_mac_locked(struct sle_usb_dev *d, u8 *mac)
 		return -ENODEV;
 	memcpy(mac, d->mac_addr, 6);
 	return 0;
-}
-
-/* -----------------------------------------------------------------------
- * Firmware download over USB bulk OUT
- *
- * Protocol (modeled after BT HCI firmware download):
- *   1. Host sends FW_DOWNLOAD_START command (opcode 0xF810, param = total size)
- *   2. Host sends firmware data in chunks via bulk OUT, prefixed with
- *      a FW_DATA header byte 0xA5
- *   3. After all chunks: host sends FW_DOWNLOAD_DONE (opcode 0xF811)
- *   4. Controller ACKs with CommandComplete
- *
- * Chunk wire format:
- *   [0]      0xA5 (FW_DATA marker)
- *   [1..4]   offset (LE32)
- *   [5..6]   chunk_len (LE16)
- *   [7..N]   firmware data
- * ----------------------------------------------------------------------- */
-
-#define SLE_FW_DATA_MARKER   0xA5
-#define SLE_FW_CHUNK_HDR     7     /* marker + offset(4) + len(2) */
-#define SLE_OP_FW_DL_START   0xF810
-#define SLE_OP_FW_DL_DONE    0xF811
-#define SLE_FW_DEFAULT_CHUNK 240   /* legacy fallback, not a device capability */
-#define SLE_FW_MAX_SIZE     (4 * 1024 * 1024) /* matches Rust loader budget */
-#define SLE_FW_DL_TIMEOUT_MS 10000
-
-/**
- * sle_usb_dev_download_fw - Download firmware to controller in chunks.
- * @dev_id:     device id
- * @data:       firmware blob from request_firmware()
- * @size:       firmware size in bytes
- * @chunk_size: max payload per transfer (0 = auto from endpoint size)
- *
- * Returns 0 on success, negative errno on failure.
- */
-static int sle_usb_dev_download_fw_locked(struct sle_usb_dev *d, const u8 *data, int size,
-			    int chunk_size)
-{
-	unsigned int pipe;
-	int offset = 0;
-	int actual_len;
-	int ret;
-	u8 *pkt;
-	int pkt_size;
-	u8 start_params[4];
-	u8 resp[32];
-	int resp_len = 0;
-
-	if (!data || size <= 0)
-		return -EINVAL;
-	if (size > SLE_FW_MAX_SIZE)
-		return -EFBIG;
-	if (chunk_size < 0)
-		return -EINVAL;
-
-	if (!d->active || !d->udev)
-		return -ENODEV;
-
-	if (!chunk_size)
-		chunk_size = d->ep_bulk_in_size > SLE_FW_CHUNK_HDR ?
-			     d->ep_bulk_in_size - SLE_FW_CHUNK_HDR :
-			     SLE_FW_DEFAULT_CHUNK;
-	/* The chunk header has a 16-bit length. This also bounds pkt_size
-	 * before integer addition and allocation, including explicit sizes.
-	 */
-	if (chunk_size <= 0 || chunk_size > 0xffff)
-		return -EMSGSIZE;
-
-	pkt_size = SLE_FW_CHUNK_HDR + chunk_size;
-	pkt = kmalloc(pkt_size, GFP_KERNEL);
-	if (!pkt)
-		return -ENOMEM;
-
-	/* Step 1: Send FW_DOWNLOAD_START with total size */
-	start_params[0] = (u8)(size & 0xFF);
-	start_params[1] = (u8)((size >> 8) & 0xFF);
-	start_params[2] = (u8)((size >> 16) & 0xFF);
-	start_params[3] = (u8)((size >> 24) & 0xFF);
-
-	ret = sle_usb_dev_send_cmd_locked(d, SLE_OP_FW_DL_START,
-				   start_params, 4);
-	if (ret) {
-		pr_err("sparklink-usb: fw download start failed: %d\n", ret);
-		goto out;
-	}
-
-	/* Step 2: Send firmware in chunks via bulk OUT */
-	pipe = usb_sndbulkpipe(d->udev, d->ep_bulk_out);
-
-	while (offset < size) {
-		int chunk = min(chunk_size, size - offset);
-		int total = SLE_FW_CHUNK_HDR + chunk;
-
-		pkt[0] = SLE_FW_DATA_MARKER;
-		pkt[1] = (u8)(offset & 0xFF);
-		pkt[2] = (u8)((offset >> 8) & 0xFF);
-		pkt[3] = (u8)((offset >> 16) & 0xFF);
-		pkt[4] = (u8)((offset >> 24) & 0xFF);
-		pkt[5] = (u8)(chunk & 0xFF);
-		pkt[6] = (u8)((chunk >> 8) & 0xFF);
-		memcpy(&pkt[SLE_FW_CHUNK_HDR], data + offset, chunk);
-
-		ret = usb_bulk_msg(d->udev, pipe, pkt, total,
-				   &actual_len, SLE_FW_DL_TIMEOUT_MS);
-		if (ret) {
-			pr_err("sparklink-usb: fw chunk at offset %d failed: %d\n",
-			       offset, ret);
-			goto out;
-		}
-		if (actual_len != total) {
-			ret = -EIO;
-			pr_err("sparklink-usb: short fw chunk at offset %d: %d/%d\n",
-			       offset, actual_len, total);
-			goto out;
-		}
-
-		offset += chunk;
-	}
-
-	/* Step 3: Send FW_DOWNLOAD_DONE and wait for ACK */
-	ret = sle_usb_send_cmd_sync(d, SLE_OP_FW_DL_DONE, NULL, 0,
-				    resp, sizeof(resp), &resp_len);
-	if (!ret)
-		ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_FW_DL_DONE, 0);
-	if (ret)
-		pr_err("sparklink-usb: fw download done cmd failed: %d\n", ret);
-	else
-		pr_info("sparklink-usb: firmware downloaded (%d bytes)\n", size);
-
-out:
-	kfree(pkt);
-	return ret;
 }
 
 /* -----------------------------------------------------------------------
@@ -1103,16 +930,6 @@ int sle_usb_dev_get_mac(struct sle_usb_dev *d, u8 *mac)
 	if (!d) return -EINVAL;
 	mutex_lock(&d->io_lock);
 	result = d->active ? sle_usb_dev_get_mac_locked(d, mac) : -ENODEV;
-	mutex_unlock(&d->io_lock);
-	return result;
-}
-
-int sle_usb_dev_download_fw(struct sle_usb_dev *d, const u8 *data, int size, int chunk_size)
-{
-	int result;
-	if (!d) return -EINVAL;
-	mutex_lock(&d->io_lock);
-	result = d->active ? sle_usb_dev_download_fw_locked(d, data, size, chunk_size) : -ENODEV;
 	mutex_unlock(&d->io_lock);
 	return result;
 }

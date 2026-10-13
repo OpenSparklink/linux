@@ -1,3 +1,4 @@
+// Retired experiment, not compiled into kernel; historical tests only.
 // SPDX-License-Identifier: GPL-2.0
 
 //! Firmware loading for the legacy generic USB controller backend.
