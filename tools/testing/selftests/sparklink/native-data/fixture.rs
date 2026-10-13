@@ -46,7 +46,7 @@ struct Poll;impl Poll{fn notify_all(&self){}}
 struct Dummy{transport:*mut c_void}
 impl Dummy{fn command_transport(&self)->NativeCommandTransport{NativeCommandTransport{transport:self.transport}}}
 struct NativeCommandTransport{transport:*mut c_void}
-mod sle_dli{pub enum ControllerBackend{Ws73(super::Dummy)}}
+mod sle_dli{pub enum ControllerBackend{Native(super::Dummy)}}
 struct State{controller:sle_dli::ControllerBackend}
 struct Owner{
  identity:DeviceIdentity,host:Lock<Host>,data:Lock<sle_native_data::NativeData>,data_poll:Poll,
@@ -56,7 +56,7 @@ struct Owner{
 impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  identity:DeviceIdentity{id,generation},host:Lock::new(Host{grants:{let mut g=sle_grant::LeaseAuthority::new();assert!(g.activate(1,true));g},links:LinkObservation::new(),data_revoked:false,fault:None}),
  data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll,sessions:Lock::new([const{None};16]),schedule_gate:Lock::new(false),
- native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Ws73(Dummy{transport:(id as usize+1) as *mut c_void})})),
+ native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Native(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
 })}}
 impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
