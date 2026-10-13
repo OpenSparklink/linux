@@ -30,7 +30,7 @@ class AuthorizationContract(unittest.TestCase):
             self.assertCountEqual(re.findall(r'SL_IOCTL_\w+',guest),expected)
 
     def test_missing_feature_config_rejected(self):
-        names = ['RUST','SPARKLINK','SPARKLINK_SLE','SPARKLINK_WS73_USB']
+        names = ['RUST','SPARKLINK','SPARKLINK_WS73_USB']
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / '.config'
             path.write_text(''.join(f'CONFIG_{name}=y\n' for name in names))
@@ -42,7 +42,7 @@ class AuthorizationContract(unittest.TestCase):
                         require_config(path)
 
     def test_authorization_needs_all_entrypoints(self):
-        names = ['RUST','SPARKLINK','SPARKLINK_SLE','SPARKLINK_WS73_USB','SPARKLINK_GENL','CONFIGFS_FS']
+        names = ['RUST','SPARKLINK','SPARKLINK_WS73_USB','SPARKLINK_GENL','CONFIGFS_FS']
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / '.config'
             path.write_text(''.join(f'CONFIG_{name}=y\n' for name in names))
