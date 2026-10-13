@@ -157,6 +157,54 @@ static void release_inflight_queries(struct controller c, struct controller peer
 	puts("VIRTUAL_QUERY_RELEASE_PASS: queued_cancel=2 inflight_reply=1 no_typed_stops=1 peer=1 setup=1");
 }
 
+static struct controller diagnostic_fd_lifetime(struct controller c, struct controller peer)
+{
+	int alias = dup(c.fd);
+	CHECK(alias >= 0 && !close(c.fd));
+	c.fd = alias;
+	query(c, 0x0406, 6);
+	struct controller observer = c;
+	observer.fd = open("/dev/sparklink", O_RDWR | O_NONBLOCK);
+	uint16_t id = c.status.id;
+	CHECK(observer.fd >= 0 && !ioctl(observer.fd, SL_IOCTL_DEV_SELECT, &id));
+	struct sle_mgmt_stats before, after;
+	CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &before) && !before.pending);
+	config(c, 800, 0, 0);
+	submit(c, 0x0404); pending(c);
+	submit(c, 0x0403); submit(c, 0x0406);
+	alias = dup(c.fd);
+	CHECK(alias >= 0 && !close(c.fd));
+	c.fd = alias;
+	struct sle_management_query q = { .version = 1, .generation = c.status.generation };
+	CHECK(!ioctl(c.fd, SL_IOCTL_MANAGEMENT_QUERY, &q) && q.state == SLE_MANAGEMENT_HELD && q.flags == 1);
+	struct sparklink_virtual_status driver_before, driver_after;
+	CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &driver_before) && driver_before.pending);
+	CHECK(!close(c.fd));
+	q = (struct sle_management_query){ .version = 1, .generation = c.status.generation };
+	CHECK(!ioctl(observer.fd, SL_IOCTL_MANAGEMENT_QUERY, &q) && q.state == SLE_MANAGEMENT_REVOKING && !q.flags);
+	query(peer, 0x0406, 6);
+	double deadline = now() + 3;
+	for (;;) {
+		q = (struct sle_management_query){ .version = 1, .generation = c.status.generation };
+		CHECK(!ioctl(observer.fd, SL_IOCTL_MANAGEMENT_QUERY, &q));
+		if (q.state == SLE_MANAGEMENT_FREE) break;
+		CHECK(q.state == SLE_MANAGEMENT_REVOKING && now() < deadline);
+		usleep(1000);
+	}
+	CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &driver_after) && !driver_after.pending &&
+	      driver_after.submitted == driver_before.submitted);
+	CHECK(!ioctl(observer.fd, SL_IOCTL_MGMT_STATS, &after) && !after.pending &&
+	      after.total_submitted == before.total_submitted + 3 && after.total_resolved == before.total_resolved + 3);
+	CHECK(snapshot(observer).flags == SLE_CONTROLLER_SETUP);
+	struct sle_management_request acquire = { .version = 1, .generation = c.status.generation,
+		.mode = SLE_MANAGEMENT_DIAGNOSTIC };
+	CHECK(!ioctl(observer.fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &acquire));
+	config(observer, 0, 0, 0);
+	query(observer, 0x0406, 6);
+	puts("VIRTUAL_DIAGNOSTIC_FD_PASS: dup_keeps_lease=1 final_close_revokes=1 queued_cancel=2 inflight_reply=1 peer=1");
+	return observer;
+}
+
 static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
 		  struct controller peer)
 {
@@ -198,6 +246,7 @@ int main(void)
 		query(a, queries[i], lengths[i]); query(b, queries[i], lengths[i]);
 	}
 	release_inflight_queries(b, a);
+	b = diagnostic_fd_lifetime(b, a);
 	int alias = dup(a.control); CHECK(alias >= 0 && !close(a.control)); a.control = alias;
 	query(a, 0x0406, 6);
 	struct sparklink_virtual_control bad = { .delay_ms = 6001 };

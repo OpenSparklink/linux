@@ -103,6 +103,8 @@ busybox poweroff -f
         log = (out / 'console.log').read_text(errors='replace')
         record.update(qemu_exit=result.returncode, console_sha256=sha(out / 'console.log'))
         if (result.returncode or log.count('VIRTUAL_RUNTIME_PASS:') != 2
+                or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
+                or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
                 or 'VIRTUAL_MODULE_ROUND_PASS:2' not in log or 'VIRTUAL_VM_PASS' not in log
                 or any(marker in log for marker in ('VIRTUAL_VM_FAIL', 'VIRTUAL_RUNTIME_FAIL',
                                                     'Kernel panic', 'BUG:', 'WARNING:'))):
@@ -111,7 +113,9 @@ busybox poweroff -f
                for name, path in paths.items() if path.is_file()):
             raise RuntimeError('input changed during VM')
         record.update(status='PASS_VIRTUAL_CORE_HOST_VM', module_rounds=2,
-                      query_results=[line for line in log.splitlines() if 'VIRTUAL_RUNTIME_PASS:' in line])
+                      query_results=[line for line in log.splitlines() if 'VIRTUAL_RUNTIME_PASS:' in line],
+                      diagnostic_fd_results=[line for line in log.splitlines()
+                                             if 'VIRTUAL_DIAGNOSTIC_FD_PASS:' in line])
         save()
         print(record['status'])
     except BaseException as exc:
