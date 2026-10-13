@@ -209,7 +209,7 @@ impl WorkItem<0> for ControllerRuntime {
                 let count = sle_ingress::drain_runtime_events(&this, &mut tagged[..budget]);
                 for item in tagged.iter_mut().take(count) {
                     let (id, event) = core::mem::take(item);
-                    if let Some(ev) = event {
+                    if event.is_some() {
                         debug_assert_eq!(id, Some(this.identity.id));
                         pumped += 1;
                         drained += 1;

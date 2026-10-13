@@ -283,7 +283,7 @@ struct RuntimeRegistration {
 }
 
 impl ControllerRuntime {
-    fn new(registration: RuntimeRegistration, mut state: KBox<ControllerState>) -> Result<Arc<Self>> {
+    fn new(registration: RuntimeRegistration, mut state: KBox<ControllerState>, initial_command_credits: u8) -> Result<Arc<Self>> {
         state.identity = registration.identity;
         state.dev_info.index = registration.identity.id;
         state.dev_info.bus = registration.bus as u8;
@@ -291,7 +291,7 @@ impl ControllerRuntime {
         let len = registration.name.len().min(state.dev_info.name.len());
         state.dev_info.name[..len].copy_from_slice(&registration.name[..len]);
         let ingress = sle_dli::ControllerEventRing::new_boxed()?;
-        let host = sle_host::CommandHost::new_boxed(1)?;
+        let host = sle_host::CommandHost::new_boxed(initial_command_credits)?;
         let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
         let snoop = sle_snoop::SnoopLog::new_boxed()?;
         let protocol_profile = state.controller.provider().profile();
@@ -497,7 +497,7 @@ pub(crate) fn cancel_backend_reservation(identity: sle_dev::DeviceIdentity) {
 /// same reserved identity. A competing install/retire/reuse wins cleanly;
 /// failed candidates drop after the registry guard, with no lock across I/O.
 pub(crate) fn install_backend_runtime(
-    identity: sle_dev::DeviceIdentity, state: KBox<ControllerState>,
+    identity: sle_dev::DeviceIdentity, state: KBox<ControllerState>, initial_command_credits: u8,
     queried: Option<([u8; 6], u32)>,
 ) -> Result<Arc<ControllerRuntime>> {
     let registration = {
@@ -512,7 +512,7 @@ pub(crate) fn install_backend_runtime(
         RuntimeRegistration { identity, bus: dev.bus(),
             addr: queried.map_or(*dev.addr(), |info| info.0), name }
     };
-    let owner = ControllerRuntime::new(registration, state)?;
+    let owner = ControllerRuntime::new(registration, state, initial_command_credits)?;
     {
         let mut registry = SUBSYSTEM.lock();
         let shared = registry.as_mut().ok_or(ENODEV)?;

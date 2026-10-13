@@ -441,11 +441,10 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
         controller.identity = identity;
         // Candidate construction and driver put/drop are outside the registry.
         let installed = (|| -> Result<kernel::sync::Arc<super::ControllerRuntime>> {
-            let mut state = super::ControllerState::new_boxed(
+            let state = super::ControllerState::new_boxed(
                 metadata.address, super::sle_dli::ControllerBackend::Native(controller),
             )?;
-            state.command_credits = metadata.command_credits;
-            super::install_backend_runtime(identity, state, Some((metadata.address, ctrl_info.fw_version)))
+            super::install_backend_runtime(identity, state, metadata.command_credits, Some((metadata.address, ctrl_info.fw_version)))
         })();
         let owner = match installed {
             Ok(owner) => owner,

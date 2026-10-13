@@ -69,21 +69,21 @@ struct ControllerState;
 impl Drop for ControllerState{
  fn drop(&mut self){assert!(SUBSYSTEM.0.try_lock().is_ok(),"state/driver destructor under registry lock");DROPS.fetch_add(1,Ordering::Relaxed);}
 }
-struct ControllerRuntime{identity:DeviceIdentity,registration:RuntimeRegistration,_state:KBox<ControllerState>}
+struct ControllerRuntime{identity:DeviceIdentity,registration:RuntimeRegistration,_state:KBox<ControllerState>,bootstrap_credits:u8}
 impl ControllerRuntime{
- fn new(registration:RuntimeRegistration,state:KBox<ControllerState>)->Result<Arc<Self>>{
+ fn new(registration:RuntimeRegistration,state:KBox<ControllerState>,bootstrap_credits:u8)->Result<Arc<Self>>{
   assert!(SUBSYSTEM.0.try_lock().is_ok(),"allocation/callback dependency under registry lock");
   CONSTRUCTIONS.fetch_add(1,Ordering::Relaxed);
   match HOOK.with(|h|h.replace(0)){
    1=>return Err(ENOMEM),
    2=>sle_detach_device(registration.identity),
    3=>{sle_detach_device(registration.identity);reserve_backend_identity(&SleControllerInfo::default()).unwrap();},
-   4=>{let peer=Self::new(registration,Box::new(ControllerState)).unwrap();SUBSYSTEM.lock().as_mut().unwrap().runtimes[registration.identity.id as usize]=Some(peer);},
+   4=>{let peer=Self::new(registration,Box::new(ControllerState),bootstrap_credits).unwrap();SUBSYSTEM.lock().as_mut().unwrap().runtimes[registration.identity.id as usize]=Some(peer);},
    5=>{let prior=SUBSYSTEM.lock().take();drop(prior);},
    6=>{SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(registration.identity.id).unwrap().begin_unregister();},
    _=>(),
   }
-  Ok(Arc::new(Self{identity:registration.identity,registration,_state:state}))
+  Ok(Arc::new(Self{identity:registration.identity,registration,_state:state,bootstrap_credits}))
  }
  fn invalidate(&self){assert!(SUBSYSTEM.0.try_lock().is_ok());}
 }
@@ -96,16 +96,16 @@ fn setup()->DeviceIdentity{
  reserve_backend_identity(&info).unwrap()
 }
 fn install(id:DeviceIdentity,hook:u8)->Result<Arc<ControllerRuntime>>{
- HOOK.with(|h|h.set(hook));install_backend_runtime(id,Box::new(ControllerState),Some(([9;6],77)))
+ HOOK.with(|h|h.set(hook));install_backend_runtime(id,Box::new(ControllerState),1,Some(([9;6],77)))
 }
 fn failed(r:Result<Arc<ControllerRuntime>>,e:i32){assert!(matches!(r,Err(n) if n==e));}
 #[test]fn candidate_allocation_and_drop_outside_registry(){let id=setup();failed(install(id,1),ENOMEM);assert_eq!(DROPS.load(Ordering::Relaxed),1);let s=SUBSYSTEM.lock();assert!(s.as_ref().unwrap().runtime(id.id).is_none());}
-#[test]fn successful_candidate_publishes_exact_identity_queried_metadata_and_selection(){
+#[test]fn successful_candidate_publishes_exact_identity_queried_metadata(){
  let id=setup();let o=install(id,0).unwrap();assert_eq!(o.identity,id);assert_eq!(o.registration.addr,[9;6]);assert_eq!(o.registration.bus,SleBus::None);assert!(o.registration.name.starts_with(b"sle0\0"));
  let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_eq!((d.addr,d.fw_version),([9;6],77));assert_eq!((d.features,d.max_connections),(0,0));assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);let _=&d.stats;
 }
-#[test]fn successful_unselected_native_candidate_keeps_peer_selection(){
- let id=setup();let peer=reserve_backend_identity(&SleControllerInfo{bus:SleBus::Test,addr:[3;6],..Default::default()}).unwrap();let p=install_backend_runtime(peer,Box::new(ControllerState),None).unwrap();let o=install(id,0).unwrap();assert_eq!(o.identity,id);assert_eq!(p.registration.bus,SleBus::Test);assert_eq!(p.registration.addr,[3;6]);
+#[test]fn successful_native_candidate_keeps_peer_owner(){
+ let id=setup();let peer=reserve_backend_identity(&SleControllerInfo{bus:SleBus::Test,addr:[3;6],..Default::default()}).unwrap();let p=install_backend_runtime(peer,Box::new(ControllerState),1,None).unwrap();let o=install(id,0).unwrap();assert_eq!(o.identity,id);assert_eq!(p.registration.bus,SleBus::Test);assert_eq!(p.registration.addr,[3;6]);
 }
 #[test]fn retire_during_candidate_construction_rejects_publication(){let id=setup();failed(install(id,2),ENODEV);assert_eq!(DROPS.load(Ordering::Relaxed),1);assert!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(id.id).is_none());}
 #[test]fn reuse_during_construction_preserves_new_generation(){let id=setup();failed(install(id,3),ENODEV);cancel_backend_reservation(id);let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_ne!(d.identity(),id);assert_eq!(d.addr,[0;6]);}
@@ -150,4 +150,8 @@ fn failed(r:Result<Arc<ControllerRuntime>>,e:i32){assert!(matches!(r,Err(n) if n
 }
 #[test]fn snapshot_keeps_fault_and_installed_peer_separate_and_rejects_missing_slot(){
  let id=setup();update_backend_pending(id,3,-2).unwrap();let p=reserve_backend_identity_profile(&SleControllerInfo{bus:SleBus::Usb,..Default::default()},1).unwrap();let _o=install(p,0).unwrap();assert_eq!(snapshot_backend_registration(id.id,0).unwrap().error,-2);let s=snapshot_backend_registration(p.id,p.generation).unwrap();assert_eq!((s.bus,s.profile,s.state),(4,1,REGISTRATION_INSTALLED));assert_eq!(snapshot_backend_registration(16,0).unwrap_err(),ENODEV);
+}
+
+#[test]fn actual_install_forwards_bootstrap_credit_seed_without_a_default(){
+ for credit in [0,1,7,255] {let id=setup();let owner=install_backend_runtime(id,Box::new(ControllerState),credit,None).unwrap();assert_eq!(owner.bootstrap_credits,credit);}
 }

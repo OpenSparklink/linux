@@ -28,9 +28,9 @@ def run(output):
         p=Path(tmp)/'actual.rs';p.write_text(s);exe=Path(tmp)/'test'
         subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(p),'-o',str(exe)],check=True)
         text=subprocess.check_output([str(exe),'--test-threads=1'],text=True);print(text)
-    assert 'test result: ok. 18 passed; 0 failed' in text
+    assert 'test result: ok. 19 passed; 0 failed' in text
     assert all((net/n).read_text()==s for n,s in inputs.items())
-    record=dict(status='ACTUAL_COMMON_BACKEND_INSTALL_PASS',tests=18,sources={n:hashlib.sha256(s.encode()).hexdigest() for n,s in inputs.items()},scope='Actual reserve/profile/borrowed validation/pending error/query/install/cancel/retire and registry functions; std Mutex/Arc and instrumented Runtime constructor/destructor dependencies. Controlled retire/reuse/competing-install/subsystem-removal windows, not real kernel concurrency, IRQ, allocation/callback or physical qualification.',kernel_lifetime_proven=False,physical_acceptance=False,early_ws73_bootstrap_registered=False)
+    record=dict(status='ACTUAL_COMMON_BACKEND_INSTALL_PASS',tests=19,sources={n:hashlib.sha256(s.encode()).hexdigest() for n,s in inputs.items()},scope='Actual reserve/profile/borrowed validation/pending error/query/bootstrap-credit forwarding/install/cancel/retire and registry functions; std Mutex/Arc and instrumented Runtime constructor/destructor dependencies. Controlled retire/reuse/competing-install/subsystem-removal windows, not real kernel concurrency, IRQ, allocation/callback or physical qualification.',kernel_lifetime_proven=False,physical_acceptance=False,early_ws73_bootstrap_registered=False)
     if output:output.write_text(json.dumps(record,indent=2)+'\n')
     print(json.dumps(record,indent=2))
 
