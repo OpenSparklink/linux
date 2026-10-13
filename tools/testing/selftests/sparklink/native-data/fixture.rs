@@ -46,7 +46,9 @@ struct Poll;impl Poll{fn notify_all(&self){}}
 struct Dummy{transport:*mut c_void}
 impl Dummy{fn command_transport(&self)->NativeCommandTransport{NativeCommandTransport{transport:self.transport}}}
 struct NativeCommandTransport{transport:*mut c_void}
-mod sle_dli{pub enum ControllerBackend{Native(super::Dummy)}}
+mod sle_dli{pub enum ControllerBackend{Native(super::Dummy)}
+impl ControllerBackend{pub(super) fn provider(&self)->&super::Dummy{let Self::Native(c)=self;c}}
+}
 struct State{controller:sle_dli::ControllerBackend}
 struct Owner{
  identity:DeviceIdentity,host:Lock<Host>,data:Lock<sle_native_data::NativeData>,data_poll:Poll,

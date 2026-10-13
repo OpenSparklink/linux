@@ -60,10 +60,7 @@ impl_has_delayed_work! {
 fn progress_connection_cleanup(owner: &Arc<ControllerRuntime>, state: &ControllerState) -> Result<bool> {
     let candidate = owner.host.lock().cleanup_candidate()?;
     let Some(handle) = candidate else { return Ok(false); };
-    let controller = match &state.controller {
-        sle_dli::ControllerBackend::Native(controller) => controller,
-        _ => return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
-    };
+    let controller = state.controller.provider();
     // Normal local management termination. This is a protocol reason, not a
     // vendor opcode; the retained driver owns wire preparation and validation.
     let request = SleConnectionSubmit {

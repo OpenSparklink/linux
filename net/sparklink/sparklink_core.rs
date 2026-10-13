@@ -581,14 +581,8 @@ impl ControllerRuntime {
         let host = sle_host::CommandHost::new_boxed(state.command_credits)?;
         let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
         let snoop = sle_snoop::SnoopLog::new_boxed()?;
-        let protocol_profile = match &state.controller {
-            sle_dli::ControllerBackend::Native(controller) => controller.profile(),
-            _ => 0,
-        };
-        let (data_length, data_count) = match &state.controller {
-            sle_dli::ControllerBackend::Native(controller) => controller.data_limits(),
-            _ => (0, 0),
-        };
+        let protocol_profile = state.controller.provider().profile();
+        let (data_length, data_count) = state.controller.provider().data_limits();
         Arc::pin_init(pin_init!(Self {
             identity: registration.identity,
             protocol_profile,
@@ -1043,51 +1037,7 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
     }
 }
 
-/// Switch the subsystem controller backend to USB.
-///
-/// Called from USB probe after identity reservation and C-side registration
-/// succeed. Creates per-device protocol state and switches the active
-/// device by selecting its fixed Runtime slot. Other owners remain in place.
-pub(crate) fn sle_switch_controller_usb(identity: sle_dev::DeviceIdentity, device: sle_usb::UsbDevice, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
-    let backend = sle_dli::ControllerBackend::new_usb(addr, fw_version, credits, identity, device)?;
-    let mut state = ControllerState::new_boxed(addr, backend)?;
-    state.command_credits = credits;
-    let owner = install_backend_runtime(identity, state, true, Some((addr, fw_version)))?;
-    open_usb_runtime(&owner)
-}
 
-/// Listener startup/adoption under the shared Backend lifecycle barrier.
-/// The cloned USB transport retains resources of this exact reservation.
-pub(crate) fn open_usb_runtime(owner: &Arc<ControllerRuntime>) -> Result {
-    // Same open/close barrier as Native. Teardown closes the gate
-    // immediately, then joins this before taking state/C resources.
-    let lifecycle = owner.native_lifecycle.lock();
-    sle_ingress::publish_runtime(owner)?;
-    let transport = {
-        let guard = owner.state.lock();
-        if *owner.schedule_gate.lock() { return Err(ENODEV); }
-        let Some(sle_dli::ControllerBackend::Usb(transport)) =
-            guard.as_ref().map(|state| &state.controller) else { return Err(ENODEV) };
-        transport.clone()
-    };
-    // No state/registry/Host/IRQ lock across listener startup. Failed
-    // open cleans its partial listener; successful but retired open
-    // must be joined before this borrowed handle is discarded.
-    transport.open()?;
-    {
-        let gate = owner.schedule_gate.lock();
-        if *gate {
-            drop(gate);
-            transport.close();
-            return Err(ENODEV);
-        }
-        owner.transport_open.store(true, core::sync::atomic::Ordering::Release);
-    }
-    drop(lifecycle);
-    owner.start_workers();
-    pr_info!("sparklink: controller switched to USB (sle{})\n", owner.identity.id);
-    Ok(())
-}
 
 pub(crate) fn sle_suspend_device(identity: sle_dev::DeviceIdentity) {
     if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) {
@@ -2869,10 +2819,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
                 gate.settled(0); return Ok(());
             }
         }
-        let controller = match &state.controller {
-            sle_dli::ControllerBackend::Native(controller) => controller,
-            _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-        };
+        let controller = state.controller.provider();
         let request = SleDiscoverySubmit {
             version: 1, generation: owner.identity.generation,
             profile: owner.protocol_profile, operation: 2,
@@ -3021,17 +2968,8 @@ fn ioctl_controller_snapshot(
     out.bus = state.controller.info().bus as u8;
     let (credits, native_ready, fault) = owner.host.lock().controller_status();
     out.command_credits = credits;
-    match &state.controller {
-        sle_dli::ControllerBackend::Native(controller) => {
-            controller.fill_snapshot(&mut out);
-            out.flags = if native_ready { 1 } else { 2 };
-        }
-        sle_dli::ControllerBackend::Usb(controller) => {
-            controller.fill_snapshot(&mut out);
-            // Queried metadata/installation still do not establish Host Ready.
-            out.flags = if native_ready { 1 } else { 2 };
-        }
-    }
+    state.controller.provider().fill_snapshot(&mut out);
+    out.flags = if native_ready { 1 } else { 2 };
     if let Some(error) = fault {
         out.flags = 4;
         out.error = error.to_errno();
@@ -3085,10 +3023,7 @@ fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
-    let plan = match &state.controller {
-        sle_dli::ControllerBackend::Native(controller) => controller.prepare_connection(&request)?,
-        _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-    };
+    let plan = state.controller.provider().prepare_connection(&request)?;
     let mut watermark = me.connection_request_id.lock();
     if request.request_id <= *watermark { return Err(Error::from_errno(-(bindings::ESTALE as i32))); }
     // Same Host -> scheduling gate order as atomic physical link ingress.
@@ -3211,10 +3146,7 @@ fn ioctl_discovery_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
     if sle_configfs::power_mode() >= 2 { return Err(EPERM); }
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
-    let plan = match &state.controller {
-        sle_dli::ControllerBackend::Native(controller) => controller.prepare_discovery(&request)?,
-        _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
-    };
+    let plan = state.controller.provider().prepare_discovery(&request)?;
     let mut parts = [sle_command_plan::RecipePart { opcode: 0, params: &[] }; 4];
     for (i, step) in plan.steps[..plan.count as usize].iter().enumerate() {
         parts[i] = sle_command_plan::RecipePart { opcode: step.opcode, params: &step.params[..step.length as usize] };

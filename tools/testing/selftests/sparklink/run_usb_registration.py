@@ -28,8 +28,8 @@ def run(output):
         subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(root/'actual.rs'),'-o',str(root/'test')],check=True)
         text=subprocess.check_output([str(root/'test'),'--test-threads=1'],text=True)
     open_fixture=(here/'usb-registration/open_fixture.rs').read_text()
-    open_fixture=open_fixture.replace('// @@CORE_OPEN@@',function(inputs['sparklink_core.rs'],'open_usb_runtime'))
-    usb=inputs['sle_usb.rs'];usb=usb[usb.index('impl SleController for UsbController'):]
+    open_fixture=open_fixture.replace('// @@CORE_OPEN@@',function((here/'retired-usb-registration/static_open.rs').read_text(),'open_usb_runtime'))
+    usb=(here/'retired-usb-registration/static_controller.rs').read_text();usb=usb[usb.index('impl SleController for UsbController'):]
     open_fixture=open_fixture.replace('// @@USB_OPEN@@',function(usb,'open')).replace('// @@USB_CLOSE@@',function(usb,'close'))
     with tempfile.TemporaryDirectory(prefix='sparklink-usb-adoption-') as directory:
         root=Path(directory);(root/'actual.rs').write_text(open_fixture)
@@ -38,7 +38,7 @@ def run(output):
     assert 'test result: ok. 6 passed; 0 failed' in opened
     assert 'test result: ok. 9 passed; 0 failed' in text
     assert all((net/n).read_text()==s for n,s in inputs.items())
-    record={'status':'ACTUAL_USB_PENDING_RESERVATION_PASS','tests':15, 'pending_allocator_tests':9, 'open_adoption_tests':6,'sources':{n:hashlib.sha256(s.encode()).hexdigest() for n,s in inputs.items()},'scope':'actual constructor/pending allocator/generation/get/unregister/common reservation/cancel and Native wrapper/exact two-phase detach and USB listener/open adoption; logging/Mutex/info types/stats dependencies, not concurrent registry or callbacks/kernel/physical USB qualification','hardware_acceptance':False}
+    record={'status':'ACTUAL_USB_PENDING_RESERVATION_PASS','tests':15, 'pending_allocator_tests':9, 'retired_static_open_adoption_tests':6,'sources':{n:hashlib.sha256(s.encode()).hexdigest() for n,s in inputs.items()},'scope':'actual constructor/pending allocator/generation/get/unregister/common reservation/cancel and Native wrapper/exact two-phase detach and retired static USB listener/open adoption history; current lifecycle is common Native/provider open; logging/Mutex/info types/stats dependencies, not concurrent registry or callbacks/kernel/physical USB qualification','hardware_acceptance':False}
     if output:output.write_text(json.dumps(record,indent=2)+'\n')
     print(json.dumps(record))
 

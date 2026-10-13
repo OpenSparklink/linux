@@ -18,6 +18,7 @@ typedef uint64_t u64;
 
 struct module;
 
+#define SPARKLINK_NATIVE_STANDARD_DLI 0U
 #define SPARKLINK_NATIVE_WS73_HCC 1U
 
 /* Internal driver/core interface, not a userspace ABI. Metadata is queried,

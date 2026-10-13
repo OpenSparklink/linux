@@ -38,6 +38,7 @@ int sle_usb_dev_start_evt(struct sle_usb_dev *context);
 void sle_usb_dev_stop_evt(struct sle_usb_dev *context);
 int sle_usb_dev_start_data(struct sle_usb_dev *context);
 void sle_usb_dev_stop_data(struct sle_usb_dev *context);
+int sle_usb_dev_install_provider(struct sle_usb_dev *context);
 int sle_usb_dev_init_controller(struct sle_usb_dev *context);
 u8 sle_usb_dev_get_command_credits(struct sle_usb_dev *context);
 u32 sle_usb_dev_get_fw_version(struct sle_usb_dev *context);

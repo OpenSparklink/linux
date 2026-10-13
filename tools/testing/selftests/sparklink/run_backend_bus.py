@@ -27,7 +27,7 @@ def run(output):
         p=Path(tmp)/'actual.rs';p.write_text(fixture);exe=Path(tmp)/'test'
         subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(p),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
-    record=dict(status='ACTUAL_BACKEND_BUS_PROJECTION_PASS',tests=4,sources={n:hashlib.sha256(s.encode()).hexdigest() for n,s in sources.items()},scope='Actual production bus enum/conversion and NativeController.info; transport/errno/controller type dependencies are fixtures. Not registration lifetime/IRQ/module/Virtual or physical qualification.',physical_acceptance=False,whole_backend_complete=False)
+    record=dict(status='ACTUAL_BACKEND_BUS_PROJECTION_PASS',tests=5,sources={n:hashlib.sha256(s.encode()).hexdigest() for n,s in sources.items()},scope='Actual production bus enum/conversion and NativeController.info; transport/errno/controller type dependencies are fixtures. Not registration lifetime/IRQ/module/Virtual or physical qualification.',physical_acceptance=False,whole_backend_complete=False)
     if output:output.write_text(json.dumps(record,indent=2)+'\n')
     print(json.dumps(record,indent=2))
 

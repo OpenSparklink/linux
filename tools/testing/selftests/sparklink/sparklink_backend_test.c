@@ -65,6 +65,7 @@ int main(void)
  ops.prepare_discovery=NULL; ops.validate_discovery_step=NULL;
  ops.prepare_connection=NULL; ops.validate_connection=NULL; ops.send_acb=NULL;
  CHECK(sparklink_backend_validate(&d),0);
+ d.info.profile=SPARKLINK_NATIVE_STANDARD_DLI;CHECK(sparklink_backend_validate(&d),0);d.capabilities=SPARKLINK_BACKEND_ACB;CHECK(sparklink_backend_validate(&d),-EOPNOTSUPP);
  printf("BACKEND_DESCRIPTOR_PASS checks=%u scope=production-pure-validator\n",checks);
  return EXIT_SUCCESS;
 }

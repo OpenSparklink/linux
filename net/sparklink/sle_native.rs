@@ -152,7 +152,7 @@ impl NativeController {
         NativeCommandTransport { transport: self.transport }
     }
     fn result(ret: i32) -> Result {
-        if ret < 0 { Err(Error::from_errno(ret)) } else { Ok(()) }
+        if ret == 0 { Ok(()) } else if ret < 0 { Err(Error::from_errno(ret)) } else { Err(EIO) }
     }
 
     pub(crate) fn fill_snapshot(&self, out: &mut super::sle_uapi::SleControllerSnapshot) {
@@ -228,9 +228,9 @@ impl super::ControllerRuntime {
         let transport = {
             let state = self.state.lock();
             if *self.schedule_gate.lock() { return Err(ENODEV); }
-            let Some(super::sle_dli::ControllerBackend::Native(controller)) =
+            let Some(backend) =
                 state.as_ref().map(|state| &state.controller) else { return Err(ENODEV) };
-            controller.command_transport()
+            backend.provider().command_transport()
         };
         // Publish ingress before open submits RX. Invalidation closes its
         // gate immediately, then joins this lifecycle before unpublishing.
@@ -242,13 +242,14 @@ impl super::ControllerRuntime {
         })?;
         {
             let state = self.state.lock();
-            let Some(super::sle_dli::ControllerBackend::Native(controller)) =
+            let Some(backend) =
                 state.as_ref().map(|state| &state.controller) else {
                 drop(state);
                 // SAFETY: successful open must be closed even if adoption fails.
                 unsafe { sparklink_native_transport_close(transport.transport) };
                 return Err(ENODEV);
             };
+            let controller = backend.provider();
             // Transfer successful-open cleanup to Backend even when retirement
             // won. Teardown cannot take state until this lifecycle is released.
             controller.opened.store(true, Ordering::Release);
@@ -323,7 +324,7 @@ fn backend_bus(bus: u32) -> Result<SleBus> {
 impl SleController for NativeController {
     fn info(&self) -> SleControllerInfo {
         let mut name = [0; 32];
-        let label: &[u8] = if self.bus == SleBus::Test { b"sparklink-test" } else { b"ws73-native" };
+        let label: &[u8] = if self.bus == SleBus::Test { b"sparklink-test" } else if self.metadata.profile == 0 { b"standard-dli-usb" } else { b"ws73-native" };
         name[..label.len()].copy_from_slice(label);
         SleControllerInfo {
             name, bus: self.bus, addr: self.metadata.address,
@@ -331,7 +332,7 @@ impl SleController for NativeController {
             fw_version: u32::from_le_bytes(self.metadata.version[..4].try_into().unwrap()),
             features: u64::from_le_bytes(self.metadata.features[..8].try_into().unwrap()),
             features_ext: u16::from_le_bytes(self.metadata.features[8..].try_into().unwrap()),
-            max_pdu_payload: self.metadata.acb_length,
+            max_pdu_payload: if self.metadata.profile == 0 { 0 } else { self.metadata.acb_length },
             // These queries do not establish connection count, MTU or these
             // policy capabilities. Never borrow standard USB defaults.
             max_connections: 0, max_mtu: 0, max_mps: 0,
@@ -372,7 +373,7 @@ impl SleController for NativeController {
 pub(crate) unsafe extern "C" fn sparklink_backend_reserve_rust(bus: u32, profile: u32, out: *mut NativeIdentity) -> i32 {
     let result = (|| -> Result {
         if out.is_null() { return Err(EINVAL); }
-        if profile != 1 { return Err(Error::from_errno(UNSUPPORTED)); }
+        if profile > 1 { return Err(Error::from_errno(UNSUPPORTED)); }
         let mut info = SleControllerInfo::default();
         info.bus = backend_bus(bus)?;
         let identity = super::reserve_backend_identity_profile(&info, profile)?;
@@ -422,7 +423,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
         // SAFETY: this controller owns the retained transport; provenance is
         // copied before get/register callbacks and immutable for its lifetime.
         controller.bus = backend_bus(unsafe { sparklink_native_transport_bus(transport) })?;
-        if metadata.profile != 1 { return Err(Error::from_errno(UNSUPPORTED)); }
+        if metadata.profile > 1 { return Err(Error::from_errno(UNSUPPORTED)); }
         if metadata.address == [0; 6] || metadata.address == [255; 6]
             || metadata.acb_length > 2047 || metadata.icb_length > 2047
             || (metadata.acb_length == 0) != (metadata.acb_count == 0)
@@ -462,8 +463,8 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
         }
         // SAFETY: output is live for this C call. Written only on success.
         unsafe { *out = NativeIdentity { id, generation: identity.generation } };
-        pr_info!("sparklink: native WS73 sle{} generation={} registered SETUP, not Ready\n",
-                 id, identity.generation);
+        pr_info!("sparklink: provider sle{} generation={} profile={} registered SETUP, not Ready\n",
+                 id, identity.generation, metadata.profile);
         Ok(())
     })();
     NativeController::result_to_errno(result)
@@ -792,9 +793,10 @@ unsafe fn native_acb_send(
     let _lifecycle = owner.native_lifecycle.lock();
     let transport = {
         let state = owner.state.lock();
-        let Some(super::sle_dli::ControllerBackend::Native(controller)) = state.as_ref().map(|s| &s.controller) else {
+        let Some(backend) = state.as_ref().map(|s| &s.controller) else {
             return UNSUPPORTED;
         };
+        let controller = backend.provider();
         controller.command_transport()
     };
     {

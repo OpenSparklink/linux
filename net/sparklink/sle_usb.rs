@@ -2,7 +2,7 @@
 
 //! SparkLink USB transport for SLE DLI controllers.
 //!
-//! Implements standard EP0-command/interrupt-event USB framing and provides [`UsbController`]
+//! Implements standard EP0-command/interrupt-event USB framing and uses the common retained Backend provider
 //! which implements the [`SleController`] trait for USB-attached
 //! SparkLink radio controllers.
 //!
@@ -27,7 +27,7 @@ use kernel::usb;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::sle_dli::{
-    SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode, SleStatus,
+    SleEvent, SleStatus,
 };
 use super::sle_dev::DeviceIdentity;
 
@@ -40,33 +40,6 @@ use super::sle_ingress::{enqueue_rx, ingress_owner};
 /// Independent C allocation; immutable identity and retained USB references.
 #[repr(C)]
 pub(crate) struct UsbDeviceOpaque { _opaque: [u8; 0] }
-
-/// Internal C snapshot layout, copied once after complete bootstrap, before
-/// Runtime publication. Every field is queried; these are not policy limits.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct UsbCapabilities {
-    command_max: u16,
-    acb_length: u16,
-    icb_length: u16,
-    acb_count: u8,
-    icb_count: u8,
-    features: [u8; 10],
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct UsbMetadata {
-    capabilities: UsbCapabilities,
-    version: [u8; 5],
-    address: [u8; 6],
-    command_credits: u8,
-}
-const _: () = assert!(core::mem::size_of::<UsbCapabilities>() == 18);
-const _: () = assert!(core::mem::size_of::<UsbMetadata>() == 30);
-const _: () = assert!(core::mem::align_of::<UsbMetadata>() == 2);
-const _: () = assert!(core::mem::offset_of!(UsbMetadata, version) == 18);
-const _: () = assert!(core::mem::offset_of!(UsbMetadata, address) == 23);
-const _: () = assert!(core::mem::offset_of!(UsbMetadata, command_credits) == 29);
 
 pub(crate) struct UsbDevice { context: *mut UsbDeviceOpaque }
 // SAFETY: owned reference pins C context; all process operations serialize in C.
@@ -107,16 +80,9 @@ extern "C" {
     fn sle_usb_dev_get(context: *mut UsbDeviceOpaque);
     fn sle_usb_dev_put(context: *mut UsbDeviceOpaque);
     fn sle_usb_dev_unregister(context: *mut UsbDeviceOpaque);
-    fn sle_usb_dev_send_cmd(context: *mut UsbDeviceOpaque, opcode: u16, params: *const u8, plen: i32) -> i32;
-    fn sle_usb_dev_send_data(context: *mut UsbDeviceOpaque, handle: u16, data: *const u8, len: i32) -> i32;
-    fn sle_usb_dev_start_evt(context: *mut UsbDeviceOpaque) -> i32;
-    fn sle_usb_dev_stop_evt(context: *mut UsbDeviceOpaque);
-    fn sle_usb_dev_start_data(context: *mut UsbDeviceOpaque) -> i32;
-    fn sle_usb_dev_stop_data(context: *mut UsbDeviceOpaque);
     fn sle_usb_dev_init_controller(context: *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_get_fw_version(context: *mut UsbDeviceOpaque) -> u32;
-    fn sle_usb_dev_get_metadata(context: *mut UsbDeviceOpaque, output: *mut UsbMetadata) -> i32;
-    fn sle_usb_dev_get_command_credits(context: *mut UsbDeviceOpaque) -> u8;
+    fn sle_usb_dev_install_provider(context: *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_get_mac(context: *mut UsbDeviceOpaque, mac: *mut u8) -> i32;
     fn sle_usb_dev_suspend(context: *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_resume(context: *mut UsbDeviceOpaque) -> i32;
@@ -820,183 +786,6 @@ fn raw_to_status(raw: u8) -> SleStatus {
 // ---------------------------------------------------------------------------
 // USB controller (SleController implementation)
 // ---------------------------------------------------------------------------
-
-/// USB-attached SLE controller state.
-///
-/// Constructed during USB probe when a matching device is detected.
-/// Uses bulk and interrupt transfers to communicate with the radio
-/// controller firmware over the DLI protocol.
-///
-/// Actual USB I/O uses a retained per-probe C allocation.
-/// Runtime reference to a specific USB allocation, never an index lookup.
-#[derive(Clone)]
-pub(crate) struct UsbController {
-    metadata: UsbMetadata,
-    /// Owns the immutable USB allocation independently of registry reuse.
-    device: UsbDevice,
-    identity: super::sle_dev::DeviceIdentity,
-}
-
-impl UsbController {
-    /// Create a new USB controller handle.
-    ///
-    /// `addr` is the 6-byte SLE MAC address read from the controller
-    /// during probe via the ReadMacAddr (0x0406) command.
-    /// Identity comes from the pending reservation retained through USB cleanup.
-    pub(crate) fn new(addr: [u8; 6], fw_version: u32, credits: u8, identity: super::sle_dev::DeviceIdentity, device: UsbDevice) -> Result<Self> {
-        let mut metadata = UsbMetadata::default();
-        // SAFETY: owned retained context and complete repr(C) writable snapshot;
-        // C observes all fields and validity together under its I/O mutex.
-        let ret = unsafe { sle_usb_dev_get_metadata(device.as_raw(), &mut metadata) };
-        if ret != 0 { return Err(if ret < 0 { Error::from_errno(ret) } else { EIO }); }
-        // The caller's identity query must refer to this same observation.
-        if metadata.address != addr || metadata.command_credits != credits ||
-            u32::from_le_bytes(metadata.version[..4].try_into().unwrap()) != fw_version { return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32))); }
-        Ok(Self { metadata, device, identity })
-    }
-
-    pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
-        if params.len() > super::sle_uapi::DLI_PARAM_MAX { return Err(EINVAL); }
-        // Only locally verified standard query schemas until typed standard
-        // policy recipes are connected; raw input grants no mutation permission.
-        match opcode {
-            0x0401..=0x0404 if params.is_empty() => Ok(()),
-            0x0406 if params.len() == 1 && matches!(params[0], 0 | 2..=6) => Ok(()),
-            0x0401..=0x0404 | 0x0406 => Err(EINVAL),
-            _ => Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
-        }
-    }
-
-    pub(crate) fn fill_snapshot(&self, out: &mut super::sle_uapi::SleControllerSnapshot) {
-        // Immutable queried observation only, independent of Host readiness.
-        let metadata = &self.metadata;
-        out.valid_fields = 1;
-        out.version_tuple = metadata.version;
-        out.address = metadata.address;
-        out.features = metadata.capabilities.features;
-        out.acb_length = metadata.capabilities.acb_length;
-        out.icb_length = metadata.capabilities.icb_length;
-        out.acb_count = metadata.capabilities.acb_count;
-        out.icb_count = metadata.capabilities.icb_count;
-    }
-
-    /// Only the owner's TX worker may call this transport operation after
-    /// reserving its command slot and a controller credit.
-    pub(crate) fn send_command_transport(&self, opcode: u16, params: &[u8]) -> Result {
-        if params.len() > usize::from(self.metadata.capabilities.command_max) ||
-            params.len() > super::sle_uapi::DLI_PARAM_MAX { return Err(EINVAL); }
-        // SAFETY: worker retains its registration owner; removal drains the
-        // worker before unregistering/freeing the C transport. Data is live.
-        let ret = unsafe {
-            sle_usb_dev_send_cmd(
-                self.device.as_raw(),
-                opcode,
-                params.as_ptr(),
-                params.len() as i32,
-            )
-        };
-        if ret < 0 {
-            Err(Error::from_errno(ret))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl SleController for UsbController {
-    fn info(&self) -> SleControllerInfo {
-        let mut info = SleControllerInfo::default();
-        let name = b"sparklink-usb";
-        info.name[..name.len()].copy_from_slice(name);
-        info.bus = SleBus::Usb;
-        info.addr = self.metadata.address;
-        // Immutable queried tuple, no C I/O lock or transport wait in info().
-        info.fw_version = u32::from_le_bytes(self.metadata.version[..4].try_into().unwrap());
-        info.features = u64::from_le_bytes(self.metadata.capabilities.features[..8].try_into().unwrap());
-        info.features_ext = u16::from_le_bytes(self.metadata.capabilities.features[8..].try_into().unwrap());
-        // ACB buffers are not SSAP MTU/MPS, DTAP modes, connection counts or
-        // security policy. Those still-unqueried fields remain unavailable.
-
-        info
-    }
-
-    fn open(&self) -> Result {
-        // Start the listener using this retained allocation.
-        // SAFETY: this controller owns its context reference.
-        let ret = unsafe { sle_usb_dev_start_evt(self.device.as_raw()) };
-        if ret < 0 {
-            pr_warn!("sparklink-usb: event listener start failed: {}\n", ret);
-            return Err(Error::from_errno(ret));
-        }
-        // Start bulk IN listener for async data (T/XS 10003-2025 §7.4).
-        let ret = unsafe { sle_usb_dev_start_data(self.device.as_raw()) };
-        if ret < 0 {
-            pr_warn!("sparklink-usb: data listener start failed: {}\n", ret);
-            // SAFETY: no binding can survive failed open; join its first listener.
-            unsafe { sle_usb_dev_stop_evt(self.device.as_raw()) };
-            return Err(Error::from_errno(ret));
-        }
-        pr_info!("sparklink-usb: open dev_id={}\n", self.identity.id);
-        Ok(())
-    }
-
-    fn close(&self) {
-        // SAFETY: owned context reference; stop is idempotent.
-        unsafe { sle_usb_dev_stop_evt(self.device.as_raw()) };
-        unsafe { sle_usb_dev_stop_data(self.device.as_raw()) };
-        pr_info!("sparklink-usb: close dev_id={}\n", self.identity.id);
-    }
-
-    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
-        self.validate_command(opcode as u16, params)?;
-        let owner = ingress_owner(self.identity).ok_or(ENODEV)?;
-        super::sle_ingress::enqueue_command(&owner, opcode as u16, params, None)
-    }
-
-    fn send_data(&self, handle: u16, data: &[u8]) -> Result {
-        // SAFETY: owned context reference, data pointer and length are consistent.
-        let ret = unsafe {
-            sle_usb_dev_send_data(
-                self.device.as_raw(),
-                handle,
-                data.as_ptr(),
-                data.len() as i32,
-            )
-        };
-        if ret < 0 {
-            pr_debug!("sparklink-usb: data tx handle={} failed: {}\n", handle, ret);
-            return Err(Error::from_errno(ret));
-        }
-        pr_debug!(
-            "sparklink-usb: data tx handle={} ({} bytes)\n",
-            handle,
-            data.len()
-        );
-        Ok(())
-    }
-
-    fn poll_event(&self) -> Option<SleEvent> {
-        // USB events are drained from the owner's ingress with device
-        // routing in the owner RX worker, without a shared ingress ring.
-        None
-    }
-
-    fn reset(&self) -> Result {
-        self.send_command(SleOpcode::Reset, &[])
-    }
-}
-
-impl super::sle_backend::CommandPort for UsbController {
-    fn submit(&self, opcode: u16, params: &[u8], recipe: Option<super::sle_command_plan::RecipeTag>, connection: Option<u32>) -> Result {
-        if recipe.is_some() || connection.is_some() {
-            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
-        }
-        self.validate_command(opcode, params)?;
-        self.send_command_transport(opcode, params)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // USB driver integration — hardware discovery
 // ---------------------------------------------------------------------------
 
@@ -1013,6 +802,7 @@ kernel::usb_device_table!(
     MODULE_SLE_USB_TABLE,
     <SleUsbDriver as usb::Driver>::IdInfo,
     [
+        (usb::DeviceId::from_device_info(SLE_USB_CLASS, SLE_USB_SUBCLASS, SLE_USB_PROTOCOL), ()),
         // QEMU usb-sle-dli virtual controller (VID:PID 0x1234:0x5678)
         (usb::DeviceId::from_id(0x1234, 0x5678), ()),
         // Match by interface class/subclass/protocol:
@@ -1081,13 +871,12 @@ fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<UsbBindi
         registered = Some(UsbDevice::create(identity, intf_ptr)?);
         let device = registered.as_ref().ok_or(ENODEV)?;
         let kern_dev: &kernel::device::Device<kernel::device::Core> = interface.as_ref();
-        let (addr, fw_version) = prepare_usb_controller(device, kern_dev)?;
 
-        // Switch the subsystem controller backend to USB and sync
-        // the device registry with real hardware info.
-        // SAFETY: mandatory bootstrap completed on this still-live binding.
-        let credits = unsafe { sle_usb_dev_get_command_credits(device.as_raw()) };
-        super::sle_switch_controller_usb(identity, device.clone(), addr, fw_version, credits)?;
+        let _queried_identity = prepare_usb_controller(device, kern_dev)?;
+        // SAFETY: this live, fully queried context carries the exact immutable
+        // reservation. Common registration retains it and owns open/adoption.
+        let ret = unsafe { sle_usb_dev_install_provider(device.as_raw()) };
+        if ret != 0 { return Err(if ret < 0 { Error::from_errno(ret) } else { EIO }); }
         Ok(())
     })();
     if let Err(error) = result {

@@ -1181,12 +1181,9 @@ pub trait SleController: Send + Sync {
 // Controller dispatch enum (avoids trait objects)
 // ---------------------------------------------------------------------------
 
-/// Remaining bus controller selector; only actual registration constructs it.
-///
-/// This enum still wraps the registered USB/WS73 paths, allowing static
-/// dispatch without heap-allocated trait objects.
+/// Common registered provider. Bus/dialect live in validated descriptor metadata,
+/// not in independent USB/WS73 installation or lifetime implementations.
 pub enum ControllerBackend {
-    Usb(super::sle_usb::UsbController),
     Native(super::sle_native::NativeController),
 }
 
@@ -1200,10 +1197,12 @@ unsafe impl Send for ControllerBackend {}
 unsafe impl Sync for ControllerBackend {}
 
 impl ControllerBackend {
-    pub(crate) fn new_usb(addr: [u8; 6], fw_version: u32, credits: u8, identity: super::sle_dev::DeviceIdentity, device: super::sle_usb::UsbDevice) -> Result<Self> {
-        Ok(Self::Usb(super::sle_usb::UsbController::new(addr, fw_version, credits, identity, device)?))
+    pub(crate) fn provider(&self) -> &super::sle_native::NativeController {
+        let Self::Native(provider) = self;
+        provider
     }
 }
+
 
 // -- High-level convenience wrappers ----------------------------------------
 // These encapsulate DLI parameter encoding so the core layer never builds
@@ -1347,19 +1346,17 @@ impl ControllerBackend {
     pub(crate) fn command_port(&self) -> Result<kernel::alloc::KBox<dyn super::sle_backend::CommandPort>> {
         use kernel::alloc::KBox;
         match self {
-            Self::Usb(c) => Ok(KBox::new(c.clone(), GFP_KERNEL)? as KBox<dyn super::sle_backend::CommandPort>),
             Self::Native(c) => Ok(KBox::new(c.command_transport(), GFP_KERNEL)? as KBox<dyn super::sle_backend::CommandPort>),
         }
     }
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
         match self {
             Self::Native(c) => c.validate_command(opcode, params),
-            Self::Usb(c) => c.validate_command(opcode, params),
         }
     }
 
     pub(crate) fn uses_command_host(&self) -> bool {
-        matches!(self, Self::Usb(_) | Self::Native(_))
+        true
     }
 
 
@@ -1435,49 +1432,42 @@ impl ControllerBackend {
 impl SleController for ControllerBackend {
     fn info(&self) -> SleControllerInfo {
         match self {
-            Self::Usb(c) => c.info(),
             Self::Native(c) => c.info(),
         }
     }
 
     fn open(&self) -> Result {
         match self {
-            Self::Usb(c) => c.open(),
             Self::Native(c) => c.open(),
         }
     }
 
     fn close(&self) {
         match self {
-            Self::Usb(c) => c.close(),
             Self::Native(c) => c.close(),
         }
     }
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
         match self {
-            Self::Usb(c) => c.send_command(opcode, params),
             Self::Native(c) => c.send_command(opcode, params),
         }
     }
 
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {
         match self {
-            Self::Usb(c) => c.send_data(handle, data),
             Self::Native(c) => c.send_data(handle, data),
         }
     }
 
     fn poll_event(&self) -> Option<SleEvent> {
         match self {
-            Self::Usb(c) => c.poll_event(),
             Self::Native(c) => c.poll_event(),
         }
     }
 
     fn reset(&self) -> Result {
         match self {
-            Self::Usb(c) => c.reset(),
             Self::Native(c) => c.reset(),
         }
     }

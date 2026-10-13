@@ -52,3 +52,5 @@ fn provenance_is_independent_of_wire_capabilities() {
         assert_eq!((info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0));
     }
 }
+
+#[test]fn standard_profile_keeps_queried_identity_without_ws73_or_data_policy_claim(){let mut c=controller(1);c.metadata.profile=0;let i=c.info();assert!(i.name.starts_with(b"standard-dli-usb\0"));assert_eq!(i.bus,SleBus::Usb);assert_eq!(i.addr,c.metadata.address);assert_eq!(i.features_ext,0xa5a5);assert_eq!((i.max_pdu_payload,i.max_connections,i.max_mtu,i.max_mps,i.transport_modes,i.security_cap),(0,0,0,0,0,0));}

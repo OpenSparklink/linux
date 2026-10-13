@@ -42,8 +42,12 @@ static inline int sparklink_backend_validate(const struct sparklink_backend_desc
 		return -EOPNOTSUPP;
 	if (d->bus != SPARKLINK_BACKEND_USB && d->bus != SPARKLINK_BACKEND_TEST)
 		return -EOPNOTSUPP;
-	if (d->info.profile != SPARKLINK_NATIVE_WS73_HCC ||
+	if ((d->info.profile != SPARKLINK_NATIVE_WS73_HCC &&
+	     d->info.profile != SPARKLINK_NATIVE_STANDARD_DLI) ||
 	    (d->capabilities & ~SPARKLINK_BACKEND_CAPS))
+		return -EOPNOTSUPP;
+	/* Standard typed policy/ACB ingress still needs its own qualification. */
+	if (d->info.profile == SPARKLINK_NATIVE_STANDARD_DLI && d->capabilities)
 		return -EOPNOTSUPP;
 	o = d->ops;
 	if (!o || !d->context || !o->get || !o->put || !o->open || !o->close ||

@@ -143,7 +143,7 @@ EXPORT_SYMBOL_GPL(sparklink_backend_register_reserved);
 int sparklink_backend_reserve(u32 bus, u32 profile, struct sparklink_native_identity *identity)
 {
     if (!identity || (bus != SPARKLINK_BACKEND_USB && bus != SPARKLINK_BACKEND_TEST) ||
-        profile != SPARKLINK_NATIVE_WS73_HCC)
+        (profile != SPARKLINK_NATIVE_WS73_HCC && profile != SPARKLINK_NATIVE_STANDARD_DLI))
         return -EINVAL;
     return sparklink_backend_reserve_rust(bus, profile, identity);
 }

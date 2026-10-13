@@ -38,7 +38,7 @@ def run(output):
         fixture = fixture.replace('/* @@'+marker+'@@ */', body)
     dli = inputs['sle_dli.rs']
     rust = (here/'usb-discovery/info_fixture.rs').read_text()
-    usb=inputs['sle_usb.rs']
+    usb=(here/'retired-usb-registration/static_controller.rs').read_text()
     declarations='\n'.join('#[repr(C)]\n#[derive(Clone,Copy,Default)]\n'+block(usb,usb.index('struct '+name+' {')) for name in ('UsbCapabilities','UsbMetadata'))
     rust=rust.replace('// @@USB_METADATA_TYPES@@',declarations)
     rust=rust.replace('// @@USB_NEW@@',function(usb[usb.index('impl UsbController {'):], 'new').replace('super::sle_dev::','crate::sle_dev::'))
@@ -49,7 +49,7 @@ def run(output):
     rust = rust.replace('// @@INFO_STRUCT@@', block(dli, dli.index('pub struct SleControllerInfo {')))
     rust = rust.replace('// @@DEFAULT@@', function(dli[dli.index('impl Default for SleControllerInfo'):], 'default'))
     for marker, source in [('USB_INFO', 'sle_usb.rs'), ('SERDEV_INFO', 'sle_serdev.rs')]:
-        rust = rust.replace('// @@'+marker+'@@', function(serdev_source if source=='sle_serdev.rs' else inputs[source], 'info'))
+        rust = rust.replace('// @@'+marker+'@@', function(serdev_source if source=='sle_serdev.rs' else usb, 'info'))
     historic_attach = here/'retired-usb-registration/attach_metadata.rs'
     assembly = historic_attach.read_text()
     rust = rust.replace('// @@ATTACH_METADATA@@', assembly)
@@ -75,7 +75,7 @@ def run(output):
     assert archived.read_text()==serdev_source
     record = {'status': 'GENERIC_USB_DESCRIPTOR_CAPABILITY_SOURCE_BOUNDARIES_PASS',
               'c_cases': c_record['c_cases'], 'rust_tests': 11,
-              'scope': 'actual C register/unregister; actual Rust info structs/default, USB info/pending reservation metadata, archived attach and serdev info; descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
+              'scope': 'actual C register/unregister and pending reservation/default types; retired static USB constructor/info/snapshot and archived attach/serdev history; current registered projection tested by run_backend_bus;  descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
               'physical_acceptance': False, 'generic_dialect_acceptance': False,
               'full_capability_provenance_contract': False, 'natural_fault_root_cause_closed': False,
               'sources': {n: hashlib.sha256(s.encode()).hexdigest() for n, s in inputs.items()},

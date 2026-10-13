@@ -18,6 +18,7 @@
 #include <linux/mutex.h>
 #include <linux/refcount.h>
 #include <linux/sparklink_usb.h>
+#include <linux/sparklink_backend.h>
 #include <linux/unaligned.h>
 
 /* -----------------------------------------------------------------------
@@ -822,7 +823,8 @@ int sle_usb_dev_send_cmd(struct sle_usb_dev *d, u16 opcode, const u8 *params, in
 	int result;
 	if (!d) return -EINVAL;
 	mutex_lock(&d->io_lock);
-	result = d->active ? sle_usb_dev_send_cmd_locked(d, opcode, params, plen) : -ENODEV;
+	result = !d->active ? -ENODEV : d->suspended ? -EHOSTDOWN :
+		sle_usb_dev_send_cmd_locked(d, opcode, params, plen);
 	mutex_unlock(&d->io_lock);
 	return result;
 }
@@ -952,4 +954,110 @@ int sle_usb_dev_resume(struct sle_usb_dev *d)
 	result = d->active ? sle_usb_dev_resume_locked(d) : -ENODEV;
 	mutex_unlock(&d->io_lock);
 	return result;
+}
+
+/* Standard provider adapter: no registry index resolves transport resources.
+ * Pure query validation is independent of mutable context state. Physical send
+ * serializes against retire/PM; Core retains the context and Host obligations.
+ */
+static void sle_usb_provider_get(void *context) { sle_usb_dev_get(context); }
+static void sle_usb_provider_put(void *context) { sle_usb_dev_put(context); }
+static int sle_usb_provider_validate(void *context, u16 opcode,
+				     const u8 *params, size_t length)
+{
+	(void)context;
+	if (length > 255 || (length && !params))
+		return -EINVAL;
+	switch (opcode) {
+	case 0x0401: case 0x0402: case 0x0403: case 0x0404:
+		return length ? -EINVAL : 0;
+	case 0x0406:
+		if (length != 1)
+			return -EINVAL;
+		return params[0] == 0 || (params[0] >= 2 && params[0] <= 6) ? 0 : -EINVAL;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+static int sle_usb_provider_send(void *context, u16 opcode,
+				 const u8 *params, size_t length)
+{
+	int ret = sle_usb_provider_validate(context, opcode, params, length);
+
+	if (ret)
+		return ret;
+	return sle_usb_dev_send_cmd(context, opcode, params, length);
+}
+static int sle_usb_provider_open(void *context, u16 id, u64 generation)
+{
+	struct sle_usb_dev *d = context;
+	int ret;
+
+	mutex_lock(&d->io_lock);
+	if (!d->active || d->id != id || d->generation != generation)
+		ret = -ENODEV;
+	else if (d->suspended)
+		ret = -EAGAIN;
+	else {
+		ret = sle_usb_dev_start_evt_locked(d);
+		if (!ret) {
+			ret = sle_usb_dev_start_data_locked(d);
+			if (ret)
+				sle_usb_dev_stop_evt_locked(d);
+		}
+	}
+	mutex_unlock(&d->io_lock);
+	return ret;
+}
+static void sle_usb_provider_close(void *context)
+{
+	struct sle_usb_dev *d = context;
+
+	mutex_lock(&d->io_lock);
+	sle_usb_dev_stop_evt_locked(d);
+	sle_usb_dev_stop_data_locked(d);
+	mutex_unlock(&d->io_lock);
+}
+static const struct sparklink_native_ops sle_usb_provider_ops = {
+	.owner = THIS_MODULE,
+	.get = sle_usb_provider_get,
+	.put = sle_usb_provider_put,
+	.open = sle_usb_provider_open,
+	.close = sle_usb_provider_close,
+	.validate_command = sle_usb_provider_validate,
+	.send_command = sle_usb_provider_send,
+};
+
+int sle_usb_dev_install_provider(struct sle_usb_dev *d)
+{
+	struct sle_usb_metadata metadata;
+	struct sparklink_native_identity reserved, output;
+	struct sparklink_backend_descriptor descriptor = {
+		.version = SPARKLINK_BACKEND_VERSION,
+		.size = sizeof(descriptor),
+		.bus = SPARKLINK_BACKEND_USB,
+		.capabilities = 0,
+		.ops = &sle_usb_provider_ops,
+		.context = d,
+	};
+	int ret = sle_usb_dev_get_metadata(d, &metadata);
+
+	if (ret)
+		return ret;
+	reserved.id = d->id;
+	reserved.generation = d->generation;
+	descriptor.info.profile = SPARKLINK_NATIVE_STANDARD_DLI;
+	memcpy(descriptor.info.version, metadata.version, sizeof(metadata.version));
+	memcpy(descriptor.info.features, metadata.capabilities.features, sizeof(descriptor.info.features));
+	memcpy(descriptor.info.address, metadata.address, sizeof(metadata.address));
+	descriptor.info.command_credits = metadata.command_credits;
+	descriptor.info.acb_length = metadata.capabilities.acb_length;
+	descriptor.info.icb_length = metadata.capabilities.icb_length;
+	descriptor.info.acb_count = metadata.capabilities.acb_count;
+	descriptor.info.icb_count = metadata.capabilities.icb_count;
+	ret = sparklink_backend_register_reserved(&descriptor, &reserved, &output);
+	if (ret)
+		return ret;
+	/* Never follow a malformed callback result into another owner's cleanup. */
+	return output.id == reserved.id && output.generation == reserved.generation ? 0 : -EPROTO;
 }
