@@ -169,7 +169,7 @@ static int genl_request(int fd, unsigned short family, unsigned char cmd,
 	header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
 	header->nlmsg_seq = sequence;
 	generic->cmd = cmd;
-	generic->version = 1;
+	generic->version = family == GENL_ID_CTRL ? 1 : SPARKLINK_GENL_VERSION;
 	if (length) memcpy(buffer + NLMSG_HDRLEN + GENL_HDRLEN, payload, length);
 	if (sendto(fd, buffer, header->nlmsg_len, 0, (void *)&target, sizeof(target)) < 0)
 		return -errno;
@@ -211,11 +211,11 @@ static int genl_denied(void)
 		offset += NLA_ALIGN(a->nla_len);
 	}
 	if (!family) return failure("missing public family id");
-	unsigned char commands[] = { SPARKLINK_CMD_SET_ROLE, SPARKLINK_CMD_START_ADV, SPARKLINK_CMD_STOP_ADV,
-				     SPARKLINK_CMD_START_SCAN, SPARKLINK_CMD_STOP_SCAN };
+	/* Historical command numbers; not current production declarations. */
+	unsigned char commands[] = { 29, 4, 5, 6, 7 };
 	for (unsigned i = 0; i < COUNT(commands); ++i)
-		if (genl_request(fd, family, commands[i], NULL, 0, i + 2, reply, sizeof(reply)) != -EPERM)
-			return failure("netlink managed mutation without capability");
+		if (genl_request(fd, family, commands[i], NULL, 0, i + 2, reply, sizeof(reply)) != -EOPNOTSUPP)
+			return failure("retired netlink mutation must be unsupported");
 	close(fd);
 	return 0;
 }

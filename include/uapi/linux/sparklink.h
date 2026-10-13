@@ -1,177 +1,30 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-/*
- * SparkLink (NearLink) Generic Netlink protocol definitions.
- *
- * Family: "sparklink"
- * Version: 1
- *
- * This header defines the unpublished userspace ABI for the SparkLink
- * Generic Netlink interface. It parallels the ioctl interface on
- * /dev/sparklink and provides structured attribute-based messaging.
- *
- * Copyright (C) 2025 SparkLink for Linux Contributors
+/* Unpublished registry-only Generic Netlink ABI. Controller operations and
+ * events use identity-bound Native APIs, not a default-controller projection.
  */
 #ifndef _UAPI_LINUX_SPARKLINK_H
 #define _UAPI_LINUX_SPARKLINK_H
-
 #include <linux/types.h>
-
-/* Generic Netlink family name */
-#define SPARKLINK_GENL_NAME		"sparklink"
-#define SPARKLINK_GENL_VERSION		1
-
-/* Multicast group for async event delivery */
-#define SPARKLINK_MCGRP_EVENTS		"events"
-
-/* ---------------------------------------------------------------------------
- * Generic Netlink commands
- * ---------------------------------------------------------------------------
- */
+#define SPARKLINK_GENL_NAME "sparklink"
+#define SPARKLINK_GENL_VERSION 2
 
 enum {
-	/* Device management */
 	SPARKLINK_CMD_UNSPEC = 0,
-	SPARKLINK_CMD_GET_DEV_INFO = 1,	/* Get device information */
-	/* 2/3: removed unimplemented registration commands; not reused. */
-
-	/* Advertising / scanning */
-	SPARKLINK_CMD_START_ADV = 4,	/* Start advertising */
-	SPARKLINK_CMD_STOP_ADV = 5,		/* Stop advertising */
-	SPARKLINK_CMD_START_SCAN = 6,	/* Start scanning */
-	SPARKLINK_CMD_STOP_SCAN = 7,	/* Stop scanning */
-	SPARKLINK_CMD_INJECT_ADV = 8,	/* Inject advertising PDU (test) */
-
-	/* Connection management */
-	SPARKLINK_CMD_CONNECT = 9,		/* Initiate connection */
-	SPARKLINK_CMD_DISCONNECT = 10,	/* Disconnect */
-	SPARKLINK_CMD_GET_CONN_INFO = 11,	/* Get connection info */
-	SPARKLINK_CMD_CONN_SEND = 12,	/* Send data */
-	SPARKLINK_CMD_CONN_RECV = 13,	/* Receive data */
-	SPARKLINK_CMD_GET_CONN_LIST = 14,	/* List active connections */
-
-	/* Security */
-	SPARKLINK_CMD_SET_PSK = 15,		/* Set pre-shared key */
-	SPARKLINK_CMD_PAIR = 16,		/* Start pairing */
-	SPARKLINK_CMD_GET_SEC_INFO = 17,	/* Get security status */
-	SPARKLINK_CMD_ENCRYPT_ON = 18,	/* Enable encryption */
-
-	/* 19..22: removed unpublished service commands; not reused. */
-
-	/* Power management */
-	SPARKLINK_CMD_GET_PM_INFO = 23,	/* Get PM status */
-	SPARKLINK_CMD_SET_PM_STATE = 24,	/* Set power state */
-	SPARKLINK_CMD_SET_PM_INTERVAL = 25,	/* Set connection interval */
-
-	/* Events (multicast only) */
-	SPARKLINK_CMD_EVENT = 26,		/* Async event notification */
-
-	/* DLI controller */
-	SPARKLINK_CMD_GET_DLI_INFO = 27,	/* Get DLI controller info */
-
-	/* Version query */
-	SPARKLINK_CMD_GET_VERSION = 28,	/* Get protocol version info */
-
-	/* Role management */
-	SPARKLINK_CMD_SET_ROLE = 29,		/* Set local GT role (T/G) */
-	SPARKLINK_CMD_GET_ROLE = 30,		/* Get current GT role */
-
-	/* 31..33: removed unpublished service commands; not reused. */
-
-	__SPARKLINK_CMD_MAX = 34,
+	SPARKLINK_CMD_GET_REGISTRY_COUNT = 1, /* Registered entries, not Ready. */
+	/* Removed command numbers are not reused. */
+	SPARKLINK_CMD_GET_VERSION = 28,
+	__SPARKLINK_CMD_MAX = 29,
 };
 #define SPARKLINK_CMD_MAX (__SPARKLINK_CMD_MAX - 1)
-
-/* ---------------------------------------------------------------------------
- * Generic Netlink attributes
- * ---------------------------------------------------------------------------
- */
-
 enum {
 	SPARKLINK_ATTR_UNSPEC = 0,
-
-	/* Device attributes */
-	SPARKLINK_ATTR_DEV_INDEX = 1,	/* u16: SCI device index */
-	SPARKLINK_ATTR_DEV_STATE = 2,	/* u8: operating state */
-	SPARKLINK_ATTR_DEV_NAME = 3,	/* NUL string: device name */
-	SPARKLINK_ATTR_DEV_BUS = 4,		/* u8: transport bus type */
-	SPARKLINK_ATTR_DEV_COUNT = 5,	/* u32: device count */
-
-	/* Version info */
-	SPARKLINK_ATTR_PROTO_VERSION = 6,	/* u32: protocol stack version */
-	SPARKLINK_ATTR_GENL_VERSION = 7,	/* u32: genetlink interface version */
-
-	/* Address */
-	SPARKLINK_ATTR_ADDR = 8,		/* binary(6): local SLE address */
-	SPARKLINK_ATTR_PEER_ADDR = 9,	/* binary(6): peer SLE address */
-
-	/* Connection */
-	SPARKLINK_ATTR_HANDLE = 10,		/* u16: connection handle */
-	SPARKLINK_ATTR_CONN_STATE = 11,	/* u8: connection state */
-	SPARKLINK_ATTR_GT_ROLE = 12,		/* u8: GT role (0=T, 1=G) */
-	SPARKLINK_ATTR_BANDWIDTH = 13,	/* u8: bandwidth in MHz */
-	SPARKLINK_ATTR_MCS_INDEX = 14,	/* u8: MCS index */
-	SPARKLINK_ATTR_TX_BYTES = 15,	/* u64: total TX bytes */
-	SPARKLINK_ATTR_RX_BYTES = 16,	/* u64: total RX bytes */
-	SPARKLINK_ATTR_TIMEOUT_10MS = 17,	/* u16: supervision timeout */
-
-	/* Advertising / scanning */
-	SPARKLINK_ATTR_DISCOVERY_LEVEL = 18,	/* u8: discovery level */
-	SPARKLINK_ATTR_INTERVAL_MS = 19,	/* u16: interval in ms */
-	SPARKLINK_ATTR_WINDOW_MS = 20,	/* u16: window in ms */
-	SPARKLINK_ATTR_RSSI = 21,		/* s8: signal strength */
-	SPARKLINK_ATTR_SCAN_RESULTS = 22,	/* u32: scan result count */
-
-	/* Data */
-	SPARKLINK_ATTR_DATA = 23,		/* binary: payload data */
-	SPARKLINK_ATTR_DATA_LEN = 24,	/* u16: data length */
-
-	/* Security */
-	SPARKLINK_ATTR_PSK = 25,		/* binary(16): pre-shared key */
-	SPARKLINK_ATTR_PAIR_METHOD = 26,	/* u8: pairing method */
-	SPARKLINK_ATTR_SEC_STATE = 27,	/* u8: security state */
-	SPARKLINK_ATTR_SEC_MODE = 28,	/* u8: security mode */
-	SPARKLINK_ATTR_ENCRYPTED = 29,	/* u8: encryption active */
-	SPARKLINK_ATTR_KEY_FP = 30,		/* binary(4): key fingerprint */
-
-	/* Generic transport MTU; service DB attributes31..33 removed. */
-	SPARKLINK_ATTR_MTU = 34,		/* u16: negotiated MTU */
-
-	/* Power management */
-	SPARKLINK_ATTR_PM_STATE = 35,	/* u8: power state */
-	SPARKLINK_ATTR_FORCE_ACTIVE = 36,	/* u8: force-active flag */
-	SPARKLINK_ATTR_POWER_PCT = 37,	/* u8: estimated power % */
-	SPARKLINK_ATTR_PM_INTERVAL_MIN = 38,	/* u16: min interval */
-	SPARKLINK_ATTR_PM_INTERVAL_MAX = 39,	/* u16: max interval */
-	SPARKLINK_ATTR_PM_LATENCY = 40,	/* u16: peripheral latency */
-
-	/* Events (multicast) */
-	SPARKLINK_ATTR_EVENT_TYPE = 41,	/* u8: event type code */
-	SPARKLINK_ATTR_EVENT_PAYLOAD = 42,	/* binary: event payload */
-	SPARKLINK_ATTR_EVENT_PENDING = 43,	/* u32: pending event count */
-	SPARKLINK_ATTR_EVENT_TOTAL = 44,	/* u64: total enqueued */
-	SPARKLINK_ATTR_EVENT_DROPPED = 45,	/* u64: total dropped */
-
-	/* DLI */
-	SPARKLINK_ATTR_DLI_BUS = 46,			/* u8: DLI bus type */
-	SPARKLINK_ATTR_DLI_FW_VER = 47,		/* u32: firmware version */
-	SPARKLINK_ATTR_DLI_FEATURES = 48,		/* u64: feature bitmask */
-	SPARKLINK_ATTR_DLI_MAX_CONN = 49,		/* u8: max connections */
-	SPARKLINK_ATTR_DLI_MAX_MTU = 50,		/* u16: max MTU */
-	SPARKLINK_ATTR_DLI_MAX_MPS = 51,		/* u16: max MPS */
-	SPARKLINK_ATTR_DLI_TRANSPORT_MODES = 52,	/* u8: transport mode bitmask */
-	SPARKLINK_ATTR_DLI_MEASUREMENT_CAP = 53,	/* u8: measurement capability bitmask */
-	SPARKLINK_ATTR_DLI_SECURITY_CAP = 54,	/* u16: security capability bitmask */
-
-	/* Transport channel (per-connection) */
-	SPARKLINK_ATTR_DATA_MTU = 55,	/* u16: data channel MTU */
-	SPARKLINK_ATTR_DATA_MPS = 56,	/* u16: data channel MPS */
-	SPARKLINK_ATTR_DATA_MODE = 57,	/* u8: data channel transport mode */
-	SPARKLINK_ATTR_SVC_MTU = 58,		/* u16: service mgmt channel MTU */
-
-	__SPARKLINK_ATTR_MAX = 59,
+	/* Removed attribute numbers are not reused. */
+	SPARKLINK_ATTR_DEV_COUNT = 5, /* u32 */
+	SPARKLINK_ATTR_PROTO_VERSION = 6, /* u32; software ABI, not firmware. */
+	SPARKLINK_ATTR_GENL_VERSION = 7, /* u32 */
+	__SPARKLINK_ATTR_MAX = 8,
 };
 #define SPARKLINK_ATTR_MAX (__SPARKLINK_ATTR_MAX - 1)
-
 /* ---------------------------------------------------------------------------
  * Event types (same as sle_event.rs)
  * ---------------------------------------------------------------------------

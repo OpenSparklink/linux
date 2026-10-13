@@ -2995,7 +2995,7 @@ static int genl_resolve_family(int nlfd, const char *name)
 	req.nlh.nlmsg_flags = NLM_F_REQUEST;
 	req.nlh.nlmsg_seq = 1;
 	req.genl.cmd = CTRL_CMD_GETFAMILY;
-	req.genl.version = 1;
+	req.genl.version = SPARKLINK_GENL_VERSION;
 
 	/* Add CTRL_ATTR_FAMILY_NAME attribute */
 	nla = (struct nlattr *)((char *)&req + req.nlh.nlmsg_len);
@@ -3052,7 +3052,7 @@ static int genl_send_cmd(int nlfd, uint16_t family_id, uint8_t cmd,
 	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
 	req.nlh.nlmsg_seq = seq;
 	req.genl.cmd = cmd;
-	req.genl.version = 1;
+	req.genl.version = SPARKLINK_GENL_VERSION;
 
 	if (send(nlfd, &req, req.nlh.nlmsg_len, 0) < 0)
 		return -1;
@@ -3092,93 +3092,11 @@ static uint32_t genl_get_u32_attr(char *msg, int msg_len, uint16_t attr_type)
 	return 0xDEAD;
 }
 
-static uint8_t genl_get_u8_attr(char *msg, int msg_len, uint16_t attr_type)
-{
-	char *attr_start = msg + NLMSG_HDRLEN + GENL_HDRLEN;
-	int remaining = msg_len - NLMSG_HDRLEN - GENL_HDRLEN;
 
-	while (remaining >= (int)NLA_HDRLEN) {
-		struct nlattr *nla = (struct nlattr *)attr_start;
 
-		if (nla->nla_len < NLA_HDRLEN || (int)nla->nla_len > remaining)
-			break;
-		if (nla->nla_type == attr_type && nla->nla_len >= NLA_HDRLEN + 1)
-			return *(uint8_t *)((char *)nla + NLA_HDRLEN);
-		int step = NLA_ALIGN(nla->nla_len);
 
-		attr_start += step;
-		remaining -= step;
-	}
-	return 0xFF;
-}
 
-static uint16_t genl_get_u16_attr(char *msg, int msg_len, uint16_t attr_type)
-{
-	char *attr_start = msg + NLMSG_HDRLEN + GENL_HDRLEN;
-	int remaining = msg_len - NLMSG_HDRLEN - GENL_HDRLEN;
 
-	while (remaining >= (int)NLA_HDRLEN) {
-		struct nlattr *nla = (struct nlattr *)attr_start;
-
-		if (nla->nla_len < NLA_HDRLEN || (int)nla->nla_len > remaining)
-			break;
-		if (nla->nla_type == attr_type && nla->nla_len >= NLA_HDRLEN + 2)
-			return *(uint16_t *)((char *)nla + NLA_HDRLEN);
-		int step = NLA_ALIGN(nla->nla_len);
-
-		attr_start += step;
-		remaining -= step;
-	}
-	return 0xDEAD;
-}
-
-static int genl_send_cmd_u8(int nlfd, uint16_t family_id, uint8_t cmd,
-			    uint32_t seq, uint16_t attr_type, uint8_t val,
-			    char *resp, int resp_size)
-{
-	struct genl_msg req;
-
-	/* Drain any stale messages from socket buffer */
-	{
-		char drain[4096];
-
-		while (recv(nlfd, drain, sizeof(drain), MSG_DONTWAIT) > 0)
-			;
-	}
-
-	memset(&req, 0, sizeof(req));
-	req.nlh.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
-	req.nlh.nlmsg_type = family_id;
-	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-	req.nlh.nlmsg_seq = seq;
-	req.genl.cmd = cmd;
-	req.genl.version = 1;
-
-	/* Append a u8 NLA attribute */
-	struct nlattr *nla = (struct nlattr *)((char *)&req + req.nlh.nlmsg_len);
-
-	nla->nla_type = attr_type;
-	nla->nla_len = NLA_HDRLEN + 1;
-	*(uint8_t *)((char *)nla + NLA_HDRLEN) = val;
-	req.nlh.nlmsg_len += NLA_ALIGN(nla->nla_len);
-
-	if (send(nlfd, &req, req.nlh.nlmsg_len, 0) < 0)
-		return -1;
-
-	int len = recv(nlfd, resp, resp_size, 0);
-
-	if (len < 0)
-		return -1;
-
-	struct nlmsghdr *nlh = (struct nlmsghdr *)resp;
-
-	if (nlh->nlmsg_type == NLMSG_ERROR) {
-		struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nlh);
-
-		return err->error; /* 0 = success (ACK), <0 = error */
-	}
-	return len; /* data reply */
-}
 
 /* ------------------------------------------------------------------ */
 /* configfs tests                                                      */
@@ -5982,76 +5900,8 @@ static void test_dli_info_consistency(int fd)
 		}
 	}
 
-	/* --- genetlink cross-check --- */
-	int nlfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
-
-	if (nlfd < 0) {
-		printf("  WARN: cannot open genetlink socket\n");
-		return;
-	}
-
-	struct sockaddr_nl sa;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.nl_family = AF_NETLINK;
-	if (bind(nlfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		printf("  WARN: genetlink bind failed\n");
-		close(nlfd);
-		return;
-	}
-
-	int family_id = genl_resolve_family(nlfd, SL_GENL_NAME);
-
-	if (family_id < 0) {
-		printf("  WARN: cannot resolve sparklink genetlink family\n");
-		close(nlfd);
-		return;
-	}
-
-	char resp[4096];
-	int len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_DLI_INFO,
-				100, resp, sizeof(resp));
-	close(nlfd);
-
-	if (len <= 0) {
-		test_fail("  FAIL: GET_DLI_INFO genetlink failed (len=%d)\n", len);
-		return;
-	}
-
-	uint8_t gnl_bus = genl_get_u8_attr(resp, len, SPARKLINK_ATTR_DLI_BUS);
-	uint8_t gnl_max_conn = genl_get_u8_attr(resp, len,
-						 SPARKLINK_ATTR_DLI_MAX_CONN);
-	uint16_t gnl_max_mtu = genl_get_u16_attr(resp, len,
-						  SPARKLINK_ATTR_DLI_MAX_MTU);
-	uint16_t gnl_max_mps = genl_get_u16_attr(resp, len,
-						  SPARKLINK_ATTR_DLI_MAX_MPS);
-	uint8_t gnl_transport = genl_get_u8_attr(resp, len,
-					SPARKLINK_ATTR_DLI_TRANSPORT_MODES);
-	uint8_t gnl_meas = genl_get_u8_attr(resp, len,
-					SPARKLINK_ATTR_DLI_MEASUREMENT_CAP);
-	uint16_t gnl_sec = genl_get_u16_attr(resp, len,
-					SPARKLINK_ATTR_DLI_SECURITY_CAP);
-
-	int ok = 0, fail = 0;
-
-	if (dli.bus == gnl_bus) ok++; else fail++;
-	if (dli.max_connections == gnl_max_conn) ok++; else fail++;
-	if (dli.max_mtu == gnl_max_mtu) ok++; else fail++;
-	if (dli.max_mps == gnl_max_mps) ok++; else fail++;
-	if (dli.transport_modes == gnl_transport) ok++; else fail++;
-	if (dli.measurement_cap == gnl_meas) ok++; else fail++;
-	if (dli.security_cap == gnl_sec) ok++; else fail++;
-
-	if (fail == 0)
-		printf("  OK:   ioctl vs genetlink: %d/%d fields consistent\n",
-		       ok, ok);
-	else
-		test_fail("  FAIL: ioctl vs genetlink: %d OK, %d mismatch "
-		       "(bus=%u/%u conn=%u/%u mtu=%u/%u mps=%u/%u)\n",
-		       ok, fail, dli.bus, gnl_bus,
-		       dli.max_connections, gnl_max_conn,
-		       dli.max_mtu, gnl_max_mtu,
-		       dli.max_mps, gnl_max_mps);
+	/* Controller metadata is no longer projected through global genl. */
+	printf("  INFO: Native identity-bound metadata is the controller query path\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -6308,8 +6158,8 @@ static void test_subsys_stats(int fd)
 	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
 	check("SUBSYS_STATS", ret);
 	if (ret == 0) {
-		printf("  dev_count=%u proto=%u bind=%u active_conn=%u\n",
-		       ss.dev_count, ss.proto_count, ss.binding_count,
+		printf("  dev_count=%u pending=%u runtime=%u active_conn=%u\n",
+		       ss.dev_count, ss.pending_count, ss.runtime_count,
 		       ss.active_connections);
 		printf("  conn: created=%u completed=%u\n",
 		       ss.total_conn_created, ss.total_conn_completed);
@@ -11082,20 +10932,20 @@ static void test_genetlink(void)
 	printf("  OK:   resolved family '%s' -> id=%d\n",
 	       SL_GENL_NAME, family_id);
 
-	/* Step 2: GET_DEV_INFO command */
+	/* Step 2: GET_REGISTRY_COUNT command */
 	char resp[4096];
-	int len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_DEV_INFO,
+	int len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_REGISTRY_COUNT,
 				2, resp, sizeof(resp));
 	if (len > 0) {
 		uint32_t count = genl_get_u32_attr(resp, len,
 						   SPARKLINK_ATTR_DEV_COUNT);
 		if (count != 0xDEAD) {
-			printf("  OK:   GET_DEV_INFO: dev_count=%u\n", count);
+			printf("  OK:   GET_REGISTRY_COUNT: dev_count=%u\n", count);
 		} else {
-			test_fail("  FAIL: GET_DEV_INFO: missing DEV_COUNT attr\n");
+			test_fail("  FAIL: GET_REGISTRY_COUNT: missing DEV_COUNT attr\n");
 		}
 	} else {
-		test_fail("  FAIL: GET_DEV_INFO failed (len=%d)\n", len);
+		test_fail("  FAIL: GET_REGISTRY_COUNT failed (len=%d)\n", len);
 	}
 
 	/* Step 3: GET_VERSION command */
@@ -11116,109 +10966,13 @@ static void test_genetlink(void)
 		test_fail("  FAIL: GET_VERSION failed (len=%d)\n", len);
 	}
 
-	/* Step 4: GET_ROLE — query current role */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_ROLE,
-			    4, resp, sizeof(resp));
-	if (len > 0) {
-		uint8_t role = genl_get_u8_attr(resp, len, SPARKLINK_ATTR_GT_ROLE);
-
-		if (role != 0xFF) {
-			printf("  OK:   GET_ROLE: role=%u (%s)\n", role,
-			       role == 0 ? "TNode" : "GNode");
-		} else {
-			test_fail("  FAIL: GET_ROLE: missing GT_ROLE attr\n");
-		}
-	} else {
-		test_fail("  FAIL: GET_ROLE failed (len=%d)\n", len);
+	/* Removed global-controller operations are never accepted, even for root. */
+	for (unsigned cmd = 2; cmd <= 33; cmd++) {
+		if (cmd == SPARKLINK_CMD_GET_VERSION) continue;
+		len = genl_send_cmd(nlfd, family_id, cmd, cmd + 10, resp, sizeof(resp));
+		if (len != -EOPNOTSUPP)
+			test_fail("  FAIL: retired genl cmd %u returned %d\n", cmd, len);
 	}
-
-	/* Step 5: SET_ROLE to GNode (1) */
-	len = genl_send_cmd_u8(nlfd, family_id, SPARKLINK_CMD_SET_ROLE,
-			       5, SPARKLINK_ATTR_GT_ROLE, 1,
-			       resp, sizeof(resp));
-	if (len > 0)
-		printf("  OK:   SET_ROLE(GNode): accepted\n");
-	else
-		printf("  WARN: SET_ROLE(GNode): ret=%d (may need CAP_NET_ADMIN)\n",
-		       len);
-
-	/* Step 6: GET_ROLE again — verify it changed */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_ROLE,
-			    6, resp, sizeof(resp));
-	if (len > 0) {
-		uint8_t role = genl_get_u8_attr(resp, len, SPARKLINK_ATTR_GT_ROLE);
-
-		if (role == 1)
-			printf("  OK:   GET_ROLE after SET: GNode confirmed\n");
-		else
-			printf("  WARN: GET_ROLE after SET: role=%u (expected 1)\n",
-			       role);
-	}
-
-	/* Step 7: GET_PM_INFO — power management query */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_PM_INFO,
-			    7, resp, sizeof(resp));
-	if (len > 0) {
-		uint8_t pm_state = genl_get_u8_attr(resp, len,
-						    SPARKLINK_ATTR_PM_STATE);
-		if (pm_state != 0xFF)
-			printf("  OK:   GET_PM_INFO: pm_state=%u\n", pm_state);
-		else
-			test_fail("  FAIL: GET_PM_INFO: missing PM_STATE attr\n");
-	} else {
-		test_fail("  FAIL: GET_PM_INFO failed (len=%d)\n", len);
-	}
-
-	/* Step 8: GET_DLI_INFO — controller information */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_GET_DLI_INFO,
-			    8, resp, sizeof(resp));
-	if (len > 0) {
-		uint8_t bus = genl_get_u8_attr(resp, len, SPARKLINK_ATTR_DLI_BUS);
-
-		if (bus != 0xFF)
-			printf("  OK:   GET_DLI_INFO: bus=%u\n", bus);
-		else
-			test_fail("  FAIL: GET_DLI_INFO: missing DLI_BUS attr\n");
-	} else {
-		test_fail("  FAIL: GET_DLI_INFO failed (len=%d)\n", len);
-	}
-
-	/* Step 9: START_ADV via genetlink */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_START_ADV,
-			    9, resp, sizeof(resp));
-	if (len > 0 || len == 0)
-		printf("  OK:   START_ADV (genl): accepted\n");
-	else
-		printf("  WARN: START_ADV (genl): ret=%d\n", len);
-
-	/* Step 10: STOP_ADV via genetlink */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_STOP_ADV,
-			    10, resp, sizeof(resp));
-	if (len > 0 || len == 0)
-		printf("  OK:   STOP_ADV (genl): accepted\n");
-	else
-		printf("  WARN: STOP_ADV (genl): ret=%d\n", len);
-
-	/* Step 11: SET_ROLE back to TNode for scan */
-	genl_send_cmd_u8(nlfd, family_id, SPARKLINK_CMD_SET_ROLE,
-			 11, SPARKLINK_ATTR_GT_ROLE, 0, resp, sizeof(resp));
-
-	/* Step 12: START_SCAN via genetlink */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_START_SCAN,
-			    12, resp, sizeof(resp));
-	if (len > 0 || len == 0)
-		printf("  OK:   START_SCAN (genl): accepted\n");
-	else
-		printf("  WARN: START_SCAN (genl): ret=%d\n", len);
-
-	/* Step 13: STOP_SCAN via genetlink */
-	len = genl_send_cmd(nlfd, family_id, SPARKLINK_CMD_STOP_SCAN,
-			    13, resp, sizeof(resp));
-	if (len > 0 || len == 0)
-		printf("  OK:   STOP_SCAN (genl): accepted\n");
-	else
-		printf("  WARN: STOP_SCAN (genl): ret=%d\n", len);
-
 	close(nlfd);
 }
 

@@ -35,12 +35,11 @@ config SPARKLINK_GENL
 	bool "SparkLink Generic Netlink interface"
 	depends on NET
 	help
-	  Adds a Generic Netlink interface ("sparklink" family) alongside
-	  the /dev/sparklink ioctl control path.  This allows multiple
-	  userspace processes to subscribe to events via multicast and
-	  use attribute-based messaging for device queries.
+	  Adds read-only registry count and software version queries to the
+	  "sparklink" Generic Netlink family. It does not select a controller,
+	  submit commands or publish controller events. Identity-bound Native
+	  APIs remain the controller management and observation path.
 
-	  Say Y if you want netlink-based tooling (e.g. via libnl).
 	  If unsure, say N.
 
 config SPARKLINK_SLE

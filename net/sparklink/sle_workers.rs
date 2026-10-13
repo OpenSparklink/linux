@@ -11,7 +11,6 @@ use kernel::time::msecs_to_jiffies;
 use kernel::workqueue::{self, impl_has_delayed_work, DelayedWork, WorkItem};
 use pin_init::init_array_from_fn;
 
-use super::genl_bridge;
 use super::sle_conn;
 use super::sle_dli;
 use super::sle_dli::SleController;
@@ -164,7 +163,7 @@ fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error:
 
 
 /// Process a single controller event: resolve pending commands, drive
-/// state machine transitions, and publish the remaining legacy read projection.
+/// state machine transitions, keep the remaining standard-DLI state projection synchronized.
 ///
 /// Called from both `EventPump` (periodic background) and inline after
 /// ioctl commands (immediate drain for synchronous controller backends).
@@ -246,20 +245,13 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
                     // and no existing entry for this address.
                     let _ = shared.conn.accept_incoming(*evt_handle, addr);
                 }
-                genl_bridge::notify_event(0x01, 0, addr);
             } else {
                 shared.conn.abort_controller_connect(addr);
             }
         }
         sle_dli::SleEvent::Disconnected { handle, .. } => {
             let host_handle = shared.conn.host_handle(*handle).unwrap_or(*handle);
-            let peer_addr = shared
-                .conn
-                .info(host_handle)
-                .map(|e| e.peer_addr)
-                .unwrap_or([0u8; 6]);
             shared.conn.confirm_disconnecting_by_handle(host_handle);
-            genl_bridge::notify_event(0x01, host_handle, &peer_addr);
         }
         sle_dli::SleEvent::AdvReport {
             addr,
@@ -271,7 +263,6 @@ pub(crate) fn process_controller_event(shared: &mut ControllerState, ev: &sle_dl
                 shared
                     .adv_scan
                     .process_adv_report(addr, *rssi, *discovery_level, data.as_slice());
-            genl_bridge::notify_event(0x02, 0, addr);
         }
         sle_dli::SleEvent::DataReceived { handle, data } => {
             let raw = data.as_slice();

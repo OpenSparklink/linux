@@ -34,6 +34,7 @@ def run(args):
     record = {'status': 'PREPARING', 'physical_acceptance': False,
               'scope': 'Empty-USB KVM, actual test provider + Core/Host; no RF/data/recovery proof',
               'module_info': info, 'source_sha256': sha(here / 'virtual_runtime_test.c'),
+              'registry_probe_sha256': sha(here / 'genl_registry_test.c'),
               'inputs': {name: sha(path) for name, path in paths.items() if path.is_file()}}
     manifest = out / 'manifest.json'
 
@@ -105,6 +106,8 @@ busybox poweroff -f
         if (result.returncode or log.count('VIRTUAL_RUNTIME_PASS:') != 2
                 or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
                 or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
+                or log.count('GENL_REGISTRY_PASS:') != 10
+                or log.count('GENL_REGISTRY_PASS: uid=1000') != 2
                 or 'VIRTUAL_MODULE_ROUND_PASS:2' not in log or 'VIRTUAL_VM_PASS' not in log
                 or any(marker in log for marker in ('VIRTUAL_VM_FAIL', 'VIRTUAL_RUNTIME_FAIL',
                                                     'Kernel panic', 'BUG:', 'WARNING:'))):
@@ -113,6 +116,7 @@ busybox poweroff -f
                for name, path in paths.items() if path.is_file()):
             raise RuntimeError('input changed during VM')
         record.update(status='PASS_VIRTUAL_CORE_HOST_VM', module_rounds=2,
+                      registry_results=[line for line in log.splitlines() if 'GENL_REGISTRY_PASS:' in line],
                       query_results=[line for line in log.splitlines() if 'VIRTUAL_RUNTIME_PASS:' in line],
                       diagnostic_fd_results=[line for line in log.splitlines()
                                              if 'VIRTUAL_DIAGNOSTIC_FD_PASS:' in line])

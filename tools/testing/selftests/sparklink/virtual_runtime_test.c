@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <grp.h>
+#define GENL_REGISTRY_EMBEDDED
+#include "genl_registry_test.c"
 #include <time.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
@@ -250,6 +254,14 @@ int main(void)
 {
 	struct controller a = create(), b = create();
 	CHECK(a.status.id != b.status.id && a.status.generation != b.status.generation);
+	CHECK(!registry_probe(2));
+	fflush(NULL);
+	pid_t observer = fork(); CHECK(observer >= 0);
+	if (!observer) {
+		CHECK(!setgroups(0, NULL) && !setgid(1000) && !setuid(1000));
+		int result = registry_probe(2); fflush(stdout); _exit(result);
+	}
+	int status; CHECK(waitpid(observer, &status, 0) == observer && WIFEXITED(status) && !WEXITSTATUS(status));
 	config(a, 20, 0, 0);
 	const uint16_t queries[] = { 0x0401, 0x0402, 0x0403, 0x0404, 0x0406 };
 	const unsigned int lengths[] = { 2, 6, 10, 5, 6 };
@@ -265,14 +277,16 @@ int main(void)
 	bad = (struct sparklink_virtual_control){ .drop_next = 33 };
 	CHECK(ioctl(a.control, SPARKLINK_VIRTUAL_CONFIG, &bad) == -1 && errno == EINVAL);
 	config(a, 6000, 0, 0); submit(a, 0x0404); pending(a);
-	double began = now(); CHECK(!close(a.control)); CHECK(now() - began < 1); stale(a);
+	double began = now(); CHECK(!close(a.control)); CHECK(now() - began < 1); stale(a); CHECK(!registry_probe(1));
 	struct controller replacement = create();
 	CHECK(replacement.status.id == a.status.id && replacement.status.generation > a.status.generation);
+	CHECK(!registry_probe(2));
 	stale(a); query(replacement, 0x0406, 6); query(b, 0x0406, 6);
 	CHECK(!close(a.fd));
 	fault(0, 1, 0, b); fault(0, 0, 1, b); fault(6000, 0, 0, b);
 	CHECK(!close(replacement.control)); CHECK(!close(replacement.fd));
 	CHECK(!close(b.control)); CHECK(!close(b.fd));
+	CHECK(!registry_probe(0));
 	int fd = open("/dev/sparklink", O_RDWR); uint16_t mask = 0xffff;
 	CHECK(fd >= 0 && !ioctl(fd, SL_IOCTL_DEV_LIST, &mask) && !mask); close(fd);
 	printf("VIRTUAL_RUNTIME_PASS: query=%u dup=1 pending_last_close=1 reuse=1 stale=1 faults=3 empty=1 no_physical=1\n", query_count);
