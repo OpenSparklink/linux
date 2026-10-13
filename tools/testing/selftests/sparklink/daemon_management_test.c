@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "retired-event-poll/legacy_abi.h"
 
 int main(int argc, char **argv)
 {

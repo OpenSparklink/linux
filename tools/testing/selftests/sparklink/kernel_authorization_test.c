@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "retired-event-poll/legacy_abi.h"
 #include "../../../../include/uapi/linux/sparklink.h"
 
 static const unsigned long protected[] = {

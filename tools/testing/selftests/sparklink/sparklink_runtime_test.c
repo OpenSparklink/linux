@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "retired-event-poll/legacy_abi.h"
 
 static int failed;
 

@@ -20,6 +20,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
+#include "retired-event-poll/legacy_abi.h"
 
 _Static_assert(sizeof(struct sle_management_request) == 32, "management request ABI");
 _Static_assert(sizeof(struct sle_management_query) == 48, "management query ABI");
