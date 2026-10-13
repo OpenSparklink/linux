@@ -179,6 +179,8 @@ impl CmdRequestQueue {
     pub(crate) fn available(&self) -> usize {
         CMD_REQ_QUEUE_DEPTH - self.count as usize
     }
+    // State inspection for exact-source regression; no production consumer.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> u16 {
         self.count
     }

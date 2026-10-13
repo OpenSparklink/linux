@@ -1349,9 +1349,6 @@ impl ControllerBackend {
         }
     }
 
-    pub(crate) fn uses_command_host(&self) -> bool {
-        true
-    }
 
 
 

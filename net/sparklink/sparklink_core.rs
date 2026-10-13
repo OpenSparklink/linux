@@ -205,8 +205,6 @@ pub(crate) struct ControllerState {
     pub(crate) dev_info: SciDevInfo,
     pub(crate) controller: sle_dli::ControllerBackend,
     pub(crate) cmd_pending: sle_mgmt::CmdPendingQueue,
-    pub(crate) cmd_queue: sle_mgmt::CmdRequestQueue,
-    pub(crate) command_credits: u8,
 }
 
 impl ControllerState {
@@ -218,8 +216,6 @@ impl ControllerState {
                 dev_info: unsafe { core::mem::zeroed() },
                 controller: backend,
                 cmd_pending <- sle_mgmt::CmdPendingQueue::new_in_place(),
-                cmd_queue <- sle_mgmt::CmdRequestQueue::new_in_place(),
-                command_credits: 1,
             }),
             GFP_KERNEL,
         )
@@ -295,7 +291,7 @@ impl ControllerRuntime {
         let len = registration.name.len().min(state.dev_info.name.len());
         state.dev_info.name[..len].copy_from_slice(&registration.name[..len]);
         let ingress = sle_dli::ControllerEventRing::new_boxed()?;
-        let host = sle_host::CommandHost::new_boxed(state.command_credits)?;
+        let host = sle_host::CommandHost::new_boxed(1)?;
         let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
         let snoop = sle_snoop::SnoopLog::new_boxed()?;
         let protocol_profile = state.controller.provider().profile();
