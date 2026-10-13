@@ -1185,7 +1185,7 @@ pub trait SleController: Send + Sync {
 /// dispatch without heap-allocated trait objects.
 pub enum ControllerBackend {
     Usb(super::sle_usb::UsbController),
-    Ws73(super::sle_native::NativeController),
+    Native(super::sle_native::NativeController),
 }
 
 // SAFETY: ControllerBackend is stored in ControllerState under each Runtime state mutex.
@@ -1342,13 +1342,13 @@ pub fn sle_opcode_from_u16(v: u16) -> Option<SleOpcode> {
 impl ControllerBackend {
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
         match self {
-            Self::Ws73(c) => c.validate_command(opcode, params),
+            Self::Native(c) => c.validate_command(opcode, params),
             _ => Ok(()),
         }
     }
 
     pub(crate) fn uses_command_host(&self) -> bool {
-        matches!(self, Self::Usb(_) | Self::Ws73(_))
+        matches!(self, Self::Usb(_) | Self::Native(_))
     }
 
     pub(crate) fn send_command_transport(
@@ -1356,7 +1356,7 @@ impl ControllerBackend {
     ) -> Result {
         match self {
             Self::Usb(c) => c.send_command_transport(opcode, params),
-            Self::Ws73(c) => c.send_command_transport(opcode, params, recipe),
+            Self::Native(c) => c.send_command_transport(opcode, params, recipe),
         }
     }
 
@@ -1432,49 +1432,49 @@ impl SleController for ControllerBackend {
     fn info(&self) -> SleControllerInfo {
         match self {
             Self::Usb(c) => c.info(),
-            Self::Ws73(c) => c.info(),
+            Self::Native(c) => c.info(),
         }
     }
 
     fn open(&self) -> Result {
         match self {
             Self::Usb(c) => c.open(),
-            Self::Ws73(c) => c.open(),
+            Self::Native(c) => c.open(),
         }
     }
 
     fn close(&self) {
         match self {
             Self::Usb(c) => c.close(),
-            Self::Ws73(c) => c.close(),
+            Self::Native(c) => c.close(),
         }
     }
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
         match self {
             Self::Usb(c) => c.send_command(opcode, params),
-            Self::Ws73(c) => c.send_command(opcode, params),
+            Self::Native(c) => c.send_command(opcode, params),
         }
     }
 
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {
         match self {
             Self::Usb(c) => c.send_data(handle, data),
-            Self::Ws73(c) => c.send_data(handle, data),
+            Self::Native(c) => c.send_data(handle, data),
         }
     }
 
     fn poll_event(&self) -> Option<SleEvent> {
         match self {
             Self::Usb(c) => c.poll_event(),
-            Self::Ws73(c) => c.poll_event(),
+            Self::Native(c) => c.poll_event(),
         }
     }
 
     fn reset(&self) -> Result {
         match self {
             Self::Usb(c) => c.reset(),
-            Self::Ws73(c) => c.reset(),
+            Self::Native(c) => c.reset(),
         }
     }
 }

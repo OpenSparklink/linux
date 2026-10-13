@@ -571,12 +571,12 @@ impl ControllerRuntime {
         let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
         let snoop = sle_snoop::SnoopLog::new_boxed()?;
         let protocol_profile = match &state.controller {
-            sle_dli::ControllerBackend::Ws73(controller) => controller.profile(),
+            sle_dli::ControllerBackend::Native(controller) => controller.profile(),
             _ => 0,
         };
         let initially_open = protocol_profile == 0;
         let (data_length, data_count) = match &state.controller {
-            sle_dli::ControllerBackend::Ws73(controller) => controller.data_limits(),
+            sle_dli::ControllerBackend::Native(controller) => controller.data_limits(),
             _ => (0, 0),
         };
         Arc::pin_init(pin_init!(Self {
@@ -2785,7 +2785,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
             }
         }
         let controller = match &state.controller {
-            sle_dli::ControllerBackend::Ws73(controller) => controller,
+            sle_dli::ControllerBackend::Native(controller) => controller,
             _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         };
         let request = SleDiscoverySubmit {
@@ -2937,7 +2937,7 @@ fn ioctl_controller_snapshot(
     let (credits, native_ready, fault) = owner.host.lock().controller_status();
     out.command_credits = credits;
     match &state.controller {
-        sle_dli::ControllerBackend::Ws73(controller) => {
+        sle_dli::ControllerBackend::Native(controller) => {
             controller.fill_snapshot(&mut out);
             out.flags = if native_ready { 1 } else { 2 };
         }
@@ -3004,7 +3004,7 @@ fn ioctl_connection_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
     let plan = match &state.controller {
-        sle_dli::ControllerBackend::Ws73(controller) => controller.prepare_connection(&request)?,
+        sle_dli::ControllerBackend::Native(controller) => controller.prepare_connection(&request)?,
         _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
     };
     let mut watermark = me.connection_request_id.lock();
@@ -3130,7 +3130,7 @@ fn ioctl_discovery_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg:
     let state_guard = context.lock()?;
     let state = state_guard.as_ref().ok_or(ENODEV)?;
     let plan = match &state.controller {
-        sle_dli::ControllerBackend::Ws73(controller) => controller.prepare_discovery(&request)?,
+        sle_dli::ControllerBackend::Native(controller) => controller.prepare_discovery(&request)?,
         _ => return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
     };
     let mut parts = [sle_command_plan::RecipePart { opcode: 0, params: &[] }; 4];

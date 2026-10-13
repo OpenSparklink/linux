@@ -61,7 +61,7 @@ fn progress_connection_cleanup(owner: &Arc<ControllerRuntime>, state: &Controlle
     let candidate = owner.host.lock().cleanup_candidate()?;
     let Some(handle) = candidate else { return Ok(false); };
     let controller = match &state.controller {
-        sle_dli::ControllerBackend::Ws73(controller) => controller,
+        sle_dli::ControllerBackend::Native(controller) => controller,
         _ => return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
     };
     // Normal local management termination. This is a protocol reason, not a
@@ -738,7 +738,7 @@ impl WorkItem<1> for ControllerRuntime {
                     Err(error) => { fail_host(&this, runtime, error); return; }
                 };
                 if let Some(request) = request {
-                    if let sle_dli::ControllerBackend::Ws73(controller) = &runtime.controller {
+                    if let sle_dli::ControllerBackend::Native(controller) = &runtime.controller {
                         let transport = controller.command_transport();
                         // Own the transport independently. RPC snapshots and
                         // RX processing must not wait for a blocking USB OUT.

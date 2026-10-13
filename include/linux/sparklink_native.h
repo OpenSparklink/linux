@@ -2,7 +2,17 @@
 #ifndef _LINUX_SPARKLINK_NATIVE_H
 #define _LINUX_SPARKLINK_NATIVE_H
 
+#ifdef __KERNEL__
 #include <linux/types.h>
+#else
+/* Pure contract selftests use the same declarations and validator. */
+#include <stddef.h>
+#include <stdint.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+#endif
 #include <linux/sparklink_discovery.h>
 #include <linux/sparklink_connection.h>
 
@@ -86,9 +96,8 @@ struct sparklink_native_ops {
                     u16 handle, const u8 *data, size_t length);
 };
 
-int sparklink_native_register(const struct sparklink_native_info *info,
-			      const struct sparklink_native_ops *ops, void *context,
-			      struct sparklink_native_identity *identity);
+/* Providers register through sparklink_backend.h. No legacy registration
+ * wrapper: this internal interface has no compatibility commitment. */
 /* Exact registration only; a stale identity cannot remove a reused index. */
 void sparklink_native_unregister(u16 id, u64 generation);
 /* Process-context observation only: 2 healthy Ready, 1 Setup, negative fault

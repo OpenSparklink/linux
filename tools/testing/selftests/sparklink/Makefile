@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 
 TEST_GEN_PROGS := sparklink_test ws73_bsle_test ws73_dli_test ws73_discovery_test
-TEST_GEN_PROGS += ws73_recovery_test
+TEST_GEN_PROGS += ws73_recovery_test sparklink_backend_test
 TEST_GEN_PROGS += ws73_acb_test
 TEST_GEN_PROGS += sle_channel_wire_test
 TEST_GEN_PROGS += sle_channel_state_test
@@ -86,3 +86,6 @@ $(OUTPUT)/ws73_dli_test: ws73_dli_test.c \
 	../../../../drivers/sparklink/ws73/dli.h
 	$(CC) $(CFLAGS) $< ../../../../drivers/sparklink/ws73/wire.c \
 		../../../../drivers/sparklink/ws73/dli.c $(LDLIBS) -o $@
+
+$(OUTPUT)/sparklink_backend_test: sparklink_backend_test.c ../../../../include/linux/sparklink_backend.h
+	$(CC) $(CFLAGS) -I../../../../include $< $(LDLIBS) -o $@

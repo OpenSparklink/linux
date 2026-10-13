@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sparklink_native.h>
+#include <linux/sparklink_backend.h>
 #include <linux/uaccess.h>
 #include "native_open_fixture.h"
 
@@ -88,7 +89,14 @@ static int fixture_register(void *context)
 	};
 
 	info.address[5] += f - fixtures;
-	WRITE_ONCE(f->result, sparklink_native_register(&info, &fixture_ops, f, &output));
+	{
+		struct sparklink_backend_descriptor backend = {
+			.version = SPARKLINK_BACKEND_VERSION, .size = sizeof(backend),
+			.bus = SPARKLINK_BACKEND_TEST, .info = info,
+			.ops = &fixture_ops, .context = f,
+		};
+		WRITE_ONCE(f->result, sparklink_backend_register(&backend, &output));
+	}
 	if (!f->result && (output.id != f->identity.id ||
 			   output.generation != f->identity.generation))
 		WRITE_ONCE(f->result, -EPROTO);

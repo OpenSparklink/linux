@@ -226,7 +226,7 @@ impl super::ControllerRuntime {
         let transport = {
             let state = self.state.lock();
             if *self.schedule_gate.lock() { return Err(ENODEV); }
-            let Some(super::sle_dli::ControllerBackend::Ws73(controller)) =
+            let Some(super::sle_dli::ControllerBackend::Native(controller)) =
                 state.as_ref().map(|state| &state.controller) else { return Err(ENODEV) };
             controller.command_transport()
         };
@@ -240,7 +240,7 @@ impl super::ControllerRuntime {
         })?;
         {
             let state = self.state.lock();
-            let Some(super::sle_dli::ControllerBackend::Ws73(controller)) =
+            let Some(super::sle_dli::ControllerBackend::Native(controller)) =
                 state.as_ref().map(|state| &state.controller) else {
                 drop(state);
                 // SAFETY: successful open must be closed even if adoption fails.
@@ -384,7 +384,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
         drop(registry);
         let installed = (|| -> Result<kernel::sync::Arc<super::ControllerRuntime>> {
             let mut state = super::ControllerState::new_boxed(
-                metadata.address, super::sle_dli::ControllerBackend::Ws73(controller),
+                metadata.address, super::sle_dli::ControllerBackend::Native(controller),
             )?;
             state.command_credits = metadata.command_credits;
             let mut registry = super::SUBSYSTEM.lock();
@@ -761,7 +761,7 @@ unsafe fn native_acb_send(
     let _lifecycle = owner.native_lifecycle.lock();
     let transport = {
         let state = owner.state.lock();
-        let Some(super::sle_dli::ControllerBackend::Ws73(controller)) = state.as_ref().map(|s| &s.controller) else {
+        let Some(super::sle_dli::ControllerBackend::Native(controller)) = state.as_ref().map(|s| &s.controller) else {
             return UNSUPPORTED;
         };
         controller.command_transport()

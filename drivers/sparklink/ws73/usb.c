@@ -14,6 +14,7 @@
 #include <linux/kref.h>
 #include <linux/mutex.h>
 #include <linux/sparklink_native.h>
+#include <linux/sparklink_backend.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
@@ -1057,7 +1058,18 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	native_info.icb_length = ws->info.icb_length;
 	native_info.icb_count = ws->info.icb_count;
 	native_info.command_credits = credits;
-	ret = sparklink_native_register(&native_info, &ws73_native_ops, ws, &identity);
+	{
+		struct sparklink_backend_descriptor backend = {
+			.version = SPARKLINK_BACKEND_VERSION,
+			.size = sizeof(backend),
+			.bus = SPARKLINK_BACKEND_USB,
+			.capabilities = SPARKLINK_BACKEND_DISCOVERY |
+				SPARKLINK_BACKEND_CONNECTION | SPARKLINK_BACKEND_ACB,
+			.info = native_info, .ops = &ws73_native_ops, .context = ws,
+		};
+
+		ret = sparklink_backend_register(&backend, &identity);
+	}
 	if (ret)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_NATIVE_SETUP);

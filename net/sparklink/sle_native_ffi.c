@@ -6,6 +6,7 @@
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/sparklink_native.h>
+#include <linux/sparklink_backend.h>
 #include <linux/sparklink_channel.h>
 #include <uapi/linux/sparklink_ioctl.h>
 
@@ -78,32 +79,39 @@ struct sparklink_native_transport {
 
 #include "sle_native_ffi.h"
 
-int sparklink_native_register(const struct sparklink_native_info *info,
-			      const struct sparklink_native_ops *ops, void *context,
+int sparklink_backend_register(const struct sparklink_backend_descriptor *descriptor,
 			      struct sparklink_native_identity *identity)
 {
 	struct sparklink_native_transport *transport;
+	struct sparklink_backend_descriptor snapshot;
+	struct sparklink_native_ops operations;
+	int ret;
 
-	if (!info || !ops || !context || !identity || !ops->get || !ops->put ||
-	    !ops->open || !ops->close || !ops->validate_command || !ops->send_command ||
-	    !!ops->prepare_discovery != !!ops->validate_discovery_step ||
-        !!ops->prepare_connection != !!ops->validate_connection)
+	if (!descriptor || !identity)
 		return -EINVAL;
+	snapshot = *descriptor;
+	if (snapshot.ops) {
+		operations = *snapshot.ops;
+		snapshot.ops = &operations;
+	}
+	ret = sparklink_backend_validate(&snapshot);
+	if (ret)
+		return ret;
 	transport = kmalloc_obj(*transport);
 	if (!transport)
 		return -ENOMEM;
-	if (!try_module_get(ops->owner)) {
+	if (!try_module_get(operations.owner)) {
 		kfree(transport);
 		return -ENODEV;
 	}
-	transport->ops = *ops;
+	transport->ops = operations;
 	refcount_set(&transport->references, 1);
-	transport->context = context;
-	ops->get(context);
+	transport->context = snapshot.context;
+	operations.get(snapshot.context);
 	/* Rust consumes this reference on both success and failure. */
-	return sparklink_native_register_rust(info, transport, identity);
+	return sparklink_native_register_rust(&snapshot.info, transport, identity);
 }
-EXPORT_SYMBOL_GPL(sparklink_native_register);
+EXPORT_SYMBOL_GPL(sparklink_backend_register);
 
 void sparklink_native_transport_get(struct sparklink_native_transport *transport)
 {
