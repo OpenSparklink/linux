@@ -137,6 +137,8 @@ pub enum SleBus {
     Sdio = 3,
     Usb = 4,
     Mmio = 5,
+    /// Explicit test provider; does not claim a physical transport or VirtualBackend.
+    Test = 6,
 }
 
 /// Feature bits from the 10-byte (80-bit) feature set (T/XS 10003-2025 Table 9).

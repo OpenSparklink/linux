@@ -317,6 +317,8 @@ enum sparklink_dli_bus {
 	SPARKLINK_BUS_SDIO		= 3,
 	SPARKLINK_BUS_USB		= 4,
 	SPARKLINK_BUS_MMIO		= 5,
+	/* Test provenance, not physical hardware or a qualified VirtualBackend. */
+	SPARKLINK_BUS_TEST		= 6,
 };
 
 /* ---------------------------------------------------------------------------

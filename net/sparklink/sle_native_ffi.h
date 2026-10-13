@@ -5,6 +5,7 @@
 #include <linux/sparklink_native.h>
 
 struct sparklink_native_transport;
+u32 sparklink_native_transport_bus(const struct sparklink_native_transport *transport);
 
 int sparklink_native_register_rust(const struct sparklink_native_info *info,
 				   struct sparklink_native_transport *transport,

@@ -77,6 +77,7 @@ extern "C" {
         transport: *mut c_void, request: *const NativeDiscoveryRequest,
         plan: *mut NativeDiscoveryPlan,
     ) -> i32;
+    fn sparklink_native_transport_bus(transport: *const c_void) -> u32;
     fn sparklink_native_transport_free(transport: *mut c_void);
     fn sparklink_native_transport_get(transport: *mut c_void);
     fn sparklink_native_transport_open(transport: *mut c_void, id: u16, generation: u64) -> i32;
@@ -100,6 +101,7 @@ pub(crate) struct NativeController {
     transport: *mut c_void,
     identity: DeviceIdentity,
     metadata: NativeInfo,
+    bus: SleBus,
     opened: AtomicBool,
 }
 
@@ -304,12 +306,23 @@ impl NativeCommandTransport {
     }
 }
 
+/// Backend descriptor IDs are internal and differ from public bus values.
+/// Reject unknown provenance instead of projecting it onto a physical bus.
+fn backend_bus(bus: u32) -> Result<SleBus> {
+    match bus {
+        1 => Ok(SleBus::Usb),
+        2 => Ok(SleBus::Test),
+        _ => Err(Error::from_errno(UNSUPPORTED)),
+    }
+}
+
 impl SleController for NativeController {
     fn info(&self) -> SleControllerInfo {
         let mut name = [0; 32];
-        name[..11].copy_from_slice(b"ws73-native");
+        let label: &[u8] = if self.bus == SleBus::Test { b"sparklink-test" } else { b"ws73-native" };
+        name[..label.len()].copy_from_slice(label);
         SleControllerInfo {
-            name, bus: SleBus::Usb, addr: self.metadata.address,
+            name, bus: self.bus, addr: self.metadata.address,
             // Legacy projection only; the retained tuple contains all 5 bytes.
             fw_version: u32::from_le_bytes(self.metadata.version[..4].try_into().unwrap()),
             features: u64::from_le_bytes(self.metadata.features[..8].try_into().unwrap()),
@@ -360,9 +373,12 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
     let metadata = unsafe { *info };
     let mut controller = NativeController {
         transport, metadata, identity: DeviceIdentity { id: u16::MAX, generation: 0 },
-        opened: AtomicBool::new(false),
+        bus: SleBus::None, opened: AtomicBool::new(false),
     };
     let result = (|| -> Result {
+        // SAFETY: this controller owns the retained transport; provenance is
+        // copied before get/register callbacks and immutable for its lifetime.
+        controller.bus = backend_bus(unsafe { sparklink_native_transport_bus(transport) })?;
         if metadata.profile != 1 { return Err(Error::from_errno(UNSUPPORTED)); }
         if metadata.address == [0; 6] || metadata.address == [255; 6]
             || metadata.acb_length > 2047 || metadata.icb_length > 2047

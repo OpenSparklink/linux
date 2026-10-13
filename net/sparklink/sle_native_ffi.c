@@ -72,6 +72,8 @@ static_assert(offsetof(struct sparklink_discovery_scan_params, filter_duplicates
 
 /* The copied operations and retained context outlive the Rust Backend. */
 struct sparklink_native_transport {
+	/* Immutable validated provider provenance; independent of wire dialect. */
+	u32 bus;
 	refcount_t references;
 	struct sparklink_native_ops ops;
 	void *context;
@@ -108,6 +110,7 @@ int sparklink_backend_register(const struct sparklink_backend_descriptor *descri
 		kfree(transport);
 		return -ENODEV;
 	}
+	transport->bus = snapshot.bus;
 	transport->ops = operations;
 	refcount_set(&transport->references, 1);
 	transport->context = snapshot.context;
@@ -116,6 +119,11 @@ int sparklink_backend_register(const struct sparklink_backend_descriptor *descri
 	return sparklink_native_register_rust(&snapshot.info, transport, identity);
 }
 EXPORT_SYMBOL_GPL(sparklink_backend_register);
+
+u32 sparklink_native_transport_bus(const struct sparklink_native_transport *transport)
+{
+	return transport->bus;
+}
 
 void sparklink_native_transport_get(struct sparklink_native_transport *transport)
 {
