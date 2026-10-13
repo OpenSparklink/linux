@@ -143,6 +143,8 @@ static int virtual_send(void *context, u16 opcode, const u8 *params, size_t leng
 	}
 out:
 	mutex_unlock(&v->lock);
+    sparklink_native_snoop_tx(v->identity.id, v->identity.generation, opcode,
+                             params ? params : (const u8 *)"", length, ret);
 	return ret;
 }
 

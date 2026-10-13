@@ -25,7 +25,7 @@ impl SnoopLog {
         // SAFETY: CLOCK_BOOTTIME may be read in USB completion context.
         record.timestamp_ns=unsafe { kernel::bindings::ktime_get_boottime() } as u64;
         record.lost=0; record.profile=profile; record.original_length=length.min(u32::MAX as usize) as u32;
-        record.status=status; record.dev_index=identity.id; record.direction=direction; record.format=1;
+        record.status=status; record.dev_index=identity.id; record.direction=direction; record.format=if profile==0 {2} else {1};
         record.captured_length=length.min(SNOOP_PAYLOAD_MAX) as u16;
         record.flags=if length>SNOOP_PAYLOAD_MAX {SNOOP_TRUNCATED} else {0};
         record.reserved=0; record.payload.fill(0);
@@ -38,12 +38,14 @@ impl SnoopLog {
     }
     /// These bytes are the same WS73 A1 framing encoded by the driver's wire
     /// codec. status is the actual blocking transport result, not DLI status.
-    pub(crate) fn tx(&mut self, identity:DeviceIdentity, profile:u32, opcode:u16, params:&[u8], status:i32) {
-        if let Some(record)=self.prepare(identity,profile,2,status,params.len()+5) {
-            record.payload[0]=0xa1; record.payload[1..3].copy_from_slice(&opcode.to_le_bytes());
-            record.payload[3..5].copy_from_slice(&(params.len() as u16).to_le_bytes());
-            let n=(record.captured_length as usize).saturating_sub(5);
-            record.payload[5..5+n].copy_from_slice(&params[..n]);
+    pub(crate) fn tx(&mut self, identity: DeviceIdentity, profile:u32, opcode:u16, params:&[u8], status:i32) {
+        let header = if profile == 0 {4} else {5};
+        if let Some(record)=self.prepare(identity,profile,2,status,params.len()+header) {
+            let offset = if profile == 0 {0} else {record.payload[0]=0xa1; 1};
+            record.payload[offset..offset+2].copy_from_slice(&opcode.to_le_bytes());
+            record.payload[offset+2..offset+4].copy_from_slice(&(params.len() as u16).to_le_bytes());
+            let n=(record.captured_length as usize).saturating_sub(header);
+            record.payload[header..header+n].copy_from_slice(&params[..n]);
         }
     }
     pub(crate) fn next_after(&self, after:u64) -> Option<SleSnoopRecord> {

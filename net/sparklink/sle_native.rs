@@ -504,12 +504,13 @@ pub(crate) extern "C" fn sparklink_native_health_rust(id: u16, generation: u64) 
     }
 }
 
-/// Callback receives a validated HCC slot, not a complete USB aggregate.
+/// Callback receives a complete standard event packet or WS73 HCC slot;
+/// attribution comes from the immutable registration, not packet bytes.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_snoop_rx_rust(id:u16, generation:u64, data:*const u8, length:usize) {
     if data.is_null() || length==0 || length>20*1024 { return; }
     let Some(owner)=super::sle_ingress::ingress_owner(DeviceIdentity {id,generation}) else { return; };
-    if owner.protocol_profile!=1 { return; }
+    if owner.protocol_profile>1 { return; }
     // SAFETY: driver retains its validated HCC slot until the callback returns.
     let data=unsafe {core::slice::from_raw_parts(data,length)};
     let gate=owner.schedule_gate.lock();
@@ -522,7 +523,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_snoop_rx_rust(id:u16, generatio
 pub(crate) unsafe extern "C" fn sparklink_native_snoop_tx_rust(id:u16, generation:u64, opcode:u16, params:*const u8, length:usize, status:i32) {
     if params.is_null() || length>u16::MAX as usize {return;}
     let Some(owner)=super::sle_ingress::ingress_owner(DeviceIdentity {id,generation}) else {return;};
-    if owner.protocol_profile!=1 {return;}
+    if owner.protocol_profile>1 || (owner.protocol_profile==0 && length>u16::MAX as usize-4) {return;}
     // SAFETY: driver retains the command parameter buffer for this callback.
     let params=unsafe {core::slice::from_raw_parts(params,length)};
     let gate=owner.schedule_gate.lock();
@@ -531,7 +532,8 @@ pub(crate) unsafe extern "C" fn sparklink_native_snoop_tx_rust(id:u16, generatio
     drop(gate); owner.snoop_poll.notify_all();
 }
 
-/// Callback receives a validated HCC slot, not a complete USB aggregate.
+/// Callback receives a complete standard event packet or WS73 HCC slot;
+/// attribution comes from the immutable registration, not packet bytes.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_event_rust(
     id: u16, generation: u64, profile: u32, event_code: u16, params: *const u8, length: usize,
@@ -592,7 +594,8 @@ unsafe fn publish_native_event(
     NativeController::result_to_errno(result)
 }
 
-/// Callback receives a validated HCC slot, not a complete USB aggregate.
+/// Callback receives a complete standard event packet or WS73 HCC slot;
+/// attribution comes from the immutable registration, not packet bytes.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
     id: u16, generation: u64, data: *const u8, length: usize,

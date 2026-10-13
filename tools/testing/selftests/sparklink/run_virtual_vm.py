@@ -111,6 +111,7 @@ busybox poweroff -f
         record.update(qemu_exit=result.returncode, console_sha256=sha(out / 'console.log'))
         if (result.returncode or log.count('VIRTUAL_RUNTIME_PASS:') != 2
                 or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
+                or log.count('VIRTUAL_STANDARD_SNOOP_PASS:') != 2
                 or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
                 or log.count('PROTOCOL_STATE_REFUSAL_PASS:') != 4
                 or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
@@ -124,7 +125,8 @@ busybox poweroff -f
         if any(sha(path) != record['inputs'][name]
                for name, path in paths.items() if path.is_file()):
             raise RuntimeError('input changed during VM')
-        record.update(status='PASS_VIRTUAL_CORE_HOST_VM', module_rounds=2,
+        record.update(status='PASS_VIRTUAL_CORE_HOST_VM',
+                      standard_snoop_results=[line for line in log.splitlines() if 'VIRTUAL_STANDARD_SNOOP_PASS:' in line], module_rounds=2,
                       registry_results=[line for line in log.splitlines() if 'GENL_REGISTRY_PASS:' in line],
                       protocol_state_results=[line for line in log.splitlines() if 'PROTOCOL_STATE_REFUSAL_PASS:' in line],
                       power_results=[line for line in log.splitlines() if 'VIRTUAL_POWER_' in line or 'VIRTUAL_GLOBAL_POWER_' in line],

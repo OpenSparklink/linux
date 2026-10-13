@@ -1094,6 +1094,7 @@ struct sle_management_query {
 #define SLE_SNOOP_RX 1U
 #define SLE_SNOOP_TX 2U
 #define SLE_SNOOP_WS73_DLI 1U
+#define SLE_SNOOP_STANDARD_DLI 2U
 #define SLE_SNOOP_TRUNCATED 1U
 struct sle_snoop_record {
     __aligned_u64 seq, generation, timestamp_ns, lost;

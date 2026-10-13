@@ -121,6 +121,50 @@ static void query(struct controller c, uint16_t opcode, unsigned int length)
 	query_count++;
 }
 
+static void standard_snoop(struct controller c, struct controller peer)
+{
+    int fds[2] = {open("/dev/sparklink",O_RDWR),open("/dev/sparklink",O_RDWR)};
+    struct sle_snoop_query q[2] = {{.version=1,.generation=c.status.generation},{.version=1,.generation=c.status.generation}};
+    int16_t id=c.status.id;
+    for(unsigned i=0;i<2;i++) {
+        CHECK(fds[i]>=0 && !ioctl(fds[i],SL_IOCTL_DEV_SELECT,&id));
+        struct sle_snoop_query invalid=q[i], before;
+        invalid.flags=1;before=invalid;errno=0;
+        CHECK(ioctl(fds[i],SL_IOCTL_SNOOP_GET,&invalid)==-1 && errno==EINVAL && !memcmp(&invalid,&before,sizeof(invalid)));
+        invalid=q[i];invalid.reserved=1;before=invalid;errno=0;
+        CHECK(ioctl(fds[i],SL_IOCTL_SNOOP_GET,&invalid)==-1 && errno==EINVAL && !memcmp(&invalid,&before,sizeof(invalid)));
+        errno=0;CHECK(ioctl(fds[i],SL_IOCTL_SNOOP_GET,&q[i])==-1 && errno==EAGAIN);
+    }
+    config(c,20,0,0);query(c,0x0402,6);
+    unsigned directions[2]={0,0};
+    for(unsigned n=0;n<2;n++) {
+        for(unsigned i=0;i<2;i++) {
+            CHECK(!ioctl(fds[i],SL_IOCTL_SNOOP_GET,&q[i]));
+            struct sle_snoop_record *s=&q[i].record;
+            CHECK(s->profile==0 && s->format==2 && s->generation==c.status.generation && s->dev_index==c.status.id && !s->lost && !s->status && !s->flags);
+            CHECK(s->direction==1 || s->direction==2);
+            CHECK(!(directions[i] & (1U<<s->direction))); directions[i]|=1U<<s->direction;
+            if(s->direction==2)CHECK(s->captured_length==4 && !memcmp(s->payload,(uint8_t[4]){2,4,0,0},4));
+            else CHECK(s->captured_length==14 && !memcmp(s->payload,(uint8_t[14]){2,0,10,0,2,4,1,0},14));
+        }
+        CHECK(!memcmp(&q[0].record,&q[1].record,sizeof(q[0].record)));
+        for(unsigned i=0;i<2;i++)q[i].after_seq=q[i].record.seq;
+    }
+    CHECK(directions[0]==6 && directions[1]==6);
+    fflush(NULL);pid_t child=fork();CHECK(child>=0);
+    if(!child) {
+        CHECK(!setgroups(0,NULL) && !setgid(1000) && !setuid(1000));
+        struct sle_snoop_query before=q[0];errno=0;
+        CHECK(ioctl(fds[0],SL_IOCTL_SNOOP_GET,&q[0])==-1 && errno==EPERM && !memcmp(&before,&q[0],sizeof(before)));
+        struct pollfd p={.fd=fds[0],.events=POLLIN};CHECK(poll(&p,1,0)==1 && (p.revents&POLLERR));
+        _exit(0);
+    }
+    int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    query(peer,0x0406,6);
+    CHECK(!close(fds[0]) && !close(fds[1]));
+    printf("VIRTUAL_STANDARD_SNOOP_PASS: readers=2 exact_tx_rx=1 independent=1 flags_reserved=EINVAL inherited_CAP=EPERM peer_query=1 no_rf=1\n");
+}
+
 static void pending(struct controller c)
 {
 	double deadline = now() + 2;
@@ -289,6 +333,7 @@ int main(void)
 		int result = registry_probe(2); fflush(stdout); _exit(result);
 	}
 	int status; CHECK(waitpid(observer, &status, 0) == observer && WIFEXITED(status) && !WEXITSTATUS(status));
+	standard_snoop(a,b);
 	config(a, 20, 0, 0);
 	const uint16_t queries[] = { 0x0401, 0x0402, 0x0403, 0x0404, 0x0406 };
 	const unsigned int lengths[] = { 2, 6, 10, 5, 6 };

@@ -44,6 +44,11 @@ pub(crate) extern "C" fn sparklink_standard_receive_rust(
     // SAFETY: C's registered event URB retains the immutable owner and supplies
     // its live transfer buffer with USB-core-validated actual_length.
     let slice = unsafe { core::slice::from_raw_parts(data, len) };
+    // Independent privileged trace precedes schema parsing; neither malformed
+    // packets nor a slow reader may consume or complete a Host transaction.
+    unsafe { super::sle_native::sparklink_native_snoop_rx_rust(
+        identity.id, identity.generation, data, len) };
+
 
     // Try to parse as a DLI event packet
     match parse_event_packet(slice) {

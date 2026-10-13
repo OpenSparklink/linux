@@ -1503,9 +1503,10 @@ fn ioctl_controller_event_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, 
 fn ioctl_snoop_get(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
     let mut query: SleSnoopQuery = read_user_struct(arg)?;
     if query.version != SNOOP_VERSION { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if query.flags != 0 || query.reserved != 0 { return Err(EINVAL); }
     let owner = context.owner.as_ref().ok_or(ENODEV)?;
     if me.target.lock().as_ref().map(|target| target.identity) != Some(owner.identity) || query.generation == 0 { return Err(EINVAL); }
-    if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if owner.protocol_profile > 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if me.controller_subscription.lock().is_some() { return Err(EBUSY); }
     let gate=owner.schedule_gate.lock();
     if *gate { return Err(ENODEV); }
