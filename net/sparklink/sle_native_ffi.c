@@ -89,14 +89,18 @@ int sparklink_backend_register(const struct sparklink_backend_descriptor *descri
 
 	if (!descriptor || !identity)
 		return -EINVAL;
+	/* Reject a different layout before copying its tail or following ops. */
+	if (descriptor->version != SPARKLINK_BACKEND_VERSION ||
+	    descriptor->size != sizeof(*descriptor))
+		return -EOPNOTSUPP;
 	snapshot = *descriptor;
-	if (snapshot.ops) {
-		operations = *snapshot.ops;
-		snapshot.ops = &operations;
-	}
 	ret = sparklink_backend_validate(&snapshot);
 	if (ret)
 		return ret;
+	/* Provider owns immutable descriptor/ops for this entire call. The
+	 * validator rejects unsupported provenance before dereferencing ops.
+	 */
+	operations = *snapshot.ops;
 	transport = kmalloc_obj(*transport);
 	if (!transport)
 		return -ENOMEM;
