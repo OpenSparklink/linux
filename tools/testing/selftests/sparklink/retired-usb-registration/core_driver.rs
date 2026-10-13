@@ -1,3 +1,4 @@
+// Retired Core-owned USB driver sourcea368cf5f1784; tests only.
 // SPDX-License-Identifier: GPL-2.0
 
 //! SparkLink USB transport for SLE DLI controllers.

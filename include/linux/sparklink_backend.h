@@ -85,4 +85,11 @@ int sparklink_backend_pending_query(u16 id, u64 generation, struct sparklink_bac
  * reached: caller must re-query validity before keeping a diagnostic record. */
 void sparklink_backend_cancel(u16 id, u64 generation);
 
+/* Standard DLI attributed packet ingress, not a transport pointer or user ABI.
+ * lane1=event; unqualified lane2=data is rejected. Caller retains the live span
+ * and original identity until return; close joins its callbacks. No Ready claim.
+ */
+void sparklink_backend_standard_receive(u32 id, u64 generation, const u8 *data,
+                                       int length, u8 lane, int status);
+
 #endif

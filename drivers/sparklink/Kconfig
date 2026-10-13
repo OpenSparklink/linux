@@ -11,6 +11,16 @@ menuconfig SPARKLINK_DRIVERS
 
 if SPARKLINK_DRIVERS
 
+config SPARKLINK_STANDARD_USB
+	tristate "Standard SparkLink DLI USB query provider (experimental)"
+	depends on USB
+	help
+	  Bind standard E0/01/05 DLI device/interface descriptors. EP0 commands
+	  and interrupt events use the common per-controller Backend lifecycle.
+	  Query-only: standard typed policy/data and PM remain unqualified.
+	  Firmware/boot-ROM protocols belong to matched vendor drivers.
+	  The module is called sparklink_standard_usb. No test device is created.
+
 config SPARKLINK_WS73_USB
 	tristate "HiSilicon WS73 USB firmware and BSLE transport (experimental)"
 	depends on USB

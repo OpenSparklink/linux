@@ -4,9 +4,7 @@ menuconfig SPARKLINK
 	bool "SparkLink (NearLink) subsystem support"
 	depends on RUST
 	depends on NET
-	depends on USB=y
 	select CONFIGFS_FS
-	select RUST_FW_LOADER_ABSTRACTIONS
 	select CRYPTO
 	select CRYPTO_SM3_GENERIC
 	select CRYPTO_SM4_GENERIC

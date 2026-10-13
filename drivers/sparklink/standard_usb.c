@@ -3,7 +3,7 @@
  * SparkLink USB transport FFI helpers.
  *
  * Provides thin C wrappers around the kernel USB URB API for consumption
- * by the Rust sle_usb module. The wrappers handle the unsafe parts of
+ * by the standard driver and common Backend provider. The wrappers handle the unsafe parts of
  * URB lifecycle management (allocation, fill, submit, complete) and
  * expose a minimal, type-safe surface to Rust.
  *
@@ -30,7 +30,7 @@
  *   length   — actual number of bytes transferred
  *   status   — URB completion status (0 = success, negative = error)
  */
-extern void sparklink_usb_registered_complete(u32 dev_id, u64 generation,
+extern void sparklink_backend_standard_receive(u32 dev_id, u64 generation,
 					      const u8 *data, int length, u8 lane,
 					      int status);
 
@@ -65,7 +65,7 @@ struct sle_urb_ctx {
 static void sle_usb_receive_complete(struct sle_urb_ctx *ctx, struct urb *urb, u8 lane)
 {
 	/* All live RX URBs belong to a registered immutable identity. */
-	sparklink_usb_registered_complete(ctx->registration_id,
+	sparklink_backend_standard_receive(ctx->registration_id,
 					  ctx->registration_generation,
 					  ctx->buf, urb->actual_length, lane,
 					  urb->status);
@@ -1061,3 +1061,86 @@ int sle_usb_dev_install_provider(struct sle_usb_dev *d)
 	/* Never follow a malformed callback result into another owner's cleanup. */
 	return output.id == reserved.id && output.generation == reserved.generation ? 0 : -EPROTO;
 }
+
+/* Hardware binding is driver-owned. Probe reserves before I/O, then installs
+ * through common provider adoption. Errors retire only the original identity.
+ */
+static int sparklink_standard_usb_probe(struct usb_interface *interface,
+                                        const struct usb_device_id *match)
+{
+    struct sparklink_native_identity identity;
+    struct sle_usb_dev *context = NULL;
+    int ret;
+
+    (void)match;
+    ret = sparklink_backend_reserve(SPARKLINK_BACKEND_USB,
+                                    SPARKLINK_NATIVE_STANDARD_DLI, &identity);
+    if (ret)
+        return ret;
+    ret = sle_usb_dev_register(identity.id, interface, identity.generation, &context);
+    if (!ret)
+        ret = sle_usb_dev_init_controller(context);
+    if (!ret)
+        ret = sle_usb_dev_install_provider(context);
+    if (ret) {
+        /* Defensively retire the original Core identity even if install reached
+         * an unexpected callback result. Core joins while USB resources live.
+         */
+        sparklink_native_unregister(identity.id, identity.generation);
+        /* Failed common open already unregisters installed ownership. Pure
+         * pending failures remain cancellable; never remove another generation.
+         */
+        if (context) {
+            sle_usb_dev_unregister(context);
+            sle_usb_dev_put(context);
+        }
+        sparklink_backend_cancel(identity.id, identity.generation);
+        return ret < 0 ? ret : -EIO;
+    }
+    usb_set_intfdata(interface, context);
+    return 0;
+}
+
+static void sparklink_standard_usb_disconnect(struct usb_interface *interface)
+{
+    struct sle_usb_dev *context = usb_get_intfdata(interface);
+
+    usb_set_intfdata(interface, NULL);
+    if (!context)
+        return;
+    /* Core closes admission, joins workers/open and calls provider close while
+     * the driver owns this live reference. Only then retire/free USB resources.
+     */
+    sparklink_native_unregister(context->id, context->generation);
+    sle_usb_dev_unregister(context);
+    sle_usb_dev_put(context);
+}
+
+static int sparklink_standard_usb_suspend(struct usb_interface *interface,
+                                          pm_message_t message)
+{
+    (void)interface;
+    (void)message;
+    /* No qualified Host/ticket/credit PM protocol. Refuse rather than suspend
+     * hardware behind a still-live connection lifetime or silently lose debt.
+     */
+    return -EBUSY;
+}
+
+static const struct usb_device_id sparklink_standard_usb_ids[] = {
+    { USB_DEVICE_INFO(0xe0, 0x01, 0x05) },
+    { USB_INTERFACE_INFO(0xe0, 0x01, 0x05) },
+    { }
+};
+MODULE_DEVICE_TABLE(usb, sparklink_standard_usb_ids);
+
+static struct usb_driver sparklink_standard_usb_driver = {
+    .name = "sparklink_standard_usb",
+    .probe = sparklink_standard_usb_probe,
+    .disconnect = sparklink_standard_usb_disconnect,
+    .suspend = sparklink_standard_usb_suspend,
+    .id_table = sparklink_standard_usb_ids,
+};
+module_usb_driver(sparklink_standard_usb_driver);
+MODULE_DESCRIPTION("Experimental SparkLink standard DLI USB query provider");
+MODULE_LICENSE("GPL");

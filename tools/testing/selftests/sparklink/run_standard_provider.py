@@ -12,7 +12,7 @@ import tempfile
 
 def run(output):
     here = Path(__file__).resolve().parent
-    source = here.parents[3]/'net/sparklink/sle_usb_ffi.c'
+    source = here.parents[3]/'drivers/sparklink/standard_usb.c'
     header = here.parents[3]/'include/linux/sparklink_usb.h'
     original = source.read_text()
     definitions = header.read_text()
@@ -20,7 +20,7 @@ def run(output):
     start = definitions.index('struct sle_usb_capabilities {')
     end = definitions.index('int sle_usb_dev_register(', start)
     fixture = fixture.replace('/* @@METADATA@@ */', definitions[start:end])
-    fixture = fixture.replace('/* @@ADAPTER@@ */', original[original.index('static void sle_usb_provider_get'):])
+    fixture = fixture.replace('/* @@ADAPTER@@ */', original[original.index('static void sle_usb_provider_get'):original.index('/* Hardware binding is driver-owned.')])
     with tempfile.TemporaryDirectory(prefix='sparklink-common-standard-provider-', dir=here) as temporary:
         path = Path(temporary)
         (path/'actual.c').write_text(fixture)

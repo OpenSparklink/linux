@@ -10,6 +10,7 @@ import re
 import subprocess
 import tempfile
 from run_connection_tx import function
+from usb_source_paths import source_path
 
 
 def block(text, start):
@@ -24,7 +25,7 @@ def block(text, start):
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3]/'net/sparklink'
-    inputs = {n: (net/n).read_text() for n in
+    inputs = {n: source_path(net,n).read_text() for n in
               ['sle_usb_ffi.c', 'sle_usb.rs', 'sle_dli.rs', 'sparklink_core.rs']}
     archived=here/'retired-serdev/sle_serdev.rs'
     serdev_source=archived.read_text()
@@ -53,7 +54,7 @@ def run(output):
     historic_attach = here/'retired-usb-registration/attach_metadata.rs'
     assembly = historic_attach.read_text()
     rust = rust.replace('// @@ATTACH_METADATA@@', assembly)
-    reserve = function(inputs['sparklink_core.rs'], 'reserve_usb_identity')
+    reserve = function((here/'retired-usb-registration/core_wrappers.rs').read_text(), 'reserve_usb_identity')
     metadata = reserve[reserve.index('    let mut info ='):reserve.index('    reserve_backend_identity(')]
     rust = rust.replace('// @@RESERVE_METADATA@@', metadata)
     with tempfile.TemporaryDirectory(prefix='sparklink-usb-discovery-') as tmp:
@@ -71,7 +72,7 @@ def run(output):
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test', '-D', 'warnings',
                         str(tmp/'fixture.rs'), '-o', str(tmp/'rust-test')], check=True)
         subprocess.run([str(tmp/'rust-test'), '--test-threads=1'], check=True)
-    assert all((net/n).read_text() == s for n, s in inputs.items())
+    assert all(source_path(net,n).read_text() == s for n, s in inputs.items())
     assert archived.read_text()==serdev_source
     record = {'status': 'GENERIC_USB_DESCRIPTOR_CAPABILITY_SOURCE_BOUNDARIES_PASS',
               'c_cases': c_record['c_cases'], 'rust_tests': 11,

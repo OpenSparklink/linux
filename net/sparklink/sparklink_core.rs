@@ -45,7 +45,7 @@ mod sle_power;
 mod sle_security;
 mod sle_snoop;
 mod sle_uapi;
-mod sle_usb;
+mod sle_standard_dli;
 mod sle_workers;
 
 use sle_dli::SleController;
@@ -690,15 +690,11 @@ pub(crate) fn runtime_snapshot() -> [Option<Arc<ControllerRuntime>>; sle_dev::SL
     core::array::from_fn(|id| ss.as_ref().and_then(|s| s.runtime(id as u16)))
 }
 
-pub(crate) fn runtime_by_id(id: u16) -> Option<Arc<ControllerRuntime>> {
-    SUBSYSTEM.lock().as_ref().and_then(|s| s.runtime(id))
-}
+
 
 /// Stop protocol operations and workers before the transport frees resources.
 /// The registry keeps the index reserved until the transport joins its URBs.
-pub(crate) fn sle_quiesce_device(identity: sle_dev::DeviceIdentity) {
-    if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) { owner.invalidate(); }
-}
+
 
 // ---------------------------------------------------------------------------
 // Transport device attach / detach (called from driver probe/remove)
@@ -706,9 +702,7 @@ pub(crate) fn sle_quiesce_device(identity: sle_dev::DeviceIdentity) {
 
 /// One reservation allocator for actual providers. Metadata may be unknown;
 /// registration reserves identity only, never Runtime/open/Ready.
-pub(crate) fn reserve_backend_identity(info: &sle_dli::SleControllerInfo) -> Result<sle_dev::DeviceIdentity> {
-    reserve_backend_identity_profile(info, 0)
-}
+
 
 pub(crate) fn reserve_backend_identity_profile(info: &sle_dli::SleControllerInfo, profile: u32) -> Result<sle_dev::DeviceIdentity> {
     let mut registry = SUBSYSTEM.lock();
@@ -838,13 +832,7 @@ pub(crate) fn install_backend_runtime(
 
 /// Reserve one exact identity before standard USB resources/bootstrap exist.
 /// Unknown address/capabilities stay zero; no Runtime or Ready is published.
-pub(crate) fn reserve_usb_identity() -> Result<sle_dev::DeviceIdentity> {
-    let mut info = sle_dli::SleControllerInfo::default();
-    let name = b"sparklink-usb";
-    info.name[..name.len()].copy_from_slice(name);
-    info.bus = sle_dli::SleBus::Usb;
-    reserve_backend_identity(&info)
-}
+
 
 /// Detach a device from the subsystem.
 ///
@@ -1039,17 +1027,9 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
 
 
 
-pub(crate) fn sle_suspend_device(identity: sle_dev::DeviceIdentity) {
-    if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) {
-        if let Some(state) = Option::as_mut(&mut *owner.state.lock()) { let _ = state.power.suspend(); }
-    }
-}
 
-pub(crate) fn sle_resume_device(identity: sle_dev::DeviceIdentity) {
-    if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) {
-        if let Some(state) = Option::as_mut(&mut *owner.state.lock()) { state.power.resume(); }
-    }
-}
+
+
 
 
 // ---------------------------------------------------------------------------
@@ -1128,8 +1108,6 @@ struct SparkLinkModule {
     _genl: genl_bridge::GenlGuard,
     #[pin]
     _configfs: configfs::Subsystem<sle_configfs::SparkLinkConfig>,
-    #[pin]
-    _usb: sle_usb::UsbRegistration,
     /// Dropped LAST — after _miscdev closes all fds.
     _subsystem_guard: SubsystemGuard,
 }
@@ -1146,7 +1124,7 @@ fn init_build_string() -> Result<CString> {
 
 #[inline(never)]
 fn init_subsys_string() -> Result<CString> {
-    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_usb: USB transport\nsparklink_genl: C Generic Netlink bridge"))
+    CString::try_from_fmt(fmt!("sle_pdu: frame codec\nsle_adv: advertising/scanning\nsle_conn: connection management\nsle_crypto: SM3/SM4 crypto\nsle_security: pairing/encryption\nsle_power: power management\nsle_event: async event notification\nsle_dli: driver layer interface\nsle_standard_dli: standard DLI codec\nsparklink_genl: C Generic Netlink bridge"))
 }
 
 #[inline(never)]
@@ -1354,7 +1332,6 @@ impl kernel::InPlaceModule for SparkLinkModule {
                 )
             },
             _subsystem_guard: init_subsystem()?,
-            _usb <- sle_usb::UsbRegistration::new(c"sparklink_usb", _module),
         })
     }
 }
@@ -3609,7 +3586,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             write_user_struct(arg, &stats)?;
             Ok(0)
         }
-        SL_IOCTL_USB_DEV_COUNT => Ok(sle_usb::usb_device_count() as isize),
+        SL_IOCTL_USB_DEV_COUNT => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
         // No authenticated PHY transaction or confirmed hardware snapshot is
         // implemented. Local models must not impersonate controller state.
         SL_IOCTL_PHY_INFO

@@ -5,6 +5,8 @@
 #include <linux/sparklink_native.h>
 
 struct sparklink_native_transport;
+void sparklink_standard_receive_rust(u32 id, u64 generation, const u8 *data,
+                                    int length, u8 lane, int status);
 struct sparklink_backend_pending;
 u32 sparklink_native_transport_bus(const struct sparklink_native_transport *transport);
 

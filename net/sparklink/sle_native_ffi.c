@@ -363,3 +363,13 @@ int sparklink_native_session_admit(u16 id, u64 generation, u64 lifetime, u16 han
 {
     return sparklink_native_session_admit_rust(id, generation, lifetime, handle, epoch, admit, context);
 }
+
+/* Caller owns the live packet span; only the attributed standard profile accepts
+ * it. Core copies/decodes before return. Endpoint/transport owns I/O and joins.
+ */
+void sparklink_backend_standard_receive(u32 id, u64 generation, const u8 *data,
+                                       int length, u8 lane, int status)
+{
+    sparklink_standard_receive_rust(id, generation, data, length, lane, status);
+}
+EXPORT_SYMBOL_GPL(sparklink_backend_standard_receive);

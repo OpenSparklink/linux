@@ -14,13 +14,15 @@ from run_connection_tx import function
 
 def run(output):
     here = Path(__file__).resolve().parent
-    source = here.parents[3]/'net/sparklink/sle_usb_ffi.c'
+    source = here.parents[3]/'drivers/sparklink/standard_usb.c'
     original = source.read_text()
-    rust_source=source.with_name('sle_usb.rs');rust_original=rust_source.read_text()
+    rust_source=here.parents[3]/'net/sparklink/sle_standard_dli.rs';rust_original=rust_source.read_text()
     rust=(here/'usb_binding_prepare_fixture.rs').read_text()
-    for marker,name in [('INIT','initialize_usb_controller'),('PREPARE','prepare_usb_controller'),('RX','sparklink_usb_registered_complete')]:rust=rust.replace('// @@'+marker+'@@',function(rust_original.replace('pub(crate) extern "C" fn sparklink_usb_registered_complete','fn sparklink_usb_registered_complete'),name).replace('super::sle_dev::','crate::sle_dev::'))
-    assert 'load_usb_firmware' not in rust_original and not source.with_name('sle_fw.rs').exists()
-    assert 'mod sle_fw;' not in source.with_name('sparklink_core.rs').read_text()
+    archived=(here/'retired-usb-registration/core_driver.rs').read_text()
+    for marker,name in [('INIT','initialize_usb_controller'),('PREPARE','prepare_usb_controller')]:rust=rust.replace('// @@'+marker+'@@',function(archived,name))
+    rust=rust.replace('// @@RX@@',function(rust_original.replace('pub(crate) extern "C" fn sparklink_standard_receive_rust','fn sparklink_standard_receive_rust'),'sparklink_standard_receive_rust').replace('super::sle_dev::','crate::sle_dev::'))
+    assert 'load_usb_firmware' not in rust_original and not (here.parents[3]/'net/sparklink/sle_fw.rs').exists()
+    assert 'mod sle_fw;' not in (here.parents[3]/'net/sparklink/sparklink_core.rs').read_text()
     fixture = (here/'usb_binding_fixture.c').read_text()
     defines = '\n'.join(re.search(r'(?m)^#define '+name+r' .+$', original).group() for name in ['SLE_CMD_TIMEOUT_MS', 'SLE_INIT_TIMEOUT_MS'])
     fixture = fixture.replace('/* @@DEFINES@@ */', defines)
@@ -37,7 +39,7 @@ def run(output):
     assert '8 passed; 0 failed' in log and rust_source.read_text()==rust_original
     data = json.loads(result)
     assert data['cases'] == 25 and source.read_text() == original
-    record = dict(status=data['status'], cases=data['cases'],rust_tests=8,rust_sha256=hashlib.sha256(rust_original.encode()).hexdigest(), source_sha256=hashlib.sha256(original.encode()).hexdigest(), scope='Actual EP0 writer/control setup/four-byte framing/interrupt bootstrap read/unsupported data stub, and Rust prepare/endpoint lane callback; decoder/ingress ownership are controlled fixture dependencies, not protocol/lifetime proof; USB, allocation and retained active context dependencies controlled. Includes u16 wLength boundary and uncertain/short transfers. No hardware, class discovery, async listener, lifetime, Ready or firmware proof.', physical_acceptance=False)
+    record = dict(status=data['status'], cases=data['cases'],rust_tests=8,rust_sha256=hashlib.sha256(rust_original.encode()).hexdigest(), source_sha256=hashlib.sha256(original.encode()).hexdigest(), scope='Actual EP0 writer/control setup/four-byte framing/interrupt bootstrap read/unsupported data stub, and current attributed DLI lane callback with retired prepare history; decoder/ingress ownership are controlled fixture dependencies, not protocol/lifetime proof; USB, allocation and retained active context dependencies controlled. Includes u16 wLength boundary and uncertain/short transfers. No hardware, class discovery, async listener, lifetime, Ready or firmware proof.', physical_acceptance=False)
     if output:
         output.write_text(json.dumps(record, indent=2)+'\n')
     print(json.dumps(record, indent=2))

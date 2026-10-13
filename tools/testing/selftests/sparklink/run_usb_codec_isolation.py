@@ -15,7 +15,7 @@ from run_usb_discovery import block
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
-    live = (net/'sle_usb.rs').read_text()
+    live = (net/'sle_standard_dli.rs').read_text()
     archive = (here/'retired-usb-registration/legacy_usb_codec.rs').read_text()
     fixture = (here/'retired-usb-registration/codec_fixture.rs').read_text()
     fixture = fixture.replace('// @@ARCHIVE@@', archive)
@@ -27,7 +27,7 @@ def run(output):
         exe = Path(tmp)/'test'
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test', '-D', 'warnings', str(source), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
-    assert live == (net/'sle_usb.rs').read_text()
+    assert live == (net/'sle_standard_dli.rs').read_text()
     record = dict(status='LIVE_USB_PARSER_AND_HISTORICAL_CODEC_WITNESSES_PASS',
                   live_parser_tests=4, historical_witnesses=3,
                   sources={'sle_usb.rs': hashlib.sha256(live.encode()).hexdigest(),
