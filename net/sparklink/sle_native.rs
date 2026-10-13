@@ -452,11 +452,12 @@ pub(crate) extern "C" fn sparklink_native_health_rust(id: u16, generation: u64) 
     let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else {
         return ENODEV.to_errno();
     };
+    // Observers follow the same Host -> gate order as RX/data admission.
+    let host = owner.host.lock();
     let gate = owner.schedule_gate.lock();
     if *gate {
         return ENODEV.to_errno();
     }
-    let host = owner.host.lock();
     let (_, ready, fault) = host.controller_status();
     if let Some(error) = fault {
         return error.to_errno();

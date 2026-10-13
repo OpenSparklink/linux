@@ -11,6 +11,9 @@ use std::ops::{Deref,DerefMut};
 thread_local!{static HELD:RefCell<Vec<u8>>=const{RefCell::new(Vec::new())};}
 type Result = std::result::Result<(), i32>;
 const EINVAL:i32=-22;const ENODEV:i32=-19;const EBUSY:i32=-16;
+trait Errno{fn to_errno(&self)->i32;}impl Errno for i32{fn to_errno(&self)->i32{*self}}
+use sle_dev::DeviceIdentity;
+struct Fault(i32);impl Fault{fn to_errno(&self)->i32{self.0}}
 struct Lock<T>{inner:Mutex<T>,rank:u8}
 struct Guard<'a,T>{inner:MutexGuard<'a,T>,rank:u8}
 impl<T> Deref for Guard<'_,T>{type Target=T;fn deref(&self)->&T{&self.inner}}
@@ -27,20 +30,21 @@ mod sle_dev {
 #[derive(Debug,PartialEq,Eq)] enum SleOpcode{ReadMacAddr}
 #[derive(Debug,PartialEq,Eq)] enum SleEvent{Packet(u32),CommandComplete{opcode:SleOpcode},NativeCommandReply{}}
 mod sle_command_plan{#[derive(Clone,Copy,Debug,Eq,PartialEq)] pub enum DiscoveryIntent{Advertising(bool),Scanning(bool)} pub struct RecipePart<'a>{pub opcode:u16,pub params:&'a[u8]}}
-struct Host{reserved:bool,fail:bool,received:u32,queued:u32}
-impl Host{fn receive(&mut self,event:SleEvent)->Option<SleEvent>{self.received+=1;if self.reserved{None}else{Some(event)}}
+struct Host{reserved:bool,fail:bool,received:u32,queued:u32,ready:bool,radio:(u8,u8),fault:Option<Fault>}
+impl Host{fn controller_status(&self)->((),bool,Option<&Fault>){((),self.ready,self.fault.as_ref())}fn discovery_radio(&self)->(u8,u8,()){(self.radio.0,self.radio.1,())}fn receive(&mut self,event:SleEvent)->Option<SleEvent>{self.received+=1;if self.reserved{None}else{Some(event)}}
  fn enqueue(&mut self,opcode:u16,params:&[u8],seq:u32)->Result{assert_eq!(seq,0);assert_ne!(opcode,0);assert!(!params.is_empty());if self.fail{Err(EBUSY)}else{self.queued+=1;Ok(())}}
  fn enqueue_recipe(&mut self,intent:sle_command_plan::DiscoveryIntent,parts:&[sle_command_plan::RecipePart<'_>])->Result{assert!(matches!(intent,sle_command_plan::DiscoveryIntent::Advertising(true)|sle_command_plan::DiscoveryIntent::Scanning(true)));assert_eq!(parts.len(),1);self.enqueue(parts[0].opcode,parts[0].params,0)}}
 struct Queue{dropped:u32,entries:VecDeque<(Option<u16>,SleEvent)>}
 impl Queue{fn push_tagged(&mut self,id:Option<u16>,event:SleEvent)->bool{self.entries.push_back((id,event));true}fn pop_tagged(&mut self)->Option<(Option<u16>,SleEvent)>{self.entries.pop_front()}}
 struct ControllerRuntime{identity:sle_dev::DeviceIdentity,schedule_gate:Lock<bool>,host:Lock<Host>,scheduled:AtomicU32,kicked:AtomicU32,ingress:Lock<Queue>,dropped_commands:AtomicU32,dropped_mac:AtomicU32,dropped_decode:AtomicU32}
-fn owner(id:u16,generation:u64)->Arc<ControllerRuntime>{Arc::new(ControllerRuntime{identity:sle_dev::DeviceIdentity{id,generation},schedule_gate:Lock::rank(false,30),host:Lock::rank(Host{reserved:false,fail:false,received:0,queued:0},10),scheduled:AtomicU32::new(0),kicked:AtomicU32::new(0),ingress:Lock::new(Queue{dropped:0,entries:VecDeque::new()}),dropped_commands:AtomicU32::new(0),dropped_mac:AtomicU32::new(0),dropped_decode:AtomicU32::new(0)})}
+fn owner(id:u16,generation:u64)->Arc<ControllerRuntime>{Arc::new(ControllerRuntime{identity:sle_dev::DeviceIdentity{id,generation},schedule_gate:Lock::rank(false,30),host:Lock::rank(Host{reserved:false,fail:false,received:0,queued:0,ready:false,radio:(1,1),fault:None},10),scheduled:AtomicU32::new(0),kicked:AtomicU32::new(0),ingress:Lock::new(Queue{dropped:0,entries:VecDeque::new()}),dropped_commands:AtomicU32::new(0),dropped_mac:AtomicU32::new(0),dropped_decode:AtomicU32::new(0)})}
 impl ControllerRuntime{fn schedule_rx(&self,_delay:u32){no_locks();self.scheduled.fetch_add(1,Ordering::Relaxed);}fn kick_commands(&self){no_locks();self.kicked.fetch_add(1,Ordering::Relaxed);}}
 mod actual {
  use super::*;
  static RUNTIME_ROUTES:LazyLock<Lock<[Option<Arc<ControllerRuntime>>;16]>>=LazyLock::new(||Lock::new(std::array::from_fn(|_|None)));
  // @@FUNCTIONS@@
  // @@STATS@@
+ // @@HEALTH@@
  fn clear(){*RUNTIME_ROUTES.lock()=std::array::from_fn(|_|None);}
  #[test] fn publication_is_idempotent_and_keeps_one_route_reference(){
   clear();let a=owner(0,1);assert!(ingress_owner(a.identity).is_none());
@@ -85,5 +89,11 @@ mod actual {
   assert_eq!(a.host.lock().queued,3);assert_eq!(a.kicked.load(Ordering::Relaxed),3);
   a.host.lock().fail=true;assert_eq!(enqueue_command(&a,9,&[1],None),Err(EBUSY));assert_eq!(a.kicked.load(Ordering::Relaxed),3);
   *a.schedule_gate.lock()=true;assert_eq!(enqueue_command(&a,9,&[1],None),Err(ENODEV));assert_eq!(a.host.lock().queued,3);assert_eq!(a.kicked.load(Ordering::Relaxed),3);no_locks();
+ }
+ #[test] fn actual_health_observer_obeys_host_gate_and_does_not_mutate_other_owner(){
+  clear();let a=owner(0,1);let b=owner(1,2);publish_runtime(&a).unwrap();publish_runtime(&b).unwrap();
+  assert_eq!(sparklink_native_health_rust(0,1),1);a.host.lock().ready=true;assert_eq!(sparklink_native_health_rust(0,1),2);assert_eq!(sparklink_native_health_rust(1,2),1);
+  a.host.lock().radio=(0,1);assert_eq!(sparklink_native_health_rust(0,1),1);a.host.lock().fault=Some(Fault(-5));assert_eq!(sparklink_native_health_rust(0,1),-5);
+  *a.schedule_gate.lock()=true;assert_eq!(sparklink_native_health_rust(0,1),ENODEV);assert_eq!(sparklink_native_health_rust(0,2),ENODEV);assert_eq!(sparklink_native_health_rust(1,2),1);no_locks();
  }
 }
