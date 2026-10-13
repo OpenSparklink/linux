@@ -20,7 +20,7 @@ def run(output):
     rust=(here/'usb_binding_prepare_fixture.rs').read_text()
     archived=(here/'retired-usb-registration/core_driver.rs').read_text()
     for marker,name in [('INIT','initialize_usb_controller'),('PREPARE','prepare_usb_controller')]:rust=rust.replace('// @@'+marker+'@@',function(archived,name))
-    rust=rust.replace('// @@RX@@',function(rust_original.replace('pub(crate) extern "C" fn sparklink_standard_receive_rust','fn sparklink_standard_receive_rust'),'sparklink_standard_receive_rust').replace('super::sle_dev::','crate::sle_dev::'))
+    rust=rust.replace('// @@RX@@','pub(super) '+function(rust_original.replace('pub(crate) extern "C" fn sparklink_standard_receive_rust','fn sparklink_standard_receive_rust'),'sparklink_standard_receive_rust'))
     assert 'load_usb_firmware' not in rust_original and not (here.parents[3]/'net/sparklink/sle_fw.rs').exists()
     assert 'mod sle_fw;' not in (here.parents[3]/'net/sparklink/sparklink_core.rs').read_text()
     fixture = (here/'usb_binding_fixture.c').read_text()
@@ -36,10 +36,10 @@ def run(output):
         (path/'actual.rs').write_text(rust)
         subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(path/'actual.rs'),'-o',str(path/'rust-test')],check=True)
         log=subprocess.check_output([str(path/'rust-test'),'--test-threads=1'],text=True)
-    assert '8 passed; 0 failed' in log and rust_source.read_text()==rust_original
+    assert '9 passed; 0 failed' in log and rust_source.read_text()==rust_original
     data = json.loads(result)
     assert data['cases'] == 25 and source.read_text() == original
-    record = dict(status=data['status'], cases=data['cases'],rust_tests=8,rust_sha256=hashlib.sha256(rust_original.encode()).hexdigest(), source_sha256=hashlib.sha256(original.encode()).hexdigest(), scope='Actual EP0 writer/control setup/four-byte framing/interrupt bootstrap read/unsupported data stub, and current attributed DLI lane callback with retired prepare history; decoder/ingress ownership are controlled fixture dependencies, not protocol/lifetime proof; USB, allocation and retained active context dependencies controlled. Includes u16 wLength boundary and uncertain/short transfers. No hardware, class discovery, async listener, lifetime, Ready or firmware proof.', physical_acceptance=False)
+    record = dict(status=data['status'], cases=data['cases'],rust_tests=9,rust_sha256=hashlib.sha256(rust_original.encode()).hexdigest(), source_sha256=hashlib.sha256(original.encode()).hexdigest(), scope='Actual EP0 writer/control setup/four-byte framing/interrupt bootstrap read/unsupported data stub, and current attributed DLI lane callback with retired prepare history; decoder/ingress/snoop ownership are controlled fixture dependencies, not protocol/lifetime proof; USB, allocation and retained active context dependencies controlled. Includes u16 wLength boundary and uncertain/short transfers. No hardware, class discovery, async listener, lifetime, Ready or firmware proof.', physical_acceptance=False)
     if output:
         output.write_text(json.dumps(record, indent=2)+'\n')
     print(json.dumps(record, indent=2))

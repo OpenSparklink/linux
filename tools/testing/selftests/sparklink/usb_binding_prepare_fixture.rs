@@ -26,7 +26,7 @@ unsafe fn sle_usb_dev_get_fw_version(id:usize)->u32{assert_eq!(id,123);state(|s|
 
 use std::sync::atomic::{AtomicUsize,Ordering};
 use std::sync::{Arc,OnceLock};
-mod sle_dev {pub const SLE_DEV_MAX:usize=16;pub struct DeviceIdentity{pub id:u16,pub generation:u64}}
+mod sle_dev {pub const SLE_DEV_MAX:usize=16;#[derive(Clone,Copy)]pub struct DeviceIdentity{pub id:u16,pub generation:u64}}
 struct Owner { dropped_decode:AtomicUsize,protocol_profile:u32 }
 static OWNER:OnceLock<Arc<Owner>>=OnceLock::new();
 static PARSES:AtomicUsize=AtomicUsize::new(0);
@@ -37,8 +37,26 @@ fn parse_event_packet(data:&[u8])->Result<Parsed>{PARSES.fetch_add(1,Ordering::R
 fn event_to_sle(_: &Parsed)->Option<()>{Some(())}
 fn enqueue_rx(_: &Owner,_:()){QUEUED.fetch_add(1,Ordering::Relaxed);}
 macro_rules! pr_debug { ($($t:tt)*) => {let _=format_args!($($t)*);}; }
-// @@RX@@
-fn rx_reset(){PARSES.store(0,Ordering::Relaxed);QUEUED.store(0,Ordering::Relaxed);OWNER.get_or_init(||Arc::new(Owner{dropped_decode:AtomicUsize::new(0),protocol_profile:0})).dropped_decode.store(0,Ordering::Relaxed);}
-#[test]fn event_lane_uses_decoder_dependency_without_uart_marker(){rx_reset();let data=[2,0,4,0,3,4,1,0];sparklink_standard_receive_rust(2,3,data.as_ptr(),8,1,0);assert_eq!(PARSES.load(Ordering::Relaxed),1);assert_eq!(QUEUED.load(Ordering::Relaxed),1);}
+mod sle_native {
+ pub(crate) unsafe fn sparklink_native_snoop_rx_rust(id:u16,generation:u64,data:*const u8,length:usize) {
+  assert_eq!((id,generation),(2,3));
+  let bytes=unsafe {std::slice::from_raw_parts(data,length)};
+  super::OBSERVED.lock().unwrap().push(bytes.to_vec());
+ }
+}
+static OBSERVED:std::sync::Mutex<Vec<Vec<u8>>>=std::sync::Mutex::new(Vec::new());
+mod actual_rx {
+ use super::*;
+ // @@RX@@
+}
+use actual_rx::sparklink_standard_receive_rust;
+fn rx_reset(){OBSERVED.lock().unwrap().clear();PARSES.store(0,Ordering::Relaxed);QUEUED.store(0,Ordering::Relaxed);OWNER.get_or_init(||Arc::new(Owner{dropped_decode:AtomicUsize::new(0),protocol_profile:0})).dropped_decode.store(0,Ordering::Relaxed);}
+#[test]fn event_lane_uses_decoder_dependency_without_uart_marker(){rx_reset();let data=[2,0,4,0,3,4,1,0];sparklink_standard_receive_rust(2,3,data.as_ptr(),8,1,0);assert_eq!(PARSES.load(Ordering::Relaxed),1);assert_eq!(QUEUED.load(Ordering::Relaxed),1);assert_eq!(*OBSERVED.lock().unwrap(),vec![data.to_vec()]);}
 #[test]fn bulk_or_unknown_lane_never_enters_event_or_legacy_data_decoder(){rx_reset();for lane in [0,2,3]{sparklink_standard_receive_rust(2,3,1usize as *const u8,8,lane,0);}assert_eq!(PARSES.load(Ordering::Relaxed),0);assert_eq!(QUEUED.load(Ordering::Relaxed),0);assert_eq!(OWNER.get().unwrap().dropped_decode.load(Ordering::Relaxed),3);}
 #[test]fn status_stale_zero_generation_and_bad_index_precede_buffer_access(){rx_reset();for(id,generation,status)in[(2,3,-19),(16,3,0),(2,0,0),(2,4,0)]{sparklink_standard_receive_rust(id,generation,1usize as *const u8,8,1,status);}assert_eq!(PARSES.load(Ordering::Relaxed),0);assert_eq!(QUEUED.load(Ordering::Relaxed),0);}
+
+#[test]fn observation_preserves_malformed_packet_before_decoder_failure(){
+ rx_reset();let bytes=[0xfe,0,0,0];sparklink_standard_receive_rust(2,3,bytes.as_ptr(),bytes.len() as i32,1,0);
+ assert_eq!(*OBSERVED.lock().unwrap(),vec![bytes.to_vec()]);assert_eq!(PARSES.load(Ordering::Relaxed),1);
+ assert_eq!(QUEUED.load(Ordering::Relaxed),0);assert_eq!(OWNER.get().unwrap().dropped_decode.load(Ordering::Relaxed),1);
+}
