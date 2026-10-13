@@ -397,7 +397,7 @@ def main():
     process = monitor = barrier = None
     try:
         config = (build / '.config').read_text()
-        for symbol in ['RUST', 'SPARKLINK', 'USB', 'SPARKLINK_SLE']:
+        for symbol in ['RUST', 'SPARKLINK', 'USB']:
             if f'CONFIG_{symbol}=y\n' not in config:
                 raise RuntimeError(f'CONFIG_{symbol}=y required')
         if 'statically linked' not in subprocess.check_output(

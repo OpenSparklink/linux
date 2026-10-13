@@ -24,7 +24,7 @@ SOURCE = HERE.parents[3]
 
 def require_config(path, authorization=False):
     config = path.read_text().splitlines()
-    names = ['RUST', 'SPARKLINK', 'SPARKLINK_SLE', 'SPARKLINK_WS73_USB']
+    names = ['RUST', 'SPARKLINK', 'SPARKLINK_WS73_USB']
     if authorization:
         names += ['SPARKLINK_GENL', 'CONFIGFS_FS']
     for name in names:

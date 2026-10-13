@@ -31,7 +31,7 @@ static int empty_registry(int fd)
 
 int main(void)
 {
-	char vendor[64] = {0}, label[32] = {0};
+	char vendor[64] = {0};
 	int fd = open("/sys/class/dmi/id/sys_vendor", O_RDONLY);
 	if (fd < 0 || read(fd, vendor, sizeof(vendor) - 1) <= 0) return 1;
 	close(fd);
@@ -39,24 +39,13 @@ int main(void)
 	if (mount("none", "/sys/kernel/config", "configfs", 0, NULL) && errno != EBUSY) return 1;
 	fd = open("/dev/sparklink", O_RDWR | O_CLOEXEC);
 	if (fd < 0 || empty_registry(fd)) return 1;
-	const char *values[] = {"uart", "1", "spi", "2", "usb", "4", "none", "0", "i2c"};
-	for (unsigned int i = 0; i < sizeof(values)/sizeof(values[0]); i++) {
-		int cfg = open("/sys/kernel/config/sparklink/controller_type", O_WRONLY | O_CLOEXEC);
-		if (cfg < 0) return 1;
-		errno = 0;
-		ssize_t result = write(cfg, values[i], strlen(values[i]));
-		int error = errno;
-		close(cfg);
-		if (i < 6 && (result != -1 || error != EOPNOTSUPP)) return 1;
-		if ((i == 6 || i == 7) && result != (ssize_t)strlen(values[i])) return 1;
-		if (i == 8 && (result != -1 || error != EINVAL)) return 1;
-		cfg = open("/sys/kernel/config/sparklink/controller_type", O_RDONLY | O_CLOEXEC);
-		memset(label, 0, sizeof(label));
-		if (cfg < 0 || read(cfg, label, sizeof(label) - 1) <= 0) return 1;
-		close(cfg);
-		if (strcmp(label, "none\n") || empty_registry(fd)) return 1;
-	}
+    const char *names[] = {"max_connections", "adv_interval_ms", "scan_window_ms", "power_mode", "controller_type"};
+    for (unsigned i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        char path[128]; snprintf(path, sizeof(path), "/sys/kernel/config/sparklink/%s", names[i]);
+        errno = 0;
+        if (open(path, O_RDWR | O_CLOEXEC) != -1 || errno != ENOENT || empty_registry(fd)) return 1;
+    }
 	close(fd);
-	puts("SPARKLINK_NO_GHOST_BACKEND_PASS selectors=9 registered=0 select=ENODEV unbound_snapshot=EINVAL");
+	puts("SPARKLINK_NO_GHOST_BACKEND_PASS removed_attrs=5 registered=0 select=ENODEV unbound_snapshot=EINVAL");
 	return 0;
 }

@@ -274,12 +274,12 @@ int main(void)
 	CHECK(!registry_probe(2));
 	CHECK(!protocol_state_probe(a.fd));
 	rejected_power(a.fd, 0);
-	int policy = open("/sys/kernel/config/sparklink/power_mode", O_RDWR);
-	CHECK(policy >= 0);
-	char mode[16]; CHECK(read(policy, mode, sizeof(mode)) == -1 && errno == EOPNOTSUPP);
-	CHECK(write(policy, "idle\n", 5) == -1 && errno == EOPNOTSUPP);
-	CHECK(!close(policy));
-	printf("VIRTUAL_GLOBAL_POWER_POLICY_PASS: show=EOPNOTSUPP store=EOPNOTSUPP\n");
+    const char *retired_attrs[] = {"max_connections", "adv_interval_ms", "scan_window_ms", "power_mode", "controller_type"};
+    for (unsigned i = 0; i < sizeof(retired_attrs)/sizeof(retired_attrs[0]); i++) {
+        char path[128]; snprintf(path, sizeof(path), "/sys/kernel/config/sparklink/%s", retired_attrs[i]);
+        errno = 0; CHECK(open(path, O_RDWR) == -1 && errno == ENOENT);
+    }
+    printf("VIRTUAL_GLOBAL_POWER_POLICY_PASS: removed_attrs=5 ENOENT\n");
 	fflush(NULL);
 	pid_t observer = fork(); CHECK(observer >= 0);
 	if (!observer) {
