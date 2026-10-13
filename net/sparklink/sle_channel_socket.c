@@ -2,6 +2,8 @@
 /* Runtime-owned connection session, bounded fixed channels, fd bindings. Dynamic
  * TCIDs/reliable modes and same-lifetime rebinding require protocol support. */
 #include <linux/capability.h>
+#include <linux/compat.h>
+#include <linux/uaccess.h>
 #include <linux/errno.h>
 #include <linux/kref.h>
 #include <linux/module.h>
@@ -766,6 +768,68 @@ static __poll_t sl_poll(struct file *file, struct socket *sock, poll_table *wait
 	sl_connection_session_put(s);
 	return mask;
 }
+struct sl_info_read {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+	struct sock *sk;
+	struct sparklink_channel_info value;
+};
+/* Runtime Host/data/gate -> Session: validate the fd's exact grant and copy one
+ * capability snapshot. No user memory, wait, credit mutation or RX consumption.
+ */
+static int sl_read_info(void *context)
+{
+	struct sl_info_read *read = context;
+	struct sl_connection_session *s = read->session;
+	struct sl_basic_channel *c = read->channel;
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) || c->sk != read->sk)
+		ret = -ENOTCONN;
+	else if (!sl_permits(s, c, SL_GRANT_TX) && !sl_permits(s, c, SL_GRANT_RX))
+		ret = -EACCES;
+	else if (s->progress.phase != SL_CH_OPEN)
+		ret = -EAGAIN;
+	else
+		read->value = (struct sparklink_channel_info) {
+			.version = SPARKLINK_CHANNEL_INFO_VERSION, .size = sizeof(read->value),
+			.controller = s->controller, .handle = s->handle,
+			.generation = s->generation, .lifetime = s->lifetime,
+			.mtu = c->mtu, .mps = c->mps,
+			.local_tcid = c->local_tcid, .remote_tcid = c->remote_tcid,
+			.pi = c->pi, .mode = SPARKLINK_CHANNEL_MODE_BASIC,
+			.directions = sl_sk(read->sk)->grant.directions,
+		};
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
+static int sl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
+{
+	struct sl_connection_session *s;
+	struct sl_info_read read;
+	int ret;
+
+	if (cmd != SPARKLINK_CHANNEL_INFO)
+		return -ENOIOCTLCMD;
+	s = sl_binding_session(sock->sk);
+	if (!s)
+		return -ENOTCONN;
+	read = (struct sl_info_read) { .session = s, .channel = sl_bound_channel(sock->sk, s), .sk = sock->sk };
+	ret = sparklink_native_session_admit(s->controller, s->generation,
+		s->lifetime, s->handle, s->epoch, sl_read_info, &read);
+	if (!ret && copy_to_user((void __user *)arg, &read.value, sizeof(read.value)))
+		ret = -EFAULT;
+	sl_connection_session_put(s);
+	return ret;
+}
+#ifdef CONFIG_COMPAT
+static int sl_compat_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
+{
+	return sl_ioctl(sock, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
 static int sl_drained(struct sl_connection_session *s, struct sl_basic_channel *c)
 {
 	unsigned long flags;
@@ -819,7 +883,10 @@ static const struct proto_ops sl_channel_ops = {
 	.family = PF_SPARKLINK, .owner = THIS_MODULE, .release = sl_release,
 	.bind = sl_bind, .connect = sock_no_connect, .socketpair = sock_no_socketpair,
 	.accept = sock_no_accept, .getname = sock_no_getname, .poll = sl_poll,
-	.ioctl = sock_no_ioctl, .listen = sock_no_listen, .shutdown = sock_no_shutdown,
+	.ioctl = sl_ioctl, .listen = sock_no_listen, .shutdown = sock_no_shutdown,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = sl_compat_ioctl,
+#endif
 	.sendmsg = sl_sendmsg, .recvmsg = sl_recvmsg, .mmap = sock_no_mmap,
 };
 static struct proto sl_channel_proto = {

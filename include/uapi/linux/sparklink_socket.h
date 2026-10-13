@@ -2,6 +2,7 @@
 #ifndef _UAPI_LINUX_SPARKLINK_SOCKET_H
 #define _UAPI_LINUX_SPARKLINK_SOCKET_H
 #include <linux/types.h>
+#include <linux/ioctl.h>
 
 /* Experimental/unpublished. Broker binds with CAP_NET_ADMIN and can pass the
  * SOCK_DGRAM fd to ordinary applications. Basic mode has no reliable delivery
@@ -34,4 +35,20 @@ struct sockaddr_sparklink {
 #define SPARKLINK_SOCKET_SECURITY_AUTHENTICATED 2
 /* Protected security requirements are defined but currently unsupported. */
 #define SPARKLINK_SOCKET_USER_PI 241
+/* Read-only delegated socket snapshot. No lease token or trusted security
+ * projection. Success requires current Runtime authorization and completed
+ * CMTC negotiation; EAGAIN before open, ENOTCONN after local close.
+ * It is coherent at admission, not a promise of future connectivity.
+ * Fixed 40-byte layout is identical for native and compat callers.
+ */
+struct sparklink_channel_info {
+	__u16 version, size, controller, handle;
+	__aligned_u64 generation, lifetime;
+	__u16 mtu, mps;
+	__u8 local_tcid, remote_tcid, pi, mode;
+	__u32 directions, reserved;
+};
+#define SPARKLINK_CHANNEL_INFO_VERSION 1
+#define SPARKLINK_CHANNEL_MODE_BASIC 0
+#define SPARKLINK_CHANNEL_INFO _IOR('S', 0xe0, struct sparklink_channel_info)
 #endif

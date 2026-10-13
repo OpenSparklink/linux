@@ -16,6 +16,9 @@
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sparklink_socket.h"
+#define __user
+#define ENOIOCTLCMD 515
 #include <stddef.h>
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef uint64_t u64;
 typedef struct {bool held;} spinlock_t;
@@ -104,6 +107,11 @@ static int skb_copy_datagram_msg(struct sk_buff *skb,int offset,struct msghdr *m
  if(copy_fault)return -EFAULT;memcpy(msg->bytes,skb->data,length);return 0;
 }
 static void skb_free_datagram(struct sock *sk,struct sk_buff *skb){assert(!host_locked&&sk==current_session->channels[sl_sk(sk)->channel_slot].sk);kfree_skb(skb);}
+static unsigned int copy_limit = 40;
+static unsigned long copy_to_user(void *out,const void *in,unsigned long size){
+ assert(!host_locked&&!irq_disabled&&!current_session->lock.held);
+ unsigned long copied=copy_limit<size?copy_limit:size;memcpy(out,in,copied);return size-copied;
+}
 /* @@FUNCTIONS@@ */
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
 static void route(struct sl_connection_session *s,unsigned int tcid,unsigned int pi,const char *message){u8 wire[300];int n=sl_channel_frame_encode(wire,sizeof(wire),tcid,pi,(const u8 *)message,strlen(message));assert(n>0);sl_route(s,wire,n);assert(!s->lock.held&&!irq_disabled);}
@@ -220,6 +228,35 @@ static void two_channel_tests(void)
  while(s.channels[1].rx.head){struct sk_buff *skb=s.channels[1].rx.head;s.channels[1].rx.head=skb->next;kfree_skb(skb);}
  assert(allocations==0&&service.sk.sk_rmem_alloc==0&&user.sk.sk_rmem_alloc==0);
 }
+static void capability_tests(void)
+{
+ struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
+ struct socket sock={.sk=&b.sk};init_receive(&s,&b.sk);s.channels[0].mps=249;
+ struct sparklink_channel_info out,good;memset(&out,0xa5,sizeof(out));
+ assert(sizeof(out)==40&&_Alignof(struct sparklink_channel_info)==8);
+ assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO,(unsigned long)&out)==0);
+ assert(out.version==1&&out.size==40&&out.controller==1&&out.handle==3&&out.generation==7&&out.lifetime==11);
+ assert(out.mtu==249&&out.mps==249&&out.local_tcid==31&&out.remote_tcid==31&&out.pi==241&&out.mode==0&&out.directions==3&&out.reserved==0);
+ good=out;struct sl_channel_progress before=s.progress;unsigned int refs=s.refs.refs;
+ route(&s,31,241,"not consumed");
+ copy_limit=20;memset(&out,0xa5,sizeof(out));
+ assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO,(unsigned long)&out)==-EFAULT);
+ assert(!memcmp(&out,&good,20)&&memcmp(&out,&good,sizeof(out)));
+ assert(!memcmp(&before,&s.progress,sizeof(before))&&s.refs.refs==refs&&s.channels[0].rx.qlen==1);
+ copy_limit=40;assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO,(unsigned long)&out)==0&&!memcmp(&out,&good,40));
+ for(unsigned int kind=0;kind<4;kind++){
+  s.progress=before;init_grant(&s,&b.sk,3);authority=true;
+  if(kind==0)s.progress.phase=SL_CH_NEGOTIATING;
+  if(kind==1)authority=false;
+  if(kind==2)b.grant.scope.lifetime++;
+  if(kind==3)sl_binding_retire(&s.channels[0].binding);
+  memset(&out,0xa5,40);unsigned char bytes[40];memcpy(bytes,&out,40);
+  assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO,(unsigned long)&out)==(kind==0?-EAGAIN:kind==3?-ENOTCONN:-EACCES));
+  assert(!memcmp(bytes,&out,40));
+ }
+ assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO^1,0)==-ENOIOCTLCMD);
+ struct sk_buff *skb=s.channels[0].rx.head;kfree_skb(skb);assert(allocations==0);authority=true;
+}
 int main(void){
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
  sl_channel_start(&s.progress,249);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress,249,0);sl_channel_response_submitted(&s.progress,0);
@@ -254,6 +291,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- receive_tests();direction_tests();publication_tests();two_channel_tests();
+ receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }
