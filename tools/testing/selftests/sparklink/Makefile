@@ -5,7 +5,7 @@ TEST_GEN_PROGS += ws73_recovery_test sparklink_backend_test
 TEST_GEN_PROGS += ws73_acb_test
 TEST_GEN_PROGS += virtual_codec_test
 TEST_GEN_PROGS += sle_channel_wire_test
-TEST_GEN_PROGS += sle_channel_state_test
+TEST_GEN_PROGS += sle_channel_state_test sle_channel_table_test
 TEST_GEN_PROGS_EXTENDED += ssap_removed_uapi_test sparklink_socket_type_test
 TEST_GEN_PROGS_EXTENDED += sparklink_runtime_test ws73_native_runtime_test sparklink_host_plan_test sparklink_discovery_operation_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_tx_fault_test
@@ -99,3 +99,6 @@ $(OUTPUT)/ws73_dli_test: ws73_dli_test.c \
 
 $(OUTPUT)/sparklink_backend_test: sparklink_backend_test.c ../../../../include/linux/sparklink_backend.h
 	$(CC) $(CFLAGS) -I../../../../include $< $(LDLIBS) -o $@
+
+$(OUTPUT)/sle_channel_table_test: sle_channel_table_test.c ../../../../net/sparklink/sle_channel_table.h ../../../../net/sparklink/sle_channel_grant.h
+	$(CC) $(CFLAGS) $< $(LDLIBS) -o $@

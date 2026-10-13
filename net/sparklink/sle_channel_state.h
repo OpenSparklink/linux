@@ -5,7 +5,7 @@
  * structure with state_lock; a deadline flag always uses the original timer.
  * ConnectionSession owns this state; fd detach does not restart negotiation.
  */
-/* Single current basic-channel binding. Retirement is local: without a
+/* One current binding per fixed basic channel. Retirement is local: without a
  * qualified protocol close/drain barrier, reattach in this lifetime is refused.
  * busy counts a dequeued, independently owned TX in the total queue budget. */
 struct sl_binding_progress { unsigned int bound, retired, busy; };

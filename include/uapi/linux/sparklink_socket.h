@@ -12,6 +12,10 @@
  * directions is TX, RX, or TX|RX. Forbidden send/recv returns EACCES;
  * poll advertises only granted readiness. CMTC belongs to Session.
  * Current basic mode only accepts security=NONE; protected requests reject.
+ * Fixed basic channels: CUTC local/remote TCID31 with USER_PI, or SLE SMTC
+ * local/remote TCID10 with PI0. Each has one independent binding per physical
+ * connection lifetime. Final close retires only that channel; same-lifetime
+ * rebinding remains unsupported without a verified close/drain barrier.
  * No mutation/raw DLI permission.
  */
 struct sockaddr_sparklink {
