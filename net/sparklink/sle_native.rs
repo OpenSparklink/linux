@@ -386,34 +386,21 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
             || (metadata.icb_length == 0) != (metadata.icb_count == 0)
         { return Err(Error::from_errno(PROTOCOL_ERROR)); }
         let ctrl_info = controller.info();
-        let mut registry = super::SUBSYSTEM.lock();
-        let ss = registry.as_mut().ok_or(ENODEV)?;
-        let id = ss.dev_registry.register_pending(&ctrl_info)?;
-        controller.identity = ss.dev_registry.get(id).ok_or(ENODEV)?.identity();
-        let identity = controller.identity;
-        // No driver callbacks or blocking I/O while holding the registry lock.
-        drop(registry);
+        let identity = super::reserve_backend_identity(&ctrl_info)?;
+        let id = identity.id;
+        controller.identity = identity;
+        // Candidate construction and driver put/drop are outside the registry.
         let installed = (|| -> Result<kernel::sync::Arc<super::ControllerRuntime>> {
             let mut state = super::ControllerState::new_boxed(
                 metadata.address, super::sle_dli::ControllerBackend::Native(controller),
             )?;
             state.command_credits = metadata.command_credits;
-            let mut registry = super::SUBSYSTEM.lock();
-            let ss = registry.as_mut().ok_or(ENODEV)?;
-            if !ss.dev_registry.get(id).is_some_and(|dev| dev.identity() == identity
-                && !dev.test_flag(super::sle_dev::SLE_DEV_UNREGISTERING)) { return Err(ENODEV); }
-            ss.install_runtime(id, state, false)
+            super::install_backend_runtime(identity, state, false, None)
         })();
         let owner = match installed {
             Ok(owner) => owner,
             Err(error) => {
-                let mut registry = super::SUBSYSTEM.lock();
-                if let Some(ss) = registry.as_mut() {
-                    if ss.runtime(id).is_none() && ss.dev_registry.get(id).is_some_and(|dev| dev.identity() == identity
-                        && !dev.test_flag(super::sle_dev::SLE_DEV_UNREGISTERING)) {
-                        let _ = ss.dev_registry.unregister(id);
-                    }
-                }
+                super::cancel_backend_reservation(identity);
                 return Err(error);
             }
         };
@@ -440,25 +427,7 @@ impl NativeController {
 
 #[no_mangle]
 pub(crate) extern "C" fn sparklink_native_unregister_rust(id: u16, generation: u64) {
-    let identity = DeviceIdentity { id, generation };
-    let owner = {
-        let mut registry = super::SUBSYSTEM.lock();
-        let Some(ss) = registry.as_mut() else { return };
-        let Some(dev) = ss.dev_registry.get(id) else { return };
-        if dev.identity() != identity { return; }
-        dev.begin_unregister();
-        let Some(owner) = ss.runtimes.get_mut(id as usize).and_then(Option::take) else { return };
-        if ss.active_dev_id == Some(id) { ss.active_dev_id = None; }
-        owner
-    };
-    // Index remains reserved while work and transport callbacks are joined.
-    owner.invalidate();
-    let mut registry = super::SUBSYSTEM.lock();
-    if let Some(ss) = registry.as_mut() {
-        if ss.dev_registry.get(id).is_some_and(|dev| dev.identity() == identity) {
-            let _ = ss.dev_registry.unregister(id);
-        }
-    }
+    super::sle_detach_device(DeviceIdentity { id, generation });
 }
 
 /// Observational driver watchdog. The exact owner remains pinned while the

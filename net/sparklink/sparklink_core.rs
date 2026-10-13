@@ -559,14 +559,24 @@ pub(crate) struct ControllerRuntime {
     pub(crate) dropped_decode: core::sync::atomic::AtomicU32,
 }
 
+/// Owned registration snapshot. Allocation and candidate destruction must not
+/// borrow the registry or invoke transport callbacks while holding its mutex.
+#[derive(Clone, Copy)]
+struct RuntimeRegistration {
+    identity: sle_dev::DeviceIdentity,
+    bus: sle_dli::SleBus,
+    addr: [u8; 6],
+    name: [u8; 32],
+}
+
 impl ControllerRuntime {
-    fn new(dev: &sle_dev::SleDev, mut state: KBox<ControllerState>) -> Result<Arc<Self>> {
-        state.identity = dev.identity();
-        state.dev_info.index = dev.id();
-        state.dev_info.bus = dev.bus() as u8;
-        state.dev_info.addr = SleAddr { b: *dev.addr() };
-        let len = dev.name().len().min(state.dev_info.name.len());
-        state.dev_info.name[..len].copy_from_slice(&dev.name()[..len]);
+    fn new(registration: RuntimeRegistration, mut state: KBox<ControllerState>) -> Result<Arc<Self>> {
+        state.identity = registration.identity;
+        state.dev_info.index = registration.identity.id;
+        state.dev_info.bus = registration.bus as u8;
+        state.dev_info.addr = SleAddr { b: registration.addr };
+        let len = registration.name.len().min(state.dev_info.name.len());
+        state.dev_info.name[..len].copy_from_slice(&registration.name[..len]);
         let ingress = sle_dli::ControllerEventRing::new_boxed()?;
         let host = sle_host::CommandHost::new_boxed(state.command_credits)?;
         let controller_events = sle_controller_event::ControllerEventLog::new_boxed()?;
@@ -580,7 +590,7 @@ impl ControllerRuntime {
             _ => (0, 0),
         };
         Arc::pin_init(pin_init!(Self {
-            identity: dev.identity(),
+            identity: registration.identity,
             protocol_profile,
             management <- new_mutex!(sle_management::Management::new(), "sparklink_management"),
             controller_events <- new_irq_lock!(controller_events, "sparklink_controller_events"),
@@ -678,20 +688,7 @@ impl SubsystemShared {
         Ok(())
     }
 
-    #[inline(never)]
-    pub(crate) fn activate_new_device(&mut self, new_id: u16, state: KBox<ControllerState>) -> Result<Arc<ControllerRuntime>> {
-        self.install_runtime(new_id, state, true)
-    }
 
-    pub(crate) fn install_runtime(&mut self, new_id: u16, state: KBox<ControllerState>, select: bool) -> Result<Arc<ControllerRuntime>> {
-        let dev = self.dev_registry.get(new_id).ok_or(ENODEV)?;
-        let slot = self.runtimes.get_mut(new_id as usize).ok_or(EINVAL)?;
-        if slot.is_some() { return Err(EBUSY); }
-        let runtime = ControllerRuntime::new(dev, state)?;
-        *slot = Some(runtime.clone());
-        if select { self.active_dev_id = Some(new_id); }
-        Ok(runtime)
-    }
 }
 
 pub(crate) fn runtime_snapshot() -> [Option<Arc<ControllerRuntime>>; sle_dev::SLE_DEV_MAX] {
@@ -701,11 +698,6 @@ pub(crate) fn runtime_snapshot() -> [Option<Arc<ControllerRuntime>>; sle_dev::SL
 
 pub(crate) fn runtime_by_id(id: u16) -> Option<Arc<ControllerRuntime>> {
     SUBSYSTEM.lock().as_ref().and_then(|s| s.runtime(id))
-}
-
-/// Probe may need the identity before its protocol Runtime is published.
-pub(crate) fn registration_identity(id: u16) -> Option<sle_dev::DeviceIdentity> {
-    SUBSYSTEM.lock().as_ref().and_then(|s| s.dev_registry.get(id).map(|d| d.identity()))
 }
 
 /// Stop protocol operations and workers before the transport frees resources.
@@ -718,17 +710,68 @@ pub(crate) fn sle_quiesce_device(identity: sle_dev::DeviceIdentity) {
 // Transport device attach / detach (called from driver probe/remove)
 // ---------------------------------------------------------------------------
 
+/// One reservation allocator for actual providers. Metadata may be unknown;
+/// registration reserves identity only, never Runtime/open/Ready.
+pub(crate) fn reserve_backend_identity(info: &sle_dli::SleControllerInfo) -> Result<sle_dev::DeviceIdentity> {
+    let mut registry = SUBSYSTEM.lock();
+    let shared = registry.as_mut().ok_or(ENODEV)?;
+    let id = shared.dev_registry.register_pending(info)?;
+    Ok(shared.dev_registry.get(id).ok_or(ENODEV)?.identity())
+}
+
+/// Cancel only an uninstalled exact reservation. Never discard an installed
+/// Runtime or release the identity of a concurrent retiring owner.
+pub(crate) fn cancel_backend_reservation(identity: sle_dev::DeviceIdentity) {
+    let mut registry = SUBSYSTEM.lock();
+    let Some(shared) = registry.as_mut() else { return };
+    if shared.runtime(identity.id).is_none() && shared.dev_registry.get(identity.id).is_some_and(|dev|
+        dev.identity() == identity && !dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING)) {
+        let _ = shared.dev_registry.unregister(identity.id);
+    }
+}
+
+/// Construct a candidate outside the registry lock, then publish against the
+/// same reserved identity. A competing install/retire/reuse wins cleanly;
+/// failed candidates drop after the registry guard, with no lock across I/O.
+pub(crate) fn install_backend_runtime(
+    identity: sle_dev::DeviceIdentity, state: KBox<ControllerState>, select: bool,
+    queried: Option<([u8; 6], u32)>,
+) -> Result<Arc<ControllerRuntime>> {
+    let registration = {
+        let registry = SUBSYSTEM.lock();
+        let shared = registry.as_ref().ok_or(ENODEV)?;
+        let dev = shared.dev_registry.get(identity.id).ok_or(ENODEV)?;
+        if dev.identity() != identity || dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) { return Err(ENODEV); }
+        if shared.runtime(identity.id).is_some() { return Err(EBUSY); }
+        let mut name = [0; 32];
+        let len = dev.name().len().min(name.len());
+        name[..len].copy_from_slice(&dev.name()[..len]);
+        RuntimeRegistration { identity, bus: dev.bus(),
+            addr: queried.map_or(*dev.addr(), |info| info.0), name }
+    };
+    let owner = ControllerRuntime::new(registration, state)?;
+    {
+        let mut registry = SUBSYSTEM.lock();
+        let shared = registry.as_mut().ok_or(ENODEV)?;
+        let dev = shared.dev_registry.get(identity.id).ok_or(ENODEV)?;
+        if dev.identity() != identity || dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) { return Err(ENODEV); }
+        let slot = shared.runtimes.get_mut(identity.id as usize).ok_or(EINVAL)?;
+        if slot.is_some() { return Err(EBUSY); }
+        *slot = Some(owner.clone());
+        if let Some((addr, version)) = queried { shared.dev_registry.update_hw_info(identity.id, addr, version); }
+        if select { shared.active_dev_id = Some(identity.id); }
+    }
+    Ok(owner)
+}
+
 /// Reserve one exact identity before standard USB resources/bootstrap exist.
 /// Unknown address/capabilities stay zero; no Runtime or Ready is published.
 pub(crate) fn reserve_usb_identity() -> Result<sle_dev::DeviceIdentity> {
-    let mut guard = SUBSYSTEM.lock();
-    let ss = guard.as_mut().ok_or(ENODEV)?;
     let mut info = sle_dli::SleControllerInfo::default();
     let name = b"sparklink-usb";
     info.name[..name.len()].copy_from_slice(name);
     info.bus = sle_dli::SleBus::Usb;
-    let id = ss.dev_registry.register_pending(&info)?;
-    Ok(ss.dev_registry.get(id).ok_or(ENODEV)?.identity())
+    reserve_backend_identity(&info)
 }
 
 /// Detach a device from the subsystem.
@@ -928,26 +971,15 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
 /// succeed. Creates per-device protocol state and switches the active
 /// device by selecting its fixed Runtime slot. Other owners remain in place.
 pub(crate) fn sle_switch_controller_usb(identity: sle_dev::DeviceIdentity, device: sle_usb::UsbDevice, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
-    let dev_id = identity.id;
-    let result = (|| -> Result<Arc<ControllerRuntime>> {
-        if registration_identity(dev_id) != Some(identity) { return Err(ENODEV); }
-        let backend = sle_dli::ControllerBackend::new_usb(addr, identity, device);
-        let mut state = ControllerState::new_boxed(addr, backend)?;
-        state.command_credits = credits;
-        let mut guard = SUBSYSTEM.lock();
-        let ss = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
-        if !ss.dev_registry.get(dev_id).is_some_and(|dev| dev.identity() == identity) { return Err(ENODEV); }
-        ss.dev_registry.update_hw_info(dev_id, addr, fw_version);
-        ss.activate_new_device(dev_id, state)
-    })();
-    match result {
-        Ok(owner) => open_usb_runtime(&owner),
-        Err(e) => Err(e),
-    }
+    let backend = sle_dli::ControllerBackend::new_usb(addr, identity, device);
+    let mut state = ControllerState::new_boxed(addr, backend)?;
+    state.command_credits = credits;
+    let owner = install_backend_runtime(identity, state, true, Some((addr, fw_version)))?;
+    open_usb_runtime(&owner)
 }
 
 /// Listener startup/adoption under the shared Backend lifecycle barrier.
-/// The copied USB value borrows resources owned by this exact reservation.
+/// The cloned USB transport retains resources of this exact reservation.
 pub(crate) fn open_usb_runtime(owner: &Arc<ControllerRuntime>) -> Result {
     // Same open/close barrier as Native. Teardown closes the gate
     // immediately, then joins this before taking state/C resources.

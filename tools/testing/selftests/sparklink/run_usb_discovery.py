@@ -45,7 +45,7 @@ def run(output):
     assembly = historic_attach.read_text()
     rust = rust.replace('// @@ATTACH_METADATA@@', assembly)
     reserve = function(inputs['sparklink_core.rs'], 'reserve_usb_identity')
-    metadata = reserve[reserve.index('    let mut info ='):reserve.index('    let id =')]
+    metadata = reserve[reserve.index('    let mut info ='):reserve.index('    reserve_backend_identity(')]
     rust = rust.replace('// @@RESERVE_METADATA@@', metadata)
     with tempfile.TemporaryDirectory(prefix='sparklink-usb-discovery-') as tmp:
         tmp = Path(tmp)

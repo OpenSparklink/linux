@@ -33,10 +33,15 @@ impl SleDevRegistry {
 }
 mod sle_dev {pub(crate) use super::{DeviceIdentity,SLE_DEV_UNREGISTERING};}
 struct Shared{dev_registry:SleDevRegistry,runtimes:[Option<Arc<Runtime>>;SLE_DEV_MAX],active_dev_id:Option<u16>}
-impl Shared{fn new()->Self{Self{dev_registry:SleDevRegistry::new(),runtimes:std::array::from_fn(|_|None),active_dev_id:None}}}
+impl Shared{fn runtime(&self,id:u16)->Option<Arc<Runtime>>{self.runtimes.get(id as usize).and_then(Clone::clone)} fn new()->Self{Self{dev_registry:SleDevRegistry::new(),runtimes:std::array::from_fn(|_|None),active_dev_id:None}}}
 struct Lock<T>(Mutex<T>);impl<T> Lock<T>{fn lock(&self)->MutexGuard<'_,T>{self.0.lock().unwrap()}}
 static SUBSYSTEM:Lock<Option<Shared>>=Lock(Mutex::new(None));
+// @@RESERVE_BACKEND@@
+// @@CANCEL@@
 // @@RESERVE@@
+mod native_unregistration {use super::DeviceIdentity;
+ // @@UNREGISTER_NATIVE@@
+}
 // @@DETACH@@
 struct Runtime{identity:DeviceIdentity,invalidations:AtomicU32}
 impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relaxed);
@@ -72,4 +77,21 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
 }
 #[test]fn actual_detach_pending_identity_without_runtime_frees_only_exact_generation(){
  *SUBSYSTEM.lock()=Some(Shared::new());let old=reserve_usb_identity().unwrap();sle_detach_device(old);let new=reserve_usb_identity().unwrap();assert_eq!(old.id,new.id);assert_ne!(old.generation,new.generation);sle_detach_device(old);assert_eq!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(new.id).unwrap().identity(),new);
+}
+
+#[test]fn native_unregister_without_runtime_releases_pending_exact_identity(){
+ *SUBSYSTEM.lock()=Some(Shared::new());let a=reserve_usb_identity().unwrap();let b=reserve_usb_identity().unwrap();
+ native_unregistration::sparklink_native_unregister_rust(a.id,a.generation);
+ assert!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(a.id).is_none());
+ assert_eq!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(b.id).unwrap().identity(),b);
+ let new=reserve_usb_identity().unwrap();assert_eq!(new.id,a.id);assert_ne!(new.generation,a.generation);
+ native_unregistration::sparklink_native_unregister_rust(a.id,a.generation);
+ assert_eq!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(new.id).unwrap().identity(),new);
+}
+#[test]fn reservation_cancel_preserves_installed_or_retiring_owners(){
+ *SUBSYSTEM.lock()=Some(Shared::new());let a=reserve_usb_identity().unwrap();let b=reserve_usb_identity().unwrap();let c=reserve_usb_identity().unwrap();
+ {let mut g=SUBSYSTEM.lock();let s=g.as_mut().unwrap();s.runtimes[b.id as usize]=Some(Arc::new(Runtime{identity:b,invalidations:AtomicU32::new(0)}));s.dev_registry.get(c.id).unwrap().begin_unregister();}
+ cancel_backend_reservation(a);assert!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(a.id).is_none());
+ cancel_backend_reservation(b);assert!(SUBSYSTEM.lock().as_ref().unwrap().runtime(b.id).is_some());
+ cancel_backend_reservation(c);assert!(SUBSYSTEM.lock().as_ref().unwrap().dev_registry.get(c.id).is_some());
 }
