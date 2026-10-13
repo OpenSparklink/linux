@@ -20,7 +20,8 @@ static struct usb_device device;
 static int success_logs, allocs, live_allocs, fail_alloc, start_ret;
 static int chunks, done_out, reads, short_chunk, chunk_ret, done_ret, in_ret;
 static int out_length, in_length, ack_kind, starts, cases, expected_offset;
-static const u8 *firmware;
+static const u8 *firmware, *command_parameters;
+static int command_length;
 static void *kmalloc(int size,int flags) {
  (void)flags; allocs++; if(allocs==fail_alloc) return NULL;
  void *p=malloc((size_t)size); assert(p); live_allocs++; return p;
@@ -46,8 +47,9 @@ static int usb_bulk_msg(struct usb_device *d,unsigned int pipe,u8 *data,int size
  }
  assert(timeout==SLE_INIT_TIMEOUT_MS);
  if(pipe==2) {
-  assert(size==5 && data[0]==DLI_PKT_COMMAND && get_unaligned_le16(data+1)==SLE_OP_FW_DL_DONE);
-  assert(data[3]==0 && data[4]==0); done_out++; *actual=out_length; return done_ret;
+  assert(size==5+command_length && data[0]==DLI_PKT_COMMAND && get_unaligned_le16(data+1)==SLE_OP_FW_DL_DONE);
+  assert(get_unaligned_le16(data+3)==command_length);
+  if(command_length)assert(!memcmp(data+5,command_parameters,(size_t)command_length)); done_out++; *actual=out_length; return done_ret;
  }
  assert(pipe==1 && size==32); reads++; memset(data,0,(size_t)size);
  data[0]=SLE_EVT_CMD_COMPLETE; data[2]=4; data[4]=(u8)SLE_OP_FW_DL_DONE;
@@ -65,7 +67,7 @@ static void reset(const u8 *data) {
  assert(live_allocs==0); firmware=data;
  success_logs=allocs=fail_alloc=start_ret=chunks=done_out=reads=short_chunk=0;
  chunk_ret=done_ret=in_ret=ack_kind=starts=expected_offset=0;
- out_length=5; in_length=8;
+ out_length=5; in_length=8;command_length=0;command_parameters=NULL;
  device_context=(struct sle_usb_dev){.active=1,.udev=&device,.ep_bulk_in_size=64,.ep_bulk_out=2,.ep_bulk_in=1};
 }
 static void check(int got,int expected) {
@@ -97,5 +99,10 @@ int main(void) {
  reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,SLE_FW_MAX_SIZE,65535),0);assert(expected_offset==SLE_FW_MAX_SIZE);
  reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,58,0),0);assert(chunks==2);
  reset(data);device_context.ep_bulk_in_size=7;check(sle_usb_dev_download_fw_locked(&device_context,data,241,0),0);assert(chunks==2);
+ u8 reply[32];int reply_length;
+ for(int i=0;i<4;i++){int lengths[]={1,255,256,65535};reset(data);command_length=lengths[i];command_parameters=data;out_length=5+command_length;assert(!sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,data,command_length,reply,sizeof(reply),&reply_length)&&reply_length==8&&live_allocs==0);cases++;}
+ reset(data);assert(sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,NULL,1,reply,sizeof(reply),&reply_length)==-EINVAL&&allocs==0);cases++;
+ reset(data);assert(sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,data,-1,reply,sizeof(reply),&reply_length)==-EINVAL&&allocs==0);cases++;
+ reset(data);assert(sle_usb_send_cmd_sync(&device_context,SLE_OP_FW_DL_DONE,data,65536,reply,sizeof(reply),&reply_length)==-EINVAL&&allocs==0);cases++;
  free(data);printf("{\"c_cases\":%d,\"status\":\"PASS_ACTUAL_FW_C_BOUNDARIES\"}\n",cases);return 0;
 }

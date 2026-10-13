@@ -256,6 +256,7 @@ struct sle_usb_dev {
 	u8 mac_addr[6];
 	u32 fw_version;
 	u8 version[5];
+	struct sle_usb_capabilities capabilities;
 	bool metadata_valid;
 	u8 command_credits;
 };
@@ -581,6 +582,9 @@ static void sle_usb_dev_stop_data_locked(struct sle_usb_dev *d)
  * ----------------------------------------------------------------------- */
 
 /* DLI opcodes from T/XS 10003-2025 */
+#define SLE_OP_READ_CMD_LENGTH    0x0401
+#define SLE_OP_READ_BUFFER        0x0402
+#define SLE_OP_READ_FEATURES      0x0403
 #define SLE_OP_READ_LOCAL_VERSION 0x0404
 #define SLE_OP_READ_MAC_ADDR      0x0406
 #define SLE_OP_RESET              0x0408
@@ -592,7 +596,7 @@ static void sle_usb_dev_stop_data_locked(struct sle_usb_dev *d)
 #define SLE_INIT_TIMEOUT_MS       3000
 
 static int sle_usb_send_cmd_sync(struct sle_usb_dev *d, u16 opcode,
-				 u8 *resp, int resp_size, int *resp_len)
+				 const u8 *params, int plen, u8 *resp, int resp_size, int *resp_len)
 {
 	u8 *cmd;
 	u8 *rbuf;
@@ -600,23 +604,28 @@ static int sle_usb_send_cmd_sync(struct sle_usb_dev *d, u16 opcode,
 	unsigned int pipe_out, pipe_in;
 	int ret;
 
-	cmd = kmalloc(5, GFP_KERNEL);
+	if (plen < 0 || plen > 65535 || (plen && !params) ||
+	    !resp || !resp_len || resp_size <= 0)
+		return -EINVAL;
+	cmd = kmalloc(5 + plen, GFP_KERNEL);
 	if (!cmd)
 		return -ENOMEM;
 
 	cmd[0] = DLI_PKT_COMMAND;
 	cmd[1] = (u8)(opcode & 0xFF);
 	cmd[2] = (u8)(opcode >> 8);
-	cmd[3] = 0; /* param_len low */
-	cmd[4] = 0; /* param_len high */
+	cmd[3] = (u8)plen;
+	cmd[4] = (u8)(plen >> 8);
+	if (plen)
+		memcpy(cmd + 5, params, plen);
 
 	pipe_out = usb_sndbulkpipe(d->udev, d->ep_bulk_out);
-	ret = usb_bulk_msg(d->udev, pipe_out, cmd, 5,
+	ret = usb_bulk_msg(d->udev, pipe_out, cmd, 5 + plen,
 			   &actual_len, SLE_INIT_TIMEOUT_MS);
 	kfree(cmd);
 	if (ret)
 		return ret;
-	if (actual_len != 5)
+	if (actual_len != 5 + plen)
 		return -EIO;
 
 	/* Read response from bulk IN using heap buffer */
@@ -651,90 +660,81 @@ static int sle_usb_validate_init_reply(const u8 *resp, int len,
 	return 0;
 }
 
-/**
- * sle_usb_dev_init_controller - Run the SLE controller init sequence.
- * @d: retained USB context
- *
- * Sends Reset, ReadLocalVersion, ReadMacAddr commands and stores the
- * results only after all three matching CommandComplete replies succeed.
- * The driver rolls back probe on transport, framing or controller errors.
- *
- * Returns 0 on full success. Negative errno if any command fails.
+/* Bootstrap uses standard T/XS 10003-2025 sections 8.1.1--8.1.6.
+ * WS73's zero-parameter 0x0406 and 0x0401 dialect belong to its own driver.
+ * Strictly query all metadata before publishing any of it. Each next command
+ * requires the previous real Complete's command credit, not USB write success.
  */
 static int sle_usb_dev_init_controller_locked(struct sle_usb_dev *d)
 {
-	u8 resp[64];
-	int resp_len = 0;
-	int ret;
-	u32 fw_version;
-	u8 version[5];
-	u8 mac_addr[6];
-
+	static const struct { u16 opcode; int result_size; } queries[] = {
+		{ SLE_OP_RESET, 0 },
+		{ SLE_OP_READ_LOCAL_VERSION, 5 },
+		{ SLE_OP_READ_CMD_LENGTH, 2 },
+		{ SLE_OP_READ_BUFFER, 6 },
+		{ SLE_OP_READ_FEATURES, 10 },
+		{ SLE_OP_READ_MAC_ADDR, 6 },
+	};
+	struct sle_usb_capabilities capabilities = {};
+	u8 resp[64], version[5], mac_addr[6];
+	const u8 address_type = 0; /* alliance-assigned identifier */
+	int resp_len, ret;
+	size_t i;
 
 	if (!d->active || !d->udev)
 		return -ENODEV;
 	d->metadata_valid = false;
+	for (i = 0; i < ARRAY_SIZE(queries); i++) {
+		const u8 *params = queries[i].opcode == SLE_OP_READ_MAC_ADDR ?
+			&address_type : NULL;
 
-	/* Step 1: Reset controller */
-	ret = sle_usb_send_cmd_sync(d, SLE_OP_RESET, resp, sizeof(resp),
-				    &resp_len);
-	if (ret)
-		return ret;
-	ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_RESET, 0);
-	if (ret)
-		return ret;
-	/* Bootstrap has no asynchronous credit waiter yet: fail closed rather
-	 * than send a query when the controller advertises zero capacity.
-	 */
-	if (!resp[6])
-		return -EAGAIN;
-	pr_info("sparklink-usb: controller reset OK\n");
-
-	/* Step 2: ReadLocalVersion
-	 * CmdComplete wire format:
-	 *   [0..1] evt_code  (0x0002)
-	 *   [2..3] param_len (LE16)
-	 *   [4..5] opcode    (LE16)
-	 *   [6]    command credits
-	 *   [7]    status
-	 *   [8] protocol version, [9..10] company id, [11..12] sub-version
-	 *   (T/XS 10003-2025 section 8.1.4: 1 + 2 + 2 bytes)
-	 */
-	ret = sle_usb_send_cmd_sync(d, SLE_OP_READ_LOCAL_VERSION,
-				    resp, sizeof(resp), &resp_len);
-	if (ret)
-		return ret;
-	ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_READ_LOCAL_VERSION, 5);
-	if (ret)
-		return ret;
-	if (!resp[6])
-		return -EAGAIN;
-	/* Preserve the old u32 metadata projection for the legacy ABI. It is not
-	 * a complete standards version tuple; raw DLI queries return all 5 bytes.
-	 */
-	fw_version = get_unaligned_le32(resp + 8);
-	memcpy(version, resp + 8, sizeof(version));
-
-	/* Step 3: ReadMacAddr
-	 * CmdComplete: [0..7] header, opcode, credit, status; [8..13] MAC.
-	 */
-	ret = sle_usb_send_cmd_sync(d, SLE_OP_READ_MAC_ADDR,
-				    resp, sizeof(resp), &resp_len);
-	if (ret)
-		return ret;
-	ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_READ_MAC_ADDR, 6);
-	if (ret)
-		return ret;
-	memcpy(mac_addr, resp + 8, sizeof(mac_addr));
-	if (!memchr_inv(mac_addr, 0, sizeof(mac_addr)))
-		return -EPROTO;
-	/* Commit metadata together, never a partial/default successful bootstrap. */
-	d->fw_version = fw_version;
+		ret = sle_usb_send_cmd_sync(d, queries[i].opcode, params,
+			params ? 1 : 0, resp, sizeof(resp), &resp_len);
+		if (ret)
+			return ret;
+		ret = sle_usb_validate_init_reply(resp, resp_len,
+			queries[i].opcode, queries[i].result_size);
+		if (ret)
+			return ret;
+		if (i + 1 < ARRAY_SIZE(queries) && !resp[6])
+			return -EAGAIN;
+		switch (queries[i].opcode) {
+		case SLE_OP_READ_LOCAL_VERSION:
+			memcpy(version, resp + 8, sizeof(version));
+			break;
+		case SLE_OP_READ_CMD_LENGTH:
+			capabilities.command_max = get_unaligned_le16(resp + 8);
+			if (capabilities.command_max < 255)
+				return -EPROTO;
+			break;
+		case SLE_OP_READ_BUFFER:
+			capabilities.acb_length = get_unaligned_le16(resp + 8);
+			capabilities.acb_count = resp[10];
+			capabilities.icb_length = get_unaligned_le16(resp + 11);
+			capabilities.icb_count = resp[13];
+			if (capabilities.acb_length > 2047 || capabilities.icb_length > 2047 ||
+			    (!capabilities.acb_length != !capabilities.acb_count) ||
+			    (!capabilities.icb_length != !capabilities.icb_count))
+				return -EPROTO;
+			break;
+		case SLE_OP_READ_FEATURES:
+			memcpy(capabilities.features, resp + 8, sizeof(capabilities.features));
+			break;
+		case SLE_OP_READ_MAC_ADDR:
+			memcpy(mac_addr, resp + 8, sizeof(mac_addr));
+			if (!memchr_inv(mac_addr, 0, sizeof(mac_addr)) ||
+			    !memchr_inv(mac_addr, 0xff, sizeof(mac_addr)))
+				return -EPROTO;
+			break;
+		}
+	}
+	/* io_lock protects the complete observation and its validity bit. */
+	d->fw_version = get_unaligned_le32(version); /* legacy projection only */
 	memcpy(d->version, version, sizeof(d->version));
+	d->capabilities = capabilities;
 	d->command_credits = resp[6];
 	memcpy(d->mac_addr, mac_addr, sizeof(mac_addr));
 	d->metadata_valid = true;
-
 	return 0;
 }
 
@@ -894,7 +894,7 @@ static int sle_usb_dev_download_fw_locked(struct sle_usb_dev *d, const u8 *data,
 	}
 
 	/* Step 3: Send FW_DOWNLOAD_DONE and wait for ACK */
-	ret = sle_usb_send_cmd_sync(d, SLE_OP_FW_DL_DONE,
+	ret = sle_usb_send_cmd_sync(d, SLE_OP_FW_DL_DONE, NULL, 0,
 				    resp, sizeof(resp), &resp_len);
 	if (!ret)
 		ret = sle_usb_validate_init_reply(resp, resp_len, SLE_OP_FW_DL_DONE, 0);
@@ -1074,6 +1074,24 @@ u32 sle_usb_dev_get_fw_version(struct sle_usb_dev *d)
 	result = d->active ? sle_usb_dev_get_fw_version_locked(d) : 0;
 	mutex_unlock(&d->io_lock);
 	return result;
+}
+
+int sle_usb_dev_get_capabilities(struct sle_usb_dev *d,
+				 struct sle_usb_capabilities *out)
+{
+	int ret = 0;
+
+	if (!d || !out)
+		return -EINVAL;
+	mutex_lock(&d->io_lock);
+	if (!d->active)
+		ret = -ENODEV;
+	else if (!d->metadata_valid)
+		ret = -ENODATA;
+	else
+		*out = d->capabilities;
+	mutex_unlock(&d->io_lock);
+	return ret;
 }
 
 int sle_usb_dev_get_version(struct sle_usb_dev *d, u8 *version)

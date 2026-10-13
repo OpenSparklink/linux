@@ -30,7 +30,8 @@ def run(output):
     serdev_source=archived.read_text()
     c = inputs['sle_usb_ffi.c']
     fixture = (here/'usb-discovery/register_fixture.c').read_text()
-    fixture = fixture.replace('/* @@STRUCT@@ */', block(c, c.index('struct sle_usb_dev {'))+';')
+    header=(here.parents[3]/'include/linux/sparklink_usb.h').read_text()
+    fixture = fixture.replace('/* @@STRUCT@@ */', block(header, header.index('struct sle_usb_capabilities {'))+';\n'+block(c, c.index('struct sle_usb_dev {'))+';')
     fixture = fixture.replace('/* @@DEFINES@@ */', re.search(r'(?m)^#define SLE_USB_MAX_DEVS .+$', c).group())
     for marker, name in [('REGISTER', 'sle_usb_dev_register'), ('UNREGISTER', 'sle_usb_dev_unregister'), ('RELEASE','sle_usb_dev_release'), ('GET','sle_usb_dev_get'), ('PUT','sle_usb_dev_put'), ('GET_VERSION','sle_usb_dev_get_fw_version')]:
         body = block(c, re.search(r'(?m)^(?:static )?(?:void|int|u8|u32) '+name+r'\([^;{]*\)\s*\{', c).start())
