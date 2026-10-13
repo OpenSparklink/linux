@@ -20,7 +20,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
-#include "retired-event-poll/legacy_abi.h"
 #include "../../../../include/uapi/linux/sparklink.h"
 
 static const unsigned long protected[] = {
@@ -46,7 +45,6 @@ static const unsigned long protected[] = {
 	SL_IOCTL_DISCONNECT,
 	SL_IOCTL_CONNECTION_SUBMIT,
 	SL_IOCTL_DISCOVERY_SUBMIT,
-	SL_IOCTL_DLI_POLL_EVENT,
 	SL_IOCTL_DLI_RESET,
 	SL_IOCTL_DLI_SEND_CMD,
 	SL_IOCTL_EXT_ADV_CONFIGURE,
