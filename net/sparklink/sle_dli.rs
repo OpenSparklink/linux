@@ -1200,8 +1200,8 @@ unsafe impl Send for ControllerBackend {}
 unsafe impl Sync for ControllerBackend {}
 
 impl ControllerBackend {
-    pub(crate) fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: super::sle_usb::UsbDevice) -> Self {
-        Self::Usb(super::sle_usb::UsbController::new(addr, identity, device))
+    pub(crate) fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: super::sle_usb::UsbDevice) -> Result<Self> {
+        Ok(Self::Usb(super::sle_usb::UsbController::new(addr, identity, device)?))
     }
 }
 
@@ -1342,6 +1342,15 @@ pub fn sle_opcode_from_u16(v: u16) -> Option<SleOpcode> {
 }
 
 impl ControllerBackend {
+    /// Only the owner's command worker uses this independently retained handle.
+    /// Allocation/get is process-context, before releasing state; no I/O here.
+    pub(crate) fn command_port(&self) -> Result<kernel::alloc::KBox<dyn super::sle_backend::CommandPort>> {
+        use kernel::alloc::KBox;
+        match self {
+            Self::Usb(c) => Ok(KBox::new(c.clone(), GFP_KERNEL)? as KBox<dyn super::sle_backend::CommandPort>),
+            Self::Native(c) => Ok(KBox::new(c.command_transport(), GFP_KERNEL)? as KBox<dyn super::sle_backend::CommandPort>),
+        }
+    }
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
         match self {
             Self::Native(c) => c.validate_command(opcode, params),
@@ -1353,14 +1362,7 @@ impl ControllerBackend {
         matches!(self, Self::Usb(_) | Self::Native(_))
     }
 
-    pub(crate) fn send_command_transport(
-        &self, opcode: u16, params: &[u8], recipe: Option<super::sle_command_plan::RecipeTag>,
-    ) -> Result {
-        match self {
-            Self::Usb(c) => c.send_command_transport(opcode, params),
-            Self::Native(c) => c.send_command_transport(opcode, params, recipe),
-        }
-    }
+
 
     /// Send a command using a raw opcode value (u16).
     ///

@@ -13,18 +13,13 @@ impl Default for SleControllerInfo {
     // @@DEFAULT@@
 }
 static FW: AtomicU32 = AtomicU32::new(0);
-struct UsbDevice;impl UsbDevice{fn as_raw(&self)->i32{7}}
-unsafe fn sle_usb_dev_get_fw_version(id: i32) -> u32 {
-    assert_eq!(id, 7);
-    FW.load(Ordering::Relaxed)
-}
 unsafe fn sle_serdev_dev_get_fw_version(id: i32) -> u32 {
     assert_eq!(id, 8);
     FW.load(Ordering::Relaxed)
 }
 struct UsbController {
     addr: [u8; 6],
-    device: UsbDevice,
+    version: [u8; 5],
 }
 impl UsbController {
     // @@USB_INFO@@
@@ -79,7 +74,7 @@ fn usb_info_retains_only_queried_identity_and_firmware() {
         FW.store(fw, Ordering::Relaxed);
         let i = UsbController {
             addr: [1; 6],
-            device:UsbDevice,
+            version: [fw.to_le_bytes()[0],fw.to_le_bytes()[1],fw.to_le_bytes()[2],fw.to_le_bytes()[3],0xab],
         }
         .info();
         unavailable(&i);

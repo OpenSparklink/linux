@@ -88,6 +88,7 @@ extern "C" {
     fn sle_usb_dev_stop_data(context: *mut UsbDeviceOpaque);
     fn sle_usb_dev_init_controller(context: *mut UsbDeviceOpaque) -> i32;
     fn sle_usb_dev_get_fw_version(context: *mut UsbDeviceOpaque) -> u32;
+    fn sle_usb_dev_get_version(context: *mut UsbDeviceOpaque, version: *mut u8) -> i32;
     fn sle_usb_dev_get_command_credits(context: *mut UsbDeviceOpaque) -> u8;
     fn sle_usb_dev_get_mac(context: *mut UsbDeviceOpaque, mac: *mut u8) -> i32;
     fn sle_usb_dev_suspend(context: *mut UsbDeviceOpaque) -> i32;
@@ -817,6 +818,7 @@ fn raw_to_status(raw: u8) -> SleStatus {
 #[derive(Clone)]
 pub(crate) struct UsbController {
     addr: [u8; 6],
+    version: [u8; 5],
     /// Owns the immutable USB allocation independently of registry reuse.
     device: UsbDevice,
     identity: super::sle_dev::DeviceIdentity,
@@ -828,13 +830,20 @@ impl UsbController {
     /// `addr` is the 6-byte SLE MAC address read from the controller
     /// during probe via the ReadMacAddr (0x0406) command.
     /// Identity comes from the pending reservation retained through USB cleanup.
-    pub(crate) fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: UsbDevice) -> Self {
-        Self {
+    pub(crate) fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: UsbDevice) -> Result<Self> {
+        let mut version = [0; 5];
+        // SAFETY: retained context and writable whole tuple. Probe completed
+        // matching Reset/version/MAC replies before constructing this Backend.
+        let ret = unsafe { sle_usb_dev_get_version(device.as_raw(), version.as_mut_ptr()) };
+        if ret != 0 { return Err(if ret < 0 { Error::from_errno(ret) } else { EIO }); }
+        Ok(Self {
             addr,
+            version,
             device,
             identity,
-        }
+        })
     }
+    pub(crate) fn version(&self) -> [u8; 5] { self.version }
 
     /// Only the owner's TX worker may call this transport operation after
     /// reserving its command slot and a controller credit.
@@ -864,8 +873,8 @@ impl SleController for UsbController {
         info.name[..name.len()].copy_from_slice(name);
         info.bus = SleBus::Usb;
         info.addr = self.addr;
-        // SAFETY: this controller retains the registered probe binding.
-        info.fw_version = unsafe { sle_usb_dev_get_fw_version(self.device.as_raw()) };
+        // Immutable queried tuple, no C I/O lock or transport wait in info().
+        info.fw_version = u32::from_le_bytes(self.version[..4].try_into().unwrap());
         // Bootstrap queried identity only. Defaults advertise no unqueried
         // features, connection/data limits, transport or crypto capabilities.
 
@@ -942,6 +951,28 @@ impl SleController for UsbController {
 
     fn reset(&self) -> Result {
         self.send_command(SleOpcode::Reset, &[])
+    }
+}
+
+impl super::sle_backend::CommandPort for UsbController {
+    fn submit(&self, opcode: u16, params: &[u8], recipe: Option<super::sle_command_plan::RecipeTag>, connection: Option<u32>) -> Result {
+        // No typed connection or WS73 multi-step recipe implementation exists
+        // for this standard provider yet; never silently drop those obligations.
+        if connection.is_some() { return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))); }
+        if params.len() > super::sle_uapi::DLI_PARAM_MAX { return Err(EINVAL); }
+        if let Some(tag) = recipe {
+            use super::sle_command_plan::DiscoveryIntent;
+            if tag.step != 0 || tag.count != 1 || tag.recreate {
+                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+            }
+            let (expected, enabled) = match tag.intent {
+                DiscoveryIntent::Advertising(enabled) => (SleOpcode::EnableBroadcast as u16, enabled),
+                DiscoveryIntent::Scanning(enabled) => (SleOpcode::EnableScan as u16, enabled),
+                _ => return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))),
+            };
+            if opcode != expected || params != [u8::from(enabled)] { return Err(EINVAL); }
+        }
+        self.send_command_transport(opcode, params)
     }
 }
 

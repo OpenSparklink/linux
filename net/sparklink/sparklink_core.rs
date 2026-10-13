@@ -15,6 +15,7 @@
 //!   - Security: SM2/SM3/SM4 pairing and encryption (future)
 
 mod sle_adv;
+mod sle_backend;
 mod sle_authorization;
 mod sle_management;
 mod sle_grant;
@@ -1049,7 +1050,7 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
 /// succeed. Creates per-device protocol state and switches the active
 /// device by selecting its fixed Runtime slot. Other owners remain in place.
 pub(crate) fn sle_switch_controller_usb(identity: sle_dev::DeviceIdentity, device: sle_usb::UsbDevice, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
-    let backend = sle_dli::ControllerBackend::new_usb(addr, identity, device);
+    let backend = sle_dli::ControllerBackend::new_usb(addr, identity, device)?;
     let mut state = ControllerState::new_boxed(addr, backend)?;
     state.command_credits = credits;
     let owner = install_backend_runtime(identity, state, true, Some((addr, fw_version)))?;
@@ -3026,13 +3027,15 @@ fn ioctl_controller_snapshot(
             controller.fill_snapshot(&mut out);
             out.flags = if native_ready { 1 } else { 2 };
         }
-        _ => {
+        sle_dli::ControllerBackend::Usb(controller) => {
             let info = state.controller.info();
             out.address = info.addr;
-            out.version_tuple[..4].copy_from_slice(&info.fw_version.to_le_bytes());
+            out.version_tuple = controller.version();
             out.features[..8].copy_from_slice(&info.features.to_le_bytes());
             out.features[8..].copy_from_slice(&info.features_ext.to_le_bytes());
-            out.flags = 1; // legacy Runtime availability, not full queried metadata
+            // Installation/open and identity queries do not establish Host
+            // readiness or the still-unqueried standard data capabilities.
+            out.flags = if native_ready { 1 } else { 2 };
         }
     }
     if let Some(error) = fault {

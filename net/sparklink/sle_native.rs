@@ -219,11 +219,7 @@ impl NativeController {
         })
     }
 
-    pub(crate) fn send_command_transport(
-        &self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>,
-    ) -> Result {
-        self.command_transport().send(opcode, params, recipe)
-    }
+
 }
 
 impl super::ControllerRuntime {
@@ -267,9 +263,7 @@ impl super::ControllerRuntime {
 }
 
 impl NativeCommandTransport {
-    pub(crate) fn send(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>) -> Result {
-        self.send_typed(opcode, params, recipe, None)
-    }
+
     pub(crate) fn send_typed(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
         if connection.is_some() && recipe.is_some() { return Err(EINVAL); }
         if let Some(operation) = connection {
@@ -307,6 +301,12 @@ impl NativeCommandTransport {
         NativeController::result(unsafe {
             sparklink_native_transport_command(self.transport, opcode, params.as_ptr(), params.len())
         })
+    }
+}
+
+impl super::sle_backend::CommandPort for NativeCommandTransport {
+    fn submit(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
+        self.send_typed(opcode, params, recipe, connection)
     }
 }
 

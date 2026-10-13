@@ -23,7 +23,7 @@ TEST_PROGS += run_management_release.py run_link_observation.py
 TEST_PROGS += run_native_data.py run_native_ticket_driver.py run_session_dispatch.py
 TEST_PROGS += run_retired_transport.py
 TEST_PROGS += run_usb_firmware.py
-TEST_PROGS += run_usb_discovery.py
+TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
 
 include ../lib.mk
 

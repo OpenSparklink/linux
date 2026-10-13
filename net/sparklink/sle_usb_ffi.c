@@ -255,6 +255,8 @@ struct sle_usb_dev {
 	/* Read-back from controller during init */
 	u8 mac_addr[6];
 	u32 fw_version;
+	u8 version[5];
+	bool metadata_valid;
 	u8 command_credits;
 };
 
@@ -345,6 +347,8 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation,
 
 	memset(d->mac_addr, 0, 6);
 	d->fw_version = 0;
+	memset(d->version, 0, sizeof(d->version));
+	d->metadata_valid = false;
 	d->evt_urb->registration_id = dev_id;
 	d->evt_urb->registration_generation = generation;
 	d->rx_urb->registration_id = dev_id;
@@ -663,11 +667,13 @@ static int sle_usb_dev_init_controller_locked(struct sle_usb_dev *d)
 	int resp_len = 0;
 	int ret;
 	u32 fw_version;
+	u8 version[5];
 	u8 mac_addr[6];
 
 
 	if (!d->active || !d->udev)
 		return -ENODEV;
+	d->metadata_valid = false;
 
 	/* Step 1: Reset controller */
 	ret = sle_usb_send_cmd_sync(d, SLE_OP_RESET, resp, sizeof(resp),
@@ -707,6 +713,7 @@ static int sle_usb_dev_init_controller_locked(struct sle_usb_dev *d)
 	 * a complete standards version tuple; raw DLI queries return all 5 bytes.
 	 */
 	fw_version = get_unaligned_le32(resp + 8);
+	memcpy(version, resp + 8, sizeof(version));
 
 	/* Step 3: ReadMacAddr
 	 * CmdComplete: [0..7] header, opcode, credit, status; [8..13] MAC.
@@ -723,8 +730,10 @@ static int sle_usb_dev_init_controller_locked(struct sle_usb_dev *d)
 		return -EPROTO;
 	/* Commit metadata together, never a partial/default successful bootstrap. */
 	d->fw_version = fw_version;
+	memcpy(d->version, version, sizeof(d->version));
 	d->command_credits = resp[6];
 	memcpy(d->mac_addr, mac_addr, sizeof(mac_addr));
+	d->metadata_valid = true;
 
 	return 0;
 }
@@ -1066,6 +1075,24 @@ u32 sle_usb_dev_get_fw_version(struct sle_usb_dev *d)
 	mutex_unlock(&d->io_lock);
 	return result;
 }
+
+int sle_usb_dev_get_version(struct sle_usb_dev *d, u8 *version)
+{
+    int ret = 0;
+
+    if (!d || !version)
+        return -EINVAL;
+    mutex_lock(&d->io_lock);
+    if (!d->active)
+        ret = -ENODEV;
+    else if (!d->metadata_valid)
+        ret = -ENODATA;
+    else
+        memcpy(version, d->version, sizeof(d->version));
+    mutex_unlock(&d->io_lock);
+    return ret;
+}
+
 
 int sle_usb_dev_get_mac(struct sle_usb_dev *d, u8 *mac)
 {
