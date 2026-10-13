@@ -1627,10 +1627,10 @@ unsafe impl FromBytes for SleMgmtStats {}
 pub(crate) struct SleSubsysStats {
     /// Number of registered devices in the SleDev registry.
     pub dev_count: u16,
-    /// Number of registered transport protocols.
-    pub proto_count: u8,
-    /// Number of active device-transport bindings.
-    pub binding_count: u8,
+    /// Reserved identities without an installed Runtime; not Ready count.
+    pub pending_count: u8,
+    /// Installed Runtime objects, including Setup/faulted; not Ready count.
+    pub runtime_count: u8,
     /// Active connections.
     pub active_connections: u16,
     /// Management plane pending commands.

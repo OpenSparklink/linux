@@ -41,10 +41,12 @@ def run(output):
     rust = rust.replace('// @@DEFAULT@@', function(dli[dli.index('impl Default for SleControllerInfo'):], 'default'))
     for marker, source in [('USB_INFO', 'sle_usb.rs'), ('SERDEV_INFO', 'sle_serdev.rs')]:
         rust = rust.replace('// @@'+marker+'@@', function(serdev_source if source=='sle_serdev.rs' else inputs[source], 'info'))
-    attach = function(inputs['sparklink_core.rs'], 'sle_attach_device')
-    assembly = attach[attach.index('    let bus = proto.bus;'):]
-    end = assembly.index('\n    // Register in the SleDev registry.')
-    rust = rust.replace('// @@ATTACH_METADATA@@', assembly[:end])
+    historic_attach = here/'retired-usb-registration/attach_metadata.rs'
+    assembly = historic_attach.read_text()
+    rust = rust.replace('// @@ATTACH_METADATA@@', assembly)
+    reserve = function(inputs['sparklink_core.rs'], 'reserve_usb_identity')
+    metadata = reserve[reserve.index('    let mut info ='):reserve.index('    let id =')]
+    rust = rust.replace('// @@RESERVE_METADATA@@', metadata)
     with tempfile.TemporaryDirectory(prefix='sparklink-usb-discovery-') as tmp:
         tmp = Path(tmp)
         (tmp/'fixture.c').write_text(fixture)
@@ -63,11 +65,12 @@ def run(output):
     assert all((net/n).read_text() == s for n, s in inputs.items())
     assert archived.read_text()==serdev_source
     record = {'status': 'GENERIC_USB_DESCRIPTOR_CAPABILITY_SOURCE_BOUNDARIES_PASS',
-              'c_cases': c_record['c_cases'], 'rust_tests': 5,
-              'scope': 'actual C register/unregister; actual Rust info structs/default, USB info and attach metadata projection, archived serdev info; descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
+              'c_cases': c_record['c_cases'], 'rust_tests': 7,
+              'scope': 'actual C register/unregister; actual Rust info structs/default, USB info/pending reservation metadata, archived attach and serdev info; descriptor lookup/allocation/URB/types/firmware getters are dependency fixtures',
               'physical_acceptance': False, 'generic_dialect_acceptance': False,
               'full_capability_provenance_contract': False, 'natural_fault_root_cause_closed': False,
               'sources': {n: hashlib.sha256(s.encode()).hexdigest() for n, s in inputs.items()},
+              'archived_attach_sha256': hashlib.sha256(assembly.encode()).hexdigest(),
               'archived_serdev_info_sha256': hashlib.sha256(serdev_source.encode()).hexdigest()}
     if output:
         output.write_text(json.dumps(record, indent=2)+'\n')

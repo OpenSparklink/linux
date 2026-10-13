@@ -44,7 +44,6 @@ mod sle_phy;
 mod sle_power;
 mod sle_security;
 mod sle_snoop;
-mod sle_transport;
 mod sle_uapi;
 mod sle_usb;
 mod sle_workers;
@@ -534,7 +533,7 @@ pub(crate) struct ControllerRuntime {
     pub(crate) snoop_poll: PollCondVar,
     #[pin]
     pub(crate) state: Mutex<Option<KBox<ControllerState>>>,
-    /// Serializes native open against teardown, never protocol observation.
+    /// Serializes Backend open against teardown, never protocol observation.
     #[pin]
     pub(crate) native_lifecycle: Mutex<()>,
     pub(crate) transport_open: core::sync::atomic::AtomicBool,
@@ -576,7 +575,6 @@ impl ControllerRuntime {
             sle_dli::ControllerBackend::Native(controller) => controller.profile(),
             _ => 0,
         };
-        let initially_open = protocol_profile == 0;
         let (data_length, data_count) = match &state.controller {
             sle_dli::ControllerBackend::Native(controller) => controller.data_limits(),
             _ => (0, 0),
@@ -591,7 +589,7 @@ impl ControllerRuntime {
             snoop_poll <- new_poll_condvar!("sparklink_snoop_poll"),
             state <- new_mutex!(Some(state), "sparklink_runtime"),
             native_lifecycle <- new_mutex!((), "sparklink_native_lifecycle"),
-            transport_open: core::sync::atomic::AtomicBool::new(initially_open),
+            transport_open: core::sync::atomic::AtomicBool::new(false),
             ingress <- new_irq_lock!(ingress, "sparklink_runtime_rx"),
             host <- new_irq_lock!(host, "sparklink_runtime_host"),
             data <- new_irq_lock!(sle_native_data::NativeData::new(data_length, data_count), "sparklink_runtime_data"),
@@ -641,8 +639,6 @@ pub(crate) struct SubsystemShared {
     runtimes: [Option<Arc<ControllerRuntime>>; sle_dev::SLE_DEV_MAX],
     pub(crate) dev_registry: sle_dev::SleDevRegistry,
     pub(crate) active_dev_id: Option<u16>,
-    pub(crate) proto_registry: sle_transport::SleProtoRegistry,
-    pub(crate) dev_bindings: sle_transport::SleBindingTable,
 }
 
 struct RuntimeContext {
@@ -714,92 +710,53 @@ pub(crate) fn registration_identity(id: u16) -> Option<sle_dev::DeviceIdentity> 
 
 /// Stop protocol operations and workers before the transport frees resources.
 /// The registry keeps the index reserved until the transport joins its URBs.
-pub(crate) fn sle_quiesce_device(id: u16) {
-    if let Some(owner) = runtime_by_id(id) { owner.invalidate(); }
+pub(crate) fn sle_quiesce_device(identity: sle_dev::DeviceIdentity) {
+    if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) { owner.invalidate(); }
 }
 
 // ---------------------------------------------------------------------------
 // Transport device attach / detach (called from driver probe/remove)
 // ---------------------------------------------------------------------------
 
-/// Attach a newly-discovered physical device to the subsystem.
-///
-/// Called from a registered USB probe or a future Backend driver's
-/// hardware enumeration callback. Allocates a `SleDev` in the global
-/// registry, creates a transport binding, and logs the attachment.
-///
-/// Returns the allocated device id on success.
-pub(crate) fn sle_attach_device(info: &sle_transport::SleAttachInfo) -> Result<u16> {
-    let mut ss = SUBSYSTEM.lock();
-    let ss = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
-
-    // Protocol framing limits do not establish controller capabilities.
-    let proto = ss.proto_registry.get(info.proto_id).ok_or(EINVAL)?;
-    let bus = proto.bus;
-
-    // Build a SleControllerInfo for device registration.
-    let proto_name = proto.name;
-    let name_bytes = proto_name.as_bytes();
-    let mut name_buf = [0u8; 32];
-    let copy_len = name_bytes.len().min(name_buf.len());
-    name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-
-    let ctrl_info = sle_dli::SleControllerInfo {
-        name: name_buf,
-        bus,
-        addr: info.addr,
-        fw_version: info.fw_version,
-        features: info.features,
-        features_ext: info.features_ext,
-        max_pdu_payload: info.max_pdu,
-        max_connections: info.max_connections,
-        ..Default::default()
-    };
-
-    // Register in the SleDev registry.
-    let dev_id = ss.dev_registry.register(&ctrl_info)?;
-
-    // Create the transport binding.
-    let binding = sle_transport::SleDevBinding { dev_id };
-    if let Err(e) = ss.dev_bindings.insert(binding) {
-        let _ = ss.dev_registry.unregister(dev_id);
-        return Err(e);
-    }
-
-    pr_info!(
-        "sparklink: device sle{} attached via {} [{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}]\n",
-        dev_id,
-        proto_name,
-        info.addr[0],
-        info.addr[1],
-        info.addr[2],
-        info.addr[3],
-        info.addr[4],
-        info.addr[5],
-    );
-
-    Ok(dev_id)
+/// Reserve one exact identity before standard USB resources/bootstrap exist.
+/// Unknown address/capabilities stay zero; no Runtime or Ready is published.
+pub(crate) fn reserve_usb_identity() -> Result<sle_dev::DeviceIdentity> {
+    let mut guard = SUBSYSTEM.lock();
+    let ss = guard.as_mut().ok_or(ENODEV)?;
+    let mut info = sle_dli::SleControllerInfo::default();
+    let name = b"sparklink-usb";
+    info.name[..name.len()].copy_from_slice(name);
+    info.bus = sle_dli::SleBus::Usb;
+    let id = ss.dev_registry.register_pending(&info)?;
+    Ok(ss.dev_registry.get(id).ok_or(ENODEV)?.identity())
 }
 
 /// Detach a device from the subsystem.
 ///
 /// Called from registered USB disconnect or module unload cleanup.
-/// Removes the transport binding and unregisters the SleDev.  If the
+/// Removes the exact Runtime and unregisters its reserved SleDev. If the
 /// device was the active one, reverts to the no-controller state.  If it
 /// was inactive, its saved state is discarded.
-pub(crate) fn sle_detach_device(dev_id: u16) {
+pub(crate) fn sle_detach_device(identity: sle_dev::DeviceIdentity) {
+    let dev_id = identity.id;
     let owner = {
         let mut guard = SUBSYSTEM.lock();
         let Some(ss) = Option::as_mut(&mut *guard) else { return };
-        ss.dev_bindings.remove(dev_id);
+        let Some(dev) = ss.dev_registry.get(dev_id) else { return };
+        if dev.identity() != identity || dev.test_flag(sle_dev::SLE_DEV_UNREGISTERING) { return; }
+        // Reserve the retiring identity until joined cleanup finishes. A
+        // duplicate detach cannot free the index while this owner is draining.
+        dev.begin_unregister();
         if ss.active_dev_id == Some(dev_id) { ss.active_dev_id = None; }
         ss.runtimes.get_mut(dev_id as usize).and_then(Option::take)
     };
     if let Some(owner) = owner { owner.invalidate(); }
     let mut guard = SUBSYSTEM.lock();
     if let Some(ss) = Option::as_mut(&mut *guard) {
-        let _ = ss.dev_registry.unregister(dev_id);
-        pr_info!("sparklink: device sle{} detached\n", dev_id);
+        if ss.dev_registry.get(dev_id).is_some_and(|dev| dev.identity() == identity) {
+            let _ = ss.dev_registry.unregister(dev_id);
+            pr_info!("sparklink: device sle{} detached\n", dev_id);
+        }
     }
 }
 
@@ -967,46 +924,69 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
 
 /// Switch the subsystem controller backend to USB.
 ///
-/// Called from USB probe after sle_attach_device and C-side registration
+/// Called from USB probe after identity reservation and C-side registration
 /// succeed. Creates per-device protocol state and switches the active
 /// device by selecting its fixed Runtime slot. Other owners remain in place.
-pub(crate) fn sle_switch_controller_usb(dev_id: u16, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
+pub(crate) fn sle_switch_controller_usb(identity: sle_dev::DeviceIdentity, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
+    let dev_id = identity.id;
     let result = (|| -> Result<Arc<ControllerRuntime>> {
-        let identity = registration_identity(dev_id).ok_or(ENODEV)?;
+        if registration_identity(dev_id) != Some(identity) { return Err(ENODEV); }
         let backend = sle_dli::ControllerBackend::new_usb(addr, identity);
         let mut state = ControllerState::new_boxed(addr, backend)?;
         state.command_credits = credits;
         let mut guard = SUBSYSTEM.lock();
         let ss = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+        if !ss.dev_registry.get(dev_id).is_some_and(|dev| dev.identity() == identity) { return Err(ENODEV); }
         ss.dev_registry.update_hw_info(dev_id, addr, fw_version);
         ss.activate_new_device(dev_id, state)
     })();
     match result {
-        Ok(owner) => {
-            sle_ingress::publish_runtime(&owner)?;
-            let mut guard = owner.state.lock();
-            if let Some(state) = Option::as_mut(&mut *guard) {
-                if let Err(e) = state.controller.open() {
-                    return Err(e);
-                }
-            }
-            drop(guard);
-            owner.start_workers();
-            pr_info!("sparklink: controller switched to USB (sle{})\n", dev_id);
-            Ok(())
-        }
+        Ok(owner) => open_usb_runtime(&owner),
         Err(e) => Err(e),
     }
 }
 
-pub(crate) fn sle_suspend_device(dev_id: u16) {
-    if let Some(owner) = runtime_by_id(dev_id) {
+/// Listener startup/adoption under the shared Backend lifecycle barrier.
+/// The copied USB value borrows resources owned by this exact reservation.
+pub(crate) fn open_usb_runtime(owner: &Arc<ControllerRuntime>) -> Result {
+    // Same open/close barrier as Native. Teardown closes the gate
+    // immediately, then joins this before taking state/C resources.
+    let lifecycle = owner.native_lifecycle.lock();
+    sle_ingress::publish_runtime(owner)?;
+    let transport = {
+        let guard = owner.state.lock();
+        if *owner.schedule_gate.lock() { return Err(ENODEV); }
+        let Some(sle_dli::ControllerBackend::Usb(transport)) =
+            guard.as_ref().map(|state| &state.controller) else { return Err(ENODEV) };
+        *transport
+    };
+    // No state/registry/Host/IRQ lock across listener startup. Failed
+    // open cleans its partial listener; successful but retired open
+    // must be joined before this borrowed handle is discarded.
+    transport.open()?;
+    {
+        let gate = owner.schedule_gate.lock();
+        if *gate {
+            drop(gate);
+            transport.close();
+            return Err(ENODEV);
+        }
+        owner.transport_open.store(true, core::sync::atomic::Ordering::Release);
+    }
+    drop(lifecycle);
+    owner.start_workers();
+    pr_info!("sparklink: controller switched to USB (sle{})\n", owner.identity.id);
+    Ok(())
+}
+
+pub(crate) fn sle_suspend_device(identity: sle_dev::DeviceIdentity) {
+    if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) {
         if let Some(state) = Option::as_mut(&mut *owner.state.lock()) { let _ = state.power.suspend(); }
     }
 }
 
-pub(crate) fn sle_resume_device(dev_id: u16) {
-    if let Some(owner) = runtime_by_id(dev_id) {
+pub(crate) fn sle_resume_device(identity: sle_dev::DeviceIdentity) {
+    if let Some(owner) = runtime_by_id(identity.id).filter(|owner| owner.identity == identity) {
         if let Some(state) = Option::as_mut(&mut *owner.state.lock()) { state.power.resume(); }
     }
 }
@@ -1179,12 +1159,8 @@ fn init_debugfs() -> Result<Pin<KBox<DebugfsHolder>>> {
                 &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
                     let ss = SUBSYSTEM.lock();
                     if let Some(ref ss) = *ss {
-                        writeln!(f, "protocols_registered: {}", ss.proto_registry.count())?;
-                        writeln!(f, "devices_bound: {}", ss.dev_bindings.count())?;
-                        for proto in ss.proto_registry.iter() {
-                            writeln!(f, "  proto: {} (bus={:?}, max_pdu={})",
-                                proto.name, proto.bus, proto.max_pdu)?;
-                        }
+                        writeln!(f, "identities_reserved: {}", ss.dev_registry.count())?;
+                        writeln!(f, "runtimes_installed: {}", ss.runtimes.iter().flatten().count())?;
                     }
                     Ok(())
                 },
@@ -1326,8 +1302,6 @@ impl kernel::InPlaceModule for SparkLinkModule {
 #[inline(never)]
 fn init_subsystem() -> Result<SubsystemGuard> {
     let mut ss = SUBSYSTEM.lock();
-    let mut proto_registry = sle_transport::SleProtoRegistry::new();
-    sle_transport::register_builtin_protos(&mut proto_registry);
 
     // Only a bus driver's successful registration can create a Runtime.
     // Module load creates no synthetic controller or protocol state.
@@ -1338,8 +1312,6 @@ fn init_subsystem() -> Result<SubsystemGuard> {
             runtimes,
             dev_registry,
             active_dev_id: None,
-            proto_registry,
-            dev_bindings: sle_transport::SleBindingTable::new(),
         }),
         GFP_KERNEL,
     )?);
@@ -3568,17 +3540,21 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
             Ok(0)
         }
         SL_IOCTL_SUBSYS_STATS => {
-            let (dev_count, proto_count, binding_count) = {
+            let (dev_count, pending_count, runtime_count) = {
                 let guard = SUBSYSTEM.lock();
                 let s = guard.as_ref().ok_or(ENODEV)?;
-                (s.dev_registry.count() as u16, s.proto_registry.count(), s.dev_bindings.count())
+                {
+                    let runtimes = s.runtimes.iter().flatten().count() as u8;
+                    let devices = s.dev_registry.count() as u16;
+                    (devices, (devices - u16::from(runtimes)) as u8, runtimes)
+                }
             };
             let ss = context.lock()?;
             let s = ss.as_ref().ok_or(ENODEV)?;
             let stats = SleSubsysStats {
                 dev_count,
-                proto_count,
-                binding_count,
+                pending_count,
+                runtime_count,
                 active_connections: s.conn.active_count() as u16,
                 mgmt_pending: s.cmd_pending.pending_count,
                 total_conn_created: s.conn.total_created as u32,

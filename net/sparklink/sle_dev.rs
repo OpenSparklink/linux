@@ -106,7 +106,7 @@ pub(crate) struct SleDev {
 
 impl SleDev {
     /// Create a new `SleDev` from controller info. The device starts in
-    /// the `SETUP` state with no flags set until `setup_complete()` is called.
+    /// SETUP state; registration does not assert transport-open or Host Ready.
     pub(crate) fn new(id: u16, generation: u64, info: &SleControllerInfo) -> Self {
         let mut name = [0u8; SLE_DEV_NAME_LEN];
         // Format name as "sleN\0".
@@ -215,13 +215,6 @@ impl SleDev {
 
     // -- Lifecycle transitions ---------------------------------------------
 
-    /// Mark setup as complete. Transitions from `SETUP` to `UP | REGISTERED`.
-    pub(crate) fn setup_complete(&self) {
-        self.flags.fetch_and(!SLE_DEV_SETUP, Ordering::AcqRel);
-        self.flags
-            .fetch_or(SLE_DEV_UP | SLE_DEV_REGISTERED, Ordering::AcqRel);
-    }
-
     /// Check whether the device is operational (UP and not UNREGISTERING/SUSPENDED).
     pub(crate) fn is_up(&self) -> bool {
         let f = self.flags.load(Ordering::Acquire);
@@ -263,18 +256,8 @@ impl SleDevRegistry {
         }
     }
 
-    /// Register a new device from controller info. Returns the allocated
-    /// device index on success, or `ENOSPC` if the registry is full.
-    pub(crate) fn register(&mut self, info: &SleControllerInfo) -> Result<u16> {
-        self.register_state(info, true)
-    }
-
-    /// Reserve an identity without claiming initialization/Ready succeeded.
+    /// Reserve identity without assuming bootstrap/open/Ready has succeeded.
     pub(crate) fn register_pending(&mut self, info: &SleControllerInfo) -> Result<u16> {
-        self.register_state(info, false)
-    }
-
-    fn register_state(&mut self, info: &SleControllerInfo, ready: bool) -> Result<u16> {
         // Find first free bit.
         let free = (!self.allocated).trailing_zeros();
         if free as usize >= SLE_DEV_MAX {
@@ -287,7 +270,6 @@ impl SleDevRegistry {
         self.allocated |= 1 << id;
 
         let dev = SleDev::new(id, generation, info);
-        if ready { dev.setup_complete(); }
         self.slots[id as usize] = Some(dev);
 
         pr_info!("sparklink: registered device sle{} (bus={:?}, addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})\n",

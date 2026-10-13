@@ -156,28 +156,12 @@ unsafe fn sle_usb_dev_get_command_credits(id: i32) -> u8 {
     state(|s| s.events.push("credits"));
     3
 }
-enum SleProtoId {
-    UsbBulk,
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct DeviceIdentity {id:u16,generation:u64}
+fn reserve_usb_identity()->Result<DeviceIdentity>{
+ state(|s|s.events.push("attach"));Ok(DeviceIdentity{id:7,generation:42})
 }
-struct SleAttachInfo;
-impl SleAttachInfo {
-    fn new(_proto: SleProtoId, addr: [u8; 6]) -> Self {
-        assert_eq!(addr, [0x5e, 0, 0, 0, 1, 1]);
-        Self
-    }
-}
-struct Identity {
-    generation: u32,
-}
-fn sle_attach_device(_a: &SleAttachInfo) -> Result<u16> {
-    state(|s| s.events.push("attach"));
-    Ok(7)
-}
-fn registration_identity(id: u16) -> Option<Identity> {
-    assert_eq!(id, 7);
-    Some(Identity { generation: 42 })
-}
-unsafe fn sle_usb_dev_register(id: i32, ptr: *mut core::ffi::c_void, generation: u32) -> i32 {
+unsafe fn sle_usb_dev_register(id: i32, ptr: *mut core::ffi::c_void, generation: u64) -> i32 {
     assert_eq!((id, generation), (7, 42));
     assert!(!ptr.is_null());
     state(|s| {
@@ -185,8 +169,8 @@ unsafe fn sle_usb_dev_register(id: i32, ptr: *mut core::ffi::c_void, generation:
         s.reg_ret
     })
 }
-fn sle_switch_controller_usb(id: u16, addr: [u8; 6], version: u32, credits: u8) -> Result {
-    assert_eq!(id, 7);
+fn sle_switch_controller_usb(identity: DeviceIdentity, addr: [u8; 6], version: u32, credits: u8) -> Result {
+    assert_eq!(identity, DeviceIdentity{id:7,generation:42});
     state(|s| {
         s.events.push("publish");
         if let Some(e) = s.switch_error {
@@ -196,16 +180,16 @@ fn sle_switch_controller_usb(id: u16, addr: [u8; 6], version: u32, credits: u8) 
         Ok(())
     })
 }
-fn sle_quiesce_device(id: u16) {
-    assert_eq!(id, 7);
+fn sle_quiesce_device(identity: DeviceIdentity) {
+    assert_eq!(identity,DeviceIdentity{id:7,generation:42});
     state(|s| s.events.push("quiesce"));
 }
 unsafe fn sle_usb_dev_unregister(id: i32) {
     assert_eq!(id, 7);
     state(|s| s.events.push("join"));
 }
-fn sle_detach_device(id: u16) {
-    assert_eq!(id, 7);
+fn sle_detach_device(identity: DeviceIdentity) {
+    assert_eq!(identity,DeviceIdentity{id:7,generation:42});
     state(|s| s.events.push("detach"));
 }
 mod sle_fw {
@@ -215,7 +199,7 @@ mod sle_fw {
 mod production {
     use super::*;
     // @@PREPARE@@
-    pub fn probe() -> Result<u16> {
+    pub fn probe() -> Result<DeviceIdentity> {
         probe_usb_device(&usb::Interface {
             dev: device::Device(std::marker::PhantomData),
         })
@@ -224,10 +208,12 @@ mod production {
 fn failed(expected: Error) {
     assert_eq!(production::probe(), Err(expected));
     state(|s| {
-        assert_eq!(
-            &s.events[s.events.len() - 3..],
-            &["quiesce", "join", "detach"]
-        );
+        if s.reg_ret==0 {
+            assert_eq!(&s.events[s.events.len()-3..], &["quiesce","join","detach"]);
+        } else {
+            assert_eq!(&s.events[s.events.len()-2..], &["quiesce","detach"]);
+            assert!(!s.events.contains(&"join"),"must not unregister another C table owner");
+        }
         assert!(s.published.is_none());
     });
     assert_eq!(USB_DEV_COUNT.load(Ordering::Relaxed), 0);
@@ -235,7 +221,7 @@ fn failed(expected: Error) {
 #[test]
 fn absent_is_the_only_optional_request_error() {
     reset();
-    assert_eq!(production::probe(), Ok(7));
+    assert_eq!(production::probe(), Ok(DeviceIdentity{id:7,generation:42}));
     state(|s| {
         assert_eq!(
             s.events,
@@ -249,7 +235,7 @@ fn absent_is_the_only_optional_request_error() {
 fn upload_requeries_and_publishes_fresh_identity() {
     reset();
     state(|s| s.request_error = None);
-    assert_eq!(production::probe(), Ok(7));
+    assert_eq!(production::probe(), Ok(DeviceIdentity{id:7,generation:42}));
     state(|s| {
         assert_eq!(
             s.events,
@@ -352,7 +338,7 @@ fn maximum_firmware_is_borrowed_synchronously() {
         s.request_error = None;
         s.size = 4 * 1024 * 1024;
     });
-    assert_eq!(production::probe(), Ok(7));
+    assert_eq!(production::probe(), Ok(DeviceIdentity{id:7,generation:42}));
     state(|s| assert_eq!(s.download_calls, 1));
 }
 #[test]

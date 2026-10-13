@@ -637,8 +637,8 @@ struct sle_sinr_thresholds {
 
 struct sle_subsys_stats {
 	__u16 dev_count;
-	__u8  proto_count;
-	__u8  binding_count;
+	__u8  pending_count;
+	__u8  runtime_count;
 	__u16 active_connections;
 	__u16 mgmt_pending;
 	__u32 total_conn_created;

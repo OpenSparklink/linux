@@ -36,7 +36,7 @@ impl SerdevController {
     // @@SERDEV_INFO@@
 }
 mod sle_dli {
-    pub use super::SleControllerInfo;
+    pub use super::{SleControllerInfo, SleBus};
 }
 struct SleAttachInfo {
     addr: [u8; 6],
@@ -161,4 +161,15 @@ fn explicit_attach_metadata_is_preserved_without_extra_claims() {
         ),
         (0, 0, 0, 0, 0)
     );
+}
+
+fn reserve_projection()->SleControllerInfo {
+ // @@RESERVE_METADATA@@
+ info
+}
+#[test] fn pending_identity_has_unknown_address_version_and_no_queried_capabilities(){
+ let info=reserve_projection();assert_eq!(info.addr,[0;6]);assert_eq!(info.fw_version,0);assert_eq!(info.bus,SleBus::Usb);unavailable(&info);
+}
+#[test] fn unrelated_firmware_getter_does_not_backfill_pending_identity(){
+ FW.store(0xffff,Ordering::Relaxed);let info=reserve_projection();assert_eq!(info.addr,[0;6]);assert_eq!(info.fw_version,0);unavailable(&info);
 }
