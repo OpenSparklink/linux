@@ -712,19 +712,19 @@ struct sle_controller_event_query {
 /**
  * SL_IOCTL_DEV_SELECT - Set per-fd device affinity.
  *
- * Unlike DEV_SWITCH (which changes the global active controller),
- * DEV_SELECT only affects the calling fd.  Subsequent ioctls on this
- * fd auto-switch to the bound device.
+ * Bind this open File to one exact registration owner. dup/fork/SCM_RIGHTS
+ * share this File binding; no implicit/global controller route exists.
+ * A live ownership lease forbids rebinding until its cleanup completes.
  *
- * @arg: __s16  -1 = follow global active, >= 0 = bind to device id.
+ * @arg: __s16  -1 = clear this File binding/observers; >= 0 = bind device id.
  */
 #define SL_IOCTL_DEV_SELECT		_IOW(SL_MAGIC, 0x07, __s16)
 
 /**
  * SL_IOCTL_DEV_GET_ACTIVE - Get the effective device for this fd.
  *
- * Returns the per-fd target if set, otherwise the global active_dev_id.
- * 0xFFFF means no device is active.
+ * Returns this File target id even if retired; it does not assert Ready.
+ * 0xFFFF means this File is unselected.
  *
  * @arg: __u16 (output)
  */

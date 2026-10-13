@@ -73,6 +73,9 @@ busybox mount -t sysfs none /sys || fail
 busybox mount -t devtmpfs none /dev || fail
 busybox mkdir -p /sys/kernel/config || fail
 busybox mount -t configfs none /sys/kernel/config || fail
+# VM-only ordinary observation access; Virtual injection device stays root-only.
+busybox chown 0:1000 /dev/sparklink || fail
+busybox chmod 0660 /dev/sparklink || fail
 '''
         init += '[ "$(busybox uname -r)" = "' + info['vermagic'].split()[0] + '" ] || fail\n'
         init += '''for round in 1 2; do
