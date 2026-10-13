@@ -3,6 +3,7 @@
 TEST_GEN_PROGS := sparklink_test ws73_bsle_test ws73_dli_test ws73_discovery_test
 TEST_GEN_PROGS += ws73_recovery_test sparklink_backend_test
 TEST_GEN_PROGS += ws73_acb_test
+TEST_GEN_PROGS += virtual_codec_test
 TEST_GEN_PROGS += sle_channel_wire_test
 TEST_GEN_PROGS += sle_channel_state_test
 TEST_GEN_PROGS_EXTENDED += ssap_removed_uapi_test sparklink_socket_type_test
@@ -13,6 +14,7 @@ TEST_GEN_PROGS_EXTENDED += ws73_native_rpc_fault_test
 TEST_GEN_PROGS_EXTENDED += sparklink_event_copy_test
 TEST_GEN_PROGS_EXTENDED += sparklink_diagnostic_result_test
 TEST_GEN_PROGS_EXTENDED += sparklink_setup_release_test
+TEST_GEN_PROGS_EXTENDED += virtual_runtime_test
 
 TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containment.py
 TEST_PROGS += run_connection_tx.py run_ssap_containment.py run_native_connection_contract.py
@@ -29,6 +31,9 @@ TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
 
 include ../lib.mk
+
+$(OUTPUT)/virtual_codec_test: virtual_codec_test.c ../../../../drivers/sparklink/virtual_codec.h
+	$(CC) $(CFLAGS) -I../../../../include $< $(LDLIBS) -o $@
 
 $(OUTPUT)/sle_channel_state_test: sle_channel_state_test.c ../../../../net/sparklink/sle_channel_state.h
 	$(CC) $(CFLAGS) $< $(LDLIBS) -o $@

@@ -48,10 +48,13 @@ config SPARKLINK_WS73_USB
 config SPARKLINK_VIRTUAL
 	tristate "Virtual SparkLink controller (testing)"
 	help
-	  Placeholder module for the planned driver-owned virtual controller.
-	  It currently logs load/unload and does not register a controller.
-	  Existing virtual development tests use the separate core test path;
-	  this module is not a usable virtual device or a hardware gate.
+	  Explicit test backend, disabled by default. Opening the root-only
+	  /dev/sparklink_virtual creates a TEST-bus standard-DLI query Runtime
+	  through the common Backend API. Final control-file close retires the
+	  exact generation and joins its bounded reply worker. dup shares it.
+	  Private test controls allow bounded delayed, dropped or failed replies.
+	  No radio, connection, data or physical acceptance is claimed. Production
+	  hardware drivers and the daemon do not generate these emulated replies.
 
 	  To compile this as a module, choose M here:
 	  the module will be called sparklink_virtual.
