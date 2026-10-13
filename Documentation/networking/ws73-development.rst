@@ -1,3 +1,12 @@
+Mixed historical WS73 lab notes
+===============================
+
+.. warning::
+
+    Prerequisites and board inputs must be checked against the selected current runner. Missing-input and early Runtime milestones below describe earlier lab states. Use the current VM-only how-to and CURRENT_CAPABILITIES; no host installation is authorized.
+
+    Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
+
 WS73 development lab
 ====================
 

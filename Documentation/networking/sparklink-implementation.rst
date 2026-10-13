@@ -1,3 +1,12 @@
+Historical implementation roadmap
+=================================
+
+.. warning::
+
+    The current sole plan is sparklink/docs/IMPLEMENTATION_PLAN.md. Old implementation counts, statuses and build steps below are historical, not current qualification.
+
+    Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
+
 SparkLink implementation roadmap
 ================================
 

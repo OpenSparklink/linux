@@ -1,3 +1,12 @@
+Historical legacy connection submission
+=======================================
+
+.. warning::
+
+    The old submission path is not the Native channel socket contract. Check actual unpublished UAPI and current qualification before using any command below.
+
+    Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
+
 Legacy connection submission cleanup
 ====================================
 

@@ -1,3 +1,12 @@
+Historical SSAP containment stage
+=================================
+
+.. warning::
+
+    Old SSAP business ioctls were subsequently deleted; their old numeric commands return ENOTTY rather than the containment-stage EOPNOTSUPP described below. The userspace Engine is not connected. No wire service or notification success is implied.
+
+    Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
+
 Legacy SSAP containment
 =======================
 

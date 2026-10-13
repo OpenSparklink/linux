@@ -1,3 +1,12 @@
+Historical legacy read-copy analysis
+====================================
+
+.. warning::
+
+    The production read queue and 44-byte ABI were removed. This page preserves old failure and partial-copy semantics; it does not describe the current ControllerEventGet contract.
+
+    Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
+
 SparkLink legacy event record delivery
 =====================================
 
