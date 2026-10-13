@@ -927,11 +927,11 @@ pub extern "C" fn sparklink_do_stop_scan() -> i32 {
 /// Called from USB probe after identity reservation and C-side registration
 /// succeed. Creates per-device protocol state and switches the active
 /// device by selecting its fixed Runtime slot. Other owners remain in place.
-pub(crate) fn sle_switch_controller_usb(identity: sle_dev::DeviceIdentity, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
+pub(crate) fn sle_switch_controller_usb(identity: sle_dev::DeviceIdentity, device: sle_usb::UsbDevice, addr: [u8; 6], fw_version: u32, credits: u8) -> Result {
     let dev_id = identity.id;
     let result = (|| -> Result<Arc<ControllerRuntime>> {
         if registration_identity(dev_id) != Some(identity) { return Err(ENODEV); }
-        let backend = sle_dli::ControllerBackend::new_usb(addr, identity);
+        let backend = sle_dli::ControllerBackend::new_usb(addr, identity, device);
         let mut state = ControllerState::new_boxed(addr, backend)?;
         state.command_credits = credits;
         let mut guard = SUBSYSTEM.lock();
@@ -958,7 +958,7 @@ pub(crate) fn open_usb_runtime(owner: &Arc<ControllerRuntime>) -> Result {
         if *owner.schedule_gate.lock() { return Err(ENODEV); }
         let Some(sle_dli::ControllerBackend::Usb(transport)) =
             guard.as_ref().map(|state| &state.controller) else { return Err(ENODEV) };
-        *transport
+        transport.clone()
     };
     // No state/registry/Host/IRQ lock across listener startup. Failed
     // open cleans its partial listener; successful but retired open

@@ -15,7 +15,7 @@ typedef uint16_t u16;
 struct usb_device { int unused; };
 struct sle_usb_dev { int active; struct usb_device *udev; int ep_bulk_in_size, ep_bulk_out, ep_bulk_in; };
 /* @@DEFINES@@ */
-static struct sle_usb_dev usb_dev_table[SLE_USB_MAX_DEVS];
+static struct sle_usb_dev device_context;
 static struct usb_device device;
 static int success_logs, allocs, live_allocs, fail_alloc, start_ret;
 static int chunks, done_out, reads, short_chunk, chunk_ret, done_ret, in_ret;
@@ -29,8 +29,8 @@ static void kfree(void *p) { if(p) { live_allocs--; free(p); } }
 static unsigned int usb_sndbulkpipe(struct usb_device *d,int ep) { assert(d==&device); return (unsigned)ep; }
 static unsigned int usb_rcvbulkpipe(struct usb_device *d,int ep) { assert(d==&device); return (unsigned)ep; }
 static u16 get_unaligned_le16(const u8 *p) { return (u16)(p[0]|((u16)p[1]<<8)); }
-static int sle_usb_dev_send_cmd(int id,int opcode,u8 *params,int len) {
- assert(id==0 && opcode==SLE_OP_FW_DL_START && len==4);
+static int sle_usb_dev_send_cmd_locked(struct sle_usb_dev*d,int opcode,u8 *params,int len) {
+ assert(d==&device_context && opcode==SLE_OP_FW_DL_START && len==4);
  assert((params[0]|params[1]|params[2]|params[3])!=0); starts++; return start_ret;
 }
 static int usb_bulk_msg(struct usb_device *d,unsigned int pipe,u8 *data,int size,int *actual,int timeout) {
@@ -66,7 +66,7 @@ static void reset(const u8 *data) {
  success_logs=allocs=fail_alloc=start_ret=chunks=done_out=reads=short_chunk=0;
  chunk_ret=done_ret=in_ret=ack_kind=starts=expected_offset=0;
  out_length=5; in_length=8;
- usb_dev_table[0]=(struct sle_usb_dev){.active=1,.udev=&device,.ep_bulk_in_size=64,.ep_bulk_out=2,.ep_bulk_in=1};
+ device_context=(struct sle_usb_dev){.active=1,.udev=&device,.ep_bulk_in_size=64,.ep_bulk_out=2,.ep_bulk_in=1};
 }
 static void check(int got,int expected) {
  assert(got==expected && live_allocs==0);
@@ -75,29 +75,27 @@ static void check(int got,int expected) {
 int main(void) {
  u8 *data=malloc(SLE_FW_MAX_SIZE); assert(data);
  for(int i=0;i<SLE_FW_MAX_SIZE;i++)data[i]=(u8)(i^0x69);
- reset(data);check(sle_usb_dev_download_fw(0,data,16,8),0);assert(chunks==2 && done_out==1 && reads==1);
- for(int n=1;n<=2;n++) {reset(data);short_chunk=n;check(sle_usb_dev_download_fw(0,data,16,8),-EIO);assert(chunks==n && done_out==0 && reads==0);}
- reset(data);chunk_ret=-ETIMEDOUT;check(sle_usb_dev_download_fw(0,data,16,8),-ETIMEDOUT);assert(chunks==1 && done_out==0);
- reset(data);start_ret=-ENODEV;check(sle_usb_dev_download_fw(0,data,16,8),-ENODEV);assert(starts==1 && chunks==0);
- for(int n=1;n<=3;n++) {reset(data);fail_alloc=n;check(sle_usb_dev_download_fw(0,data,16,8),-ENOMEM);}
- for(int n=1;n<=4;n++) {reset(data);ack_kind=n;check(sle_usb_dev_download_fw(0,data,16,8),n==4?-EREMOTEIO:-EPROTO);assert(reads==1);}
- for(int n=-1;n<=33;n++) {if(n==8)continue;reset(data);in_length=n;check(sle_usb_dev_download_fw(0,data,16,8),-EPROTO);}
- for(int n=0;n<=6;n++) {if(n==5)continue;reset(data);out_length=n;check(sle_usb_dev_download_fw(0,data,16,8),-EIO);assert(reads==0);}
- reset(data);done_ret=-EPIPE;check(sle_usb_dev_download_fw(0,data,16,8),-EPIPE);assert(reads==0);
- reset(data);in_ret=-ETIMEDOUT;check(sle_usb_dev_download_fw(0,data,16,8),-ETIMEDOUT);
- reset(data);check(sle_usb_dev_download_fw(-1,data,16,8),-EINVAL);assert(allocs==0);
- reset(data);check(sle_usb_dev_download_fw(SLE_USB_MAX_DEVS,data,16,8),-EINVAL);assert(allocs==0);
- reset(data);check(sle_usb_dev_download_fw(0,NULL,16,8),-EINVAL);assert(allocs==0);
- for(int n=-1;n<=0;n++){reset(data);check(sle_usb_dev_download_fw(0,data,n,8),-EINVAL);assert(allocs==0);}
- reset(data);check(sle_usb_dev_download_fw(0,data,SLE_FW_MAX_SIZE+1,8),-EFBIG);assert(allocs==0);
- reset(data);check(sle_usb_dev_download_fw(0,data,16,-1),-EINVAL);assert(allocs==0);
- reset(data);check(sle_usb_dev_download_fw(0,data,16,65536),-EMSGSIZE);assert(allocs==0);
- reset(data);usb_dev_table[0].ep_bulk_in_size=100000;check(sle_usb_dev_download_fw(0,data,16,0),-EMSGSIZE);assert(allocs==0);
- reset(data);usb_dev_table[0].active=0;check(sle_usb_dev_download_fw(0,data,16,8),-ENODEV);assert(allocs==0);
- reset(data);usb_dev_table[0].udev=NULL;check(sle_usb_dev_download_fw(0,data,16,8),-ENODEV);assert(allocs==0);
- reset(data);check(sle_usb_dev_download_fw(0,data,65536,65535),0);assert(chunks==2 && expected_offset==65536);
- reset(data);check(sle_usb_dev_download_fw(0,data,SLE_FW_MAX_SIZE,65535),0);assert(expected_offset==SLE_FW_MAX_SIZE);
- reset(data);check(sle_usb_dev_download_fw(0,data,58,0),0);assert(chunks==2);
- reset(data);usb_dev_table[0].ep_bulk_in_size=7;check(sle_usb_dev_download_fw(0,data,241,0),0);assert(chunks==2);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),0);assert(chunks==2 && done_out==1 && reads==1);
+ for(int n=1;n<=2;n++) {reset(data);short_chunk=n;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-EIO);assert(chunks==n && done_out==0 && reads==0);}
+ reset(data);chunk_ret=-ETIMEDOUT;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-ETIMEDOUT);assert(chunks==1 && done_out==0);
+ reset(data);start_ret=-ENODEV;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-ENODEV);assert(starts==1 && chunks==0);
+ for(int n=1;n<=3;n++) {reset(data);fail_alloc=n;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-ENOMEM);}
+ for(int n=1;n<=4;n++) {reset(data);ack_kind=n;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),n==4?-EREMOTEIO:-EPROTO);assert(reads==1);}
+ for(int n=-1;n<=33;n++) {if(n==8)continue;reset(data);in_length=n;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-EPROTO);}
+ for(int n=0;n<=6;n++) {if(n==5)continue;reset(data);out_length=n;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-EIO);assert(reads==0);}
+ reset(data);done_ret=-EPIPE;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-EPIPE);assert(reads==0);
+ reset(data);in_ret=-ETIMEDOUT;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-ETIMEDOUT);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,NULL,16,8),-EINVAL);assert(allocs==0);
+ for(int n=-1;n<=0;n++){reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,n,8),-EINVAL);assert(allocs==0);}
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,SLE_FW_MAX_SIZE+1,8),-EFBIG);assert(allocs==0);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,16,-1),-EINVAL);assert(allocs==0);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,16,65536),-EMSGSIZE);assert(allocs==0);
+ reset(data);device_context.ep_bulk_in_size=100000;check(sle_usb_dev_download_fw_locked(&device_context,data,16,0),-EMSGSIZE);assert(allocs==0);
+ reset(data);device_context.active=0;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-ENODEV);assert(allocs==0);
+ reset(data);device_context.udev=NULL;check(sle_usb_dev_download_fw_locked(&device_context,data,16,8),-ENODEV);assert(allocs==0);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,65536,65535),0);assert(chunks==2 && expected_offset==65536);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,SLE_FW_MAX_SIZE,65535),0);assert(expected_offset==SLE_FW_MAX_SIZE);
+ reset(data);check(sle_usb_dev_download_fw_locked(&device_context,data,58,0),0);assert(chunks==2);
+ reset(data);device_context.ep_bulk_in_size=7;check(sle_usb_dev_download_fw_locked(&device_context,data,241,0),0);assert(chunks==2);
  free(data);printf("{\"c_cases\":%d,\"status\":\"PASS_ACTUAL_FW_C_BOUNDARIES\"}\n",cases);return 0;
 }

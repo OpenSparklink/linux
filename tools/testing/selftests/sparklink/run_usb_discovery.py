@@ -32,8 +32,8 @@ def run(output):
     fixture = (here/'usb-discovery/register_fixture.c').read_text()
     fixture = fixture.replace('/* @@STRUCT@@ */', block(c, c.index('struct sle_usb_dev {'))+';')
     fixture = fixture.replace('/* @@DEFINES@@ */', re.search(r'(?m)^#define SLE_USB_MAX_DEVS .+$', c).group())
-    for marker, name in [('REGISTER', 'sle_usb_dev_register'), ('UNREGISTER', 'sle_usb_dev_unregister')]:
-        body = function(c, name) if marker == 'REGISTER' else block(c, re.search(r'(?m)^void '+name+r'\([^;{]*\)\s*\{', c).start())
+    for marker, name in [('REGISTER', 'sle_usb_dev_register'), ('UNREGISTER', 'sle_usb_dev_unregister'), ('RELEASE','sle_usb_dev_release'), ('GET','sle_usb_dev_get'), ('PUT','sle_usb_dev_put'), ('GET_VERSION','sle_usb_dev_get_fw_version')]:
+        body = block(c, re.search(r'(?m)^(?:static )?(?:void|int|u8|u32) '+name+r'\([^;{]*\)\s*\{', c).start())
         fixture = fixture.replace('/* @@'+marker+'@@ */', body)
     dli = inputs['sle_dli.rs']
     rust = (here/'usb-discovery/info_fixture.rs').read_text()
@@ -53,7 +53,7 @@ def run(output):
         (tmp/'fixture.rs').write_text(rust)
         subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(tmp/'fixture.c'),
-                        '-o', str(tmp/'c-test')], check=True)
+                        '-pthread', '-o', str(tmp/'c-test')], check=True)
         result = subprocess.run([str(tmp/'c-test')], check=True, text=True, stdout=subprocess.PIPE,
                                 env=dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=1',
                                          UBSAN_OPTIONS='halt_on_error=1'))

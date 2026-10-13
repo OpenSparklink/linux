@@ -35,7 +35,7 @@ def run(output):
     rust=(here/'connection/tx_fixture.rs').read_text().replace('// @@CONN_METHODS@@',methods).replace('// @@SEQ_METHOD@@',function(conn,'advance_tx')).replace('// @@IOCTL@@',function(inputs['sparklink_core.rs'],'ioctl_conn_send'))
     usb=inputs['sle_usb_ffi.c']
     defines='\n'.join(re.search(r'(?m)^#define '+n+r' .+$',usb).group() for n in ['SLE_USB_MAX_DEVS','DLI_PKT_ASYNC_DATA','SLE_CMD_TIMEOUT_MS'])
-    c=(here/'connection/usb_tx_fixture.c').read_text().replace('/* @@DEFINES@@ */',defines).replace('/* @@USB_FUNCTION@@ */',function(usb,'sle_usb_dev_send_data'))
+    c=(here/'connection/usb_tx_fixture.c').read_text().replace('/* @@DEFINES@@ */',defines).replace('/* @@USB_FUNCTION@@ */',function(usb.replace('static int sle_usb_dev_send_data_locked','int sle_usb_dev_send_data_locked'),'sle_usb_dev_send_data_locked'))
     with tempfile.TemporaryDirectory(prefix='sparklink-connection-tx-') as tmp:
         path=Path(tmp)
         (path/'tx.rs').write_text(rust);(path/'tx.c').write_text(c)

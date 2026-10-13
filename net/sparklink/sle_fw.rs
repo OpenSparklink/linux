@@ -34,7 +34,7 @@ use kernel::prelude::*;
 // ---------------------------------------------------------------------------
 
 extern "C" {
-    fn sle_usb_dev_download_fw(dev_id: i32, data: *const u8, size: i32, chunk_size: i32) -> i32;
+    fn sle_usb_dev_download_fw(context: *mut super::sle_usb::UsbDeviceOpaque, data: *const u8, size: i32, chunk_size: i32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ const FW_MAX_SIZE: usize = 4 * 1024 * 1024;
 ///
 /// Errors are returned to the caller; fallback policy belongs to its probe.
 pub(crate) fn load_usb_firmware(
-    dev_id: u16,
+    device: &super::sle_usb::UsbDevice,
     fw_name: &kernel::str::CStr,
     dev: &kernel::device::Device,
 ) -> Result<usize> {
@@ -102,7 +102,7 @@ pub(crate) fn load_usb_firmware(
     // sle_usb_dev_download_fw copies from it synchronously.
     let ret = unsafe {
         sle_usb_dev_download_fw(
-            i32::from(dev_id),
+            device.as_raw(),
             fw.data().as_ptr(),
             size as i32,
             FW_DEFAULT_CHUNK_SIZE,
@@ -111,8 +111,7 @@ pub(crate) fn load_usb_firmware(
 
     if ret != 0 {
         pr_err!(
-            "sparklink-fw: download failed for dev_id={}: {}\n",
-            dev_id,
+            "sparklink-fw: download failed: {}\n",
             ret
         );
         return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });

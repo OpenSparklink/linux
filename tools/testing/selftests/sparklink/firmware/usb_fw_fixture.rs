@@ -156,20 +156,24 @@ unsafe fn sle_usb_dev_get_command_credits(id: i32) -> u8 {
     state(|s| s.events.push("credits"));
     3
 }
+#[derive(Clone,Debug)]
+pub struct UsbDevice;
+impl UsbDevice {
+ fn as_raw(&self)->i32{7}
+ fn create(identity:DeviceIdentity,ptr:*mut core::ffi::c_void)->Result<Self>{
+  assert_eq!(identity,DeviceIdentity{id:7,generation:42});assert!(!ptr.is_null());
+  let r=state(|s|{s.events.push("register");s.reg_ret});if r!=0{Err(if r<0{Error(r)}else{EIO})}else{Ok(Self)}
+ }
+ fn retire(&self){state(|s|s.events.push("join"));}
+}
+mod sle_usb{pub use super::UsbDevice;}
+struct UsbBinding{identity:DeviceIdentity,device:UsbDevice}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 struct DeviceIdentity {id:u16,generation:u64}
 fn reserve_usb_identity()->Result<DeviceIdentity>{
  state(|s|s.events.push("attach"));Ok(DeviceIdentity{id:7,generation:42})
 }
-unsafe fn sle_usb_dev_register(id: i32, ptr: *mut core::ffi::c_void, generation: u64) -> i32 {
-    assert_eq!((id, generation), (7, 42));
-    assert!(!ptr.is_null());
-    state(|s| {
-        s.events.push("register");
-        s.reg_ret
-    })
-}
-fn sle_switch_controller_usb(identity: DeviceIdentity, addr: [u8; 6], version: u32, credits: u8) -> Result {
+fn sle_switch_controller_usb(identity: DeviceIdentity, _device:UsbDevice, addr: [u8; 6], version: u32, credits: u8) -> Result {
     assert_eq!(identity, DeviceIdentity{id:7,generation:42});
     state(|s| {
         s.events.push("publish");
@@ -184,10 +188,6 @@ fn sle_quiesce_device(identity: DeviceIdentity) {
     assert_eq!(identity,DeviceIdentity{id:7,generation:42});
     state(|s| s.events.push("quiesce"));
 }
-unsafe fn sle_usb_dev_unregister(id: i32) {
-    assert_eq!(id, 7);
-    state(|s| s.events.push("join"));
-}
 fn sle_detach_device(identity: DeviceIdentity) {
     assert_eq!(identity,DeviceIdentity{id:7,generation:42});
     state(|s| s.events.push("detach"));
@@ -200,9 +200,10 @@ mod production {
     use super::*;
     // @@PREPARE@@
     pub fn probe() -> Result<DeviceIdentity> {
-        probe_usb_device(&usb::Interface {
+        let binding=probe_usb_device(&usb::Interface {
             dev: device::Device(std::marker::PhantomData),
-        })
+        })?;
+        assert_eq!(binding.device.as_raw(),7);Ok(binding.identity)
     }
 }
 fn failed(expected: Error) {

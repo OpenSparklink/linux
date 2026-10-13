@@ -17,7 +17,7 @@ def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
     inputs = {n: (net/n).read_text() for n in ['sle_usb_ffi.c', 'sle_fw.rs', 'sle_usb.rs']}
-    c = inputs['sle_usb_ffi.c'].replace('static int sle_usb_send_cmd_sync', 'int sle_usb_send_cmd_sync').replace('static int sle_usb_validate_init_reply', 'int sle_usb_validate_init_reply')
+    c = inputs['sle_usb_ffi.c'].replace('static int sle_usb_dev_download_fw_locked', 'int sle_usb_dev_download_fw_locked').replace('static int sle_usb_send_cmd_sync', 'int sle_usb_send_cmd_sync').replace('static int sle_usb_validate_init_reply', 'int sle_usb_validate_init_reply')
     defines = '\n'.join(re.search(r'(?m)^#define '+n+r' .+$', c).group() for n in
                         ['SLE_USB_MAX_DEVS', 'DLI_PKT_COMMAND', 'SLE_EVT_CMD_COMPLETE',
                          'SLE_INIT_TIMEOUT_MS', 'SLE_FW_DATA_MARKER', 'SLE_FW_CHUNK_HDR',
@@ -25,7 +25,7 @@ def run(output):
                          'SLE_FW_MAX_SIZE', 'SLE_FW_DL_TIMEOUT_MS'])
     fixture = (here/'firmware/usb_fw_fixture.c').read_text().replace('/* @@DEFINES@@ */', defines)
     for marker, name in [('SYNC', 'sle_usb_send_cmd_sync'), ('VALIDATOR', 'sle_usb_validate_init_reply'),
-                         ('DOWNLOAD', 'sle_usb_dev_download_fw')]:
+                         ('DOWNLOAD', 'sle_usb_dev_download_fw_locked')]:
         fixture = fixture.replace('/* @@'+marker+'@@ */', function(c, name))
     rust = (here/'firmware/usb_fw_fixture.rs').read_text()
     loader = function(inputs['sle_fw.rs'], 'load_usb_firmware')

@@ -1198,8 +1198,8 @@ unsafe impl Send for ControllerBackend {}
 unsafe impl Sync for ControllerBackend {}
 
 impl ControllerBackend {
-    pub fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
-        Self::Usb(super::sle_usb::UsbController::new(addr, identity))
+    pub(crate) fn new_usb(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: super::sle_usb::UsbDevice) -> Self {
+        Self::Usb(super::sle_usb::UsbController::new(addr, identity, device))
     }
 }
 

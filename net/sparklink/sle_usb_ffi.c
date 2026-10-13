@@ -22,6 +22,9 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/refcount.h>
+#include <linux/sparklink_usb.h>
 #include <linux/unaligned.h>
 
 /* -----------------------------------------------------------------------
@@ -353,11 +356,10 @@ int sle_usb_sync_bulk_in(struct usb_device *udev, u8 ep,
 }
 
 /* =======================================================================
- * Per-device USB state table
+ * Per-probe USB context ownership
  *
- * Maps dev_id (from sle_attach_device) to USB resources. This allows
- * Rust code to send commands/data by dev_id without dealing with
- * raw USB device pointers.
+ * References pin one allocation and immutable registration identity. No
+ * operation resolves a reusable registry index to transport resources.
  * ======================================================================= */
 
 #define SLE_USB_MAX_DEVS 16
@@ -369,32 +371,17 @@ int sle_usb_sync_bulk_in(struct usb_device *udev, u8 ep,
 /* Timeout for synchronous command transfers (ms) */
 #define SLE_CMD_TIMEOUT_MS 5000
 
-/* Forward declarations for device table functions */
-int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation);
-void sle_usb_dev_unregister(int dev_id);
-int sle_usb_dev_send_cmd(int dev_id, u16 opcode, const u8 *params, int plen);
-int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len);
-int sle_usb_dev_start_evt(int dev_id);
-void sle_usb_dev_stop_evt(int dev_id);
-int sle_usb_dev_start_data(int dev_id);
-void sle_usb_dev_stop_data(int dev_id);
-int sle_usb_dev_init_controller(int dev_id);
-u32 sle_usb_dev_get_fw_version(int dev_id);
-u8 sle_usb_dev_get_command_credits(int dev_id);
-int sle_usb_dev_get_mac(int dev_id, u8 *mac);
-int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
-			    int chunk_size);
-int sle_usb_dev_suspend(int dev_id);
-int sle_usb_dev_resume(int dev_id);
-
 struct sle_usb_dev {
+	refcount_t references;
+	struct mutex io_lock;
+	u16 id;
+	u64 generation;
 	bool active;
 	bool suspended;
 	struct usb_interface *intf;
 	struct usb_device *udev;
 	struct sle_urb_ctx *evt_urb;  /* interrupt IN for events */
 	struct sle_urb_ctx *rx_urb;   /* bulk IN for data */
-	spinlock_t lock;
 	/* Discovered endpoint addresses (from endpoint descriptors) */
 	u8 ep_bulk_in;                /* 0x92 per T/XS 10003 */
 	u8 ep_bulk_out;               /* 0x12 per T/XS 10003 */
@@ -408,18 +395,36 @@ struct sle_usb_dev {
 	u8 command_credits;
 };
 
-static struct sle_usb_dev usb_dev_table[SLE_USB_MAX_DEVS];
+/* One allocation per probe. Identity and USB references never change. Every
+ * caller owns a reference; process I/O and retirement serialize on io_lock.
+ * URBs are killed/joined before release, callbacks carry immutable identity.
+ */
+static void sle_usb_dev_release(struct sle_usb_dev *d)
+{
+	if (d->evt_urb) { sle_usb_kill_ctx(d->evt_urb); sle_usb_free_ctx(d->evt_urb); }
+	if (d->rx_urb) { sle_usb_kill_ctx(d->rx_urb); sle_usb_free_ctx(d->rx_urb); }
+	usb_put_intf(d->intf);
+	usb_put_dev(d->udev);
+	kfree(d);
+}
+
+void sle_usb_dev_get(struct sle_usb_dev *d) { refcount_inc(&d->references); }
+void sle_usb_dev_put(struct sle_usb_dev *d)
+{
+	if (refcount_dec_and_test(&d->references)) sle_usb_dev_release(d);
+}
 
 /**
  * sle_usb_dev_register - Register a USB device for I/O by dev_id.
- * @dev_id:   device id from sle_attach_device
+ * @dev_id:   reserved pending identity index
  * @intf_ptr: raw struct usb_interface pointer (from Rust probe)
  * @generation: nonzero registration generation allocated by the registry
  *
  * Extracts the usb_device, allocates URB contexts for event and data
  * reception. Returns 0 on success.
  */
-int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
+int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation,
+			 struct sle_usb_dev **output)
 {
 	struct sle_usb_dev *d;
 	struct usb_interface *intf;
@@ -427,12 +432,8 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
 	struct sle_urb_ctx *evt_urb, *rx_urb;
 	int ret;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !intf_ptr || !generation)
+	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !intf_ptr || !generation || !output)
 		return -EINVAL;
-
-	d = &usb_dev_table[dev_id];
-	if (d->active)
-		return -EBUSY;
 
 	intf = (struct usb_interface *)intf_ptr;
 
@@ -456,9 +457,18 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
 		return -ENOMEM;
 	}
 
-	spin_lock_init(&d->lock);
-	d->intf = intf;
-	d->udev = interface_to_usbdev(intf);
+	d = kzalloc(sizeof(*d), GFP_KERNEL);
+	if (!d) {
+		sle_usb_free_ctx(rx_urb);
+		sle_usb_free_ctx(evt_urb);
+		return -ENOMEM;
+	}
+	refcount_set(&d->references, 1);
+	mutex_init(&d->io_lock);
+	d->id = dev_id;
+	d->generation = generation;
+	d->intf = usb_get_intf(intf);
+	d->udev = usb_get_dev(interface_to_usbdev(intf));
 	d->ep_bulk_in = bulk_in->bEndpointAddress;
 	d->ep_bulk_out = bulk_out->bEndpointAddress;
 	d->ep_intr_in = int_in->bEndpointAddress;
@@ -477,26 +487,23 @@ int sle_usb_dev_register(int dev_id, void *intf_ptr, u64 generation)
 	d->rx_urb->registration_id = dev_id;
 	d->rx_urb->registration_generation = generation;
 	d->active = true;
+	*output = d;
 	return 0;
 }
 
 /**
  * sle_usb_dev_unregister - Remove a device from the USB I/O table.
- * @dev_id: device id
+ * @d: retained USB context
  *
  * Cancels pending URBs and frees resources.
  */
-void sle_usb_dev_unregister(int dev_id)
+void sle_usb_dev_unregister(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return;
 
-	d = &usb_dev_table[dev_id];
-	if (!d->active)
-		return;
-
+	if (!d) return;
+	mutex_lock(&d->io_lock);
+	if (!d->active) { mutex_unlock(&d->io_lock); return; }
 	d->active = false;
 
 	if (d->evt_urb) {
@@ -510,13 +517,12 @@ void sle_usb_dev_unregister(int dev_id)
 		d->rx_urb = NULL;
 	}
 
-	d->intf = NULL;
-	d->udev = NULL;
+	mutex_unlock(&d->io_lock);
 }
 
 /**
  * sle_usb_dev_send_cmd - Send a DLI command via USB bulk OUT.
- * @dev_id: device id
+ * @d: retained USB context
  * @opcode: DLI opcode (host byte order)
  * @params: parameter bytes
  * @plen:   parameter length
@@ -524,24 +530,20 @@ void sle_usb_dev_unregister(int dev_id)
  * Builds a DLI command packet and sends synchronously.
  * Returns 0 on success, negative errno on failure.
  */
-int sle_usb_dev_send_cmd(int dev_id, u16 opcode, const u8 *params, int plen)
+static int sle_usb_dev_send_cmd_locked(struct sle_usb_dev *d, u16 opcode, const u8 *params, int plen)
 {
-	struct sle_usb_dev *d;
 	u8 *pkt;
 	int total;
 	int actual_len;
 	unsigned int pipe;
 	int ret;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev)
 		return -ENODEV;
 
-	if (plen > 255)
-		plen = 255;
+	if (plen < 0) return -EINVAL;
+	if (plen > 255) return -EMSGSIZE;
 
 	if (plen > 0 && !params)
 		return -EINVAL;
@@ -571,16 +573,15 @@ int sle_usb_dev_send_cmd(int dev_id, u16 opcode, const u8 *params, int plen)
 
 /**
  * sle_usb_dev_send_data - Send a DLI async data packet via USB bulk OUT.
- * @dev_id: device id
+ * @d: retained USB context
  * @handle: link handle
  * @data:   payload bytes
  * @len:    payload length
  *
  * Returns 0 on success, negative errno on failure.
  */
-int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len)
+static int sle_usb_dev_send_data_locked(struct sle_usb_dev *d, u16 handle, const u8 *data, int len)
 {
-	struct sle_usb_dev *d;
 	u8 *pkt;
 	int total;
 	int actual_len;
@@ -589,10 +590,7 @@ int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len)
 	u16 data_len_field;
 	int ret;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev)
 		return -ENODEV;
 
@@ -629,19 +627,15 @@ int sle_usb_dev_send_data(int dev_id, u16 handle, const u8 *data, int len)
 
 /**
  * sle_usb_dev_start_evt - Start listening for events on interrupt IN.
- * @dev_id: device id
+ * @d: retained USB context
  *
  * Submits the event interrupt URB which auto-resubmits on completion.
  */
-int sle_usb_dev_start_evt(int dev_id)
+static int sle_usb_dev_start_evt_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 	int ret;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev || !d->evt_urb)
 		return -ENODEV;
 
@@ -654,34 +648,26 @@ int sle_usb_dev_start_evt(int dev_id)
 
 /**
  * sle_usb_dev_stop_evt - Stop listening for events.
- * @dev_id: device id
+ * @d: retained USB context
  */
-void sle_usb_dev_stop_evt(int dev_id)
+static void sle_usb_dev_stop_evt_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return;
 
-	d = &usb_dev_table[dev_id];
 	if (d->evt_urb)
 		sle_usb_kill_ctx(d->evt_urb);
 }
 
 /**
  * sle_usb_dev_start_data - Start listening for async data on bulk IN.
- * @dev_id: device id
+ * @d: retained USB context
  *
  * Submits the bulk IN URB which auto-resubmits on completion.
  */
-int sle_usb_dev_start_data(int dev_id)
+static int sle_usb_dev_start_data_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev || !d->rx_urb)
 		return -ENODEV;
 
@@ -692,16 +678,12 @@ int sle_usb_dev_start_data(int dev_id)
 
 /**
  * sle_usb_dev_stop_data - Stop listening for async data.
- * @dev_id: device id
+ * @d: retained USB context
  */
-void sle_usb_dev_stop_data(int dev_id)
+static void sle_usb_dev_stop_data_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return;
 
-	d = &usb_dev_table[dev_id];
 	if (d->rx_urb)
 		sle_usb_kill_ctx(d->rx_urb);
 }
@@ -806,7 +788,7 @@ static int sle_usb_validate_init_reply(const u8 *resp, int len,
 
 /**
  * sle_usb_dev_init_controller - Run the SLE controller init sequence.
- * @dev_id: device id (must be registered)
+ * @d: retained USB context
  *
  * Sends Reset, ReadLocalVersion, ReadMacAddr commands and stores the
  * results only after all three matching CommandComplete replies succeed.
@@ -814,19 +796,15 @@ static int sle_usb_validate_init_reply(const u8 *resp, int len,
  *
  * Returns 0 on full success. Negative errno if any command fails.
  */
-int sle_usb_dev_init_controller(int dev_id)
+static int sle_usb_dev_init_controller_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 	u8 resp[64];
 	int resp_len = 0;
 	int ret;
 	u32 fw_version;
 	u8 mac_addr[6];
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev)
 		return -ENODEV;
 
@@ -890,42 +868,40 @@ int sle_usb_dev_init_controller(int dev_id)
 	return 0;
 }
 
-u8 sle_usb_dev_get_command_credits(int dev_id)
+static u8 sle_usb_dev_get_command_credits_locked(struct sle_usb_dev *d)
 {
-    if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !usb_dev_table[dev_id].active)
+    if (!d->active)
         return 0;
-    return usb_dev_table[dev_id].command_credits;
+    return d->command_credits;
 }
 
 /**
  * sle_usb_dev_get_fw_version - Read back the firmware version.
- * @dev_id: device id
+ * @d: retained USB context
  *
  * Returns the firmware version obtained during init, or 0.
  */
-u32 sle_usb_dev_get_fw_version(int dev_id)
+static u32 sle_usb_dev_get_fw_version_locked(struct sle_usb_dev *d)
 {
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
+	if (!d->active)
 		return 0;
-	if (!usb_dev_table[dev_id].active)
-		return 0;
-	return usb_dev_table[dev_id].fw_version;
+	return d->fw_version;
 }
 
 /**
  * sle_usb_dev_get_mac - Read back the MAC address.
- * @dev_id: device id
+ * @d: retained USB context
  * @mac:    output buffer (6 bytes)
  *
  * Returns 0 on success.
  */
-int sle_usb_dev_get_mac(int dev_id, u8 *mac)
+static int sle_usb_dev_get_mac_locked(struct sle_usb_dev *d, u8 *mac)
 {
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS || !mac)
+	if (!mac)
 		return -EINVAL;
-	if (!usb_dev_table[dev_id].active)
+	if (!d->active)
 		return -ENODEV;
-	memcpy(mac, usb_dev_table[dev_id].mac_addr, 6);
+	memcpy(mac, d->mac_addr, 6);
 	return 0;
 }
 
@@ -963,10 +939,9 @@ int sle_usb_dev_get_mac(int dev_id, u8 *mac)
  *
  * Returns 0 on success, negative errno on failure.
  */
-int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
+static int sle_usb_dev_download_fw_locked(struct sle_usb_dev *d, const u8 *data, int size,
 			    int chunk_size)
 {
-	struct sle_usb_dev *d;
 	unsigned int pipe;
 	int offset = 0;
 	int actual_len;
@@ -977,8 +952,6 @@ int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 	u8 resp[32];
 	int resp_len = 0;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 	if (!data || size <= 0)
 		return -EINVAL;
 	if (size > SLE_FW_MAX_SIZE)
@@ -986,7 +959,6 @@ int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 	if (chunk_size < 0)
 		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active || !d->udev)
 		return -ENODEV;
 
@@ -1011,7 +983,7 @@ int sle_usb_dev_download_fw(int dev_id, const u8 *data, int size,
 	start_params[2] = (u8)((size >> 16) & 0xFF);
 	start_params[3] = (u8)((size >> 24) & 0xFF);
 
-	ret = sle_usb_dev_send_cmd(dev_id, SLE_OP_FW_DL_START,
+	ret = sle_usb_dev_send_cmd_locked(d, SLE_OP_FW_DL_START,
 				   start_params, 4);
 	if (ret) {
 		pr_err("sparklink-usb: fw download start failed: %d\n", ret);
@@ -1076,19 +1048,15 @@ out:
 
 /**
  * sle_usb_dev_suspend - Quiesce the device for system/runtime suspend.
- * @dev_id: device table slot
+ * @d: retained USB context
  *
  * Kills the event (interrupt IN) and data (bulk IN) URBs so no further
  * transfers are pending when the host controller suspends.
  */
-int sle_usb_dev_suspend(int dev_id)
+static int sle_usb_dev_suspend_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active)
 		return -ENODEV;
 
@@ -1102,26 +1070,22 @@ int sle_usb_dev_suspend(int dev_id)
 		sle_usb_kill_ctx(d->rx_urb);
 
 	d->suspended = true;
-	pr_debug("sparklink-usb: dev %d suspended\n", dev_id);
+	pr_debug("sparklink-usb: dev %d suspended\n", d->id);
 	return 0;
 }
 
 /**
  * sle_usb_dev_resume - Re-activate the device after suspend.
- * @dev_id: device table slot
+ * @d: retained USB context
  *
  * Re-submits the event interrupt URB so the driver resumes receiving
  * asynchronous events from the controller.
  */
-int sle_usb_dev_resume(int dev_id)
+static int sle_usb_dev_resume_locked(struct sle_usb_dev *d)
 {
-	struct sle_usb_dev *d;
 	int ret;
 
-	if (dev_id < 0 || dev_id >= SLE_USB_MAX_DEVS)
-		return -EINVAL;
 
-	d = &usb_dev_table[dev_id];
 	if (!d->active)
 		return -ENODEV;
 
@@ -1134,11 +1098,11 @@ int sle_usb_dev_resume(int dev_id)
 	if (d->evt_urb && d->udev) {
 		ret = sle_usb_submit_intr_in(d->evt_urb, d->udev,
 					     d->ep_intr_in,
-					     (void *)(uintptr_t)(dev_id + 1),
+					     NULL,
 					     d->ep_intr_in_interval);
 		if (ret) {
 			pr_err("sparklink-usb: dev %d resume evt URB failed: %d\n",
-			       dev_id, ret);
+			       d->id, ret);
 			return ret;
 		}
 	}
@@ -1147,12 +1111,139 @@ int sle_usb_dev_resume(int dev_id)
 	if (d->rx_urb && d->udev) {
 		ret = sle_usb_submit_bulk_in(d->rx_urb, d->udev,
 					     d->ep_bulk_in,
-					     (void *)(uintptr_t)(dev_id + 1));
+					     NULL);
 		if (ret)
 			pr_err("sparklink-usb: dev %d resume data URB failed: %d\n",
-			       dev_id, ret);
+			       d->id, ret);
 	}
 
-	pr_debug("sparklink-usb: dev %d resumed\n", dev_id);
+	pr_debug("sparklink-usb: dev %d resumed\n", d->id);
 	return 0;
+}
+
+/* Retained process-context operations, never identity-index lookup. */
+int sle_usb_dev_send_cmd(struct sle_usb_dev *d, u16 opcode, const u8 *params, int plen)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_send_cmd_locked(d, opcode, params, plen) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+int sle_usb_dev_send_data(struct sle_usb_dev *d, u16 handle, const u8 *data, int len)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_send_data_locked(d, handle, data, len) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+int sle_usb_dev_start_evt(struct sle_usb_dev *d)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_start_evt_locked(d) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+void sle_usb_dev_stop_evt(struct sle_usb_dev *d)
+{
+	if (!d) return;
+	mutex_lock(&d->io_lock);
+	sle_usb_dev_stop_evt_locked(d);
+	mutex_unlock(&d->io_lock);
+}
+
+int sle_usb_dev_start_data(struct sle_usb_dev *d)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_start_data_locked(d) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+void sle_usb_dev_stop_data(struct sle_usb_dev *d)
+{
+	if (!d) return;
+	mutex_lock(&d->io_lock);
+	sle_usb_dev_stop_data_locked(d);
+	mutex_unlock(&d->io_lock);
+}
+
+int sle_usb_dev_init_controller(struct sle_usb_dev *d)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_init_controller_locked(d) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+u8 sle_usb_dev_get_command_credits(struct sle_usb_dev *d)
+{
+	u8 result;
+	if (!d) return 0;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_get_command_credits_locked(d) : 0;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+u32 sle_usb_dev_get_fw_version(struct sle_usb_dev *d)
+{
+	u32 result;
+	if (!d) return 0;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_get_fw_version_locked(d) : 0;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+int sle_usb_dev_get_mac(struct sle_usb_dev *d, u8 *mac)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_get_mac_locked(d, mac) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+int sle_usb_dev_download_fw(struct sle_usb_dev *d, const u8 *data, int size, int chunk_size)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_download_fw_locked(d, data, size, chunk_size) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+int sle_usb_dev_suspend(struct sle_usb_dev *d)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_suspend_locked(d) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
+}
+
+int sle_usb_dev_resume(struct sle_usb_dev *d)
+{
+	int result;
+	if (!d) return -EINVAL;
+	mutex_lock(&d->io_lock);
+	result = d->active ? sle_usb_dev_resume_locked(d) : -ENODEV;
+	mutex_unlock(&d->io_lock);
+	return result;
 }

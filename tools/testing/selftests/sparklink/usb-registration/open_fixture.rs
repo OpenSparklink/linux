@@ -10,8 +10,9 @@ const ENODEV:Error=Error(-19);
 macro_rules! pr_info{($($t:tt)*)=>{let _=format_args!($($t)*);}}
 macro_rules! pr_warn{($($t:tt)*)=>{let _=format_args!($($t)*);}}
 struct Lock<T>(Mutex<T>);impl<T> Lock<T>{fn new(t:T)->Self{Self(Mutex::new(t))}fn lock(&self)->MutexGuard<'_,T>{self.0.lock().unwrap()}}
-struct Identity{id:u16}
-#[derive(Clone,Copy)]struct UsbController{dev_id:u16}
+#[derive(Clone)]struct Identity{id:u16}
+#[derive(Clone)]struct UsbDevice;impl UsbDevice{fn as_raw(&self)->i32{7}}
+#[derive(Clone)]struct UsbController{device:UsbDevice,identity:Identity}
 impl UsbController{
  // @@USB_OPEN@@
  // @@USB_CLOSE@@
@@ -30,7 +31,7 @@ unsafe fn sle_usb_dev_stop_evt(id:i32){before_io(id);calls("stop_evt");}
 unsafe fn sle_usb_dev_stop_data(id:i32){before_io(id);calls("stop_data");}
 mod sle_ingress{use super::*;pub fn publish_runtime(o:&Arc<ControllerRuntime>)->Result{calls("route");if *o.schedule_gate.lock(){Err(ENODEV)}else{Ok(())}}}
 // @@CORE_OPEN@@
-fn setup(evt:i32,data:i32,retire:bool)->Arc<ControllerRuntime>{let o=Arc::new(ControllerRuntime{identity:Identity{id:7},native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Usb(UsbController{dev_id:7})})),schedule_gate:Lock::new(false),transport_open:AtomicBool::new(false)});SCENARIO.with(|s|*s.borrow_mut()=Scenario{owner:Some(o.clone()),calls:Vec::new(),evt,data,retire});o}
+fn setup(evt:i32,data:i32,retire:bool)->Arc<ControllerRuntime>{let o=Arc::new(ControllerRuntime{identity:Identity{id:7},native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Usb(UsbController{device:UsbDevice,identity:Identity{id:7}})})),schedule_gate:Lock::new(false),transport_open:AtomicBool::new(false)});SCENARIO.with(|s|*s.borrow_mut()=Scenario{owner:Some(o.clone()),calls:Vec::new(),evt,data,retire});o}
 fn observed()->Vec<&'static str>{SCENARIO.with(|s|s.borrow().calls.clone())}
 #[test]fn success_adopts_only_after_both_listeners_and_unlocked_state(){let o=setup(0,0,false);assert_eq!(open_usb_runtime(&o),Ok(()));assert!(o.transport_open.load(Ordering::Acquire));assert_eq!(observed(),["route","evt","data","workers"]);}
 #[test]fn first_listener_failure_does_not_start_second_or_publish_open(){let o=setup(-5,0,false);assert_eq!(open_usb_runtime(&o),Err(Error(-5)));assert!(!o.transport_open.load(Ordering::Acquire));assert_eq!(observed(),["route","evt"]);}

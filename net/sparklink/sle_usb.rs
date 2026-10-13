@@ -48,6 +48,43 @@ pub struct SleUrbCtxOpaque {
     _opaque: [u8; 0],
 }
 
+/// Independent C allocation; immutable identity and retained USB references.
+#[repr(C)]
+pub(crate) struct UsbDeviceOpaque { _opaque: [u8; 0] }
+
+pub(crate) struct UsbDevice { context: *mut UsbDeviceOpaque }
+// SAFETY: owned reference pins C context; all process operations serialize in C.
+unsafe impl Send for UsbDevice {}
+unsafe impl Sync for UsbDevice {}
+impl Clone for UsbDevice {
+    fn clone(&self) -> Self {
+        // SAFETY: self owns a live reference; get performs no I/O.
+        unsafe { sle_usb_dev_get(self.context) };
+        Self { context: self.context }
+    }
+}
+impl Drop for UsbDevice {
+    fn drop(&mut self) {
+        // SAFETY: drop releases exactly this reference; C final put joins URBs.
+        unsafe { sle_usb_dev_put(self.context) };
+    }
+}
+impl UsbDevice {
+    pub(crate) fn as_raw(&self) -> *mut UsbDeviceOpaque { self.context }
+    fn create(identity: DeviceIdentity, interface: *mut core::ffi::c_void) -> Result<Self> {
+        let mut context = core::ptr::null_mut();
+        // SAFETY: probe retains interface through this call; out is live.
+        let result = unsafe { sle_usb_dev_register(i32::from(identity.id), interface, identity.generation, &mut context) };
+        if result != 0 { return Err(if result < 0 { Error::from_errno(result) } else { EIO }); }
+        if context.is_null() { return Err(EIO); }
+        Ok(Self { context })
+    }
+    fn retire(&self) {
+        // SAFETY: retained allocation; invalidates and joins, does not put.
+        unsafe { sle_usb_dev_unregister(self.context) };
+    }
+}
+
 extern "C" {
     fn sle_usb_alloc_ctx(buf_size: i32) -> *mut SleUrbCtxOpaque;
     fn sle_usb_free_ctx(ctx: *mut SleUrbCtxOpaque);
@@ -90,20 +127,22 @@ extern "C" {
     ) -> i32;
 
     // Per-device USB state table: high-level send functions
-    fn sle_usb_dev_register(dev_id: i32, intf_ptr: *mut core::ffi::c_void, generation: u64) -> i32;
-    fn sle_usb_dev_unregister(dev_id: i32);
-    fn sle_usb_dev_send_cmd(dev_id: i32, opcode: u16, params: *const u8, plen: i32) -> i32;
-    fn sle_usb_dev_send_data(dev_id: i32, handle: u16, data: *const u8, len: i32) -> i32;
-    fn sle_usb_dev_start_evt(dev_id: i32) -> i32;
-    fn sle_usb_dev_stop_evt(dev_id: i32);
-    fn sle_usb_dev_start_data(dev_id: i32) -> i32;
-    fn sle_usb_dev_stop_data(dev_id: i32);
-    fn sle_usb_dev_init_controller(dev_id: i32) -> i32;
-    fn sle_usb_dev_get_fw_version(dev_id: i32) -> u32;
-    fn sle_usb_dev_get_command_credits(dev_id: i32) -> u8;
-    fn sle_usb_dev_get_mac(dev_id: i32, mac: *mut u8) -> i32;
-    fn sle_usb_dev_suspend(dev_id: i32) -> i32;
-    fn sle_usb_dev_resume(dev_id: i32) -> i32;
+    fn sle_usb_dev_register(dev_id: i32, intf_ptr: *mut core::ffi::c_void, generation: u64, output: *mut *mut UsbDeviceOpaque) -> i32;
+    fn sle_usb_dev_get(context: *mut UsbDeviceOpaque);
+    fn sle_usb_dev_put(context: *mut UsbDeviceOpaque);
+    fn sle_usb_dev_unregister(context: *mut UsbDeviceOpaque);
+    fn sle_usb_dev_send_cmd(context: *mut UsbDeviceOpaque, opcode: u16, params: *const u8, plen: i32) -> i32;
+    fn sle_usb_dev_send_data(context: *mut UsbDeviceOpaque, handle: u16, data: *const u8, len: i32) -> i32;
+    fn sle_usb_dev_start_evt(context: *mut UsbDeviceOpaque) -> i32;
+    fn sle_usb_dev_stop_evt(context: *mut UsbDeviceOpaque);
+    fn sle_usb_dev_start_data(context: *mut UsbDeviceOpaque) -> i32;
+    fn sle_usb_dev_stop_data(context: *mut UsbDeviceOpaque);
+    fn sle_usb_dev_init_controller(context: *mut UsbDeviceOpaque) -> i32;
+    fn sle_usb_dev_get_fw_version(context: *mut UsbDeviceOpaque) -> u32;
+    fn sle_usb_dev_get_command_credits(context: *mut UsbDeviceOpaque) -> u8;
+    fn sle_usb_dev_get_mac(context: *mut UsbDeviceOpaque, mac: *mut u8) -> i32;
+    fn sle_usb_dev_suspend(context: *mut UsbDeviceOpaque) -> i32;
+    fn sle_usb_dev_resume(context: *mut UsbDeviceOpaque) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,15 +1184,13 @@ fn raw_to_status(raw: u8) -> SleStatus {
 ///
 /// Actual USB I/O is delegated to the C FFI layer which maintains a
 /// per-device table mapping `dev_id` to `usb_device` and URB contexts.
-/* Copies are borrowed handles, not independent resource owners. I/O requires
- * a retained Runtime/probe reservation; unregister joins work before C free.
- */
-#[derive(Clone, Copy)]
+/// Runtime reference to a specific USB allocation, never an index lookup.
+#[derive(Clone)]
 pub struct UsbController {
     addr: [u8; 6],
     /// Device ID in the sle_dev registry. Used to index the C-side
     /// USB device table for actual I/O.
-    dev_id: u16,
+    device: UsbDevice,
     identity: super::sle_dev::DeviceIdentity,
 }
 
@@ -1163,10 +1200,10 @@ impl UsbController {
     /// `addr` is the 6-byte SLE MAC address read from the controller
     /// during probe via the ReadMacAddr (0x0406) command.
     /// Identity comes from the pending reservation retained through USB cleanup.
-    pub fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity) -> Self {
+    pub(crate) fn new(addr: [u8; 6], identity: super::sle_dev::DeviceIdentity, device: UsbDevice) -> Self {
         Self {
             addr,
-            dev_id: identity.id,
+            device,
             identity,
         }
     }
@@ -1178,7 +1215,7 @@ impl UsbController {
         // worker before unregistering/freeing the C transport. Data is live.
         let ret = unsafe {
             sle_usb_dev_send_cmd(
-                i32::from(self.dev_id),
+                self.device.as_raw(),
                 opcode,
                 params.as_ptr(),
                 params.len() as i32,
@@ -1200,7 +1237,7 @@ impl SleController for UsbController {
         info.bus = SleBus::Usb;
         info.addr = self.addr;
         // SAFETY: this controller retains the registered probe binding.
-        info.fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(self.dev_id)) };
+        info.fw_version = unsafe { sle_usb_dev_get_fw_version(self.device.as_raw()) };
         // Bootstrap queried identity only. Defaults advertise no unqueried
         // features, connection/data limits, transport or crypto capabilities.
 
@@ -1210,28 +1247,28 @@ impl SleController for UsbController {
     fn open(&self) -> Result {
         // Register event listener via the C device table.
         // SAFETY: dev_id was validated during probe.
-        let ret = unsafe { sle_usb_dev_start_evt(i32::from(self.dev_id)) };
+        let ret = unsafe { sle_usb_dev_start_evt(self.device.as_raw()) };
         if ret < 0 {
             pr_warn!("sparklink-usb: event listener start failed: {}\n", ret);
             return Err(Error::from_errno(ret));
         }
         // Start bulk IN listener for async data (T/XS 10003-2025 §7.4).
-        let ret = unsafe { sle_usb_dev_start_data(i32::from(self.dev_id)) };
+        let ret = unsafe { sle_usb_dev_start_data(self.device.as_raw()) };
         if ret < 0 {
             pr_warn!("sparklink-usb: data listener start failed: {}\n", ret);
             // SAFETY: no binding can survive failed open; join its first listener.
-            unsafe { sle_usb_dev_stop_evt(i32::from(self.dev_id)) };
+            unsafe { sle_usb_dev_stop_evt(self.device.as_raw()) };
             return Err(Error::from_errno(ret));
         }
-        pr_info!("sparklink-usb: open dev_id={}\n", self.dev_id);
+        pr_info!("sparklink-usb: open dev_id={}\n", self.identity.id);
         Ok(())
     }
 
     fn close(&self) {
         // SAFETY: dev_id was validated during probe; stop is idempotent.
-        unsafe { sle_usb_dev_stop_evt(i32::from(self.dev_id)) };
-        unsafe { sle_usb_dev_stop_data(i32::from(self.dev_id)) };
-        pr_info!("sparklink-usb: close dev_id={}\n", self.dev_id);
+        unsafe { sle_usb_dev_stop_evt(self.device.as_raw()) };
+        unsafe { sle_usb_dev_stop_data(self.device.as_raw()) };
+        pr_info!("sparklink-usb: close dev_id={}\n", self.identity.id);
     }
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
@@ -1251,7 +1288,7 @@ impl SleController for UsbController {
         // SAFETY: dev_id is valid, data pointer and length are consistent.
         let ret = unsafe {
             sle_usb_dev_send_data(
-                i32::from(self.dev_id),
+                self.device.as_raw(),
                 handle,
                 data.as_ptr(),
                 data.len() as i32,
@@ -1310,25 +1347,23 @@ kernel::usb_device_table!(
 
 /// Per-device state stored as driver data during probe.
 #[pin_data]
-pub(crate) struct SleUsbDriver {
-    /// Exact reserved registration; no index-only remove/PM identity.
-    identity: DeviceIdentity,
-}
+pub(crate) struct SleUsbDriver { binding: UsbBinding }
+struct UsbBinding { identity: DeviceIdentity, device: UsbDevice }
 
 /// Require bootstrap and optional firmware before reading publishable identity.
 fn prepare_usb_controller(
-    dev_id: u16,
+    device: &UsbDevice,
     dev: &kernel::device::Device,
 ) -> Result<([u8; 6], u32)> {
     // Bootstrap must establish a real controller before optional firmware.
-    initialize_usb_controller(dev_id)?;
+    initialize_usb_controller(device)?;
     let fw_name = kernel::c_str!("sparklink/sle_usb_v1.bin");
-    match super::sle_fw::load_usb_firmware(dev_id, fw_name, dev) {
+    match super::sle_fw::load_usb_firmware(device, fw_name, dev) {
         Ok(size) => {
             pr_info!("sparklink-usb: firmware loaded ({} bytes)\n", size);
             // Cached identity predates the download. Require fresh successful
             // Reset/version/MAC replies before publishing this binding.
-            initialize_usb_controller(dev_id)?;
+            initialize_usb_controller(device)?;
         }
         Err(ENOENT) => pr_debug!("sparklink-usb: optional firmware absent\n"),
         Err(error) => return Err(error),
@@ -1336,7 +1371,7 @@ fn prepare_usb_controller(
 
     let mut addr = [0u8; 6];
     // SAFETY: probe owns a live registered binding; addr has six bytes.
-    let ret = unsafe { sle_usb_dev_get_mac(i32::from(dev_id), addr.as_mut_ptr()) };
+    let ret = unsafe { sle_usb_dev_get_mac(device.as_raw(), addr.as_mut_ptr()) };
     if ret != 0 {
         return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });
     }
@@ -1344,13 +1379,13 @@ fn prepare_usb_controller(
         return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
     }
     // SAFETY: the mandatory successful bootstrap populated this binding.
-    let fw_version = unsafe { sle_usb_dev_get_fw_version(i32::from(dev_id)) };
+    let fw_version = unsafe { sle_usb_dev_get_fw_version(device.as_raw()) };
     Ok((addr, fw_version))
 }
 
-fn initialize_usb_controller(dev_id: u16) -> Result {
+fn initialize_usb_controller(device: &UsbDevice) -> Result {
     // SAFETY: probe owns the live registered interface throughout this call.
-    let ret = unsafe { sle_usb_dev_init_controller(i32::from(dev_id)) };
+    let ret = unsafe { sle_usb_dev_init_controller(device.as_raw()) };
     if ret != 0 {
         return Err(if ret < 0 { Error::from_errno(ret) } else { EIO });
     }
@@ -1358,12 +1393,12 @@ fn initialize_usb_controller(dev_id: u16) -> Result {
 }
 
 /// Publish only the freshly prepared identity; failures join and detach.
-fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<DeviceIdentity> {
+fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<UsbBinding> {
     pr_info!("sparklink-usb: SLE controller discovered\n");
 
     let identity = super::reserve_usb_identity()?;
     let dev_id = identity.id;
-    let mut registered = false;
+    let mut registered: Option<UsbDevice> = None;
     let result = (|| -> Result {
         pr_info!("sparklink-usb: attached as sle{}\n", dev_id);
 
@@ -1376,33 +1411,27 @@ fn probe_usb_device(interface: &usb::Interface<device::Core>) -> Result<DeviceId
             as *mut core::ffi::c_void;
         // SAFETY: dev_id is valid; intf_ptr points to a live USB
         // interface that outlives this driver binding.
-        let reg_ret = unsafe { sle_usb_dev_register(i32::from(dev_id), intf_ptr, identity.generation) };
-        if reg_ret != 0 {
-            return Err(if reg_ret < 0 { Error::from_errno(reg_ret) } else { EIO });
-        }
-        registered = true;
+        registered = Some(UsbDevice::create(identity, intf_ptr)?);
+        let device = registered.as_ref().ok_or(ENODEV)?;
         let kern_dev: &kernel::device::Device<kernel::device::Core> = interface.as_ref();
-        let (addr, fw_version) = prepare_usb_controller(dev_id, kern_dev)?;
+        let (addr, fw_version) = prepare_usb_controller(device, kern_dev)?;
 
         // Switch the subsystem controller backend to USB and sync
         // the device registry with real hardware info.
         // SAFETY: mandatory bootstrap completed on this still-live binding.
-        let credits = unsafe { sle_usb_dev_get_command_credits(i32::from(dev_id)) };
-        super::sle_switch_controller_usb(identity, addr, fw_version, credits)?;
+        let credits = unsafe { sle_usb_dev_get_command_credits(device.as_raw()) };
+        super::sle_switch_controller_usb(identity, device.clone(), addr, fw_version, credits)?;
         Ok(())
     })();
     if let Err(error) = result {
         super::sle_quiesce_device(identity);
-        if registered {
-            // SAFETY: only this probe's successful C registration is cleaned.
-            unsafe { sle_usb_dev_unregister(i32::from(dev_id)) };
-        }
+        if let Some(device) = registered.as_ref() { device.retire(); }
         super::sle_detach_device(identity);
         return Err(error);
     }
     USB_DEV_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    Ok(identity)
+    Ok(UsbBinding { identity, device: registered.ok_or(ENODEV)? })
 }
 
 impl usb::Driver for SleUsbDriver {
@@ -1414,16 +1443,14 @@ impl usb::Driver for SleUsbDriver {
         _id: &usb::DeviceId,
         _info: &Self::IdInfo,
     ) -> impl PinInit<Self, Error> {
-        try_pin_init!(Self {
-            identity: probe_usb_device(interface)?
-        })
+        try_pin_init!(Self { binding: probe_usb_device(interface)? })
     }
 
     fn disconnect(_interface: &usb::Interface<device::Core>, data: Pin<&Self>) {
         pr_info!("sparklink-usb: SLE controller removed\n");
         USB_DEV_COUNT.fetch_sub(1, Ordering::Relaxed);
 
-        let identity = data.identity;
+        let identity = data.binding.identity;
         let dev_id = identity.id;
         if dev_id != u16::MAX {
             // Reject new protocol access and join workers while C resources
@@ -1431,7 +1458,7 @@ impl usb::Driver for SleUsbDriver {
             super::sle_quiesce_device(identity);
             // Stop URBs and unregister from C device table.
             // SAFETY: dev_id is valid; unregister kills URBs and frees C resources.
-            unsafe { sle_usb_dev_unregister(i32::from(dev_id)) };
+            data.binding.device.retire();
             super::sle_detach_device(identity);
             pr_info!("sparklink-usb: detached sle{}\n", dev_id);
         }
@@ -1442,13 +1469,13 @@ impl usb::Driver for SleUsbDriver {
         data: Pin<&Self>,
         _event: kernel::ffi::c_int,
     ) -> Result {
-        let identity = data.identity;
+        let identity = data.binding.identity;
         let dev_id = identity.id;
         if dev_id == u16::MAX {
             return Ok(());
         }
         // SAFETY: dev_id is valid; suspend stops pending URBs.
-        let ret = unsafe { sle_usb_dev_suspend(i32::from(dev_id)) };
+        let ret = unsafe { sle_usb_dev_suspend(data.binding.device.as_raw()) };
         if ret < 0 {
             pr_err!("sparklink-usb: suspend sle{} failed: {}\n", dev_id, ret);
             return Err(Error::from_errno(ret));
@@ -1459,13 +1486,13 @@ impl usb::Driver for SleUsbDriver {
     }
 
     fn resume(_interface: &usb::Interface<device::Core>, data: Pin<&Self>) -> Result {
-        let identity = data.identity;
+        let identity = data.binding.identity;
         let dev_id = identity.id;
         if dev_id == u16::MAX {
             return Ok(());
         }
         // SAFETY: dev_id is valid; resume restarts URB submissions.
-        let ret = unsafe { sle_usb_dev_resume(i32::from(dev_id)) };
+        let ret = unsafe { sle_usb_dev_resume(data.binding.device.as_raw()) };
         if ret < 0 {
             pr_err!("sparklink-usb: resume sle{} failed: {}\n", dev_id, ret);
             return Err(Error::from_errno(ret));
