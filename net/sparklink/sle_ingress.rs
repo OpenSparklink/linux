@@ -111,15 +111,20 @@ pub(crate) fn enqueue_rx(owner: &kernel::sync::Arc<super::ControllerRuntime>, ev
             ..
         }
     );
+    // Host -> gate -> ingress, matching data admission and atomic submission.
+    // Holding gate before Host would invert those paths. Reverse guard release
+    // also preserves nested IRQ-save state; schedule only after both unlock.
+    let mut host = owner.host.lock();
     let stopping = owner.schedule_gate.lock();
     if *stopping {
         return;
     }
-    let event = owner.host.lock().receive(event);
+    let event = host.receive(event);
     let Some(event) = event else {
         // A matching reply is retained in the Host's reserved slot. It
         // cannot be lost when discovery/data fill the ordinary RX ring.
         drop(stopping);
+        drop(host);
         owner.schedule_rx(0);
         return;
     };
@@ -136,6 +141,27 @@ pub(crate) fn enqueue_rx(owner: &kernel::sync::Arc<super::ControllerRuntime>, ev
         }
     }
     drop(stopping);
+    drop(host);
     owner.schedule_rx(0);
+}
+
+/// Common software command admission. Dialect validation belongs to the
+/// provider before this call and again before physical submission. This only
+/// queues Host work, never performs transport I/O or invents a reply/credit.
+pub(crate) fn enqueue_command(
+    owner: &kernel::sync::Arc<super::ControllerRuntime>, opcode: u16, params: &[u8],
+    intent: Option<super::sle_command_plan::DiscoveryIntent>,
+) -> Result {
+    use super::sle_command_plan::RecipePart;
+    let mut host = owner.host.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return Err(ENODEV); }
+    let result = if let Some(intent) = intent {
+        host.enqueue_recipe(intent, &[RecipePart { opcode, params }])
+    } else { host.enqueue(opcode, params, 0) };
+    drop(gate); drop(host);
+    result?;
+    owner.kick_commands();
+    Ok(())
 }
 

@@ -1232,24 +1232,15 @@ impl SleController for UsbController {
 
     fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
         let owner = ingress_owner(self.identity).ok_or(ENODEV)?;
-        let stopping = owner.schedule_gate.lock();
-        if *stopping {
-            return Err(ENODEV);
-        }
-        if params.len() == 1 && params[0] <= 1
-            && (opcode == SleOpcode::EnableBroadcast || opcode == SleOpcode::EnableScan)
-        {
-            use super::sle_command_plan::{DiscoveryIntent, RecipePart};
-            let intent = if opcode == SleOpcode::EnableBroadcast {
-                DiscoveryIntent::Advertising(params[0] == 1)
-            } else { DiscoveryIntent::Scanning(params[0] == 1) };
-            owner.host.lock().enqueue_recipe(intent, &[RecipePart { opcode: opcode as u16, params }])?;
-        } else {
-            owner.host.lock().enqueue(opcode as u16, params, 0)?;
-        }
-        drop(stopping);
-        owner.kick_commands();
-        Ok(())
+        use super::sle_command_plan::DiscoveryIntent;
+        let intent = if params.len() == 1 && params[0] <= 1 {
+            if opcode == SleOpcode::EnableBroadcast {
+                Some(DiscoveryIntent::Advertising(params[0] == 1))
+            } else if opcode == SleOpcode::EnableScan {
+                Some(DiscoveryIntent::Scanning(params[0] == 1))
+            } else { None }
+        } else { None };
+        super::sle_ingress::enqueue_command(&owner, opcode as u16, params, intent)
     }
 
     fn send_data(&self, handle: u16, data: &[u8]) -> Result {

@@ -19,7 +19,7 @@ def run(output):
     inputs = {path: path.read_text() for path in paths}
     source = inputs[paths[0]]
     names = ['publish_runtime', 'unpublish_runtime', 'ingress_owner', 'drain_runtime_events',
-             'drain_events_for', 'take_dropped_stats']
+             'drain_events_for', 'take_dropped_stats', 'enqueue_rx', 'enqueue_command']
     bodies = '\n'.join(function(source, name) for name in names)
     identity = re.search(r'pub\(crate\) struct DeviceIdentity \{[^}]+\}', inputs[paths[1]]).group()
     stats = re.search(r'pub\(crate\) struct RxDropStats \{[^}]+\}', source).group()
@@ -31,9 +31,9 @@ def run(output):
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test', '-D', 'warnings', str(rust), '-o', str(root / 'actual')], check=True)
         text = subprocess.check_output([str(root / 'actual'), '--test-threads=1'], text=True)
     assert all(path.read_text() == text for path, text in inputs.items())
-    assert 'test result: ok. 6 passed; 0 failed' in text
-    record = {'status': 'ACTUAL_RUNTIME_INGRESS_PASS', 'tests': 6,
-              'scope': 'production route/queue functions and identity; std Mutex/Arc, event/queue dependency fixtures; not kernel IRQ/workqueue/module/Host or hardware refinement',
+    assert 'test result: ok. 8 passed; 0 failed' in text
+    record = {'status': 'ACTUAL_RUNTIME_INGRESS_PASS', 'tests': 8,
+              'scope': 'production route/queue functions and identity; std Mutex/Arc with ranked guard checks, Host admission/receive and event/queue dependency fixtures; not kernel IRQ/workqueue/module/Host or hardware refinement',
               'sources': {str(p.relative_to(here.parents[3])): hashlib.sha256(s.encode()).hexdigest() for p, s in inputs.items()},
               'actual_function_sha256': hashlib.sha256(bodies.encode()).hexdigest(), 'hardware_acceptance': False}
     if output:

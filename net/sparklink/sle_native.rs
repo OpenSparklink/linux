@@ -342,12 +342,7 @@ impl SleController for NativeController {
         if !self.opened.load(Ordering::Acquire) { return Err(EAGAIN); }
         self.validate_command(opcode as u16, params)?;
         let owner = super::sle_ingress::ingress_owner(self.identity).ok_or(ENODEV)?;
-        let gate = owner.schedule_gate.lock();
-        if *gate { return Err(ENODEV); }
-        owner.host.lock().enqueue(opcode as u16, params, 0)?;
-        drop(gate);
-        owner.kick_commands();
-        Ok(())
+        super::sle_ingress::enqueue_command(&owner, opcode as u16, params, None)
     }
 
     fn send_data(&self, _handle: u16, _data: &[u8]) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
