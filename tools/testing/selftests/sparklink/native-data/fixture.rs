@@ -121,6 +121,7 @@ unsafe fn sparklink_native_transport_acb(p:*mut c_void,ticket:*mut c_void,handle
 mod under_test{use super::*;
 // @@TICKET@@
 // @@COMMIT@@
+// @@CONTROLLER_DATA@@
 // @@RECEIVE@@
 // @@SEND@@
 // @@SEND_COMMON@@
@@ -371,4 +372,43 @@ unsafe extern "C" fn actual_admission_callback(context:*mut c_void)->i32 {
  unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert!(!(*q.cast::<FakeSession>()).stopped);}
  assert_eq!(session(0,7,1,0).1,-13);
  b.stop_sessions(-19);unsafe{sl_connection_session_put(p);sl_connection_session_put(q);}
+}
+
+
+fn controller_data(handle:u16,index:u16,payload:&[u8])->Vec<u8>{
+ let n=payload.len()+5;let mut p=vec![0xa2,0x14,0,n as u8,(n>>8) as u8];
+ p.extend_from_slice(&handle.to_le_bytes());p.extend_from_slice(&index.to_le_bytes());
+ p.push(payload.len() as u8);p.extend_from_slice(payload);p
+}
+#[test] fn controller_data_all_u8_payload_lengths_are_valid_but_unsupported(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ for len in 0..=255 {
+  let packet=controller_data(0,0x0134,&vec![0xa5;len]);
+  assert_eq!(receive(0,7,&packet),-95,"payload {len}");
+ }
+ assert!(a.commands.borrow().is_empty());assert!(b.commands.borrow().is_empty());
+ assert_eq!(take(0,7,1,0,2047).0,-11);assert_eq!(take(1,8,1,0,2047).0,-11);
+ // Unsupported security cannot refill or spend either controller's ACB debt.
+ for _ in 0..5 {assert_eq!(send(0,7,1,0,b"own data"),0);}
+ assert_eq!(send(0,7,1,0,b"full"),-11);assert_eq!(send(1,8,1,0,b"peer data"),0);
+}
+#[test] fn controller_data_truncated_overlong_mismatched_handle_is_malformed(){
+ setup();
+ let packet=controller_data(0x0fff,0x0147,&[2;255]);assert_eq!(packet.len(),265);
+ for n in 0..packet.len(){assert_eq!(receive(0,7,&packet[..n]),-71,"cut {n}");}
+ for offset in [3,4,9]{let mut p=packet.clone();p[offset]^=1;assert_eq!(receive(0,7,&p),-71);}
+ let mut p=packet.clone();p.push(0);p[3]=5;p[4]=1;assert_eq!(receive(0,7,&p),-71);
+ assert_eq!(receive(0,7,&controller_data(0x1000,0x0133,&[0])),-71);
+ assert_eq!(receive(0,7,&controller_data(0xffff,0x0133,&[0])),-71);
+}
+#[test] fn controller_data_budget_does_not_expand_other_event_or_reply_budgets(){
+ let(a,_)=setup();let mut p=controller_data(0,0x0134,&[0;255]);
+ p[1]=0x18;assert_eq!(receive(0,7,&p),-71); // unrelated 265-byte event
+ p[1]=2;assert_eq!(receive(0,7,&p),-71); // command Complete still bounded
+ p[0]=0x55;p[1]=0x14;assert_eq!(receive(0,7,&p),-71);
+ assert!(a.commands.borrow().is_empty());
+}
+#[test] fn controller_data_does_not_resolve_retired_registration(){
+ setup();let p=controller_data(0,0x0134,&[0;255]);
+ assert_eq!(receive(0,99,&p),-19);assert_eq!(receive(3,7,&p),-19);
 }

@@ -653,6 +653,15 @@ unsafe fn publish_native_event(
     NativeController::result_to_errno(result)
 }
 
+/// Common ControllerData envelope (NearLink Host f087 DLI_ControllerDataEvt).
+/// No structure cast/padding, SMP index interpretation, authorization or
+/// lifecycle acceptance occurs here. Those belong to the Session actor.
+fn native_controller_data_valid(params: &[u8]) -> bool {
+    if !(5..=260).contains(&params.len()) { return false; }
+    let handle = u16::from_le_bytes([params[0], params[1]]);
+    handle <= 0x0fff && params[4] as usize == params.len() - 5
+}
+
 /// Callback receives a complete standard event packet or WS73 HCC slot;
 /// attribution comes from the immutable registration, not packet bytes.
 #[no_mangle]
@@ -696,9 +705,18 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         owner.schedule_rx(0);
         return 0; // bounded ingress drop is not a USB/device recovery request
     }
-    if length > 260 { return PROTOCOL_ERROR; }
     if packet[0] != 0xa2 || count != length - 5 { return PROTOCOL_ERROR; }
     let params = &packet[5..];
+    if event == 0x0014 {
+        // ControllerData has an independent u8 payload length after its
+        // five-byte handle/index/length envelope: 255 + 5 + 5 = 265 on wire.
+        // Do not apply the command-event 260-byte budget to this event.
+        // The producer validates its dialect; common framing is checked here
+        // too. No security actor is enabled yet, so a valid packet is honestly
+        // unsupported, not accepted, a fake Complete or trusted peer state.
+        return if native_controller_data_valid(params) { UNSUPPORTED } else { PROTOCOL_ERROR };
+    }
+    if length > 260 { return PROTOCOL_ERROR; }
     if event == 9 {
         if params.len() != 3 { return PROTOCOL_ERROR; }
         let handle = u16::from_le_bytes([params[0], params[1]]);

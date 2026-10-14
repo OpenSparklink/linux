@@ -28,7 +28,8 @@ def run(output):
     start = source.index('struct NativeTxTicket {')
     end = source.index('\n}', start) + 2
     fixture = fixture.replace('// @@TICKET@@', source[start:end])
-    for marker, name in [('RECEIVE', 'sparklink_native_receive_rust'),
+    for marker, name in [('CONTROLLER_DATA', 'native_controller_data_valid'),
+                         ('RECEIVE', 'sparklink_native_receive_rust'),
                          ('SEND', 'sparklink_native_acb_send_rust'),
                          ('SEND_COMMON', 'native_acb_send'),
                          ('GUARDED_SEND', 'sparklink_native_acb_send_guarded_rust'),
