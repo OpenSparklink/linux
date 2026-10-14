@@ -63,8 +63,11 @@ $(OUTPUT)/ws73_native_rpc_fault_test: ws73_native_rpc_fault_test.c ws73_native_o
 RUSTC ?= rustc
 $(OUTPUT)/sparklink_host_plan_test: sparklink_host_plan_test.rs \
 	../../../../net/sparklink/sle_command_plan.rs \
-	../../../../net/sparklink/sle_command_queue.rs
-	$(RUSTC) --edition=2021 --test -D warnings $< -o $@
+	../../../../net/sparklink/sle_command_queue.rs \
+	../../../../net/sparklink/sle_security_relay.rs \
+	../../../../net/sparklink/sle_security_relay_state.rs \
+	run_host_plan.py security_relay_fixture.py
+	RUSTC=$(RUSTC) python3 run_host_plan.py --binary $@
 
 $(OUTPUT)/sparklink_discovery_operation_test: sparklink_discovery_operation_test.rs \
 	../../../../net/sparklink/sle_command_plan.rs \
