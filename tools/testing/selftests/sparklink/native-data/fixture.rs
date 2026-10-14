@@ -66,6 +66,7 @@ impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
  CommandCredits{credits:u8},
  NativeCommandReply{opcode:u16,command_credits:u8,status:u8,complete:bool,data:KVec<u8>},
  HardwareError{code:u8},
+ NativeControllerData{lifetime:u64,handle:u16,index:u16,data:KVec<u8>},
 }
 thread_local!{
  static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(Vec::new())};
@@ -380,13 +381,18 @@ fn controller_data(handle:u16,index:u16,payload:&[u8])->Vec<u8>{
  p.extend_from_slice(&handle.to_le_bytes());p.extend_from_slice(&index.to_le_bytes());
  p.push(payload.len() as u8);p.extend_from_slice(payload);p
 }
-#[test] fn controller_data_all_u8_payload_lengths_are_valid_but_unsupported(){
+#[test] fn controller_data_all_u8_payload_lengths_freeze_observed_lifetime(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
  for len in 0..=255 {
   let packet=controller_data(0,0x0134,&vec![0xa5;len]);
-  assert_eq!(receive(0,7,&packet),-95,"payload {len}");
+  assert_eq!(receive(0,7,&packet),0,"payload {len}");
  }
- assert!(a.commands.borrow().is_empty());assert!(b.commands.borrow().is_empty());
+ assert_eq!(a.commands.borrow().len(),256);assert!(b.commands.borrow().is_empty());
+ for (n,e) in a.commands.borrow().iter().enumerate() {
+  match e {SleEvent::NativeControllerData{lifetime,handle,index,data}=>{
+   assert_eq!((*lifetime,*handle,*index),(1,0,0x0134));assert_eq!(data.0,vec![0xa5;n]);
+  },_=>panic!("wrong event")}
+ }
  assert_eq!(take(0,7,1,0,2047).0,-11);assert_eq!(take(1,8,1,0,2047).0,-11);
  // Unsupported security cannot refill or spend either controller's ACB debt.
  for _ in 0..5 {assert_eq!(send(0,7,1,0,b"own data"),0);}

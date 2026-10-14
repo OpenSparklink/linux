@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#[path = "../../../../../net/sparklink/experimental/security_relay.rs"]
+#[path = "../../../../../net/sparklink/sle_security_relay_state.rs"]
 mod relay;
 use relay::*;
 
@@ -237,4 +237,17 @@ fn certain_submit_refusal_is_not_a_controller_completion() {
     assert!(!s.outstanding());
     assert!(!s.reset_required());
     assert_eq!(s.reply(t, 13, true, 0), None);
+}
+
+#[test]
+fn payload_view_is_exact_without_driver_envelope() {
+ let mut s=session();s.enqueue(identity(),10,0x0147,&[2]).unwrap();
+ let p=s.prepare(identity(),11).unwrap().unwrap();assert_eq!(p.payload(),&[2]);
+}
+
+#[test] fn initial_request_role_and_length_are_exact() {
+ for role in 0..=2 {for length in 0..=255 {for index in [0x0133,0x0134,0x0135,0x0147] {
+  let expected=(role==0&&index==0x0133&&length==1)||(role==1&&index==0x0134&&length==10);
+  assert_eq!(initial_pairing_request(role,index,length),expected);
+ }}}
 }

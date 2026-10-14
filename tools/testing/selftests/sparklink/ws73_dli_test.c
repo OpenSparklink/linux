@@ -461,6 +461,30 @@ static void security_event_tests(void)
 	CHECK(ws73_dli_validate_command(0x1c05, data, 20) == -EOPNOTSUPP);
 }
 
+static void relay_command_tests(void)
+{
+ unsigned char params[255],payload[255];unsigned short opcode;
+ memset(payload,0xa5,sizeof(payload));
+ for(unsigned int n=0;n<=250;n++) {
+  memset(params,0xcc,sizeof(params));opcode=0xaaaa;
+  CHECK(ws73_dli_relay_prepare(0x0fff,0x0147,payload,n,&opcode,params,sizeof(params))==(int)n+5);
+  CHECK(opcode==0x1812&&u16(params)==0x0fff&&u16(params+2)==0x0147&&params[4]==n);
+  CHECK(!memcmp(params+5,payload,n));CHECK(!ws73_dli_relay_validate(opcode,params,n+5));
+  CHECK(ws73_dli_validate_command(opcode,params,n+5)==-EOPNOTSUPP);
+ }
+ for(unsigned int n=251;n<=255;n++) {
+  memset(params,0xcc,sizeof(params));opcode=0xaaaa;
+  CHECK(ws73_dli_relay_prepare(0,0x0147,payload,n,&opcode,params,sizeof(params))==-EMSGSIZE);
+  CHECK(opcode==0xaaaa&&params[0]==0xcc&&params[254]==0xcc);
+ }
+ CHECK(ws73_dli_relay_prepare(0x1000,0x0147,payload,1,&opcode,params,sizeof(params))==-EINVAL);
+ CHECK(ws73_dli_relay_prepare(0,0x0147,payload,1,&opcode,params,5)==-EMSGSIZE);
+ CHECK(ws73_dli_relay_validate(0x1812,NULL,5)==-EINVAL);
+ CHECK(ws73_dli_relay_validate(0x1812,params,256)==-EINVAL);
+ CHECK(ws73_dli_relay_validate(0x1c03,params,6)==-EOPNOTSUPP);
+ params[0]=params[1]=0;params[4]=2;CHECK(ws73_dli_relay_validate(0x1812,params,6)==-EPROTO);
+}
+
 int main(void)
 {
 	/* SDK ignores SLE RX sub_type; all 16 still pass the full query
@@ -477,6 +501,7 @@ int main(void)
 	}
 	link_event_tests();
 	security_event_tests();
+	relay_command_tests();
 	reply_tests();
 	command_tests();
 	query_tests();

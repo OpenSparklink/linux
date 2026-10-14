@@ -18,7 +18,7 @@ parser.add_argument('--output', type=Path)
 parser.add_argument('--kani', action='store_true', help='verify the same staged source in a private mirrored tree')
 parser.add_argument('--timeout', type=int, default=300, help='formal tool seconds; timeout is NOT_PROVEN')
 args = parser.parse_args()
-paths = [root / 'net/sparklink/experimental/security_relay.rs', here / 'security/relay_session.rs']
+paths = [root / 'net/sparklink/sle_security_relay_state.rs', here / 'security/relay_session.rs']
 if args.kani:
     paths.append(here / 'security/relay_session_kani.rs')
 originals = {p: p.read_bytes() for p in paths}
@@ -59,15 +59,15 @@ with tempfile.TemporaryDirectory(prefix='sparklink-relay-session-') as directory
         if args.output:
             args.output.with_suffix('.kani.log').write_text(log)
 assert all(p.read_bytes() == data for p, data in originals.items())
-record = dict(status='STAGED_RELAY_SESSION_REGRESSION_PASS', tests=7,
-              default_kernel_implementation=False, rf_acceptance=False,
+record = dict(status='PRODUCTION_RELAY_SESSION_REGRESSION_PASS', tests=9,
+              default_kernel_implementation=True, rf_acceptance=False,
               rustc=subprocess.check_output(['rustc', '--version'], text=True).strip(),
               sources={str(p.relative_to(root)): hashlib.sha256(data).hexdigest() for p, data in originals.items()})
 if formal is not None:
     record['formal'] = formal
     record['regression_status'] = 'PASS'
     if formal['status'] != 'BOUNDED_PASS':
-        record['status'] = 'STAGED_RELAY_SESSION_FORMAL_NOT_PROVEN'
+        record['status'] = 'PRODUCTION_RELAY_SESSION_FORMAL_NOT_PROVEN'
 if args.output:
     args.output.write_text(json.dumps(record, indent=2) + '\n')
 print(json.dumps(record))

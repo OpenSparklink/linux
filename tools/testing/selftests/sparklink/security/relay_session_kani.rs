@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 pub mod relay {
-    include!("../../../../../net/sparklink/experimental/security_relay.rs");
+    include!("../../../../../net/sparklink/sle_security_relay_state.rs");
 
     #[cfg(kani)]
     mod verification {

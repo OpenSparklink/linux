@@ -1,3 +1,5 @@
+#[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;
+#[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 // SPDX-License-Identifier: GPL-2.0-only
 // Actual Host methods with clock, kernel errno, allocation and wire-event
 // dependency fixtures. No hardware, VFS permission or scheduler acceptance.
@@ -18,7 +20,7 @@ type Error=i32; type Result<T=()>=std::result::Result<T,Error>;
 const EAGAIN:i32=-11;const EINVAL:i32=-22;const EBUSY:i32=-16;const EEXIST:i32=-17;const ENOENT:i32=-2;
 const EOVERFLOW:i32=-75;const ETIMEDOUT:i32=-110;const EIO:i32=-5;
 mod kernel {pub mod bindings {
- pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;pub const EALREADY:u32=114;
+ pub const EACCES:u32=13;pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;pub const EALREADY:u32=114;
  #[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;
  pub unsafe fn ktime_get_boottime()->i64 {unsafe{jiffies_64 as i64 * 1000000}}
 }}
@@ -49,7 +51,7 @@ fn host()->CommandHost {let mut operations=Operations::new();operations.initiali
  connections:sle_connection_operation::Connections::new(),credits:1,credit_revision:0,active:None,reply:None,fault:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
  grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
-fn clock(now:u64){unsafe{kernel::bindings::jiffies_64=now}}
+fn clock(now:u64){super::sle_security_relay::clock(now);unsafe{kernel::bindings::jiffies_64=now}}
 fn reference(handle:u16)->sle_connection_operation::ExpectedLink { sle_connection_operation::ExpectedLink { lifetime:1,handle,role:0,address_type:0,address:[1;6] } }
 fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None).unwrap()}
 #[test] fn stale_peer_reference_rejects_before_admission_without_mutation(){
@@ -387,4 +389,41 @@ fn adack(h:&mut CommandHost,r:&CmdRequest,code:u8) {
  a.fail(-5);assert!(!a.admits_data());assert!(b.admits_data());
 }
 
+
+fn relay_host() -> (CommandHost,super::sle_security_relay::Command) {
+ clock(1);let mut h=host();assert!(h.grants.activate(1,true));
+ h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:0,role:0,address_type:0,address:[1;6],reserved:[0;2]});
+ let identity=super::sle_security_relay_state::Identity{controller:42,generation:2,lifetime:1,handle:0,grant_epoch:1};
+ let command=super::sle_security_relay::prepare(identity,100);
+ (h,command)
+}
+#[test] fn actual_relay_shares_slot_credit_and_requires_real_complete() {
+ let(mut h,c)=relay_host();h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,c.clone()).unwrap();
+ let q=h.next(|_|true).unwrap().unwrap();assert!(q.relay.is_some());assert_eq!(h.credits,0);
+ h.validate_command_commit(q.cookie,0x1812).unwrap();let mut submits=0;
+ assert_eq!(h.commit_relay(q.cookie,||{submits+=1;0}),0);h.command_committed(q.cookie);assert_eq!(submits,1);
+ assert_ne!(c.commit(||panic!("duplicate submitted")),0);
+ assert!(h.transport_complete(q.cookie)==false);assert!(h.active.is_some());assert_eq!(h.credits,0);
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:false,data:vec![]});
+ assert!(h.take_reply().is_none());assert!(h.active.is_some());
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![]});
+ assert!(h.take_reply().is_some());assert!(h.active.is_none());assert_eq!(h.credits,1);
+ assert_ne!(c.commit(||panic!("closed relay reused")),0);
+}
+#[test] fn actual_relay_revoke_before_commit_and_queued_expiry_do_not_submit() {
+ let(mut h,c)=relay_host();h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,c.clone()).unwrap();
+ let q=h.next(|_|true).unwrap().unwrap();h.revoke_connections();assert_eq!(h.validate_command_commit(q.cookie,0x1812),Err(-13));
+ assert_ne!(h.commit_relay(q.cookie,||panic!("revoked queued")),0);h.abort_unsubmitted(q.cookie,-13).unwrap();assert_eq!(h.credits,1);
+ let(mut h,c)=relay_host();h.credits=0;h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],10,c.clone()).unwrap();clock(11);
+ assert!(!h.timed_out());assert!(h.requests.is_empty());assert_eq!(h.credits,0);assert!(h.fault.is_none());
+ assert_ne!(c.commit(||panic!("expired queued")),0);
+}
+#[test] fn actual_relay_revoke_retains_inflight_and_peer_remains_independent() {
+ let(mut h,c)=relay_host();h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,c.clone()).unwrap();let q=h.next(|_|true).unwrap().unwrap();
+ assert_eq!(h.commit_relay(q.cookie,||0),0);h.command_committed(q.cookie);h.transport_complete(q.cookie);h.revoke_connections();
+ assert!(h.active.is_some());assert_eq!(h.credits,0);
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![]});
+ assert!(h.take_reply().is_some());assert_eq!(h.credits,1);assert_ne!(c.commit(||panic!("withdrawn")),0);
+ let(mut peer,p)=relay_host();peer.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,p).unwrap();assert!(peer.next(|_|true).unwrap().is_some());
+}
 }

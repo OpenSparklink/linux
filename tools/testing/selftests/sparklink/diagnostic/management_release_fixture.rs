@@ -1,3 +1,5 @@
+#[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;
+#[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 // SPDX-License-Identifier: GPL-2.0-only
 #[path="sle_grant.rs"] mod sle_grant;
 // Actual Host predicates and core release decision; lock/transport dependencies
@@ -20,7 +22,7 @@ mod under_test {
 use super::*;
 type Error=i32;
 type Result<T=()>=std::result::Result<T,Error>;
-mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EOPNOTSUPP:u32=95;pub const ESTALE:u32=116;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
+mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EACCES:u32=13;pub const EOPNOTSUPP:u32=95;pub const ESTALE:u32=116;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
 use kernel::bindings;
 fn error_from_errno(value:i32)->i32 {value}
 const ENODEV:i32=-19;const EBUSY:i32=-16;
@@ -94,7 +96,7 @@ fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:
   else {assert_eq!(result,Err(-16));assert!(h.revoking);assert_eq!(h.selected_policy_domains,3);assert_eq!(gate.state,sle_management::FREE);}
  }
 }
-fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,deadline:1000,recipe:None,connection:None,connection_reference:None,transport_done:false,transport_submitted:false,withdrawn:false,credit_revision:0,advertising_params:None,advertising_was_absent:false}}
+fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,deadline:1000,recipe:None,connection:None,relay:None,connection_reference:None,transport_done:false,transport_submitted:false,withdrawn:false,credit_revision:0,advertising_params:None,advertising_was_absent:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby,recreate:false},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
  intent:sle_command_plan::DiscoveryIntent::AdvertisingStandby,state:State::Cancelled,

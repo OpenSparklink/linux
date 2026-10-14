@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """Actual complete Host connection admission/TX/reply/revoke bodies with dependency fixtures."""
+from security_relay_fixture import write_fixture
 import argparse,hashlib,json,os,re,subprocess,tempfile
 from pathlib import Path
 from run_connection_tx import function
@@ -8,6 +9,7 @@ from run_connection_tx import function
 def run(output=None):
     here=Path(__file__).resolve().parent;net=here.parents[3]/'net/sparklink'
     names=['sle_host.rs','sle_command_queue.rs','sle_command_plan.rs','sle_discovery_operation.rs','sle_connection_operation.rs','sle_link_observation.rs','sle_mgmt.rs','sle_dli.rs','sle_workers.rs','sle_grant.rs','sle_native.rs']
+    names += ['sle_security_relay.rs','sle_security_relay_state.rs']
     inputs={n:(net/n).read_bytes() for n in names}
     source=inputs['sle_host.rs'].decode();source=source[source.index('struct InFlight {'):]
     constructor=function(source,'new_boxed');source=source.replace(constructor,'')
@@ -24,7 +26,7 @@ def run(output=None):
     outcome=(here/'native-ticket/command_outcome.rs').read_text().replace('// @@SEND@@',function(native,'send_typed')).replace('super::ControllerRuntime','ControllerRuntime').replace('Error::from_errno(','error_from_errno(')
     fixture=fixture.replace('// @@COMMAND_OUTCOME@@',outcome)
     with tempfile.TemporaryDirectory(prefix='sparklink-native-connection-host-') as tmp:
-        tmp=Path(tmp)
+        tmp=Path(tmp); write_fixture(here.parents[3], tmp)
         for n in names[1:]:(tmp/n).write_bytes(inputs[n])
         (tmp/'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-D','warnings',str(tmp/'fixture.rs'),'-o',str(tmp/'test')],check=True)
