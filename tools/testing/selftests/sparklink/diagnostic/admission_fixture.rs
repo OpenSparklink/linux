@@ -41,10 +41,11 @@ struct Management {file:u64}
 impl Management {fn authorize(&self,file:u64,mode:u32)->Result{if self.file==file&&mode==2 {Ok(())}else{Err(EPERM)}}}
 mod sle_management {pub const DIAGNOSTIC:u32=2;}
 fn management_error(e:Error)->Error{e}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)] struct Active {seq:u32,withdrawn:bool}
 struct Host {
  requests:sle_command_queue::CmdRequestQueue, fault:Option<Error>, next_cookie:u64,
  // Reservation sentinels are inspected, not used to fake receive success.
- active:Option<u32>, credits:u8, reply:Option<u32>,
+ active:Option<Active>, credits:u8, reply:Option<u32>,
 }
 impl Host {
  // @@ENQUEUE@@
@@ -102,9 +103,9 @@ fn seq()->u32{OUTPUT.with(|p|p.borrow().as_ref().unwrap().seq)}
 }
 #[test] fn on_wire_cancel_keeps_reservation_and_late_reply_cannot_change_final(){
  let(c,f)=setup();submit(&c,&f,request(1),1).unwrap();let first=seq();
- {let mut h=c.owner.as_ref().unwrap().host.lock();h.requests.pop();h.active=Some(first);h.credits=0;h.reply=Some(first);}
+ {let mut h=c.owner.as_ref().unwrap().host.lock();h.requests.pop();h.active=Some(Active{seq:first,withdrawn:false});h.credits=0;h.reply=Some(first);}
  let mut cancel=request(1);cancel.action=2;submit(&c,&f,cancel,1).unwrap();
- {let h=c.owner.as_ref().unwrap().host.lock();assert_eq!((h.active,h.credits,h.reply),(Some(first),0,Some(first)));}
+ {let h=c.owner.as_ref().unwrap().host.lock();assert_eq!((h.active,h.credits,h.reply),(Some(Active{seq:first,withdrawn:true}),0,Some(first)));}
  let mut state=c.state.lock();let q=&mut state.as_mut().unwrap().cmd_pending;
  assert!(!q.resolve_seq(first,0,&[9]));assert_eq!(q.find_by_seq(first).unwrap().error,-125);
 }
