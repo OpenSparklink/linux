@@ -7,7 +7,7 @@ from run_connection_tx import function
 
 def run(output=None):
     here=Path(__file__).resolve().parent;net=here.parents[3]/'net/sparklink'
-    names=['sle_host.rs','sle_command_queue.rs','sle_command_plan.rs','sle_discovery_operation.rs','sle_connection_operation.rs','sle_link_observation.rs','sle_mgmt.rs','sle_dli.rs','sle_workers.rs','sle_grant.rs']
+    names=['sle_host.rs','sle_command_queue.rs','sle_command_plan.rs','sle_discovery_operation.rs','sle_connection_operation.rs','sle_link_observation.rs','sle_mgmt.rs','sle_dli.rs','sle_workers.rs','sle_grant.rs','sle_native.rs']
     inputs={n:(net/n).read_bytes() for n in names}
     source=inputs['sle_host.rs'].decode();source=source[source.index('struct InFlight {'):]
     constructor=function(source,'new_boxed');source=source.replace(constructor,'')
@@ -17,6 +17,10 @@ def run(output=None):
     fixture=(here/'connection/native_host_fixture.rs').read_text().replace('// @@ACTUAL_HOST@@',source).replace('// @@PUSH_COOKIE@@',function(inputs['sle_mgmt.rs'].decode(),'push_cookie'))
     variants='\n'.join(re.search(r'(?m)^    '+name+r' = 0x[0-9A-F]+,',inputs['sle_dli.rs'].decode()).group() for name in ['CreateConnection','EnableBroadcast','EnableScan','SetScanParam'])
     fixture=fixture.replace('// @@OPCODES@@',variants).replace('// @@TIMEOUT@@',re.search(r'(?m)^pub\(crate\) const CMD_TIMEOUT_MS: u32 = [0-9_]+;',inputs['sle_mgmt.rs'].decode()).group())
+    native=inputs['sle_native.rs'].decode()
+    start=native.index("struct NativeCommandTicket<'a> {");end=native.index('\n}',start)+2
+    callback=function(re.sub(r'unsafe extern "C" fn (\w+)',r'unsafe fn \1',native),'sparklink_native_command_commit_rust')
+    fixture=fixture.replace('// @@COMMAND_CALLBACK@@',(here/'native-ticket/command_commit.rs').read_text().replace('// @@TICKET@@',native[start:end]).replace('// @@COMMIT@@',callback).replace('super::ControllerRuntime','ControllerRuntime'))
     with tempfile.TemporaryDirectory(prefix='sparklink-native-connection-host-') as tmp:
         tmp=Path(tmp)
         for n in names[1:]:(tmp/n).write_bytes(inputs[n])

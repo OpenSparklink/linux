@@ -18,7 +18,7 @@ type Error=i32; type Result<T=()>=std::result::Result<T,Error>;
 const EAGAIN:i32=-11;const EINVAL:i32=-22;const EBUSY:i32=-16;const EEXIST:i32=-17;const ENOENT:i32=-2;
 const EOVERFLOW:i32=-75;const ETIMEDOUT:i32=-110;const EIO:i32=-5;
 mod kernel {pub mod bindings {
- pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;
+ pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;pub const EALREADY:u32=114;
  #[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;
  pub unsafe fn ktime_get_boottime()->i64 {unsafe{jiffies_64 as i64 * 1000000}}
 }}
@@ -43,6 +43,7 @@ impl CmdRequestQueue {
 // @@PUSH_COOKIE@@
 }
 // @@ACTUAL_HOST@@
+// @@COMMAND_CALLBACK@@
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
  connections:sle_connection_operation::Connections::new(),credits:1,active:None,reply:None,fault:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
@@ -92,6 +93,35 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  a.revoke_connections();assert!(a.next(|_|true).unwrap().is_none());assert_eq!(a.credits,1);
  assert!(a.links_clear_for_management());assert_eq!(a.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
  assert!(b.next(|_|true).unwrap().is_some());assert!(!b.links_clear_for_management());
+}
+
+#[test] fn final_command_commit_checks_real_slot_and_never_pays_credit(){
+ clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();
+ let credits=h.credits;
+ assert_eq!(h.validate_command_commit(r.cookie+1,r.opcode),Err(EINVAL));
+ assert_eq!(h.validate_command_commit(r.cookie,r.opcode+1),Err(EINVAL));
+ assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Ok(()));
+ h.command_committed(r.cookie);assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(-114));
+ assert_eq!(h.credits,credits);assert!(!h.transport_complete(r.cookie+1));
+}
+
+#[test] fn prepared_diagnostic_cancel_and_deadline_block_actual_submit(){
+ clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],9,100).unwrap();
+ let r=h.next(|_|true).unwrap().unwrap();h.cancel_diagnostic(9);
+ assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(-125));assert!(!h.active.as_ref().unwrap().transport_submitted);
+ let mut peer=host();peer.enqueue_diagnostic(0x0404,&[],10,100).unwrap();let p=peer.next(|_|true).unwrap().unwrap();
+ assert_eq!(peer.validate_command_commit(p.cookie,p.opcode),Ok(()));clock(100);
+ assert_eq!(peer.validate_command_commit(p.cookie,p.opcode),Err(ETIMEDOUT));
+}
+
+#[test] fn prepared_disconnect_keeps_reference_after_outcome_and_handle_reuse(){
+ clock(1);let mut h=host();create(&mut h,1);let first=h.next(|_|true).unwrap().unwrap();
+ h.transport_complete(first.cookie);h.receive(status(0x1401,0));h.take_reply();up(&mut h,[1;6]);
+ h.submit_connection(42,2,sle_connection_operation::Intent::Disconnect{handle:7},2,0x1403,&[7,0,19],100,Some(reference(7))).unwrap();
+ let r=h.next(|_|true).unwrap().unwrap();assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Ok(()));
+ down(&mut h);up(&mut h,[1;6]);
+ assert!(h.active.as_ref().unwrap().connection_reference.is_some());
+ assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(-116));assert!(!h.active.as_ref().unwrap().transport_submitted);
 }
 #[test] fn settled_revoke_new_lease_accepts_create_without_losing_history_or_credits(){
  clock(1);let mut h=host();h.operations.advertising=1;h.operations.scanning=1;
