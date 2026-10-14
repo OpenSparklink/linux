@@ -52,7 +52,10 @@ struct sl_connection_session {
 	struct sl_basic_channel channels[SL_SESSION_CHANNELS];
 	unsigned int tx_next; /* serialized worker-only round-robin start */
 	u16 acb_maximum; /* controller packet size, distinct from DTAP MTU */
-	int fragment_slot; /* worker-only; -1 or sole unfinished connection PDU */
+	int fragment_slot; /* sole operation slot; Session lock protects ownership */
+	struct sk_buff *tx_inflight; /* Session-owned, never in an fd queue */
+	struct sl_channel_grant tx_grant; /* immutable bounded operation scope */
+	bool tx_started; /* set at first successful actual atomic USB submit */
 	u8 response_id;
 	u32 response_mask; /* only serialized session worker writes these */
 	u8 rx_buffer[2047]; /* sole connection consumer, fixed budget */
@@ -64,7 +67,7 @@ struct sl_socket_binding {
 	struct sl_connection_session *session;
 	unsigned int channel_slot; /* immutable after binding publication */
 };
-struct sl_submit_scope { struct sl_connection_session *session; struct sl_basic_channel *channel; };
+struct sl_submit_scope { struct sl_connection_session *session; struct sl_basic_channel *channel; struct sk_buff *operation; };
 static struct proto sl_channel_proto;
 
 static struct sl_socket_binding *sl_sk(struct sock *sk)
@@ -89,6 +92,7 @@ static void sl_session_destroy(struct kref *refs)
 	unsigned int i;
 
 	WARN_ON(delayed_work_pending(&s->work));
+	WARN_ON(s->tx_inflight);
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		WARN_ON(s->channels[i].sk);
 		skb_queue_purge(&s->channels[i].tx);
@@ -225,13 +229,34 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 {
 	struct sl_submit_scope *permission = scope;
 	struct sl_connection_session *s = permission->session;
+	struct sl_basic_channel *c = permission->channel;
 	int ret;
 
 	spin_lock(&s->lock); /* Runtime commit has IRQs disabled */
-	if (!sl_channel_active(s->progress) ||
-	    (permission->channel && !sl_binding_live(permission->channel->binding)))
+	if (!sl_channel_active(s->progress))
 		ret = -ECANCELED;
-	else if (permission->channel && !sl_permits(s, permission->channel, SL_GRANT_TX))
+	else if (permission->operation) {
+		struct sl_grant_scope observed = { .controller = s->controller,
+			.generation = s->generation, .lifetime = s->lifetime, .epoch = s->epoch,
+			.handle = s->handle, .local_tcid = c->local_tcid,
+			.remote_tcid = c->remote_tcid, .pi = c->pi };
+		struct sl_fragment_cursor *cursor = (void *)permission->operation->cb;
+		if (s->tx_inflight != permission->operation || s->fragment_slot != c - s->channels)
+			ret = -ECANCELED;
+		else if (!sl_grant_permits(&s->tx_grant, observed, SL_GRANT_TX))
+			ret = -EACCES;
+		else if (time_after_eq(jiffies, cursor->deadline))
+			ret = -ETIMEDOUT;
+		else if (!s->tx_started && (!sl_binding_live(c->binding) || !sl_permits(s, c, SL_GRANT_TX)))
+			ret = -ECANCELED;
+		else {
+			ret = submit(context);
+			if (!ret)
+				s->tx_started = true; /* same linearization as first USB acceptance */
+		}
+	} else if (c && !sl_binding_live(c->binding))
+		ret = -ECANCELED;
+	else if (c && !sl_permits(s, c, SL_GRANT_TX))
 		ret = -EACCES;
 	else
 		ret = submit(context); /* atomic queue only; no wait or protocol reentry */
@@ -240,7 +265,7 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 }
 static int sl_send(struct sl_connection_session *s, struct sl_basic_channel *c, const u8 *data, size_t length)
 {
-	struct sl_submit_scope permission = { s, c };
+	struct sl_submit_scope permission = { .session = s, .channel = c };
 
 	return sparklink_native_acb_send_guarded(s->controller, s->generation, s->lifetime,
 		s->handle, data, length, s->epoch, sl_session_submit, &permission);
@@ -331,32 +356,56 @@ static void sl_fail_channel(struct sl_connection_session *s, struct sl_basic_cha
 		sock_put(sk);
 	}
 }
+/* Serialized worker or stop-after-join only. Physical credit lives in Runtime
+ * and is never returned by dropping an operation or closing its author fd. */
+static void sl_retire_tx(struct sl_connection_session *s)
+{
+	unsigned long flags;
+	struct sk_buff *skb;
+	spin_lock_irqsave(&s->lock, flags);
+	skb = s->tx_inflight;
+	if (skb) {
+		sl_binding_finish_tx(&s->channels[s->fragment_slot].binding);
+		s->tx_inflight = NULL;
+		s->tx_started = false;
+		s->fragment_slot = -1;
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	kfree_skb(skb);
+}
 static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_channel *c)
 {
 	unsigned long flags;
-	struct sk_buff *skb = NULL;
+	struct sk_buff *skb;
 	struct sl_fragment_cursor *cursor;
-	struct sl_submit_scope permission = { s, c };
+	struct sl_submit_scope permission = { .session = s, .channel = c };
 	unsigned int length, boundary;
 	int slot = c - s->channels, ret = 0;
-	bool local_timeout = false;
+	bool started, local_timeout;
 
-	if (s->fragment_slot >= 0 && s->fragment_slot != slot)
-		return 0; /* DLI PB has no TCID; do not interleave connection PDUs. */
 	spin_lock_irqsave(&s->lock, flags);
-	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) && sl_permits(s, c, SL_GRANT_TX) && !c->binding.busy) {
-		skb = skb_dequeue(&c->tx);
-		if (skb)
-			sl_binding_start_tx(&c->binding);
+	if (s->tx_inflight && s->fragment_slot != slot) {
+		spin_unlock_irqrestore(&s->lock, flags);
+		return 0; /* PB has no TCID: never interleave physical PDUs. */
 	}
+	if (!s->tx_inflight && s->progress.phase == SL_CH_OPEN &&
+	    sl_binding_live(c->binding) && sl_permits(s, c, SL_GRANT_TX) && !c->binding.busy) {
+		s->tx_inflight = skb_dequeue(&c->tx);
+		if (s->tx_inflight) {
+			sl_binding_start_tx(&c->binding);
+			s->fragment_slot = slot;
+			s->tx_started = false;
+			s->tx_grant = sl_sk(c->sk)->grant;
+		}
+	}
+	skb = s->tx_inflight;
 	spin_unlock_irqrestore(&s->lock, flags);
 	if (!skb)
-		return s->fragment_slot == slot ? -ECANCELED : 0;
+		return 0;
 	cursor = (void *)skb->cb;
-	if (time_after_eq(jiffies, cursor->deadline)) {
+	permission.operation = skb;
+	if (time_after_eq(jiffies, cursor->deadline))
 		ret = -ETIMEDOUT;
-		local_timeout = cursor->offset == 0;
-	}
 	else if (!sl_fragment_next(skb->len, cursor->offset, s->acb_maximum, &length, &boundary))
 		ret = -EPROTO;
 	else {
@@ -367,28 +416,35 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 			ret = -EPROTO;
 	}
 	spin_lock_irqsave(&s->lock, flags);
-	sl_binding_finish_tx(&c->binding);
-	if ((ret == -EAGAIN || (!ret && cursor->offset < skb->len)) &&
-	    sl_binding_live(c->binding) && sl_permits(s, c, SL_GRANT_TX)) {
-		/* A blocked first submit permits other PDUs. A committed prefix owns
-		 * the entire connection stream until its final fragment is submitted. */
-		if (cursor->offset)
-			s->fragment_slot = slot;
+	started = s->tx_started;
+	local_timeout = ret == -ETIMEDOUT && !started;
+	if (ret == -EAGAIN && !started && sl_binding_live(c->binding)) {
+		/* Zero submitted prefix: return author-owned work for fair scheduling.
+		 * Close linearizes under this lock and may purge it after retirement. */
+		sl_binding_finish_tx(&c->binding);
 		skb_queue_head(&c->tx, skb);
-		skb = NULL;
-	} else {
-		if ((!ret || ret == -EAGAIN || ret == -ECANCELED) && cursor->offset && cursor->offset < skb->len)
-			ret = -ECONNABORTED; /* no qualified partial-PDU discard barrier */
+		s->tx_inflight = NULL;
 		s->fragment_slot = -1;
+		skb = NULL;
+	} else if (ret == -EAGAIN && !started) {
+		ret = 0; /* detached before any USB acceptance */
+	} else if (ret == -EAGAIN || (!ret && cursor->offset < skb->len)) {
+		/* Once started, fd detach cannot erase this Session-owned obligation.
+		 * Runtime still verifies managed epoch/lifetime before every USB submit. */
+		if (started)
+			skb = NULL;
+	} else if (ret == -ECANCELED && !started) {
+		ret = 0; /* author closed before first submit: no physical obligation */
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
-	kfree_skb(skb);
+	if (skb)
+		sl_retire_tx(s);
 	if (local_timeout) {
 		sl_fail_channel(s, c, ret);
 		ret = 0;
 	}
 	sl_wake(s);
-	return ret == -EAGAIN || ret == -ECANCELED ? 0 : ret;
+	return ret == -EAGAIN ? 0 : ret;
 }
 static void sl_work(struct work_struct *work)
 {
@@ -459,6 +515,8 @@ again:
 	if (sl_channel_active(sl_snapshot(s)))
 		sl_schedule(s);
 put:
+	if (!sl_channel_active(sl_snapshot(s)))
+		sl_retire_tx(s);
 	sl_connection_session_put(s);
 }
 void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch, u16 maximum)
@@ -515,6 +573,7 @@ void sl_connection_session_stop(void *opaque, int error)
 	}
 	if (cancel_delayed_work_sync(&s->work))
 		sl_connection_session_put(s); /* queued work owned one reference */
+	sl_retire_tx(s); /* joined worker cannot hold the borrowed operation */
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		skb_queue_purge(&s->channels[i].tx);
 		skb_queue_purge(&s->channels[i].rx);

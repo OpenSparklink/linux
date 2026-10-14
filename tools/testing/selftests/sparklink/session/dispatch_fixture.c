@@ -131,7 +131,7 @@ static void skb_queue_head(struct sk_buff_head *q,struct sk_buff *skb){
 }
 static unsigned int packet_budget,fragment_count,fragment_pb[16],fragment_size[16];
 static u8 fragment_bytes[4096];static unsigned int fragment_bytes_count;
-static int fragment_failure;static bool retire_after_fragment;
+static int fragment_failure;static bool retire_after_fragment, retire_before_fragment;
 static int fragment_submit(void *context){
  (void)context;assert(irq_disabled);if(!packet_budget)return -EAGAIN;
  if(fragment_failure)return fragment_failure;
@@ -143,6 +143,7 @@ static int sparklink_native_acb_fragment_guarded(u16 id,u64 generation,u64 lifet
  assert(id==permission->session->controller&&generation==permission->session->generation);
  assert(lifetime==permission->session->lifetime&&handle==permission->session->handle&&epoch==permission->session->epoch);
  assert(!permission->session->lock.held&&length<=254&&boundary<=3);
+ if(retire_before_fragment){sl_binding_retire(&permission->channel->binding);permission->channel->sk=NULL;}
  /* Host/data/gate and credit are dependencies here, separately tested in Rust.
   * Invoke the actual Session consent before accepting a fragment. */
  flags=irq_disabled;irq_disabled=true;result=consent(scope,fragment_submit,NULL);irq_disabled=flags;
@@ -150,7 +151,7 @@ static int sparklink_native_acb_fragment_guarded(u16 id,u64 generation,u64 lifet
   fragment_pb[fragment_count]=boundary;fragment_size[fragment_count++]=length;
   memcpy(fragment_bytes+fragment_bytes_count,bytes,length);fragment_bytes_count+=length;
   if(retire_after_fragment){spin_lock_irqsave(&permission->session->lock,flags);
-   sl_binding_retire(&permission->channel->binding);spin_unlock_irqrestore(&permission->session->lock,flags);}
+   sl_binding_retire(&permission->channel->binding);permission->channel->sk=NULL;spin_unlock_irqrestore(&permission->session->lock,flags);}
  }
  return result;
 }
@@ -203,7 +204,7 @@ static void direction_tests(void){
  struct sl_admission access={.session=&s,.channel=&s.channels[0]};assert(sl_tx_access(&access)==-EACCES);
  assert(sl_poll(NULL,&sock,NULL)==0);
  struct sl_admission admission={&s,&s.channels[0],alloc_skb(1,0),1};assert(sl_admit(&admission)==-EACCES&&admission.skb);kfree_skb(admission.skb);
- struct sl_submit_scope scope={&s,&s.channels[0]};unsigned int before=submitted;irq_disabled=true;
+ struct sl_submit_scope scope={.session=&s,.channel=&s.channels[0]};unsigned int before=submitted;irq_disabled=true;
  assert(sl_session_submit(&scope,atomic_submit,&s)==-EACCES&&submitted==before);
  scope.channel=NULL;assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==before+1);irq_disabled=false;
  route(&s,31,241,"allowed RX");assert(sl_poll(NULL,&sock,NULL)==(EPOLLIN|EPOLLRDNORM));assert(sl_recvmsg(&sock,&msg,100,0)==10);
@@ -257,7 +258,7 @@ static void two_channel_tests(void)
  route(&s,31,241,"user second");assert(s.channels[0].rx.qlen==2);
  assert(sl_recvmsg(&us,&msg,100,0)==10&&!memcmp(msg.bytes,"user first",10));
  assert(sl_recvmsg(&us,&msg,100,0)==11&&!memcmp(msg.bytes,"user second",11));
- struct sl_submit_scope service_scope={&s,&s.channels[1]},user_scope={&s,&s.channels[0]};
+ struct sl_submit_scope service_scope={.session=&s,.channel=&s.channels[1]},user_scope={.session=&s,.channel=&s.channels[0]};
  sl_binding_retire(&s.channels[1].binding);s.channels[1].sk=NULL;
  irq_disabled=true;
  assert(sl_session_submit(&service_scope,atomic_submit,&s)==-ECANCELED);
@@ -317,7 +318,7 @@ static void fragment_worker_tests(void){
  fragment_count=fragment_bytes_count=0;packet_budget=2;fragment_failure=0;retire_after_fragment=false;jiffies=42;
  enqueue_fragment_test(&s.channels[0],2047);enqueue_fragment_test(&s.channels[1],4);
  assert(!sl_transmit_channel(&s,&s.channels[0]));assert(!sl_transmit_channel(&s,&s.channels[0]));
- assert(fragment_count==2&&s.fragment_slot==0&&s.channels[0].tx.qlen==1);
+ assert(fragment_count==2&&s.fragment_slot==0&&!s.channels[0].tx.qlen&&s.tx_inflight&&s.channels[0].binding.busy);
  assert(!sl_transmit_channel(&s,&s.channels[0]));assert(fragment_count==2);
  assert(!sl_transmit_channel(&s,&s.channels[1]));assert(s.channels[1].tx.qlen==1);
  packet_budget=7;for(unsigned int i=0;i<7;i++)assert(!sl_transmit_channel(&s,&s.channels[0]));
@@ -329,12 +330,39 @@ static void fragment_worker_tests(void){
  /* Successful first fragment followed by last-fd retirement: do not allow
   * another PDU to replace the controller's uncompleted stream. */
  enqueue_fragment_test(&s.channels[0],255);packet_budget=1;retire_after_fragment=true;
- assert(sl_transmit_channel(&s,&s.channels[0])==-ECONNABORTED);assert(!s.channels[0].tx.qlen);
- retire_after_fragment=false;assert(!allocations);
+ assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!s.channels[0].sk&&s.tx_inflight&&s.tx_started&&s.channels[0].binding.busy);
+ retire_after_fragment=false;packet_budget=1;
+ assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!s.tx_inflight&&!s.channels[0].binding.busy&&s.progress.phase==SL_CH_OPEN);
+ assert(sl_binding_live(s.channels[1].binding));assert(!allocations);
+ /* Last close wins before first atomic submit: actual consent denies it. */
+ init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;
+ enqueue_fragment_test(&s.channels[0],255);retire_before_fragment=true;
+ unsigned int before=fragment_count;
+ assert(!sl_transmit_channel(&s,&s.channels[0]));assert(fragment_count==before&&!s.tx_inflight&&!allocations);
+ retire_before_fragment=false;
  init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;
  enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
  jiffies+=5000;packet_budget=1;
  assert(sl_transmit_channel(&s,&s.channels[0])==-ETIMEDOUT);assert(!allocations);
+ /* Even a started operation's frozen authority must match its Session. */
+ init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;jiffies=42;
+ enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
+ s.tx_grant.scope.lifetime++;packet_budget=1;before=fragment_count;
+ assert(sl_transmit_channel(&s,&s.channels[0])==-EACCES);
+ assert(fragment_count==before&&!s.tx_inflight&&!allocations);
+ /* Deadline also rechecked at the actual commit callback after preparation. */
+ init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=0;
+ enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!s.tx_inflight&&s.channels[0].tx.qlen==1);
+ struct sk_buff *deadline_skb=skb_dequeue(&s.channels[0].tx);
+ s.tx_inflight=deadline_skb;s.fragment_slot=0;s.tx_grant=bindings[0].grant;
+ assert(sl_binding_start_tx(&s.channels[0].binding));
+ struct sl_submit_scope expired_scope={.session=&s,.channel=&s.channels[0],.operation=deadline_skb};
+ jiffies=5042;irq_disabled=true;before=submitted;
+ assert(sl_session_submit(&expired_scope,atomic_submit,&s)==-ETIMEDOUT&&submitted==before);
+ irq_disabled=false;sl_retire_tx(&s);assert(!allocations);
  /* A queue-only timeout uses actual socket error publication and retains the
   * second Channel/Session. Deadline comes from actual admission, not dequeue. */
  init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;jiffies=42;
@@ -358,7 +386,7 @@ int main(void){
  route(&s,32,241,"wrong TCID");route(&s,SL_CHANNEL_CUTC,242,"wrong PI");assert(s.channels[0].rx.qlen==1&&s.channels[0].rx_dropped==0);
  for(unsigned int i=1;i<SL_CHANNEL_RX;i++)route(&s,SL_CHANNEL_CUTC,241,"bounded");
  route(&s,SL_CHANNEL_CUTC,241,"full queue");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==1);
- struct sl_submit_scope scope={&s,&s.channels[0]};irq_disabled=true;
+ struct sl_submit_scope scope={.session=&s,.channel=&s.channels[0]};irq_disabled=true;
  assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==1);
 
  irq_disabled=false;
