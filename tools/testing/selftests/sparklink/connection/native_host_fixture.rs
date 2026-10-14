@@ -406,7 +406,7 @@ fn relay_host() -> (CommandHost,super::sle_security_relay::Command) {
  assert!(h.transport_complete(q.cookie)==false);assert!(h.active.is_some());assert_eq!(h.credits,0);
  h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:false,data:vec![]});
  assert!(h.take_reply().is_none());assert!(h.active.is_some());
- h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![]});
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![0,0,0x47,1]});
  assert!(h.take_reply().is_some());assert!(h.active.is_none());assert_eq!(h.credits,1);
  assert_ne!(c.commit(||panic!("closed relay reused")),0);
 }
@@ -422,8 +422,23 @@ fn relay_host() -> (CommandHost,super::sle_security_relay::Command) {
  let(mut h,c)=relay_host();h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,c.clone()).unwrap();let q=h.next(|_|true).unwrap().unwrap();
  assert_eq!(h.commit_relay(q.cookie,||0),0);h.command_committed(q.cookie);h.transport_complete(q.cookie);h.revoke_connections();
  assert!(h.active.is_some());assert_eq!(h.credits,0);
- h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![]});
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![0,0,0x47,1]});
  assert!(h.take_reply().is_some());assert_eq!(h.credits,1);assert_ne!(c.commit(||panic!("withdrawn")),0);
  let(mut peer,p)=relay_host();peer.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,p).unwrap();assert!(peer.next(|_|true).unwrap().is_some());
 }
+#[test] fn relay_echo_mismatch_cannot_release_slot_credit_or_extend_deadline() {
+ let(mut h,c)=relay_host();h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],100,c.clone()).unwrap();
+ let q=h.next(|_|true).unwrap().unwrap();assert_eq!(h.commit_relay(q.cookie,||0),0);
+ h.command_committed(q.cookie);h.transport_complete(q.cookie);
+ for data in [vec![],vec![0,0,0x47],vec![1,0,0x47,1],vec![0,0,0x34,1],vec![0,0,0x47,1,0]] {
+  assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:255,status:0,complete:true,data}).is_some());
+  assert!(h.take_reply().is_none());assert_eq!(h.credits,0);
+  assert_eq!(h.active.as_ref().unwrap().deadline,100);
+ }
+ h.revoke_connections(); // Author revocation still keeps the submitted obligation.
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![0,0,0x47,1]});
+ assert!(h.take_reply().is_some());assert_eq!(h.credits,1);assert!(h.active.is_none());
+ assert_ne!(c.commit(||panic!("withdrawn submission revived")),0);
+}
+
 }

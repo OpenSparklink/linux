@@ -91,6 +91,7 @@ unsafe extern "C" fn sl_security_owner_destroy_rust(raw: *mut c_void) {
 pub(crate) struct Command {
     pointer: *mut c_void,
     pub(crate) ticket: Ticket,
+    index: u16,
 }
 // SAFETY: C kref protects lifetime, pinned IRQ lock serializes all ledger access.
 unsafe impl Send for Command {}
@@ -102,6 +103,7 @@ impl Clone for Command {
         Self {
             pointer: self.pointer,
             ticket: self.ticket,
+            index: self.index,
         }
     }
 }
@@ -149,7 +151,7 @@ impl Command {
         })();
         drop(state);
         match prepared {
-            Ok((ticket, packet)) => Ok((Self { pointer, ticket }, packet)),
+            Ok((ticket, packet)) => Ok((Self { pointer, ticket, index: packet.index }, packet)),
             Err(e) => {
                 unsafe { sl_connection_session_put(pointer) };
                 Err(e)
@@ -180,6 +182,14 @@ impl Command {
             Err(relay::Error::NeverSubmitted) => result,
             Err(e) => error(e).to_errno(),
         }
+    }
+    /// SDK111 successful Complete echoes this submission's handle and index.
+    /// Error Status/Complete has no guaranteed echo and can only end in failure.
+    /// The echo has no lifetime token; reuse still needs a proven wire barrier.
+    pub(crate) fn reply_matches(&self, complete: bool, status: u8, data: &[u8]) -> bool {
+        !complete || status != 0 || (data.len() == 4
+            && u16::from_le_bytes([data[0], data[1]]) == self.ticket.identity.handle
+            && u16::from_le_bytes([data[2], data[3]]) == self.index)
     }
     pub(crate) fn withdraw(&self) {
         let mut state = self.owner().state.lock();

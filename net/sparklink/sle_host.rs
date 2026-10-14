@@ -726,7 +726,14 @@ impl CommandHost {
                 }
                 *opcode as u16
             }
-            SleEvent::NativeCommandReply { opcode, command_credits, status, complete, .. } => {
+            SleEvent::NativeCommandReply { opcode, command_credits, status, complete, data } => {
+                if self.active.as_ref().is_some_and(|active| active.opcode == *opcode
+                    && active.relay.as_ref().is_some_and(|relay| !relay.reply_matches(*complete, *status, data))) {
+                    // A foreign/malformed successful echo cannot release the
+                    // slot, replenish credit or complete this relay. Its
+                    // original deadline remains armed; no new qualification.
+                    return Some(event);
+                }
                 self.update_credits(*command_credits);
                 // Native query Status only acknowledges acceptance. Keep the
                 // active slot/deadline until matching Complete or failure.

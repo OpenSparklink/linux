@@ -170,9 +170,13 @@ int ws73_dli_validate_reply(const unsigned char *data, size_t size)
 	case 0x0c05:
 	case 0x1001:
 	case 0x1002:
-	case 0x1812: /* typed relay Complete, not raw command authorization */
 		expected = 0;
 		break;
+	case 0x1812:
+		/* SDK111 real capture: success echoes handle LE16 and SMP index
+		 * LE16. Host matches both to its frozen submission; this is not
+		 * a generation/lifetime token or raw-command authorization. */
+		return params == 8 && dli_u16(data + 9) <= 0x0fff ? 0 : -EPROTO;
 	default:
 		return 0; /* no capability or command authorization inferred */
 	}

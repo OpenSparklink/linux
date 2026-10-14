@@ -308,6 +308,19 @@ static void reply_tests(void)
 	event[0] = 0xa1;
 	CHECK(ws73_dli_validate_reply(event, 8) == -EPROTO);
 	CHECK(ws73_dli_validate_reply(NULL, 8) == -EINVAL);
+	/* Real SDK111 1812 Complete: opcode/credit/status + handle/index echo.
+	 * The previous empty-return assumption retired a real Native Runtime. */
+	memset(event, 0, sizeof(event));
+	event[0] = 0xa2; event[1] = 2; event[3] = 8;
+	event[5] = 0x12; event[6] = 0x18; event[7] = 1;
+	event[11] = 0x47; event[12] = 1;
+	CHECK(ws73_dli_validate_reply(event, 13) == 0);
+	for (unsigned int length = 0; length <= 20; length++) {
+		event[3] = length;
+		CHECK(ws73_dli_validate_reply(event, length + 5) == (length == 8 ? 0 : -EPROTO));
+	}
+	event[3] = 8; event[10] = 0x10;
+	CHECK(ws73_dli_validate_reply(event, 13) == -EPROTO);
 	for (unsigned int length = 0; length < 5; length++)
 		CHECK(ws73_dli_validate_reply(event, length) == -EPROTO);
 }
