@@ -126,6 +126,13 @@ impl Operations {
             }
         }
     }
+    pub(crate) fn never_submitted(&mut self, cookie: u64, error: i32) {
+        if let Some(op) = self.entries.iter_mut().flatten().find(|op| op.cookie == cookie && !op.state.terminal()) {
+            op.state = State::Failed; op.error = error;
+        }
+        // Earlier recipe steps may have real physical effects. Do not invent
+        // known radio state or clear the selected-domain cleanup footprint.
+    }
     pub(crate) fn sent(&mut self, cookie: u64, step: u8, opcode: u16) {
         if let Some(op) = self
             .entries

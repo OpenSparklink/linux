@@ -313,7 +313,14 @@ impl WorkItem<1> for ControllerRuntime {
                 }
                 Err(error) => {
                     let mut guard = this.state.lock();
-                    if let Some(runtime) = Option::as_mut(&mut *guard) { fail_host(&this, runtime, error); }
+                    if let Some(runtime) = Option::as_mut(&mut *guard) {
+                        let rolled_back = transport.never_submitted()
+                            && this.host.lock().abort_unsubmitted(request.cookie, error).is_ok();
+                        if rolled_back {
+                            runtime.cmd_pending.fail_seq(request.seq, error.to_errno());
+                            this.kick_commands(); this.schedule_rx(0);
+                        } else { fail_host(&this, runtime, error); }
+                    }
                 }
             }
         }

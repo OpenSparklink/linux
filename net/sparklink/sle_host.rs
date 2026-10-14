@@ -24,6 +24,7 @@ struct InFlight {
     transport_done: bool,
     transport_submitted: bool,
     withdrawn: bool,
+    credit_revision: u64,
     advertising_params: Option<[u8; 49]>,
     advertising_was_absent: bool,
 }
@@ -41,6 +42,7 @@ pub(crate) struct CommandHost {
     links: super::sle_link_observation::LinkObservation,
     connections: super::sle_connection_operation::Connections,
     credits: u8,
+    credit_revision: u64,
     active: Option<InFlight>,
     reply: Option<(SleEvent, u64)>,
     fault: Option<Error>,
@@ -71,6 +73,7 @@ impl CommandHost {
                 links: super::sle_link_observation::LinkObservation::new(),
                 connections <- super::sle_connection_operation::Connections::new_in_place(),
                 credits,
+                credit_revision: 0,
                 active: None,
                 reply: None,
                 fault: None,
@@ -592,6 +595,7 @@ impl CommandHost {
             transport_done: false,
             transport_submitted: false,
             withdrawn: false,
+            credit_revision: self.credit_revision,
             advertising_params,
             advertising_was_absent,
         });
@@ -607,6 +611,7 @@ impl CommandHost {
         // SAFETY: read-only clock under this owner's IRQ-safe Host lock.
         if unsafe { kernel::bindings::jiffies_64 } >= active.deadline { return Err(ETIMEDOUT); }
         if active.withdrawn { return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32))); }
+        if active.credit_revision != self.credit_revision && self.credits == 0 { return Err(EAGAIN); }
         if active.connection == Some(1) && self.data_revoked {
             return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32)));
         }
@@ -630,12 +635,43 @@ impl CommandHost {
         }
     }
 
+    fn update_credits(&mut self, credits: u8) {
+        self.credits = credits; // controller grants are absolute, not deltas
+        if let Some(next) = self.credit_revision.checked_add(1) { self.credit_revision = next; }
+        else { self.fault = Some(EOVERFLOW); } // never wrap grant identity
+    }
+
+    /// Definite never-queued evidence only. A new absolute controller grant
+    /// supersedes the old local reservation; blindly adding one would create
+    /// credit. Real replies/submission and cleanup failures remain fail-closed.
+    pub(crate) fn abort_unsubmitted(&mut self, cookie: u64, error: Error) -> Result {
+        if let Some(fault) = self.fault { return Err(fault); }
+        let active = self.active.as_ref().filter(|active| active.cookie == cookie).ok_or(EINVAL)?;
+        if active.transport_submitted || self.reply.is_some() || (self.revoking && active.recipe.is_some()) {
+            return Err(EIO);
+        }
+        let credits = if active.credit_revision == self.credit_revision {
+            self.credits.checked_add(1).ok_or(EOVERFLOW)?
+        } else { self.credits };
+        if active.connection.is_some() {
+            self.connections.never_submitted(cookie, error.to_errno()).map_err(|_| EIO)?;
+        }
+        if active.recipe.is_some() {
+            self.operations.never_submitted(cookie, error.to_errno());
+            self.requests.remove_cookie(cookie);
+            if self.recipe.as_ref().is_some_and(|(root, _)| root.cookie == cookie) { self.recipe = None; }
+        }
+        self.active = None;
+        self.credits = credits;
+        Ok(()) // no controller status, Complete or observed radio state fabricated
+    }
+
     /// Consume a matching response into its reserved slot. Other events
     /// retain their normal routing; they cannot complete a raw transaction.
     pub(crate) fn receive(&mut self, event: SleEvent) -> Option<SleEvent> {
         let opcode = match &event {
             SleEvent::CommandCredits { credits } => {
-                self.credits = *credits;
+                self.update_credits(*credits);
                 return Some(event);
             }
             SleEvent::CommandComplete {
@@ -643,7 +679,7 @@ impl CommandHost {
                 command_credits,
                 ..
             } => {
-                self.credits = *command_credits;
+                self.update_credits(*command_credits);
                 *opcode as u16
             }
             SleEvent::CommandStatus {
@@ -651,7 +687,7 @@ impl CommandHost {
                 command_credits,
                 status,
             } => {
-                self.credits = *command_credits;
+                self.update_credits(*command_credits);
                 if *status == super::sle_dli::SleStatus::Success
                     && self.active.as_ref().is_some_and(|active| active.recipe.is_some())
                 {
@@ -660,7 +696,7 @@ impl CommandHost {
                 *opcode as u16
             }
             SleEvent::NativeCommandReply { opcode, command_credits, status, complete, .. } => {
-                self.credits = *command_credits;
+                self.update_credits(*command_credits);
                 // Native query Status only acknowledges acceptance. Keep the
                 // active slot/deadline until matching Complete or failure.
                 if !complete && *status == 0

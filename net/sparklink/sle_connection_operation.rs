@@ -224,6 +224,21 @@ impl Connections {
         session.outstanding = false;
         Ok(())
     }
+    /// A final atomic ticket proves the checked-out request never queued.
+    /// Selection's sent marker is not a physical fact. Real reply/outcome or
+    /// uncertain transfer evidence forbids this rollback; cancelled authors
+    /// retain their terminal result rather than being resurrected as failures.
+    pub(crate) fn never_submitted(&mut self, cookie: u64, error: i32) -> Result<(), Error> {
+        let session = self.matching_session(cookie).ok_or(Error::Mismatch)?;
+        let operation = session.operation.as_mut().ok_or(Error::Mismatch)?;
+        if session.uncertain || operation.out_complete || operation.accepted || operation.outcome.is_some() {
+            return Err(Error::Mismatch);
+        }
+        operation.sent = false;
+        if operation.state != State::Cancelled { operation.state = State::Failed; operation.error = error; }
+        session.outstanding = false;
+        Ok(())
+    }
     pub(crate) fn out_complete(&mut self, cookie: u64) {
         if let Some(session) = self.matching_session(cookie) { let _ = session.out_complete(cookie, Ok(())); }
     }

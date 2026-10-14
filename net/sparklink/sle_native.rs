@@ -132,6 +132,7 @@ impl Drop for NativeController {
 /// Neither operation retains Runtime state or can follow a reused identity.
 pub(crate) struct NativeCommandTransport {
     transport: *mut c_void,
+    never_submitted: Cell<bool>,
 }
 
 impl Drop for NativeCommandTransport {
@@ -152,7 +153,7 @@ impl NativeController {
     pub(crate) fn command_transport(&self) -> NativeCommandTransport {
         // SAFETY: this Backend owns a live reference during acquisition.
         unsafe { sparklink_native_transport_get(self.transport) };
-        NativeCommandTransport { transport: self.transport }
+        NativeCommandTransport { transport: self.transport, never_submitted: Cell::new(false) }
     }
     fn result(ret: i32) -> Result {
         if ret == 0 { Ok(()) } else if ret < 0 { Err(Error::from_errno(ret)) } else { Err(EIO) }
@@ -270,6 +271,7 @@ impl NativeCommandTransport {
 
     pub(crate) fn send_typed(&self, owner: &super::ControllerRuntime, cookie: u64,
         opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
+        self.never_submitted.set(true); // validation performs no I/O
         if connection.is_some() && recipe.is_some() { return Err(EINVAL); }
         if let Some(operation) = connection {
             // SAFETY: only the typed Host creates this tag. Retained driver
@@ -305,6 +307,7 @@ impl NativeCommandTransport {
         // by this owner's TX worker after reserving a command credit.
         // SAFETY: retained immutable provider; callback availability is stable.
         if unsafe { sparklink_native_transport_has_command_ticket(self.transport) } {
+            self.never_submitted.set(false);
             let mut ticket = NativeCommandTicket { owner, cookie, opcode,
                 attempted: Cell::new(false), submitted: Cell::new(false) };
             // SAFETY: driver may use the borrowed ticket only synchronously,
@@ -312,8 +315,10 @@ impl NativeCommandTransport {
             let result = unsafe { sparklink_native_transport_command_ticketed(self.transport,
                 (&mut ticket as *mut NativeCommandTicket<'_>).cast(), opcode, params.as_ptr(), params.len()) };
             if result > 0 || (result == 0 && !ticket.submitted.get()) { return Err(Error::from_errno(PROTOCOL_ERROR)); }
+            if result < 0 && !ticket.submitted.get() { self.never_submitted.set(true); }
             NativeController::result(result)
         } else {
+            self.never_submitted.set(false); // legacy failure has no queue evidence
             // Explicit legacy path for other providers pending migration;
             // this is not a ticketed transport or Native security capability.
             NativeController::result(unsafe {
@@ -324,6 +329,7 @@ impl NativeCommandTransport {
 }
 
 impl super::sle_backend::CommandPort for NativeCommandTransport {
+    fn never_submitted(&self) -> bool { self.never_submitted.get() }
     fn submit(&self, owner: &super::ControllerRuntime, cookie: u64, opcode: u16,
         params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
         self.send_typed(owner, cookie, opcode, params, recipe, connection)

@@ -933,6 +933,7 @@ static int ws73_native_command(void *context, struct sparklink_native_command_ti
 {
 	struct ws73_usb *ws = context;
 	struct ws73_acb_transfer transfer;
+	bool queued = false;
 	unsigned int timeout;
 	int ret, wire_length;
 
@@ -955,6 +956,7 @@ static int ws73_native_command(void *context, struct sparklink_native_command_ti
 	ret = sparklink_native_command_commit(ticket, ws->native_id, ws->native_generation,
 					    ws73_acb_submit, &transfer);
 	if (!ret) {
+		queued = true;
 		ws->tx_sequence++;
 		/* No Host/gate guard spans the wait. Kill joins stack callback. */
 		if (!wait_for_completion_timeout(&transfer.done, msecs_to_jiffies(timeout))) {
@@ -966,8 +968,7 @@ static int ws73_native_command(void *context, struct sparklink_native_command_ti
 		}
 	}
 	usb_free_urb(transfer.urb);
-	if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -EACCES && ret != -ECANCELED &&
-	    !READ_ONCE(ws->stopping))
+	if (ret && queued && !READ_ONCE(ws->stopping))
 		ws73_async_failure(ws, ret);
 out:
 	sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
