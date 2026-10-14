@@ -38,7 +38,7 @@ static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 struct sock;
 struct sk_buff {struct sock *owner;struct sk_buff *next;unsigned int len,truesize,users;unsigned long cb[6];u8 data[2047];};
 struct sk_buff_head {spinlock_t lock;unsigned int qlen;struct sk_buff *head,*tail,*prev;};
-struct sock {unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state;void (*sk_data_ready)(struct sock *);};
+struct sock {unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state,sk_shutdown;void (*sk_data_ready)(struct sock *);void (*sk_error_report)(struct sock *);void (*sk_state_change)(struct sock *);};
 struct kref {unsigned int refs;};
 struct delayed_work {int unused;};
 static unsigned int allocations,submitted;
@@ -62,6 +62,8 @@ static void sl_fault(struct sl_connection_session *s,int error){assert(error<0);
 struct socket {struct sock *sk;int state;};
 #define SS_CONNECTED 1
 #define TCP_ESTABLISHED 1
+#define TCP_CLOSE 7
+#define SHUTDOWN_MASK 3
 #define WRITE_ONCE(x,v) ((x)=(v))
 struct msghdr {int msg_flags;u8 bytes[2047];};
 typedef u32 __poll_t;typedef int poll_table;struct file {int unused;};
@@ -123,6 +125,7 @@ static struct sk_buff *skb_dequeue(struct sk_buff_head *q){
  if(skb){q->head=skb->next;if(!q->head)q->tail=NULL;q->qlen--;skb->next=NULL;}
  spin_unlock_irqrestore(&q->lock,flags);return skb;
 }
+static void skb_queue_purge(struct sk_buff_head *q){struct sk_buff *skb;while((skb=skb_dequeue(q)))kfree_skb(skb);}
 static void skb_queue_head(struct sk_buff_head *q,struct sk_buff *skb){
  spin_lock(&q->lock);skb->next=q->head;q->head=skb;if(!q->tail)q->tail=skb;q->qlen++;spin_unlock(&q->lock);
 }
@@ -302,7 +305,8 @@ static void capability_tests(void)
 }
 static void enqueue_fragment_test(struct sl_basic_channel *c,unsigned int length){
  struct sk_buff *skb=alloc_skb(length,0);unsigned long flags;
- for(unsigned int i=0;i<length;i++)((u8 *)skb_put(skb, length))[i]=(i*37+11)&255;
+ u8 *data=skb_put(skb,length);for(unsigned int i=0;i<length;i++)data[i]=(i*37+11)&255;
+ ((struct sl_fragment_cursor *)skb->cb)->deadline=jiffies+5000;
  spin_lock_irqsave(&c->tx.lock,flags);__skb_queue_tail(&c->tx,skb);spin_unlock_irqrestore(&c->tx.lock,flags);
 }
 static void fragment_worker_tests(void){
@@ -331,6 +335,18 @@ static void fragment_worker_tests(void){
  enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
  jiffies+=5000;packet_budget=1;
  assert(sl_transmit_channel(&s,&s.channels[0])==-ETIMEDOUT);assert(!allocations);
+ /* A queue-only timeout uses actual socket error publication and retains the
+  * second Channel/Session. Deadline comes from actual admission, not dequeue. */
+ init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;jiffies=42;
+ bindings[0].sk.sk_error_report=data_ready;bindings[0].sk.sk_state_change=data_ready;
+ s.channels[1].sk=&bindings[1].sk;assert(sl_binding_attach(&s.channels[1].binding));
+ struct sk_buff *queued=alloc_skb(4,0);skb_put(queued,4);
+ struct sl_admission admission={&s,&s.channels[0],queued,4};
+ assert(!sl_admit(&admission));
+ assert(((struct sl_fragment_cursor *)queued->cb)->deadline==5042);
+ jiffies=5042;assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(bindings[0].sk.sk_err==ETIMEDOUT&&bindings[0].sk.sk_shutdown==SHUTDOWN_MASK);
+ assert(sl_binding_live(s.channels[1].binding)&&s.progress.phase==SL_CH_OPEN&&!allocations);
 }
 int main(void){
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;

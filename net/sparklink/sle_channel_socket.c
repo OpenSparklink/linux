@@ -312,6 +312,25 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 		sock_put(sk);
 	}
 }
+/* No physical prefix exists: queue timeout retires only its application
+ * Binding. It cannot consume another Channel's queues or stop the controller. */
+static void sl_fail_channel(struct sl_connection_session *s, struct sl_basic_channel *c, int error)
+{
+	unsigned long flags;
+	struct sock *sk;
+	spin_lock_irqsave(&s->lock, flags);
+	sl_binding_retire(&c->binding);
+	sk = c->sk;
+	if (sk)
+		sock_hold(sk);
+	spin_unlock_irqrestore(&s->lock, flags);
+	skb_queue_purge(&c->tx);
+	skb_queue_purge(&c->rx);
+	if (sk) {
+		sl_socket_fault(sk, error);
+		sock_put(sk);
+	}
+}
 static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_channel *c)
 {
 	unsigned long flags;
@@ -320,6 +339,7 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	struct sl_submit_scope permission = { s, c };
 	unsigned int length, boundary;
 	int slot = c - s->channels, ret = 0;
+	bool local_timeout = false;
 
 	if (s->fragment_slot >= 0 && s->fragment_slot != slot)
 		return 0; /* DLI PB has no TCID; do not interleave connection PDUs. */
@@ -333,10 +353,10 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	if (!skb)
 		return s->fragment_slot == slot ? -ECANCELED : 0;
 	cursor = (void *)skb->cb;
-	if (!cursor->deadline)
-		cursor->deadline = jiffies + msecs_to_jiffies(5000);
-	if (time_after_eq(jiffies, cursor->deadline))
+	if (time_after_eq(jiffies, cursor->deadline)) {
 		ret = -ETIMEDOUT;
+		local_timeout = cursor->offset == 0;
+	}
 	else if (!sl_fragment_next(skb->len, cursor->offset, s->acb_maximum, &length, &boundary))
 		ret = -EPROTO;
 	else {
@@ -363,6 +383,10 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
 	kfree_skb(skb);
+	if (local_timeout) {
+		sl_fail_channel(s, c, ret);
+		ret = 0;
+	}
 	sl_wake(s);
 	return ret == -EAGAIN || ret == -ECANCELED ? 0 : ret;
 }
@@ -616,6 +640,7 @@ static int sl_admit(void *context)
 		if (!sl_binding_space(c->binding, c->tx.qlen, SL_CHANNEL_TX))
 			ret = -EAGAIN;
 		else {
+			((struct sl_fragment_cursor *)skb->cb)->deadline = jiffies + msecs_to_jiffies(5000);
 			__skb_queue_tail(&c->tx, skb);
 			admission->skb = NULL;
 			ret = 0;
