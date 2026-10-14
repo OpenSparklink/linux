@@ -267,8 +267,12 @@ impl CommandHost {
         (revision, known && self.fault.is_none() && self.connections.fault_reason().is_none(), links)
     }
     pub(crate) fn cancel_connection(&mut self, file: u64, request: u64) -> Result {
+        let selected = self.connections.query(file, request).map(|operation| operation.cookie);
         let cookie = self.connections.cancel(file, request).map_err(|_| ENOENT)?;
         if let Some(cookie) = cookie { self.requests.remove_cookie(cookie); }
+        if let Some(active) = self.active.as_mut().filter(|active| Some(active.cookie) == selected) {
+            active.withdrawn = true; // submitted work still retains its reply slot
+        }
         Ok(())
     }
     pub(crate) fn admits_data(&self) -> bool {
@@ -603,6 +607,9 @@ impl CommandHost {
         // SAFETY: read-only clock under this owner's IRQ-safe Host lock.
         if unsafe { kernel::bindings::jiffies_64 } >= active.deadline { return Err(ETIMEDOUT); }
         if active.withdrawn { return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32))); }
+        if active.connection == Some(1) && self.data_revoked {
+            return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32)));
+        }
         if let Some(tag) = active.recipe {
             if tag.intent.has_enable() && (self.revoking || !self.current_recipe(tag)) {
                 return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32)));

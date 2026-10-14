@@ -123,6 +123,14 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert!(h.active.as_ref().unwrap().connection_reference.is_some());
  assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(-116));assert!(!h.active.as_ref().unwrap().transport_submitted);
 }
+
+#[test] fn prepared_connection_author_cancel_and_lease_revoke_cannot_newly_submit(){
+ for revoke in [false,true] {
+  clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();
+  if revoke {h.revoke_connections();}else{h.cancel_connection(42,1).unwrap();}
+  assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(-125));assert!(!h.active.as_ref().unwrap().transport_submitted);
+ }
+}
 #[test] fn settled_revoke_new_lease_accepts_create_without_losing_history_or_credits(){
  clock(1);let mut h=host();h.operations.advertising=1;h.operations.scanning=1;
  h.advertising_set=sle_command_plan::AdvertisingSet::Configured([0;49]);create(&mut h,1);h.revoke_connections();
