@@ -11,6 +11,13 @@ void *sparklink_native_session_get(u16 controller, u64 generation, u64 lifetime,
 int sparklink_native_session_status(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch);
 int sparklink_native_session_admit(u16 id, u64 generation, u64 lifetime, u16 handle,
     u64 epoch, int (*admit)(void *), void *context);
+struct sparklink_credit_snapshot {
+    u16 maximum, capacity, outstanding, connection_debt, peak_reserved, reserved;
+    u32 padding;
+    u64 pool_exhaustions;
+};
+int sparklink_native_session_inspect(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,
+    int (*inspect)(const struct sparklink_credit_snapshot *,void *),void *context);
 int sl_channel_socket_init(void);
 void sl_channel_socket_exit(void);
 #endif

@@ -442,3 +442,18 @@ fn actual_fragment_entry_uses_individual_credit_and_rejects_invalid_pb() {
  a.host.lock().grants.revoke();
  assert_eq!(call(3,&mut scope),-13);
 }
+
+unsafe extern "C" fn actual_inspection_callback(value:*const sle_data_credit::CreditSnapshot,context:*mut c_void)->i32 {
+ let snapshot=unsafe{&*value};let count=unsafe{&mut *context.cast::<usize>()};
+ let owner=OWNERS.with(|o|o.borrow()[0].clone());
+ assert!(owner.host.0.try_borrow_mut().is_err()&&owner.data.0.try_borrow_mut().is_err()&&owner.schedule_gate.0.try_borrow_mut().is_err());
+ assert_eq!((snapshot.capacity,snapshot.outstanding,snapshot.connection_debt,snapshot.peak_reserved),(5,1,1,1));
+ *count+=1;0
+}
+#[test] fn actual_credit_observation_is_locked_current_authority_and_never_refills() {
+ let(a,_)=setup();link(&a,0,1);assert_eq!(send(0,7,1,0,b"observed"),0);let mut count=0usize;
+ let inspect=|epoch,count:&mut usize|unsafe{sle_sessions::sparklink_native_session_inspect_rust(0,7,1,0,epoch,Some(actual_inspection_callback),(count as *mut usize).cast())};
+ assert_eq!(inspect(1,&mut count),0);assert_eq!(inspect(1,&mut count),0);assert_eq!(count,2);
+ a.host.lock().grants.revoke();assert_eq!(inspect(1,&mut count),-13);assert_eq!(count,2);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
+}

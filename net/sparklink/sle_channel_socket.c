@@ -412,10 +412,10 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 		ret = sparklink_native_acb_fragment_guarded(s->controller, s->generation,
 			s->lifetime, s->handle, boundary, skb->data + cursor->offset, length,
 			s->epoch, sl_session_submit, &permission);
-		if (!ret && !sl_fragment_advance(cursor, skb->len, length))
-			ret = -EPROTO;
 	}
 	spin_lock_irqsave(&s->lock, flags);
+	if (!ret && !sl_fragment_advance(cursor, skb->len, length))
+		ret = -EPROTO;
 	started = s->tx_started;
 	local_timeout = ret == -ETIMEDOUT && !started;
 	if (ret == -EAGAIN && !started && sl_binding_live(c->binding)) {
@@ -910,6 +910,14 @@ struct sl_info_read {
 /* Runtime Host/data/gate -> Session: validate the fd's exact grant and copy one
  * capability snapshot. No user memory, wait, credit mutation or RX consumption.
  */
+static int sl_view_access(struct sl_connection_session *s, struct sl_basic_channel *c, struct sock *sk)
+{
+    if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) || c->sk != sk)
+        return -ENOTCONN;
+    if (!sl_permits(s,c,SL_GRANT_TX) && !sl_permits(s,c,SL_GRANT_RX))
+        return -EACCES;
+    return s->progress.phase == SL_CH_OPEN ? 0 : -EAGAIN;
+}
 static int sl_read_info(void *context)
 {
 	struct sl_info_read *read = context;
@@ -919,13 +927,8 @@ static int sl_read_info(void *context)
 	int ret = 0;
 
 	spin_lock_irqsave(&s->lock, flags);
-	if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) || c->sk != read->sk)
-		ret = -ENOTCONN;
-	else if (!sl_permits(s, c, SL_GRANT_TX) && !sl_permits(s, c, SL_GRANT_RX))
-		ret = -EACCES;
-	else if (s->progress.phase != SL_CH_OPEN)
-		ret = -EAGAIN;
-	else
+	ret = sl_view_access(s,c,read->sk);
+	if (!ret)
 		read->value = (struct sparklink_channel_info) {
 			.version = SPARKLINK_CHANNEL_INFO_VERSION, .size = sizeof(read->value),
 			.controller = s->controller, .handle = s->handle,
@@ -938,22 +941,67 @@ static int sl_read_info(void *context)
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
 }
+struct sl_tx_status_read {
+    struct sl_connection_session *session;
+    struct sl_basic_channel *channel;
+    struct sock *sk;
+    struct sparklink_channel_tx_status value;
+};
+/* Runtime holds Host/data/gate and this callback adds Session lock. No pointer
+ * escapes; copy_to_user happens after all locks, withdrawal may follow it. */
+static int sl_read_tx_status(const struct sparklink_credit_snapshot *credit, void *context)
+{
+    struct sl_tx_status_read *read=context;
+    struct sl_connection_session *s=read->session;
+    struct sl_basic_channel *c=read->channel;
+    unsigned long flags;
+    int ret;
+    spin_lock_irqsave(&s->lock,flags);
+    ret=sl_view_access(s,c,read->sk);
+    if (!ret) {
+        read->value=(struct sparklink_channel_tx_status){
+            .version=SPARKLINK_CHANNEL_TX_STATUS_VERSION,.size=sizeof(read->value),
+            .controller=s->controller,.handle=s->handle,.generation=s->generation,.lifetime=s->lifetime,
+            .packet_maximum=credit->maximum,.capacity=credit->capacity,
+            .outstanding=credit->outstanding,.connection_debt=credit->connection_debt,
+            .peak_reserved=credit->peak_reserved,.queued=skb_queue_len(&c->tx),
+            .queue_limit=SL_CHANNEL_TX,.busy=c->binding.busy,.pool_exhaustions=credit->pool_exhaustions,
+        };
+        if (s->tx_inflight && s->fragment_slot==c-s->channels) {
+            struct sl_fragment_cursor *cursor=(void *)s->tx_inflight->cb;
+            read->value.active_pdu_bytes=s->tx_inflight->len;
+            read->value.active_pdu_offset=cursor->offset;
+            read->value.flags=SPARKLINK_CHANNEL_TX_ACTIVE |
+                (s->tx_started ? SPARKLINK_CHANNEL_TX_BEGUN : 0);
+        }
+    }
+    spin_unlock_irqrestore(&s->lock,flags);
+    return ret;
+}
 static int sl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
 	struct sl_connection_session *s;
 	struct sl_info_read read;
+	struct sl_tx_status_read tx_read;
 	int ret;
 
-	if (cmd != SPARKLINK_CHANNEL_INFO)
+	if (cmd != SPARKLINK_CHANNEL_INFO && cmd != SPARKLINK_CHANNEL_TX_STATUS)
 		return -ENOIOCTLCMD;
 	s = sl_binding_session(sock->sk);
 	if (!s)
 		return -ENOTCONN;
-	read = (struct sl_info_read) { .session = s, .channel = sl_bound_channel(sock->sk, s), .sk = sock->sk };
-	ret = sparklink_native_session_admit(s->controller, s->generation,
-		s->lifetime, s->handle, s->epoch, sl_read_info, &read);
-	if (!ret && copy_to_user((void __user *)arg, &read.value, sizeof(read.value)))
-		ret = -EFAULT;
+    if (cmd == SPARKLINK_CHANNEL_INFO) {
+        read = (struct sl_info_read) { .session = s, .channel = sl_bound_channel(sock->sk, s), .sk = sock->sk };
+        ret = sparklink_native_session_admit(s->controller, s->generation,
+            s->lifetime, s->handle, s->epoch, sl_read_info, &read);
+        if (!ret && copy_to_user((void __user *)arg, &read.value, sizeof(read.value)))
+            ret = -EFAULT;
+    } else {
+        tx_read=(struct sl_tx_status_read){.session=s,.channel=sl_bound_channel(sock->sk,s),.sk=sock->sk};
+        ret=sparklink_native_session_inspect(s->controller,s->generation,s->lifetime,s->handle,s->epoch,sl_read_tx_status,&tx_read);
+        if (!ret && copy_to_user((void __user *)arg,&tx_read.value,sizeof(tx_read.value)))
+            ret=-EFAULT;
+    }
 	sl_connection_session_put(s);
 	return ret;
 }

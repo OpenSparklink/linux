@@ -51,4 +51,23 @@ struct sparklink_channel_info {
 #define SPARKLINK_CHANNEL_INFO_VERSION 1
 #define SPARKLINK_CHANNEL_MODE_BASIC 0
 #define SPARKLINK_CHANNEL_INFO _IOR('S', 0xe0, struct sparklink_channel_info)
+/* Read-only coherent Host/data/gate -> Session snapshot. No lease/payload or
+ * mutation. POLLOUT is software admission, not controller credit availability.
+ * peak_reserved counts reservations (including known-never-submitted rollback),
+ * pool_exhaustions counts actual native budget refusal, not software EAGAIN.
+ * Counters belong to this controller generation and saturate. Active PDU fields
+ * describe only this fd's logical channel; debt belongs to physical connection.
+ */
+struct sparklink_channel_tx_status {
+    __u16 version, size, controller, handle;
+    __aligned_u64 generation, lifetime;
+    __u16 packet_maximum, capacity, outstanding, connection_debt;
+    __u16 peak_reserved, queued, queue_limit, busy;
+    __u32 active_pdu_bytes, active_pdu_offset, flags, reserved;
+    __aligned_u64 pool_exhaustions;
+};
+#define SPARKLINK_CHANNEL_TX_STATUS_VERSION 1
+#define SPARKLINK_CHANNEL_TX_ACTIVE 1U
+#define SPARKLINK_CHANNEL_TX_BEGUN 2U
+#define SPARKLINK_CHANNEL_TX_STATUS _IOR('S', 0xe1, struct sparklink_channel_tx_status)
 #endif

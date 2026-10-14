@@ -27,10 +27,14 @@ impl Drop for Session {
         unsafe { sl_connection_session_put(self.pointer) };
     }
 }
+enum Admission {
+    Queue(unsafe extern "C" fn(*mut c_void)->i32, *mut c_void),
+    Inspect(unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,*mut c_void)->i32,*mut c_void),
+}
 impl super::ControllerRuntime {
     /// Session table -> Host -> data -> scheduling is process-context order.
     /// Driver atomic commit never takes the session table mutex.
-    fn session_limits(&self, lifetime: u64, handle: u16, epoch: u64, admission: Option<(unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void)>) -> Result<u16> {
+    fn session_limits(&self, lifetime: u64, handle: u16, epoch: u64, admission: Option<Admission>) -> Result<u16> {
         let host = self.host.lock();
         let (_, known, links) = host.link_snapshot();
         let data = self.data.lock();
@@ -43,10 +47,17 @@ impl super::ControllerRuntime {
             return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
         }
         let maximum = data.credits.maximum().map_err(super::sle_native_data::error)?;
-        if let Some((admit, context)) = admission {
+        if let Some(admission) = admission {
             // SAFETY: callback is synchronous, atomic Session queue admission.
             // Host/data/gate remain locked; no allocation, wait or Host reentry.
-            let result = unsafe { admit(context) };
+            let result = match admission {
+                Admission::Queue(admit,context) => unsafe { admit(context) },
+                Admission::Inspect(inspect,context) => {
+                    let snapshot=data.credits.snapshot(lifetime,handle);
+                    // SAFETY: copied immutable value lives until synchronous callback returns.
+                    unsafe { inspect(&snapshot,context) }
+                }
+            };
             if result < 0 { return Err(Error::from_errno(result)); }
         }
         Ok(maximum)
@@ -174,5 +185,16 @@ pub(crate) unsafe extern "C" fn sparklink_native_session_admit_rust(
     let Some(admit) = admit else { return EINVAL.to_errno(); };
     if context.is_null() { return EINVAL.to_errno(); }
     let Some(owner) = super::sle_ingress::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
-    owner.session_limits(lifetime, handle, epoch, Some((admit, context))).map_or_else(|error| error.to_errno(), |_| 0)
+    owner.session_limits(lifetime, handle, epoch, Some(Admission::Queue(admit, context))).map_or_else(|error| error.to_errno(), |_| 0)
+}
+
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_session_inspect_rust(
+    id:u16,generation:u64,lifetime:u64,handle:u16,epoch:u64,
+    inspect:Option<unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,*mut c_void)->i32>,context:*mut c_void,
+)->i32 {
+    let Some(inspect)=inspect else {return EINVAL.to_errno();};
+    if context.is_null(){return EINVAL.to_errno();}
+    let Some(owner)=super::sle_ingress::ingress_owner(super::sle_dev::DeviceIdentity{id,generation}) else {return ENODEV.to_errno();};
+    owner.session_limits(lifetime,handle,epoch,Some(Admission::Inspect(inspect,context))).map_or_else(|error|error.to_errno(), |_|0)
 }

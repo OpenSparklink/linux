@@ -437,3 +437,11 @@ int sparklink_native_acb_fragment_guarded(u16 id, u64 generation, u64 lifetime, 
 {
     return sparklink_native_acb_fragment_guarded_rust(id, generation, lifetime, handle, boundary, data, length, epoch, consent, scope);
 }
+
+extern int sparklink_native_session_inspect_rust(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,
+    int (*inspect)(const struct sparklink_credit_snapshot *,void *),void *context);
+int sparklink_native_session_inspect(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,
+    int (*inspect)(const struct sparklink_credit_snapshot *,void *),void *context)
+{
+    return sparklink_native_session_inspect_rust(id,generation,lifetime,handle,epoch,inspect,context);
+}

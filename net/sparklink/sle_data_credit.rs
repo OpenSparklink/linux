@@ -17,6 +17,17 @@ pub(crate) struct DataCredits {
     outstanding: u16,
     debts: [Option<Debt>; LINKS],
     uncertain: bool,
+    peak_reserved: u16,
+    pool_exhaustions: u64,
+}
+
+/// Internal fixed read-only FFI value; never exposes other link identities.
+#[repr(C)]
+pub(crate) struct CreditSnapshot {
+    pub(crate) maximum: u16, pub(crate) capacity: u16,
+    pub(crate) outstanding: u16, pub(crate) connection_debt: u16,
+    pub(crate) peak_reserved: u16, pub(crate) reserved: u16,
+    pub(crate) padding: u32, pub(crate) pool_exhaustions: u64,
 }
 
 impl DataCredits {
@@ -26,7 +37,7 @@ impl DataCredits {
         Ok(self.maximum)
     }
     pub(crate) const fn new(maximum: u16, capacity: u8) -> Self {
-        Self { maximum, capacity, outstanding: 0, debts: [None; LINKS], uncertain: false }
+        Self { maximum, capacity, outstanding: 0, debts: [None; LINKS], uncertain: false, peak_reserved: 0, pool_exhaustions: 0 }
     }
 
     pub(crate) fn reserve(&mut self, lifetime: u64, handle: u16, size: usize) -> Result<(), CreditError> {
@@ -40,13 +51,25 @@ impl DataCredits {
         if existing.is_some_and(|i| self.debts[i].is_some_and(|d| d.lifetime != lifetime)) {
             return Err(CreditError::OldLifetime);
         }
-        if self.outstanding >= self.capacity as u16 { return Err(CreditError::WouldBlock); }
+        if self.outstanding >= self.capacity as u16 {
+            self.pool_exhaustions = self.pool_exhaustions.saturating_add(1);
+            return Err(CreditError::WouldBlock);
+        }
         let index = existing.or_else(|| self.debts.iter().position(Option::is_none))
             .ok_or(CreditError::WouldBlock)?;
         let packets = self.debts[index].map_or(0, |d| d.packets) + 1;
         self.debts[index] = Some(Debt { lifetime, handle, packets });
         self.outstanding += 1;
+        self.peak_reserved = self.peak_reserved.max(self.outstanding);
         Ok(())
+    }
+
+    pub(crate) fn snapshot(&self, lifetime: u64, handle: u16) -> CreditSnapshot {
+        CreditSnapshot { maximum:self.maximum, capacity:self.capacity as u16,
+            outstanding:self.outstanding, connection_debt:self.debts.iter().flatten()
+                .find(|d| d.handle==handle && d.lifetime==lifetime).map_or(0, |d|d.packets),
+            peak_reserved:self.peak_reserved, reserved:0, padding:0,
+            pool_exhaustions:self.pool_exhaustions }
     }
 
     /// NOCP only identifies handle/count: retain old lifetime debt until paid.
@@ -91,6 +114,24 @@ impl DataCredits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_tracks_reservations_not_usb_delivery_and_preserves_debt() {
+        let mut c=DataCredits::new(254,5);
+        for _ in 0..5 {c.reserve(9,3,254).unwrap();}
+        assert_eq!(c.reserve(9,3,1),Err(CreditError::WouldBlock));
+        let before=c.snapshot(9,3);
+        assert_eq!((before.capacity,before.outstanding,before.connection_debt,before.peak_reserved,before.pool_exhaustions),(5,5,5,5,1));
+        assert_eq!(c.snapshot(10,3).connection_debt,0);
+        c.unsubmitted(9,3).unwrap();
+        assert_eq!(c.snapshot(9,3).peak_reserved,5); // not a claim of five USB submissions
+        c.complete(3,2).unwrap();
+        assert_eq!(c.snapshot(9,3).outstanding,2);
+        assert_eq!(c.snapshot(9,3).pool_exhaustions,1);
+        c.pool_exhaustions=u64::MAX;
+        for _ in 0..3 {c.reserve(9,3,1).unwrap();}
+        assert_eq!(c.reserve(9,3,1),Err(CreditError::WouldBlock));
+        assert_eq!(c.snapshot(9,3).pool_exhaustions,u64::MAX);
+    }
     #[test]
     fn known_unsubmitted_rolls_back_only_current_lifetime_debt() {
         let mut c = DataCredits::new(254, 5);
@@ -210,11 +251,12 @@ mod verification {
                 *slot = Some(Debt { handle: kani::any(), lifetime: kani::any(), packets: kani::any() });
             }
         }
-        let c = DataCredits { maximum: kani::any(), capacity: kani::any(),
-            outstanding: kani::any(), debts, uncertain: kani::any() };
+        let mut c = DataCredits { maximum: kani::any(), capacity: kani::any(),
+            outstanding: kani::any(), debts, uncertain: kani::any(), peak_reserved:0, pool_exhaustions:kani::any() };
         // Inductive representation invariant; no assumption that hardware
         // count/handle is accurate, timely, unique or from a current lifetime.
         kani::assume(invariant(&c));
+        c.peak_reserved=c.outstanding;
         c
     }
     fn same_debts(a: &DataCredits, b: &DataCredits) -> bool {
@@ -226,7 +268,7 @@ mod verification {
     }
     fn duplicate(c: &DataCredits) -> DataCredits {
         DataCredits { maximum:c.maximum, capacity:c.capacity,
-            outstanding:c.outstanding, debts:c.debts, uncertain:c.uncertain }
+            outstanding:c.outstanding, debts:c.debts, uncertain:c.uncertain, peak_reserved:c.peak_reserved, pool_exhaustions:c.pool_exhaustions }
     }
     #[kani::proof]
     #[kani::unwind(17)]
