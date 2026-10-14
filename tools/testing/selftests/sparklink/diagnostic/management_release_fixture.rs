@@ -94,7 +94,7 @@ fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:
   else {assert_eq!(result,Err(-16));assert!(h.revoking);assert_eq!(h.selected_policy_domains,3);assert_eq!(gate.state,sle_management::FREE);}
  }
 }
-fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,deadline:1000,recipe:None,connection:None,transport_done:false,advertising_params:None,advertising_was_absent:false}}
+fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,deadline:1000,recipe:None,connection:None,connection_reference:None,transport_done:false,transport_submitted:false,withdrawn:false,advertising_params:None,advertising_was_absent:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby,recreate:false},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
  intent:sle_command_plan::DiscoveryIntent::AdvertisingStandby,state:State::Cancelled,
