@@ -115,6 +115,9 @@ struct sparklink_native_ops {
      * USB completion does not pay data debt or prove peer delivery. */
     int (*send_acb)(void *context, struct sparklink_native_tx_ticket *ticket,
                     u16 handle, const u8 *data, size_t length);
+    /* Typed DLI PB (0 full, 1 first, 2 middle, 3 last), not DTAP SAR. */
+    int (*send_acb_fragment)(void *context, struct sparklink_native_tx_ticket *ticket,
+                    u16 handle, u8 boundary, const u8 *data, size_t length);
 };
 
 /* Providers register through sparklink_backend.h. No legacy registration
@@ -181,6 +184,9 @@ void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
 /* Session/channel consent is held through the actual atomic queue call.
  * Scope and immutable bytes remain live until the blocking callback joins. */
 int sparklink_native_acb_send_guarded(u16 id, u64 generation, u64 lifetime, u16 handle,
+    const u8 *data, size_t length, u64 epoch,
+    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
+int sparklink_native_acb_fragment_guarded(u16 id, u64 generation, u64 lifetime, u16 handle, u8 boundary,
     const u8 *data, size_t length, u64 epoch,
     int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
 #endif

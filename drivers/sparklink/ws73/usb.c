@@ -996,8 +996,8 @@ out:
 	return ret;
 }
 
-static int ws73_native_acb(void *context, struct sparklink_native_tx_ticket *ticket,
-						   u16 handle, const u8 *data, size_t length)
+static int ws73_native_acb_fragment(void *context, struct sparklink_native_tx_ticket *ticket,
+						   u16 handle, u8 boundary, const u8 *data, size_t length)
 {
 	struct ws73_usb *ws = context;
 	struct ws73_acb_transfer transfer;
@@ -1011,7 +1011,7 @@ static int ws73_native_acb(void *context, struct sparklink_native_tx_ticket *tic
 	}
 	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
 	if (!timeout) { ret = -ETIMEDOUT; goto out; }
-	wire_length = ws73_wire_acb(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, handle,
+	wire_length = ws73_wire_acb_fragment(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, handle, boundary,
 							  ws->info.acb_length, data, length);
 	if (wire_length < 0) { ret = wire_length; goto out; }
 	transfer.urb = usb_alloc_urb(0, GFP_KERNEL); /* preparation: outside Host locks */
@@ -1044,6 +1044,12 @@ out:
 	return ret;
 }
 
+static int ws73_native_acb(void *context, struct sparklink_native_tx_ticket *ticket,
+                           u16 handle, const u8 *data, size_t length)
+{
+    return ws73_native_acb_fragment(context, ticket, handle, 0, data, length);
+}
+
 static const struct sparklink_native_ops ws73_native_ops = {
 	.owner = THIS_MODULE,
 	.get = ws73_native_get,
@@ -1059,6 +1065,7 @@ static const struct sparklink_native_ops ws73_native_ops = {
     .validate_relay = ws73_native_validate_relay,
 	.send_command_ticketed = ws73_native_command,
 	.send_acb = ws73_native_acb,
+	.send_acb_fragment = ws73_native_acb_fragment,
 };
 
 /* phase_lock held; previous generation's callbacks/URBs have been joined

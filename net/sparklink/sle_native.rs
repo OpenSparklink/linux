@@ -102,7 +102,7 @@ extern "C" {
     fn sparklink_native_transport_has_command_ticket(transport: *mut c_void) -> bool;
     fn sparklink_native_transport_command_ticketed(transport: *mut c_void, ticket: *mut c_void,
         opcode: u16, params: *const u8, length: usize) -> i32;
-    fn sparklink_native_transport_acb(transport: *mut c_void, ticket: *mut c_void, handle: u16,
+    fn sparklink_native_transport_acb(transport: *mut c_void, ticket: *mut c_void, handle: u16, boundary: u8,
         data: *const u8, length: usize) -> i32;
     fn sparklink_native_transport_has_acb(transport: *mut c_void) -> bool;
 }
@@ -881,7 +881,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
 ) -> i32 {
     // SAFETY: preserves internal caller buffer lifetime until driver joins.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, None, None, core::ptr::null_mut()) }
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, 0, None, None, core::ptr::null_mut()) }
 }
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_acb_send_guarded_rust(
@@ -890,13 +890,23 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_guarded_rust(
 ) -> i32 {
     if consent.is_none() || scope.is_null() { return EINVAL.to_errno(); }
     // SAFETY: session worker holds its reference and scope until this returns.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, Some(epoch), consent, scope) }
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, 0, Some(epoch), consent, scope) }
+}
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_acb_fragment_guarded_rust(
+    id: u16, generation: u64, lifetime: u64, handle: u16, boundary: u8,
+    data: *const u8, length: usize, epoch: u64,
+    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
+) -> i32 {
+    if consent.is_none() || scope.is_null() { return EINVAL.to_errno(); }
+    // SAFETY: identical synchronous ticket/buffer lifetime to guarded full ACB.
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, boundary, Some(epoch), consent, scope) }
 }
 unsafe fn native_acb_send(
-    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
+    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize, boundary: u8,
     epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
 ) -> i32 {
-    if data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
+    if boundary > 3 || data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
     let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     let _lifecycle = owner.native_lifecycle.lock();
     let transport = {
@@ -930,7 +940,7 @@ unsafe fn native_acb_send(
     // SAFETY: caller owns immutable bytes, the ticket and retained Backend
     // remain live until the blocking driver callback joins its completion.
     let result = unsafe { sparklink_native_transport_acb(transport.transport,
-        (&mut ticket as *mut NativeTxTicket).cast(), handle, data, length) };
+        (&mut ticket as *mut NativeTxTicket).cast(), handle, boundary, data, length) };
     let result = if result == 0 && !ticket.submitted.get() { PROTOCOL_ERROR } else { result };
     if result != 0 && ticket.submitted.get() { owner.data.lock().credits.transport_failed(); }
     owner.data_poll.notify_all();

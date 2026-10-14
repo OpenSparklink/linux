@@ -121,17 +121,17 @@ int ws73_wire_command(unsigned char *out, size_t capacity, unsigned int sequence
 	return total;
 }
 
-int ws73_wire_acb(unsigned char *out, size_t capacity, unsigned int sequence,
-		  unsigned int handle, unsigned int maximum,
+int ws73_wire_acb_fragment(unsigned char *out, size_t capacity, unsigned int sequence,
+		  unsigned int handle, unsigned int boundary, unsigned int maximum,
 		  const unsigned char *payload, size_t size)
 {
 	size_t slot, total;
 
 	/* SDK111/HCC carries standard A3 followed by handle/flags and length.
-	 * Complete SDU, low priority, reserved bit zero in this first profile.
+	 * Typed PB, low priority, reserved bit zero; one physical packet credit.
 	 * Never copy the reference single-link builder's hardcoded handle 0.
 	 */
-	if (!out || handle > 0x0fff || !maximum || maximum > 2047 ||
+	if (!out || handle > 0x0fff || boundary > 3 || !maximum || maximum > 2047 ||
 	    !size || !payload)
 		return -EINVAL;
 	if (size > maximum)
@@ -149,11 +149,18 @@ int ws73_wire_acb(unsigned char *out, size_t capacity, unsigned int sequence,
 	out[67] = (5 + size) >> 8;
 	out[68] = 0xa3;
 	out[69] = handle;
-	out[70] = handle >> 8;
+	out[70] = (handle >> 8) | (boundary << 4);
 	out[71] = size;
 	out[72] = size >> 8;
 	memcpy(out + 73, payload, size);
 	return total;
+}
+
+int ws73_wire_acb(unsigned char *out, size_t capacity, unsigned int sequence,
+                  unsigned int handle, unsigned int maximum,
+                  const unsigned char *payload, size_t size)
+{
+    return ws73_wire_acb_fragment(out, capacity, sequence, handle, 0, maximum, payload, size);
 }
 
 int ws73_wire_acb_fragment_decode(const unsigned char *data, size_t size,

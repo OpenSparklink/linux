@@ -32,7 +32,8 @@ def run(output, command=False):
     start = source.index('struct ws73_acb_transfer {')
     end = source.index('\n};', start) + 3
     code = source[start:end] + '\n' + '\n'.join(function(source, name) for name in
-        ['ws73_acb_complete', 'ws73_acb_submit', 'ws73_native_command' if command else 'ws73_native_acb'])
+        (['ws73_acb_complete', 'ws73_acb_submit', 'ws73_native_command'] if command else
+         ['ws73_acb_complete', 'ws73_acb_submit', 'ws73_native_acb_fragment', 'ws73_native_acb']))
     defines = '\n'.join(re.search(r'^#define '+name+r'\s+.*$', source, re.M)[0]
                         for name in ['WS73_FW_CHUNK', 'WS73_TX_TIMEOUT'])
     fixture = inputs[files[-1]].decode().replace('/* @@DEFINES@@ */', defines).replace('/* @@DRIVER@@ */', code)

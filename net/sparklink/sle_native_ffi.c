@@ -311,9 +311,11 @@ int sparklink_native_health(u16 id, u64 generation)
 EXPORT_SYMBOL_GPL(sparklink_native_health);
 
 int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
-				   struct sparklink_native_tx_ticket *ticket, u16 handle, const u8 *data, size_t length)
+				   struct sparklink_native_tx_ticket *ticket, u16 handle, u8 boundary, const u8 *data, size_t length)
 {
-	if (!transport->ops.send_acb)
+	if (transport->ops.send_acb_fragment)
+		return transport->ops.send_acb_fragment(transport->context, ticket, handle, boundary, data, length);
+	if (boundary || !transport->ops.send_acb)
 		return -EOPNOTSUPP;
 	return transport->ops.send_acb(transport->context, ticket, handle, data, length);
 }
@@ -425,3 +427,13 @@ void sparklink_backend_standard_receive(u32 id, u64 generation, const u8 *data,
     sparklink_standard_receive_rust(id, generation, data, length, lane, status);
 }
 EXPORT_SYMBOL_GPL(sparklink_backend_standard_receive);
+
+extern int sparklink_native_acb_fragment_guarded_rust(u16 id, u64 generation, u64 lifetime, u16 handle, u8 boundary,
+    const u8 *data, size_t length, u64 epoch,
+    int (*consent)(void *, int (*)(void *), void *), void *scope);
+int sparklink_native_acb_fragment_guarded(u16 id, u64 generation, u64 lifetime, u16 handle, u8 boundary,
+    const u8 *data, size_t length, u64 epoch,
+    int (*consent)(void *, int (*)(void *), void *), void *scope)
+{
+    return sparklink_native_acb_fragment_guarded_rust(id, generation, lifetime, handle, boundary, data, length, epoch, consent, scope);
+}

@@ -94,7 +94,8 @@ unsafe extern "C" fn atomic_submit(context:*mut c_void)->i32{
      unsafe{std::slice::from_raw_parts(x.data,x.n)}.to_vec())));}
  result
 }
-unsafe fn sparklink_native_transport_acb(p:*mut c_void,ticket:*mut c_void,handle:u16,data:*const u8,n:usize)->i32{
+unsafe fn sparklink_native_transport_acb(p:*mut c_void,ticket:*mut c_void,handle:u16,boundary:u8,data:*const u8,n:usize)->i32{
+ assert!(boundary <= 3);
  let owner=OWNERS.with(|o|o.borrow()[p as usize-1].clone());
  let mode=BEFORE_COMMIT.with(|b|*b.borrow());
  match mode {
@@ -127,6 +128,7 @@ mod under_test{use super::*;
 // @@SEND@@
 // @@SEND_COMMON@@
 // @@GUARDED_SEND@@
+// @@FRAGMENT_SEND@@
 // @@TAKE@@
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
@@ -417,4 +419,26 @@ fn controller_data(handle:u16,index:u16,payload:&[u8])->Vec<u8>{
 #[test] fn controller_data_does_not_resolve_retired_registration(){
  setup();let p=controller_data(0,0x0134,&[0;255]);
  assert_eq!(receive(0,99,&p),-19);assert_eq!(receive(3,7,&p),-19);
+}
+
+#[test]
+fn actual_fragment_entry_uses_individual_credit_and_rejects_invalid_pb() {
+ let (a, _b)=setup();link(&a,0,1);
+ let mut scope=ConsentScope{live:true};
+ let bytes=[0x5a;254];
+ let call=|pb, scope:&mut ConsentScope|unsafe{
+  under_test::sparklink_native_acb_fragment_guarded_rust(0,7,1,0,pb,
+    bytes.as_ptr(),bytes.len(),1,Some(consent_scope),(scope as *mut ConsentScope).cast())
+ };
+ assert_eq!(call(4,&mut scope),-22);
+ assert!(TX.with(|t|t.borrow().is_empty()));
+ for pb in [1,2,2,2,2] {assert_eq!(call(pb,&mut scope),0);}
+ assert_eq!(call(3,&mut scope),-11);
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,2]),0);
+ assert_eq!(call(3,&mut scope),0);
+ scope.live=false;
+ assert_eq!(call(1,&mut scope),-125);
+ assert_eq!(TX.with(|t|t.borrow().len()),6);
+ a.host.lock().grants.revoke();
+ assert_eq!(call(3,&mut scope),-13);
 }

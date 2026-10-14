@@ -25,6 +25,19 @@ int main(void)
 	CHECK(out[71] == 7 && !out[72] && !memcmp(out + 73, data, 7));
 	for (i = 80; i < 128; i++)
 		CHECK(out[i] == 0);
+	/* Each PB uses the actual codec, retaining the 12-bit identity and bytes. */
+	for (boundary = 0; boundary <= 3; boundary++) {
+		unsigned int decoded_boundary;
+		n = ws73_wire_acb_fragment(out, sizeof(out), 1, 0xabc, boundary, 254, data, 254);
+		CHECK(n == 327);
+		CHECK(ws73_wire_acb_fragment_decode(out + 68, 259, 254, &handle,
+		      &decoded_boundary, &payload, &size) == 0);
+		CHECK(handle == 0xabc && boundary == decoded_boundary && size == 254);
+		CHECK(!memcmp(payload, data, size));
+	}
+	memset(out, 0x5a, sizeof(out));
+	CHECK(ws73_wire_acb_fragment(out, sizeof(out), 1, 0, 4, 254, data, 1) == -EINVAL);
+	for (i = 0; i < sizeof(out); i++) CHECK(out[i] == 0x5a);
 	/* Explicit 253/254/255 boundaries; controller limit includes DTAP bytes. */
 	CHECK(ws73_wire_acb(out, sizeof(out), 1, 0, 254, data, 253) == 326);
 	CHECK(ws73_wire_acb(out, sizeof(out), 1, 0, 254, data, 254) == 327);
