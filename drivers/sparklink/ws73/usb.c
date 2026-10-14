@@ -743,6 +743,9 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 	}
 	if (ret != -ENOMSG)
 		return ret;
+	ret = ws73_dli_validate_security_event(data, size);
+	if (ret && ret != -ENOMSG)
+		return ret;
 	if (size >= 3 && data[0] == 0xa2 &&
 	    (get_unaligned_le16(data + 1) == 1 || get_unaligned_le16(data + 1) == 2)) {
 		ret = ws73_dli_validate_reply(data, size);

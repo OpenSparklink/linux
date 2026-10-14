@@ -417,6 +417,50 @@ static void link_event_tests(void)
 	CHECK(ws73_dli_validate_link_event(data, 0) == -ENOMSG);
 }
 
+static void security_event_tests(void)
+{
+	unsigned char data[271] = {0xa2}, before[271];
+	const unsigned int events[] = {0x0014, 0x000e, 0x0011};
+
+	CHECK(ws73_dli_validate_security_event(NULL, 0) == -EINVAL);
+	for (unsigned int kind = 0; kind < 3; kind++) {
+		put16(data + 1, events[kind]);
+		for (unsigned int n = 0; n <= 266; n++) {
+			put16(data + 3, n);
+			for (unsigned int i = 0; i < n; i++)
+				data[5 + i] = (unsigned char)(i ^ n);
+			/* Every possible one-byte relay length, including a zero-length
+			 * opaque PDU. The protocol consumer owns opcode-specific rules.
+			 */
+			for (unsigned int length = 0; length <= 255; length++) {
+				data[9] = length;
+				memcpy(before, data, sizeof(data));
+				int valid = kind == 0 ? n == 5 + length :
+					(kind == 1 ? n == 2 : n == 4);
+				CHECK(ws73_dli_validate_security_event(data, 5 + n) ==
+				      (valid ? 0 : -EPROTO));
+				CHECK(!memcmp(before, data, sizeof(data)));
+			}
+			CHECK(ws73_dli_validate_security_event(data, 4 + n) == -EPROTO);
+			if (n < 266)
+				CHECK(ws73_dli_validate_security_event(data, 6 + n) == -EPROTO);
+		}
+		for (unsigned int n = 0; n < 5; n++)
+			CHECK(ws73_dli_validate_security_event(data, n) ==
+			      (n < 3 ? -ENOMSG : -EPROTO));
+	}
+	/* Recognition must not steal another event or a command frame. */
+	put16(data + 1, 2);
+	CHECK(ws73_dli_validate_security_event(data, sizeof(data)) == -ENOMSG);
+	put16(data + 1, 0x0014);
+	data[0] = 0xa1;
+	CHECK(ws73_dli_validate_security_event(data, sizeof(data)) == -ENOMSG);
+	/* The raw channel cannot use this codec to gain mutation permission. */
+	CHECK(ws73_dli_validate_command(0x1812, data, 10) == -EOPNOTSUPP);
+	CHECK(ws73_dli_validate_command(0x1c03, data, 21) == -EOPNOTSUPP);
+	CHECK(ws73_dli_validate_command(0x1c05, data, 20) == -EOPNOTSUPP);
+}
+
 int main(void)
 {
 	/* SDK ignores SLE RX sub_type; all 16 still pass the full query
@@ -432,6 +476,7 @@ int main(void)
 		CHECK(info.address[5] == 0x11 && info.acb_length == 254);
 	}
 	link_event_tests();
+	security_event_tests();
 	reply_tests();
 	command_tests();
 	query_tests();

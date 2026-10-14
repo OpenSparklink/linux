@@ -34,6 +34,14 @@ int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
  */
 int ws73_dli_validate_reply(const unsigned char *data, size_t size);
 
+/* SDK111 controller-data (0014), encryption-parameter request (000e) and
+ * encryption-change (0011) envelopes. Explicit wire offsets, not C layouts.
+ * Unknown data indices/status/handles remain opaque. Validation establishes
+ * neither session ownership nor authenticated/encrypted state. Other events
+ * return -ENOMSG; malformed recognized events return -EPROTO.
+ */
+int ws73_dli_validate_security_event(const unsigned char *data, size_t size);
+
 /* Recognize WS73 connection/disconnection outcomes, including the controller's
  * opcode-block event numbers. Validate framing and the known prefix only;
  * connection extension bytes, status, role and address type remain opaque.

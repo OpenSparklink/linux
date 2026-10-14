@@ -42,6 +42,38 @@ static unsigned int dli_u16(const unsigned char *p)
 	return (unsigned int)p[0] | (unsigned int)p[1] << 8;
 }
 
+int ws73_dli_validate_security_event(const unsigned char *data, size_t size)
+{
+	unsigned int event;
+	size_t params;
+
+	if (!data)
+		return -EINVAL;
+	if (size < 3 || data[0] != 0xa2)
+		return -ENOMSG;
+	event = dli_u16(data + 1);
+	if (event != 0x0014 && event != 0x000e && event != 0x0011)
+		return -ENOMSG;
+	if (size < 5)
+		return -EPROTO;
+	params = dli_u16(data + 3);
+	if (params != size - 5)
+		return -EPROTO;
+	/* NearLink Host f0872df DLI_ControllerDataEvt and DLI_EncryptChangeEvt,
+	 * cross-checked with libws73-usb f4d85d0 SDK111 captures. A host C
+	 * structure may include padding; the relay header on wire is five bytes.
+	 * Legacy three-byte encryption outcomes are not this firmware's schema.
+	 */
+	switch (event) {
+	case 0x0014:
+		return params >= 5 && params - 5 == data[9] ? 0 : -EPROTO;
+	case 0x000e:
+		return params == 2 ? 0 : -EPROTO;
+	default: /* 0011: status, handle LE16, opaque encryption-change byte */
+		return params == 4 ? 0 : -EPROTO;
+	}
+}
+
 int ws73_dli_validate_link_event(const unsigned char *data, size_t size)
 {
 	unsigned int event;
