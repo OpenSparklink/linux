@@ -904,32 +904,6 @@ static int ws73_native_validate_connection(void *context, unsigned int operation
     return ws73_connection_validate(operation, opcode, params, length);
 }
 
-static int ws73_native_command(void *context, u16 opcode, const u8 *params, size_t length)
-{
-	struct ws73_usb *ws = context;
-	bool traced = false;
-	int ret;
-
-	mutex_lock(&ws->tx_lock);
-	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) || !READ_ONCE(ws->streaming)) {
-		ret = -ENODEV;
-		goto out;
-	}
-	ret = ws73_wire_command(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, opcode, params, length);
-	if (ret < 0)
-		goto out;
-	ws->tx_sequence++;
-	ret = ws73_write(ws, ws->tx, ret);
-	sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
-	traced = true;
-	if (ret && !READ_ONCE(ws->stopping))
-		ws73_async_failure(ws, ret);
-out:
-	if (!traced)
-		sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
-	mutex_unlock(&ws->tx_lock);
-	return ret;
-}
 
 struct ws73_acb_transfer {
 	struct completion done;
@@ -952,6 +926,53 @@ static int ws73_acb_submit(void *context)
 	struct ws73_acb_transfer *transfer = context;
 
 	return usb_submit_urb(transfer->urb, GFP_ATOMIC);
+}
+
+static int ws73_native_command(void *context, struct sparklink_native_command_ticket *ticket,
+                               u16 opcode, const u8 *params, size_t length)
+{
+	struct ws73_usb *ws = context;
+	struct ws73_acb_transfer transfer;
+	unsigned int timeout;
+	int ret, wire_length;
+
+	mutex_lock(&ws->tx_lock);
+	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) || !READ_ONCE(ws->streaming)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
+	if (!timeout) { ret = -ETIMEDOUT; goto out; }
+	wire_length = ws73_wire_command(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, opcode, params, length);
+	if (wire_length < 0) { ret = wire_length; goto out; }
+	transfer.urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!transfer.urb) { ret = -ENOMEM; goto out; }
+	init_completion(&transfer.done);
+	transfer.status = -EINPROGRESS;
+	transfer.actual = 0;
+	usb_fill_bulk_urb(transfer.urb, ws->udev, usb_sndbulkpipe(ws->udev, ws->bulk_out),
+			 ws->tx, wire_length, ws73_acb_complete, &transfer);
+	ret = sparklink_native_command_commit(ticket, ws->native_id, ws->native_generation,
+					    ws73_acb_submit, &transfer);
+	if (!ret) {
+		ws->tx_sequence++;
+		/* No Host/gate guard spans the wait. Kill joins stack callback. */
+		if (!wait_for_completion_timeout(&transfer.done, msecs_to_jiffies(timeout))) {
+			usb_kill_urb(transfer.urb);
+			ret = -ETIMEDOUT;
+		} else {
+			ret = transfer.status;
+			if (!ret && transfer.actual != wire_length) ret = -EREMOTEIO;
+		}
+	}
+	usb_free_urb(transfer.urb);
+	if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -EACCES && ret != -ECANCELED &&
+	    !READ_ONCE(ws->stopping))
+		ws73_async_failure(ws, ret);
+out:
+	sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
+	mutex_unlock(&ws->tx_lock);
+	return ret;
 }
 
 static int ws73_native_acb(void *context, struct sparklink_native_tx_ticket *ticket,
@@ -1013,7 +1034,7 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.validate_discovery_step = ws73_native_validate_step,
     .prepare_connection = ws73_native_prepare_connection,
     .validate_connection = ws73_native_validate_connection,
-	.send_command = ws73_native_command,
+	.send_command_ticketed = ws73_native_command,
 	.send_acb = ws73_native_acb,
 };
 

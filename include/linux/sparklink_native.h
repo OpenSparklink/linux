@@ -61,6 +61,10 @@ struct sparklink_native_identity {
  * must not retain the ticket or return success without a successful commit.
  */
 struct sparklink_native_tx_ticket;
+struct sparklink_native_command_ticket;
+int sparklink_native_command_commit(struct sparklink_native_command_ticket *ticket,
+                                   u16 id, u64 generation,
+                                   int (*submit)(void *context), void *context);
 int sparklink_native_tx_commit(struct sparklink_native_tx_ticket *ticket,
                               int (*submit)(void *context), void *context);
 
@@ -90,6 +94,14 @@ struct sparklink_native_ops {
     int (*validate_connection)(void *context, unsigned int operation,
         u16 opcode, const u8 *params, size_t length);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
+	/* Optional atomic command submission. Prepare outside Host locks, then
+	 * commit exactly once; wait/kill/join after commit returns. The core checks
+	 * the real active reservation and immutable registration at USB queueing.
+	 * This is not command Complete or a grant for raw mutation/security APIs.
+	 */
+	int (*send_command_ticketed)(void *context,
+		struct sparklink_native_command_ticket *ticket,
+		u16 opcode, const u8 *params, size_t length);
 	/* Optional one-transfer ACB path. Core retains identity and Backend;
      * credit and canonical lifetime are checked at actual atomic submission.
      * USB completion does not pay data debt or prove peer delivery. */

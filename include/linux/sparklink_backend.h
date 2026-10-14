@@ -51,7 +51,7 @@ static inline int sparklink_backend_validate(const struct sparklink_backend_desc
 		return -EOPNOTSUPP;
 	o = d->ops;
 	if (!o || !d->context || !o->get || !o->put || !o->open || !o->close ||
-	    !o->validate_command || !o->send_command ||
+	    !o->validate_command || (!o->send_command && !o->send_command_ticketed) ||
 	    !!o->prepare_discovery != !!o->validate_discovery_step ||
 	    !!o->prepare_connection != !!o->validate_connection)
 		return -EINVAL;

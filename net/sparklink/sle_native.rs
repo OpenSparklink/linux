@@ -96,6 +96,9 @@ extern "C" {
     fn sparklink_native_transport_command(
         transport: *mut c_void, opcode: u16, params: *const u8, length: usize,
     ) -> i32;
+    fn sparklink_native_transport_has_command_ticket(transport: *mut c_void) -> bool;
+    fn sparklink_native_transport_command_ticketed(transport: *mut c_void, ticket: *mut c_void,
+        opcode: u16, params: *const u8, length: usize) -> i32;
     fn sparklink_native_transport_acb(transport: *mut c_void, ticket: *mut c_void, handle: u16,
         data: *const u8, length: usize) -> i32;
     fn sparklink_native_transport_has_acb(transport: *mut c_void) -> bool;
@@ -265,7 +268,8 @@ impl super::ControllerRuntime {
 
 impl NativeCommandTransport {
 
-    pub(crate) fn send_typed(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
+    pub(crate) fn send_typed(&self, owner: &super::ControllerRuntime, cookie: u64,
+        opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
         if connection.is_some() && recipe.is_some() { return Err(EINVAL); }
         if let Some(operation) = connection {
             // SAFETY: only the typed Host creates this tag. Retained driver
@@ -299,16 +303,65 @@ impl NativeCommandTransport {
         }
         // SAFETY: retained transport lives until this handle drops. Called only
         // by this owner's TX worker after reserving a command credit.
-        NativeController::result(unsafe {
-            sparklink_native_transport_command(self.transport, opcode, params.as_ptr(), params.len())
-        })
+        // SAFETY: retained immutable provider; callback availability is stable.
+        if unsafe { sparklink_native_transport_has_command_ticket(self.transport) } {
+            let mut ticket = NativeCommandTicket { owner, cookie, opcode,
+                attempted: Cell::new(false), submitted: Cell::new(false) };
+            // SAFETY: driver may use the borrowed ticket only synchronously,
+            // and must join transfer callbacks before this stack object retires.
+            let result = unsafe { sparklink_native_transport_command_ticketed(self.transport,
+                (&mut ticket as *mut NativeCommandTicket<'_>).cast(), opcode, params.as_ptr(), params.len()) };
+            if result == 0 && !ticket.submitted.get() { return Err(Error::from_errno(PROTOCOL_ERROR)); }
+            NativeController::result(result)
+        } else {
+            // Explicit legacy path for other providers pending migration;
+            // this is not a ticketed transport or Native security capability.
+            NativeController::result(unsafe {
+                sparklink_native_transport_command(self.transport, opcode, params.as_ptr(), params.len())
+            })
+        }
     }
 }
 
 impl super::sle_backend::CommandPort for NativeCommandTransport {
-    fn submit(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
-        self.send_typed(opcode, params, recipe, connection)
+    fn submit(&self, owner: &super::ControllerRuntime, cookie: u64, opcode: u16,
+        params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
+        self.send_typed(owner, cookie, opcode, params, recipe, connection)
     }
+}
+
+struct NativeCommandTicket<'a> {
+    owner: &'a super::ControllerRuntime,
+    cookie: u64,
+    opcode: u16,
+    attempted: Cell<bool>,
+    submitted: Cell<bool>,
+}
+
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_command_commit_rust(
+    opaque: *mut c_void, id: u16, generation: u64,
+    submit: Option<unsafe extern "C" fn(*mut c_void) -> i32>, context: *mut c_void,
+) -> i32 {
+    if opaque.is_null() || submit.is_none() { return EINVAL.to_errno(); }
+    // SAFETY: opaque belongs to this synchronous retained driver's call.
+    let ticket = unsafe { &*opaque.cast::<NativeCommandTicket<'_>>() };
+    if ticket.attempted.replace(true) { return -(kernel::bindings::EALREADY as i32); }
+    let owner = ticket.owner;
+    if owner.identity != (DeviceIdentity { id, generation }) { return -(kernel::bindings::ESTALE as i32); }
+    let mut host = owner.host.lock();
+    let gate = owner.schedule_gate.lock();
+    if *gate { return ENODEV.to_errno(); }
+    if !owner.transport_open.load(Ordering::Acquire) { return EAGAIN.to_errno(); }
+    if let Err(error) = host.validate_command_commit(ticket.cookie, ticket.opcode) { return error.to_errno(); }
+    // SAFETY: prepared non-sleeping queue operation; guards serialize queueing
+    // with Host withdrawal/link publication. No decode, wait or Host reentry.
+    let result = unsafe { submit.unwrap()(context) };
+    if result == 0 {
+        host.command_committed(ticket.cookie);
+        ticket.submitted.set(true);
+    }
+    result // Neither USB admission nor failure fabricates command credit.
 }
 
 /// Backend descriptor IDs are internal and differ from public bus values.

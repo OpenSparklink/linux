@@ -243,8 +243,33 @@ int sparklink_native_transport_validate_connection(struct sparklink_native_trans
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,
 				       u16 opcode, const u8 *params, size_t length)
 {
+	if (!transport->ops.send_command)
+		return -EOPNOTSUPP;
 	return transport->ops.send_command(transport->context, opcode, params, length);
 }
+
+bool sparklink_native_transport_has_command_ticket(struct sparklink_native_transport *transport)
+{
+	return transport->ops.send_command_ticketed != NULL;
+}
+
+int sparklink_native_transport_command_ticketed(struct sparklink_native_transport *transport,
+	struct sparklink_native_command_ticket *ticket, u16 opcode, const u8 *params, size_t length)
+{
+	if (!transport->ops.send_command_ticketed)
+		return -EOPNOTSUPP;
+	return transport->ops.send_command_ticketed(transport->context, ticket, opcode, params, length);
+}
+
+extern int sparklink_native_command_commit_rust(void *ticket, u16 id, u64 generation,
+	int (*submit)(void *context), void *context);
+
+int sparklink_native_command_commit(struct sparklink_native_command_ticket *ticket,
+	u16 id, u64 generation, int (*submit)(void *context), void *context)
+{
+	return sparklink_native_command_commit_rust(ticket, id, generation, submit, context);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_command_commit);
 
 void sparklink_native_unregister(u16 id, u64 generation)
 {

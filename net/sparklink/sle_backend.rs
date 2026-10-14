@@ -9,5 +9,6 @@ use super::sle_command_plan::RecipeTag;
 /// Submission success means transport completion, not controller Complete or
 /// peer receipt. Typed tags grant no raw command/management permission.
 pub(crate) trait CommandPort {
-    fn submit(&self, opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result;
+    fn submit(&self, owner: &super::ControllerRuntime, cookie: u64, opcode: u16,
+        params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result;
 }

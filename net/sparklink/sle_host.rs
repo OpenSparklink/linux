@@ -20,7 +20,10 @@ struct InFlight {
     deadline: u64,
     recipe: Option<RecipeTag>,
     connection: Option<u32>,
+    connection_reference: Option<super::sle_connection_operation::ExpectedLink>,
     transport_done: bool,
+    transport_submitted: bool,
+    withdrawn: bool,
     advertising_params: Option<[u8; 49]>,
     advertising_was_absent: bool,
 }
@@ -122,6 +125,9 @@ impl CommandHost {
 
     pub(crate) fn cancel_diagnostic(&mut self, seq: u32) {
         self.requests.remove_seq(seq);
+        if let Some(active) = self.active.as_mut().filter(|active| active.seq == seq) {
+            active.withdrawn = true;
+        }
         // active/reply/credits/deadline remain untouched. Cancelling an on-wire
         // author waits for its real reply or a normal uncertain-outcome fault.
     }
@@ -578,11 +584,43 @@ impl CommandHost {
                 .min(request.deadline),
             recipe: request.recipe,
             connection: request.connection,
+            connection_reference: self.connections.reference(request.cookie),
             transport_done: false,
+            transport_submitted: false,
+            withdrawn: false,
             advertising_params,
             advertising_was_absent,
         });
         Ok(Some(request))
+    }
+
+    /// Final command check while Host/gate serialize actual atomic submission.
+    /// A checked-out command is not proof that USB has already queued it.
+    pub(crate) fn validate_command_commit(&self, cookie: u64, opcode: u16) -> Result {
+        if let Some(error) = self.fault { return Err(error); }
+        let active = self.active.as_ref().filter(|a| a.cookie == cookie && a.opcode == opcode).ok_or(EINVAL)?;
+        if active.transport_submitted { return Err(Error::from_errno(-(kernel::bindings::EALREADY as i32))); }
+        // SAFETY: read-only clock under this owner's IRQ-safe Host lock.
+        if unsafe { kernel::bindings::jiffies_64 } >= active.deadline { return Err(ETIMEDOUT); }
+        if active.withdrawn { return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32))); }
+        if let Some(tag) = active.recipe {
+            if tag.intent.has_enable() && (self.revoking || !self.current_recipe(tag)) {
+                return Err(Error::from_errno(-(kernel::bindings::ECANCELED as i32)));
+            }
+        }
+        if let Some(reference) = active.connection_reference {
+            if !self.links.matches(reference.lifetime, reference.handle, reference.role,
+                reference.address_type, reference.address) {
+                return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn command_committed(&mut self, cookie: u64) {
+        if let Some(active) = self.active.as_mut().filter(|active| active.cookie == cookie) {
+            active.transport_submitted = true;
+        }
     }
 
     /// Consume a matching response into its reserved slot. Other events
