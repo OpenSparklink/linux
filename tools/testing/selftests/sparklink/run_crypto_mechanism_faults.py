@@ -8,6 +8,7 @@ from run_security_remediation import function
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path)
+    parser.add_argument('--cbmc',action='store_true',help='Verify the same generated production bodies with CBMC; retain all checks.')
     args=parser.parse_args()
     here=Path(__file__).resolve().parent
     source=here.parents[3]/'net/sparklink/sle_crypto_ffi.c'
@@ -18,8 +19,10 @@ def main():
         temp=Path(name);(temp/'probe.c').write_text(fixture)
         subprocess.run([os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-g',str(temp/'probe.c'),'-o',str(temp/'probe')],check=True)
         subprocess.run([str(temp/'probe')],check=True)
+        if args.cbmc:
+            subprocess.run(['cbmc',str(temp/'probe.c'),'--function','main','--unwind','70','--unwinding-assertions','--bounds-check','--pointer-check','--signed-overflow-check','--unsigned-overflow-check','--conversion-check'],check=True)
     if source.read_bytes()!=original:raise RuntimeError('production source changed during run')
-    result={'status':'ACTUAL_ECDH_FAILURE_BOUNDARIES_PASS','source_sha256':hashlib.sha256(original).hexdigest(),'scope':'verbatim C generate/shared functions; allocated resources/atomic failure,8 finite invalid-scalar attempts, asynchronous partial-destination error','faults':'alloc_tfm,alloc_buffer,random_wait,encode,set_secret,invalid_scalar,alloc_request,partial_crypto_failure','limits':'Mock dependencies; no crypto math, kernel execution, pairing, trust or RF proof'}
+    result={'formal_status':'BOUNDED_PASS' if args.cbmc else 'NOT_RUN','formal_scope':'9 explicit dependency fault modes plus nondeterministic allocation failures, unwind70; no kernel crypto math or concurrent state proof','status':'ACTUAL_ECDH_FAILURE_BOUNDARIES_PASS','source_sha256':hashlib.sha256(original).hexdigest(),'scope':'verbatim C generate/shared functions; allocated resources/atomic failure,8 finite invalid-scalar attempts, asynchronous partial-destination error','faults':'alloc_tfm,alloc_buffer,random_not_ready,encode,set_secret,invalid_scalar,alloc_request,partial_crypto_failure','limits':'Mock dependencies; no crypto math, kernel execution, pairing, trust or RF proof'}
     if args.output:args.output.write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))
 if __name__=='__main__':main()

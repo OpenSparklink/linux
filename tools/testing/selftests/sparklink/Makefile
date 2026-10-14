@@ -19,6 +19,7 @@ TEST_GEN_PROGS_EXTENDED += protocol_state_unsupported_test
 TEST_GEN_PROGS_EXTENDED += virtual_runtime_test
 
 TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containment.py
+TEST_PROGS += run_crypto_mechanism_faults.py
 TEST_PROGS += run_connection_tx.py run_ssap_containment.py run_native_connection_contract.py
 TEST_PROGS += run_event_copy.py run_runtime_ingress.py run_usb_registration.py
 TEST_PROGS += run_phy_model.py run_power_retirement.py

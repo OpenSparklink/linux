@@ -279,10 +279,12 @@ int sle_ecdh_generate(u8 *private_key, u8 *public_key)
         result = -ENOMEM;
         goto out;
     }
-    /* Process-context only. Never generate security keys before CRNG ready. */
-    result = wait_for_random_bytes();
-    if (result)
+    /* Do not wait for entropy under a future session's original deadline.
+     * Readiness is monotonic; reject rather than use uninitialized randomness. */
+    if (!rng_is_initialized()) {
+        result = -EAGAIN;
         goto out;
+    }
     for (attempt = 0; attempt < 8; attempt++) {
         get_random_bytes(candidate_private, sizeof(candidate_private));
         result = crypto_ecdh_encode_key(encoded, encoded_len, &parameters);
