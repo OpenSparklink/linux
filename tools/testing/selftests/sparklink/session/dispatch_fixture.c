@@ -18,6 +18,7 @@ static unsigned long jiffies = 42;
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sle_fragment_cursor.h"
 #include "sparklink_socket.h"
 #define __user
 #define ENOIOCTLCMD 515
@@ -35,7 +36,7 @@ static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 #define SPARKLINK_SOCKET_USER_PI 241
 /* @@LIMITS@@ */
 struct sock;
-struct sk_buff {struct sock *owner;struct sk_buff *next;unsigned int len,truesize,users;u8 data[2047];};
+struct sk_buff {struct sock *owner;struct sk_buff *next;unsigned int len,truesize,users;unsigned long cb[6];u8 data[2047];};
 struct sk_buff_head {spinlock_t lock;unsigned int qlen;struct sk_buff *head,*tail,*prev;};
 struct sock {unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state;void (*sk_data_ready)(struct sock *);};
 struct kref {unsigned int refs;};
@@ -113,6 +114,42 @@ static unsigned int copy_limit = 40;
 static unsigned long copy_to_user(void *out,const void *in,unsigned long size){
  assert(!host_locked&&!irq_disabled&&!current_session->lock.held);
  unsigned long copied=copy_limit<size?copy_limit:size;memcpy(out,in,copied);return size-copied;
+}
+static int time_after_eq(unsigned long a,unsigned long b){return a>=b;}
+static void sl_wake(struct sl_connection_session *s){(void)s;}
+static struct sk_buff *skb_dequeue(struct sk_buff_head *q){
+ unsigned long flags;struct sk_buff *skb;
+ spin_lock_irqsave(&q->lock,flags);skb=q->head;
+ if(skb){q->head=skb->next;if(!q->head)q->tail=NULL;q->qlen--;skb->next=NULL;}
+ spin_unlock_irqrestore(&q->lock,flags);return skb;
+}
+static void skb_queue_head(struct sk_buff_head *q,struct sk_buff *skb){
+ spin_lock(&q->lock);skb->next=q->head;q->head=skb;if(!q->tail)q->tail=skb;q->qlen++;spin_unlock(&q->lock);
+}
+static unsigned int packet_budget,fragment_count,fragment_pb[16],fragment_size[16];
+static u8 fragment_bytes[4096];static unsigned int fragment_bytes_count;
+static int fragment_failure;static bool retire_after_fragment;
+static int fragment_submit(void *context){
+ (void)context;assert(irq_disabled);if(!packet_budget)return -EAGAIN;
+ if(fragment_failure)return fragment_failure;
+ packet_budget--;return 0;
+}
+static int sparklink_native_acb_fragment_guarded(u16 id,u64 generation,u64 lifetime,u16 handle,u8 boundary,
+ const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope){
+ struct sl_submit_scope *permission=scope;int result;unsigned long flags;
+ assert(id==permission->session->controller&&generation==permission->session->generation);
+ assert(lifetime==permission->session->lifetime&&handle==permission->session->handle&&epoch==permission->session->epoch);
+ assert(!permission->session->lock.held&&length<=254&&boundary<=3);
+ /* Host/data/gate and credit are dependencies here, separately tested in Rust.
+  * Invoke the actual Session consent before accepting a fragment. */
+ flags=irq_disabled;irq_disabled=true;result=consent(scope,fragment_submit,NULL);irq_disabled=flags;
+ if(!result){assert(fragment_count<16&&fragment_bytes_count+length<=sizeof(fragment_bytes));
+  fragment_pb[fragment_count]=boundary;fragment_size[fragment_count++]=length;
+  memcpy(fragment_bytes+fragment_bytes_count,bytes,length);fragment_bytes_count+=length;
+  if(retire_after_fragment){spin_lock_irqsave(&permission->session->lock,flags);
+   sl_binding_retire(&permission->channel->binding);spin_unlock_irqrestore(&permission->session->lock,flags);}
+ }
+ return result;
 }
 /* @@FUNCTIONS@@ */
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
@@ -263,6 +300,38 @@ static void capability_tests(void)
  assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO^1,0)==-ENOIOCTLCMD);
  struct sk_buff *skb=s.channels[0].rx.head;kfree_skb(skb);assert(allocations==0);authority=true;
 }
+static void enqueue_fragment_test(struct sl_basic_channel *c,unsigned int length){
+ struct sk_buff *skb=alloc_skb(length,0);unsigned long flags;
+ for(unsigned int i=0;i<length;i++)((u8 *)skb_put(skb, length))[i]=(i*37+11)&255;
+ spin_lock_irqsave(&c->tx.lock,flags);__skb_queue_tail(&c->tx,skb);spin_unlock_irqrestore(&c->tx.lock,flags);
+}
+static void fragment_worker_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding bindings[2]={0};
+ init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;
+ s.channels[1].local_tcid=10;s.channels[1].remote_tcid=10;s.channels[1].sk=&bindings[1].sk;
+ bindings[1].channel_slot=1;assert(sl_binding_attach(&s.channels[1].binding));init_grant(&s,&bindings[1].sk,SL_GRANT_TX);
+ fragment_count=fragment_bytes_count=0;packet_budget=2;fragment_failure=0;retire_after_fragment=false;jiffies=42;
+ enqueue_fragment_test(&s.channels[0],2047);enqueue_fragment_test(&s.channels[1],4);
+ assert(!sl_transmit_channel(&s,&s.channels[0]));assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(fragment_count==2&&s.fragment_slot==0&&s.channels[0].tx.qlen==1);
+ assert(!sl_transmit_channel(&s,&s.channels[0]));assert(fragment_count==2);
+ assert(!sl_transmit_channel(&s,&s.channels[1]));assert(s.channels[1].tx.qlen==1);
+ packet_budget=7;for(unsigned int i=0;i<7;i++)assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(fragment_count==9&&fragment_bytes_count==2047&&s.fragment_slot==-1&&!s.channels[0].tx.qlen);
+ assert(fragment_pb[0]==1&&fragment_pb[8]==3&&fragment_size[8]==15);
+ for(unsigned int i=1;i<8;i++)assert(fragment_pb[i]==2);
+ for(unsigned int i=0;i<2047;i++)assert(fragment_bytes[i]==((i*37+11)&255));
+ packet_budget=1;assert(!sl_transmit_channel(&s,&s.channels[1]));assert(fragment_pb[9]==0);
+ /* Successful first fragment followed by last-fd retirement: do not allow
+  * another PDU to replace the controller's uncompleted stream. */
+ enqueue_fragment_test(&s.channels[0],255);packet_budget=1;retire_after_fragment=true;
+ assert(sl_transmit_channel(&s,&s.channels[0])==-ECONNABORTED);assert(!s.channels[0].tx.qlen);
+ retire_after_fragment=false;assert(!allocations);
+ init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;
+ enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
+ jiffies+=5000;packet_budget=1;
+ assert(sl_transmit_channel(&s,&s.channels[0])==-ETIMEDOUT);assert(!allocations);
+}
 int main(void){
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
  sl_channel_start(&s.progress,249);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress,249,0);sl_channel_response_submitted(&s.progress,0);
@@ -297,6 +366,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();
+ receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

@@ -22,6 +22,7 @@
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sle_fragment_cursor.h"
 #include "sle_security_relay.h"
 
 _Static_assert(SL_SESSION_CHANNELS == 2 && SL_CHANNEL_USER_SLOT == 0 && SL_CHANNEL_SMTC_SLOT == 1, "fixed channel table bounds");
@@ -50,6 +51,8 @@ struct sl_connection_session {
 	struct delayed_work work;
 	struct sl_basic_channel channels[SL_SESSION_CHANNELS];
 	unsigned int tx_next; /* serialized worker-only round-robin start */
+	u16 acb_maximum; /* controller packet size, distinct from DTAP MTU */
+	int fragment_slot; /* worker-only; -1 or sole unfinished connection PDU */
 	u8 response_id;
 	u32 response_mask; /* only serialized session worker writes these */
 	u8 rx_buffer[2047]; /* sole connection consumer, fixed budget */
@@ -312,9 +315,14 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_channel *c)
 {
 	unsigned long flags;
-	struct sk_buff *skb;
-	int ret;
-	skb = NULL;
+	struct sk_buff *skb = NULL;
+	struct sl_fragment_cursor *cursor;
+	struct sl_submit_scope permission = { s, c };
+	unsigned int length, boundary;
+	int slot = c - s->channels, ret = 0;
+
+	if (s->fragment_slot >= 0 && s->fragment_slot != slot)
+		return 0; /* DLI PB has no TCID; do not interleave connection PDUs. */
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) && sl_permits(s, c, SL_GRANT_TX) && !c->binding.busy) {
 		skb = skb_dequeue(&c->tx);
@@ -322,22 +330,41 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 			sl_binding_start_tx(&c->binding);
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
-	if (skb) {
-		ret = sl_send(s, c, skb->data, skb->len);
-		spin_lock_irqsave(&s->lock, flags);
-		sl_binding_finish_tx(&c->binding);
-		if (ret == -EAGAIN && sl_binding_live(c->binding)) {
-			skb_queue_head(&c->tx, skb);
-			skb = NULL;
-		}
-		spin_unlock_irqrestore(&s->lock, flags);
-		kfree_skb(skb);
-		sl_wake(s);
-		if (ret && ret != -EAGAIN && ret != -ECANCELED) {
-			return ret;
-		}
+	if (!skb)
+		return s->fragment_slot == slot ? -ECANCELED : 0;
+	cursor = (void *)skb->cb;
+	if (!cursor->deadline)
+		cursor->deadline = jiffies + msecs_to_jiffies(5000);
+	if (time_after_eq(jiffies, cursor->deadline))
+		ret = -ETIMEDOUT;
+	else if (!sl_fragment_next(skb->len, cursor->offset, s->acb_maximum, &length, &boundary))
+		ret = -EPROTO;
+	else {
+		ret = sparklink_native_acb_fragment_guarded(s->controller, s->generation,
+			s->lifetime, s->handle, boundary, skb->data + cursor->offset, length,
+			s->epoch, sl_session_submit, &permission);
+		if (!ret && !sl_fragment_advance(cursor, skb->len, length))
+			ret = -EPROTO;
 	}
-	return 0;
+	spin_lock_irqsave(&s->lock, flags);
+	sl_binding_finish_tx(&c->binding);
+	if ((ret == -EAGAIN || (!ret && cursor->offset < skb->len)) &&
+	    sl_binding_live(c->binding) && sl_permits(s, c, SL_GRANT_TX)) {
+		/* A blocked first submit permits other PDUs. A committed prefix owns
+		 * the entire connection stream until its final fragment is submitted. */
+		if (cursor->offset)
+			s->fragment_slot = slot;
+		skb_queue_head(&c->tx, skb);
+		skb = NULL;
+	} else {
+		if ((!ret || ret == -EAGAIN || ret == -ECANCELED) && cursor->offset && cursor->offset < skb->len)
+			ret = -ECONNABORTED; /* no qualified partial-PDU discard barrier */
+		s->fragment_slot = -1;
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	kfree_skb(skb);
+	sl_wake(s);
+	return ret == -EAGAIN || ret == -ECANCELED ? 0 : ret;
 }
 static void sl_work(struct work_struct *work)
 {
@@ -385,7 +412,7 @@ static void sl_work(struct work_struct *work)
 	}
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
-	if (s->response_id) {
+	if (s->response_id && s->fragment_slot < 0) {
 		n = sl_channel_cap_response(signal, sizeof(signal), s->response_id, s->response_mask, sl_snapshot(s).maximum);
 		if (n >= 0)
 			n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
@@ -416,6 +443,7 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 	unsigned int i;
 	if (!s)
 		return NULL;
+	if (maximum < 24 || maximum > SL_FRAGMENT_PDU_MAX) { kfree(s); return NULL; }
 	s->security = sl_security_owner_create_rust(controller, generation, lifetime, handle, epoch);
 	if (!s->security) { kfree(s); return NULL; }
 	kref_init(&s->refs);
@@ -434,7 +462,9 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 	 * negotiation at the first authorized channel binding, never at allocation
 	 * or each subsequent fd open. Inactive sessions have no work/timer refs.
 	 */
-	s->progress.maximum = min_t(unsigned int, maximum - 5, 2042);
+	s->acb_maximum = maximum;
+	s->fragment_slot = -1;
+	s->progress.maximum = SL_FRAGMENT_PDU_MAX - 5;
 	return s;
 }
 void sl_connection_session_stop(void *opaque, int error)
@@ -636,6 +666,7 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 	header = c->remote_tcid <= 0x1d ? 4 : 5;
 	skb = alloc_skb(length + header, GFP_KERNEL);
 	if (!skb) { ret = -ENOMEM; goto put; }
+	memset(skb->cb, 0, sizeof(skb->cb));
 	p = skb_put(skb, length + header);
 	p[0] = c->remote_tcid; p[1] = 0;
 	p[2] = (length + header - 4) & 255; p[3] = (length + header - 4) >> 8;
