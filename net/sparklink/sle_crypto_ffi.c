@@ -42,6 +42,7 @@ int sle_hmac_sm3(const u8 *key, u32 key_len,
 		 const u8 *data, u32 data_len, u8 *digest);
 int sle_sm4_ecb_crypt(const u8 *key, const u8 *input, u8 *output, int decrypt);
 int sle_sm4_ctr_crypt(const u8 *key, u8 *iv, u8 *data, u32 data_len);
+int sle_aes_cmac(const u8 *key, const u8 *data, u32 data_len, u8 *digest);
 int sle_ecdh_generate(u8 *private_key, u8 *public_key);
 int sle_ecdh_shared_secret(const u8 *private_key, const u8 *remote_public_key,
 			   u8 *secret);
@@ -254,116 +255,68 @@ out_tfm:
  */
 int sle_ecdh_generate(u8 *private_key, u8 *public_key)
 {
-	struct crypto_kpp *tfm;
-	struct kpp_request *req;
-	struct ecdh p = {0};
-	struct scatterlist dst;
-	DECLARE_CRYPTO_WAIT(wait);
-	u8 *buf;
-	unsigned int buf_len;
-	u8 *tmp;
-	int err;
+    struct crypto_kpp *tfm;
+    struct kpp_request *req = NULL;
+    struct ecdh parameters;
+    struct scatterlist destination;
+    DECLARE_CRYPTO_WAIT(wait);
+    u8 candidate_private[ECDH_P256_KEY_SIZE];
+    u8 candidate_public[ECDH_P256_PUB_SIZE];
+    u8 *encoded = NULL;
+    unsigned int encoded_len, attempt;
+    int result;
 
-	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
-	if (IS_ERR(tfm))
-		return PTR_ERR(tfm);
-
-	/* Set secret with empty key to trigger random generation */
-	buf_len = crypto_ecdh_key_len(&p);
-	buf = kmalloc(buf_len, GFP_KERNEL);
-	if (!buf) {
-		err = -ENOMEM;
-		goto out_tfm;
-	}
-
-	err = crypto_ecdh_encode_key(buf, buf_len, &p);
-	if (err)
-		goto out_buf;
-
-	err = crypto_kpp_set_secret(tfm, buf, buf_len);
-	if (err)
-		goto out_buf;
-
-	/* Generate the public key */
-	tmp = kmalloc(ECDH_P256_PUB_SIZE, GFP_KERNEL);
-	if (!tmp) {
-		err = -ENOMEM;
-		goto out_buf;
-	}
-
-	req = kpp_request_alloc(tfm, GFP_KERNEL);
-	if (!req) {
-		err = -ENOMEM;
-		goto out_tmp;
-	}
-
-	sg_init_one(&dst, tmp, ECDH_P256_PUB_SIZE);
-	kpp_request_set_input(req, NULL, 0);
-	kpp_request_set_output(req, &dst, ECDH_P256_PUB_SIZE);
-	kpp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-				 crypto_req_done, &wait);
-
-	err = crypto_kpp_generate_public_key(req);
-	err = crypto_wait_req(err, &wait);
-	if (err)
-		goto out_req;
-
-	memcpy(public_key, tmp, ECDH_P256_PUB_SIZE);
-
-	/*
-	 * Extract the private key: re-encode with a caller-provided buffer.
-	 * The kernel generated the key internally; we retrieve it by reading
-	 * it back from the tfm context via a second set_secret round-trip.
-	 *
-	 * Since the kernel KPP API does not expose a "get private key"
-	 * accessor, we generate 32 bytes of cryptographic randomness and
-	 * re-set the secret to derive a deterministic key pair.  This is
-	 * the same approach used by Bluetooth SMP.
-	 */
-	get_random_bytes(private_key, ECDH_P256_KEY_SIZE);
-
-	/* Re-set secret with the explicit private key to make the pair
-	 * consistent: private_key <=> public_key.
-	 */
-	kfree_sensitive(buf);
-	p.key = private_key;
-	p.key_size = ECDH_P256_KEY_SIZE;
-	buf_len = crypto_ecdh_key_len(&p);
-	buf = kmalloc(buf_len, GFP_KERNEL);
-	if (!buf) {
-		err = -ENOMEM;
-		goto out_req;
-	}
-
-	err = crypto_ecdh_encode_key(buf, buf_len, &p);
-	if (err)
-		goto out_req;
-
-	err = crypto_kpp_set_secret(tfm, buf, buf_len);
-	if (err)
-		goto out_req;
-
-	/* Re-generate public key from the explicit private key */
-	sg_init_one(&dst, tmp, ECDH_P256_PUB_SIZE);
-	kpp_request_set_input(req, NULL, 0);
-	kpp_request_set_output(req, &dst, ECDH_P256_PUB_SIZE);
-
-	err = crypto_kpp_generate_public_key(req);
-	err = crypto_wait_req(err, &wait);
-	if (err)
-		goto out_req;
-
-	memcpy(public_key, tmp, ECDH_P256_PUB_SIZE);
-
-out_req:
-	kpp_request_free(req);
-out_tmp:
-	kfree(tmp);
-out_buf:
-	kfree_sensitive(buf);
-out_tfm:
-	crypto_free_kpp(tfm);
-	return err;
+    if (!private_key || !public_key)
+        return -EINVAL;
+    tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
+    if (IS_ERR(tfm))
+        return PTR_ERR(tfm);
+    parameters.key = (char *)candidate_private;
+    parameters.key_size = sizeof(candidate_private);
+    encoded_len = crypto_ecdh_key_len(&parameters);
+    encoded = kmalloc(encoded_len, GFP_KERNEL);
+    if (!encoded) {
+        result = -ENOMEM;
+        goto out;
+    }
+    /* Process-context only. Never generate security keys before CRNG ready. */
+    result = wait_for_random_bytes();
+    if (result)
+        goto out;
+    for (attempt = 0; attempt < 8; attempt++) {
+        get_random_bytes(candidate_private, sizeof(candidate_private));
+        result = crypto_ecdh_encode_key(encoded, encoded_len, &parameters);
+        if (result)
+            goto out;
+        result = crypto_kpp_set_secret(tfm, encoded, encoded_len);
+        if (result != -EINVAL)
+            break;
+    }
+    if (result)
+        goto out;
+    req = kpp_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        result = -ENOMEM;
+        goto out;
+    }
+    sg_init_one(&destination, candidate_public, sizeof(candidate_public));
+    kpp_request_set_input(req, NULL, 0);
+    kpp_request_set_output(req, &destination, sizeof(candidate_public));
+    kpp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+                            crypto_req_done, &wait);
+    result = crypto_wait_req(crypto_kpp_generate_public_key(req), &wait);
+    if (!result) {
+        memcpy(private_key, candidate_private, sizeof(candidate_private));
+        memcpy(public_key, candidate_public, sizeof(candidate_public));
+    }
+out:
+    if (req)
+        kpp_request_free(req);
+    kfree_sensitive(encoded);
+    memzero_explicit(candidate_private, sizeof(candidate_private));
+    memzero_explicit(candidate_public, sizeof(candidate_public));
+    crypto_free_kpp(tfm);
+    return result;
 }
 
 /*
@@ -386,9 +339,12 @@ int sle_ecdh_shared_secret(const u8 *private_key,
 	struct scatterlist src, dst;
 	DECLARE_CRYPTO_WAIT(wait);
 	u8 *buf;
+	u8 candidate[ECDH_P256_KEY_SIZE];
 	unsigned int buf_len;
 	int err;
 
+	if (!private_key || !remote_public_key || !secret)
+		return -EINVAL;
 	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
 	if (IS_ERR(tfm))
 		return PTR_ERR(tfm);
@@ -418,7 +374,7 @@ int sle_ecdh_shared_secret(const u8 *private_key,
 	}
 
 	sg_init_one(&src, remote_public_key, ECDH_P256_PUB_SIZE);
-	sg_init_one(&dst, secret, ECDH_P256_KEY_SIZE);
+	sg_init_one(&dst, candidate, ECDH_P256_KEY_SIZE);
 	kpp_request_set_input(req, &src, ECDH_P256_PUB_SIZE);
 	kpp_request_set_output(req, &dst, ECDH_P256_KEY_SIZE);
 	kpp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
@@ -426,11 +382,49 @@ int sle_ecdh_shared_secret(const u8 *private_key,
 
 	err = crypto_kpp_compute_shared_secret(req);
 	err = crypto_wait_req(err, &wait);
+	if (!err)
+		memcpy(secret, candidate, sizeof(candidate));
 
 	kpp_request_free(req);
 out_buf:
 	kfree_sensitive(buf);
 out_tfm:
+	memzero_explicit(candidate, sizeof(candidate));
 	crypto_free_kpp(tfm);
 	return err;
+}
+
+/* Process-context AES-CMAC mechanism for HA2. No protocol/trust state changes.
+ * Bound matches the reviewed WS73 pairing PRF inputs; failures are atomic.
+ */
+int sle_aes_cmac(const u8 *key, const u8 *data, u32 data_len, u8 *digest)
+{
+    struct crypto_shash *tfm;
+    struct shash_desc *description;
+    u8 candidate[16], empty = 0;
+    int result;
+
+    if (!key || !digest || (data_len && !data))
+        return -EINVAL;
+    if (data_len > 160)
+        return -EMSGSIZE;
+    tfm = crypto_alloc_shash("cmac(aes)", 0, 0);
+    if (IS_ERR(tfm))
+        return PTR_ERR(tfm);
+    description = kmalloc(sizeof(*description) + crypto_shash_descsize(tfm), GFP_KERNEL);
+    if (!description) {
+        result = -ENOMEM;
+        goto out;
+    }
+    description->tfm = tfm;
+    result = crypto_shash_setkey(tfm, key, 16);
+    if (!result)
+        result = crypto_shash_digest(description, data_len ? data : &empty, data_len, candidate);
+    if (!result)
+        memcpy(digest, candidate, sizeof(candidate));
+    kfree_sensitive(description);
+out:
+    memzero_explicit(candidate, sizeof(candidate));
+    crypto_free_shash(tfm);
+    return result;
 }
