@@ -20,3 +20,20 @@ Unpublished legacy test ioctl numbers still exist for caller migration, but thei
 production handlers return EOPNOTSUPP. Tests call retained actual wrappers instead. Model tests are historical; the default runtime has no SecurityInner/RpaManager.
 The real WS73 Native discovery implementation is untouched and needs regression
 on each new kernel in a VM with real devices before hardware preservation claims.
+
+SDK111 security event envelope proof (CBMC 6.11.0):
+  cbmc tools/testing/selftests/sparklink/security/relay_envelope_cbmc.c \
+    --function main --unwind 266 --unwinding-assertions --bounds-check \
+    --pointer-check --signed-overflow-check --unsigned-overflow-check \
+    --conversion-check --trace
+
+The harness includes the actual driver dli.c. Packets are nondeterministic,
+0..265 bytes, dynamically allocated at the advertised input size; allocation
+failure is not excluded. All header/status/handle/index/payload bytes are free.
+Properties cover recognition, exact nested lengths and memory/arithmetic safety.
+No alignment/padding from the reference Host's C structures is assumed. The
+scope does not cover framing above 265 bytes, RF, command serialization,
+generation/lifetime attribution, key validation, or security state transitions.
+Record the exact source/harness hashes, command, tool version and terminal result
+for each run. Timeout, missing tools, unsupported or incomplete unwinding are
+NOT_PROVEN, never a hardware or pairing PASS.
