@@ -56,7 +56,7 @@ int sparklink_native_transport_validate_connection(struct sparklink_native_trans
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,
 				       u16 opcode, const u8 *params, size_t length);
 int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
-				   struct sparklink_native_tx_ticket *ticket, u16 handle, const u8 *data, size_t length);
+				   struct sparklink_native_tx_ticket *ticket, u16 handle, u8 boundary, const u8 *data, size_t length);
 bool sparklink_native_transport_has_acb(struct sparklink_native_transport *transport);
 
 #endif
