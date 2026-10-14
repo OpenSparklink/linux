@@ -12,11 +12,11 @@ import subprocess
 import tempfile
 
 
-def run(output, timeout, baseline):
+def run(output, timeout, baseline, kind='complete'):
     here = Path(__file__).resolve().parent
     root = here.parents[3]
     driver = root / 'drivers/sparklink/ws73'
-    harness = here / 'security/relay_complete_cbmc.c'
+    harness = here / ('security/relay_' + kind + '_cbmc.c')
     paths = [driver / 'dli.c', *sorted(driver.glob('*.h')), harness]
     originals = {p: p.read_bytes() for p in paths}
     source = originals[driver / 'dli.c']
@@ -67,7 +67,8 @@ def run(output, timeout, baseline):
               'tool_version': subprocess.check_output(['cbmc', '--version'], text=True).strip(),
               'command': command, 'log_sha256': hashlib.sha256(log.encode()).hexdigest(),
               'generated_checks': re.findall(r'(\d+) of (\d+) failed', log),
-              'scope': 'Actual production ws73_dli_validate_reply: memory safety for arbitrary allocated bytes[265]/length0..265, successful1812 exact13-byte frame/handle12bit; no second parser',
+              'scope': ('Actual production ws73_dli_validate_reply: memory safety for arbitrary allocated bytes[265]/length0..265, successful1812 exact13-byte frame/handle12bit; no second parser' if kind == 'complete' else
+                        'Actual production relay prepare/RX normalization: bytes265/length0..265, handle/index0..65535, payload/capacity0..255; mapping, frozen wire echo, byte preservation and failure atomicity; no second codec'),
               'assumptions': ['Valid allocated C packet object; actual lifetime/generation/locks/USB/firmware outside this harness',
                               'Lengths beyond265 outside this bounded model; packet contents are not trusted'],
               'trusted_base': ['CBMC C front-end/solver and C semantics; not a proof of Linux, firmware or hardware'],
@@ -83,5 +84,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--baseline', help='Replay an actual old committed validator; require a counterexample')
+    parser.add_argument('--kind', choices=['complete', 'index'], default='complete')
     args = parser.parse_args()
-    raise SystemExit(0 if run(args.output, args.timeout, args.baseline) else 1)
+    if args.baseline and args.kind != 'complete':
+        parser.error('Old-source counterexample replay applies only to the Complete harness')
+    raise SystemExit(0 if run(args.output, args.timeout, args.baseline, args.kind) else 1)

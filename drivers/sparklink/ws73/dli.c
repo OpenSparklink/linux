@@ -402,10 +402,10 @@ int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
      * establish TX255; current negotiated SM messages fit, oversize rejects. */
     if (size > 250 || capacity < size + 5)
         return -EMSGSIZE;
-    params[0] = handle; params[1] = handle >> 8;
+    params[0] = handle & 0xff; params[1] = handle >> 8;
     /* SDK111 gle_sm_cmd_list[26] uses1ff/1byte, unlike standard147.
      * Keep canonical policy in Host and correlate Complete with raw wire. */
-    params[2] = wire_index; params[3] = wire_index >> 8;
+    params[2] = wire_index & 0xff; params[3] = wire_index >> 8;
     params[4] = size;
     if (size) memcpy(params + 5, payload, size);
     *opcode = 0x1812;
