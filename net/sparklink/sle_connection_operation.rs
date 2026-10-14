@@ -319,6 +319,18 @@ mod tests {
         c.reserve(42,2,20,create(),0,100,None).unwrap();c.sent(20).unwrap();
         assert_eq!(c.reject_before_send(20,-116),Err(Error::Mismatch));
     }
+
+    #[test]
+    fn certified_unqueued_selection_preserves_cancel_and_rejects_real_evidence() {
+        let mut c=Connections::new();c.reserve(1,1,20,create(),0,30,None).unwrap();c.sent(20).unwrap();
+        c.cancel(1,1).unwrap();c.never_submitted(20,-12).unwrap();assert!(c.clear());
+        let o=c.query(1,1).unwrap();assert_eq!(o.state,State::Cancelled);assert!(o.command_status.is_none());assert!(o.outcome_status.is_none());
+        for accepted in [false,true] {
+            let mut c=Connections::new();c.reserve(1,1,20,create(),0,30,None).unwrap();c.sent(20).unwrap();
+            if accepted {c.status(20,0).unwrap();}else{c.out_complete(20);}
+            assert_eq!(c.never_submitted(20,-12),Err(Error::Mismatch));assert!(!c.clear());
+        }
+    }
     #[test] fn status_is_acceptance_and_all_three_evidences_are_required() {
         for order in [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
             let mut s=session();
