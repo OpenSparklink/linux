@@ -44,8 +44,9 @@ impl CmdRequestQueue {
 }
 // @@ACTUAL_HOST@@
 // @@COMMAND_CALLBACK@@
+// @@COMMAND_OUTCOME@@
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
- connections:sle_connection_operation::Connections::new(),credits:1,active:None,reply:None,fault:None,next_cookie:1,
+ connections:sle_connection_operation::Connections::new(),credits:1,credit_revision:0,active:None,reply:None,fault:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
  grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){unsafe{kernel::bindings::jiffies_64=now}}
@@ -129,6 +130,34 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
   clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();
   if revoke {h.revoke_connections();}else{h.cancel_connection(42,1).unwrap();}
   assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(-125));assert!(!h.active.as_ref().unwrap().transport_submitted);
+ }
+}
+
+#[test] fn definitely_unsubmitted_cancel_releases_only_software_reservation(){
+ clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();
+ h.cancel_connection(42,1).unwrap();assert_eq!(h.credits,0);
+ assert_eq!(h.abort_unsubmitted(r.cookie,-125),Ok(()));assert_eq!(h.credits,1);assert!(h.active.is_none());
+ assert!(h.fault.is_none());assert!(h.connections.clear());
+ let result=h.connection_result(42,1).unwrap();assert_eq!(result.state,sle_connection_operation::State::Cancelled);
+ assert!(result.command_status.is_none());assert!(result.outcome_status.is_none());
+ create(&mut h,2);assert!(h.next(|_|true).unwrap().is_some());
+}
+
+#[test] fn unsubmitted_credit_rollback_never_adds_to_new_absolute_grant(){
+ for grant in [0,1,255] {
+  clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],9,100).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+  h.receive(SleEvent::CommandCredits{credits:grant});
+  if grant==0 {assert_eq!(h.validate_command_commit(r.cookie,r.opcode),Err(EAGAIN));}
+  assert_eq!(h.abort_unsubmitted(r.cookie,-12),Ok(()));assert_eq!(h.credits,grant);
+  assert!(h.fault.is_none());assert!(h.active.is_none());
+ }
+}
+
+#[test] fn real_submit_reply_fault_and_cleanup_do_not_allow_credit_rollback(){
+ for case in 0..4 {
+  clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],9,100).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+  match case {0=>h.command_committed(r.cookie),1=>{h.receive(SleEvent::NativeCommandReply{opcode:r.opcode,command_credits:1,status:0,complete:true,data:vec![]});},2=>{h.fault=Some(EIO);},_=>{h.credit_revision=u64::MAX;h.receive(SleEvent::CommandCredits{credits:1});}}
+  let credits=h.credits;assert!(h.abort_unsubmitted(r.cookie,-12).is_err());assert_eq!(h.credits,credits);
  }
 }
 #[test] fn settled_revoke_new_lease_accepts_create_without_losing_history_or_credits(){

@@ -21,6 +21,8 @@ def run(output=None):
     start=native.index("struct NativeCommandTicket<'a> {");end=native.index('\n}',start)+2
     callback=function(re.sub(r'unsafe extern "C" fn (\w+)',r'unsafe fn \1',native),'sparklink_native_command_commit_rust')
     fixture=fixture.replace('// @@COMMAND_CALLBACK@@',(here/'native-ticket/command_commit.rs').read_text().replace('// @@TICKET@@',native[start:end]).replace('// @@COMMIT@@',callback).replace('super::ControllerRuntime','ControllerRuntime'))
+    outcome=(here/'native-ticket/command_outcome.rs').read_text().replace('// @@SEND@@',function(native,'send_typed')).replace('super::ControllerRuntime','ControllerRuntime').replace('Error::from_errno(','error_from_errno(')
+    fixture=fixture.replace('// @@COMMAND_OUTCOME@@',outcome)
     with tempfile.TemporaryDirectory(prefix='sparklink-native-connection-host-') as tmp:
         tmp=Path(tmp)
         for n in names[1:]:(tmp/n).write_bytes(inputs[n])
