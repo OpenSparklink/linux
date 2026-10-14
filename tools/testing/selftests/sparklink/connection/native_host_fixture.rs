@@ -441,4 +441,15 @@ fn relay_host() -> (CommandHost,super::sle_security_relay::Command) {
  assert_ne!(c.commit(||panic!("withdrawn submission revived")),0);
 }
 
+#[test] fn actual_driver_wire_echo_is_frozen_separately_from_canonical_index() {
+ let(mut h,mut c)=relay_host();c.bind_wire_echo_index(0x01ff);
+ h.enqueue_relay(0x1812,&[0,0,0xff,1,1,2],100,c.clone()).unwrap();let q=h.next(|_|true).unwrap().unwrap();
+ assert_eq!(h.commit_relay(q.cookie,||0),0);h.command_committed(q.cookie);h.transport_complete(q.cookie);
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:255,status:0,complete:true,data:vec![0,0,0x47,1]});
+ assert_eq!(h.credits,0);assert!(h.take_reply().is_none());assert!(h.active.is_some());
+ h.revoke_connections(); // Retain the submitted wire obligation, not the author's grant.
+ h.receive(SleEvent::NativeCommandReply{opcode:0x1812,command_credits:1,status:0,complete:true,data:vec![0,0,0xff,1]});
+ assert!(h.take_reply().is_some());assert_eq!(h.credits,1);assert_ne!(c.commit(||panic!("revoked reused")),0);
+}
+
 }

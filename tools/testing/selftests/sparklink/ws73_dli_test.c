@@ -476,26 +476,58 @@ static void security_event_tests(void)
 
 static void relay_command_tests(void)
 {
- unsigned char params[255],payload[255];unsigned short opcode;
+ unsigned char params[255],payload[255];unsigned short opcode, echo_index;
  memset(payload,0xa5,sizeof(payload));
  for(unsigned int n=0;n<=250;n++) {
   memset(params,0xcc,sizeof(params));opcode=0xaaaa;
-  CHECK(ws73_dli_relay_prepare(0x0fff,0x0147,payload,n,&opcode,params,sizeof(params))==(int)n+5);
-  CHECK(opcode==0x1812&&u16(params)==0x0fff&&u16(params+2)==0x0147&&params[4]==n);
+  CHECK(ws73_dli_relay_prepare(0x0fff,0x0147,payload,n,&opcode,params,sizeof(params),&echo_index)==(int)n+5);
+  CHECK(opcode==0x1812&&u16(params)==0x0fff&&u16(params+2)==0x01ff&&echo_index==0x01ff&&params[4]==n);
   CHECK(!memcmp(params+5,payload,n));CHECK(!ws73_dli_relay_validate(opcode,params,n+5));
   CHECK(ws73_dli_validate_command(opcode,params,n+5)==-EOPNOTSUPP);
  }
  for(unsigned int n=251;n<=255;n++) {
   memset(params,0xcc,sizeof(params));opcode=0xaaaa;
-  CHECK(ws73_dli_relay_prepare(0,0x0147,payload,n,&opcode,params,sizeof(params))==-EMSGSIZE);
+  CHECK(ws73_dli_relay_prepare(0,0x0147,payload,n,&opcode,params,sizeof(params),&echo_index)==-EMSGSIZE);
   CHECK(opcode==0xaaaa&&params[0]==0xcc&&params[254]==0xcc);
  }
- CHECK(ws73_dli_relay_prepare(0x1000,0x0147,payload,1,&opcode,params,sizeof(params))==-EINVAL);
- CHECK(ws73_dli_relay_prepare(0,0x0147,payload,1,&opcode,params,5)==-EMSGSIZE);
+ CHECK(ws73_dli_relay_prepare(0x1000,0x0147,payload,1,&opcode,params,sizeof(params),&echo_index)==-EINVAL);
+ CHECK(ws73_dli_relay_prepare(0,0x0147,payload,1,&opcode,params,5,&echo_index)==-EMSGSIZE);
  CHECK(ws73_dli_relay_validate(0x1812,NULL,5)==-EINVAL);
  CHECK(ws73_dli_relay_validate(0x1812,params,256)==-EINVAL);
  CHECK(ws73_dli_relay_validate(0x1c03,params,6)==-EOPNOTSUPP);
  params[0]=params[1]=0;params[4]=2;CHECK(ws73_dli_relay_validate(0x1812,params,6)==-EPROTO);
+}
+
+static void relay_index_tests(void)
+{
+	unsigned char wire[12] = {0xa2, 0x14, 0, 6, 0, 0xff, 0x0f, 0xff, 1, 1, 2, 0};
+	unsigned char original[12], normalized[12];
+
+	memcpy(original, wire, sizeof(wire));
+	memset(normalized, 0xcc, sizeof(normalized));
+	CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, sizeof(normalized)) == 11);
+	CHECK(!memcmp(wire, original, sizeof(wire)));
+	CHECK(normalized[7] == 0x47 && normalized[8] == 1 && normalized[10] == 2 && normalized[11] == 0xcc);
+	for (unsigned int i = 0; i < 11; i++)
+		if (i != 7 && i != 8)
+			CHECK(normalized[i] == wire[i]);
+	for (unsigned int capacity = 0; capacity < 11; capacity++) {
+		memset(normalized, 0xcc, sizeof(normalized));
+		CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, capacity) == -EMSGSIZE);
+		for (unsigned int i = 0; i < sizeof(normalized); i++)
+			CHECK(normalized[i] == 0xcc);
+	}
+	CHECK(ws73_dli_relay_normalize_rx(NULL, 11, normalized, sizeof(normalized)) == -EINVAL);
+	CHECK(ws73_dli_relay_normalize_rx(wire, 11, NULL, 11) == -EMSGSIZE);
+	wire[6] = 0x10;
+	CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, sizeof(normalized)) == -EPROTO);
+	wire[6] = 0;
+	wire[3] = 7; wire[9] = 2;
+	CHECK(ws73_dli_relay_normalize_rx(wire, 12, normalized, sizeof(normalized)) == -EPROTO);
+	wire[3] = 6; wire[9] = 1; wire[7] = 0x47;
+	CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, sizeof(normalized)) == 0);
+	wire[7] = 0xff; wire[1] = 2;
+	CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, sizeof(normalized)) == 0);
 }
 
 int main(void)
@@ -515,6 +547,7 @@ int main(void)
 	link_event_tests();
 	security_event_tests();
 	relay_command_tests();
+	relay_index_tests();
 	reply_tests();
 	command_tests();
 	query_tests();

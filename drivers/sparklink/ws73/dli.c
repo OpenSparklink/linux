@@ -392,18 +392,49 @@ int ws73_dli_relay_validate(unsigned int opcode, const unsigned char *params, si
 }
 int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
     const unsigned char *payload, size_t size, unsigned short *opcode,
-    unsigned char *params, size_t capacity)
+    unsigned char *params, size_t capacity, unsigned short *echo_index)
 {
-    if (!opcode || !params || handle > 0x0fff || index > 65535 || (size && !payload))
+    unsigned int wire_index = index == 0x0147 ? 0x01ff : index;
+
+    if (!opcode || !params || !echo_index || handle > 0x0fff || index > 65535 || (size && !payload))
         return -EINVAL;
     /* Confirmed command budget includes the relay envelope. RX255 does not
      * establish TX255; current negotiated SM messages fit, oversize rejects. */
     if (size > 250 || capacity < size + 5)
         return -EMSGSIZE;
     params[0] = handle; params[1] = handle >> 8;
-    params[2] = index; params[3] = index >> 8;
+    /* SDK111 gle_sm_cmd_list[26] uses1ff/1byte, unlike standard147.
+     * Keep canonical policy in Host and correlate Complete with raw wire. */
+    params[2] = wire_index; params[3] = wire_index >> 8;
     params[4] = size;
     if (size) memcpy(params + 5, payload, size);
     *opcode = 0x1812;
+    *echo_index = wire_index;
     return size + 5;
+}
+
+int ws73_dli_relay_normalize_rx(const unsigned char *data, size_t size,
+    unsigned char *out, size_t capacity)
+{
+    int ret;
+
+    if (!data)
+        return -EINVAL;
+    if (size < 3 || data[0] != 0xa2 || dli_u16(data + 1) != 0x0014)
+        return 0;
+    ret = ws73_dli_validate_security_event(data, size);
+    if (ret)
+        return ret;
+    if (dli_u16(data + 7) != 0x01ff)
+        return 0;
+    /* The SDK111 failure entry has exactly one reason byte. No truncation,
+     * fabricated reply or change to the original snoop/USB packet. */
+    if (size != 11 || dli_u16(data + 5) > 0x0fff)
+        return -EPROTO;
+    if (!out || capacity < size)
+        return -EMSGSIZE;
+    memcpy(out, data, size);
+    out[7] = 0x47;
+    out[8] = 0x01;
+    return size;
 }

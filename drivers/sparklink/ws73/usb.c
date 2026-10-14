@@ -777,6 +777,16 @@ static int ws73_native_packet(void *context, unsigned int service, unsigned int 
 		if (ret)
 			return ret;
 	}
+	{
+		u8 normalized[11];
+
+		ret = ws73_dli_relay_normalize_rx(data, size, normalized, sizeof(normalized));
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			return sparklink_native_receive(ws->native_id, ws->native_generation,
+						 normalized, ret);
+	}
 	ret = sparklink_native_receive(ws->native_id, ws->native_generation, data, size);
 	if (ret == -EOPNOTSUPP) {
 		atomic_inc(&ws->unsupported_rx);
@@ -906,9 +916,9 @@ static int ws73_native_validate_connection(void *context, unsigned int operation
 
 
 static int ws73_native_prepare_relay(void *context, u16 handle, u16 index,
-    const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity)
+    const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity, u16 *echo_index)
 {
-    return ws73_dli_relay_prepare(handle, index, payload, size, opcode, params, capacity);
+    return ws73_dli_relay_prepare(handle, index, payload, size, opcode, params, capacity, echo_index);
 }
 static int ws73_native_validate_relay(void *context, u16 opcode, const u8 *params, size_t size)
 {

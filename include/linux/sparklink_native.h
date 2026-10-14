@@ -94,9 +94,12 @@ struct sparklink_native_ops {
     int (*validate_connection)(void *context, unsigned int operation,
         u16 opcode, const u8 *params, size_t length);
     /* Internal Host relay only. Missing callbacks reject, never grant raw
-     * ioctl authority. Wire layout and finite parameter budget are driver-owned. */
+     * ioctl authority. Wire layout and finite parameter budget are driver-owned. The returned
+     * echo_index names the actual transmitted index, frozen before admission;
+     * canonical SMP identity is separate. */
     int (*prepare_relay)(void *context, u16 handle, u16 index,
-        const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity);
+        const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity,
+        u16 *echo_index);
     int (*validate_relay)(void *context, u16 opcode, const u8 *params, size_t size);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
 	/* Optional atomic command submission. Prepare outside Host locks, then

@@ -73,7 +73,10 @@ int ws73_dli_query(struct ws73_bsle_io *io, unsigned int *credits,
 /* Typed relay prepare returns exact parameter bytes, no I/O or truncation. */
 int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
     const unsigned char *payload, size_t size, unsigned short *opcode,
-    unsigned char *params, size_t capacity);
+    unsigned char *params, size_t capacity, unsigned short *echo_index);
+/* SDK111 wire failure1ff -> canonical147; original packet is never changed. */
+int ws73_dli_relay_normalize_rx(const unsigned char *data, size_t size,
+    unsigned char *out, size_t capacity);
 int ws73_dli_relay_validate(unsigned int opcode, const unsigned char *params, size_t size);
 
 #endif

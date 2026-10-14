@@ -13,7 +13,7 @@
 /* Internal opaque transport helpers called by Rust, not exported UAPI. */
 struct sparklink_native_transport;
 int sparklink_native_transport_prepare_relay(struct sparklink_native_transport *transport,
-    u16 handle, u16 index, const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity);
+    u16 handle, u16 index, const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity, u16 *echo_index);
 int sparklink_native_transport_validate_relay(struct sparklink_native_transport *transport,
     u16 opcode, const u8 *params, size_t size);
 bool sparklink_native_transport_has_command_ticket(struct sparklink_native_transport *transport);
@@ -252,12 +252,12 @@ int sparklink_native_transport_validate_connection(struct sparklink_native_trans
 
 int sparklink_native_transport_prepare_relay(struct sparklink_native_transport *transport,
     u16 handle, u16 index, const u8 *payload, size_t size, u16 *opcode,
-    u8 *params, size_t capacity)
+    u8 *params, size_t capacity, u16 *echo_index)
 {
     if (!transport->ops.prepare_relay)
         return -EOPNOTSUPP;
     return transport->ops.prepare_relay(transport->context, handle, index,
-                                      payload, size, opcode, params, capacity);
+                                      payload, size, opcode, params, capacity, echo_index);
 }
 int sparklink_native_transport_validate_relay(struct sparklink_native_transport *transport,
     u16 opcode, const u8 *params, size_t size)

@@ -186,6 +186,10 @@ impl Command {
     /// SDK111 successful Complete echoes this submission's handle and index.
     /// Error Status/Complete has no guaranteed echo and can only end in failure.
     /// The echo has no lifetime token; reuse still needs a proven wire barrier.
+    /// Frozen driver wire echo; set before cloning/admission, never after TX.
+    pub(crate) fn bind_wire_echo_index(&mut self, index: u16) {
+        self.index = index;
+    }
     pub(crate) fn reply_matches(&self, complete: bool, status: u8, data: &[u8]) -> bool {
         !complete || status != 0 || (data.len() == 4
             && u16::from_le_bytes([data[0], data[1]]) == self.ticket.identity.handle
@@ -269,7 +273,7 @@ impl super::ControllerRuntime {
                 return Err(e);
             }
         };
-        let (command, packet) = unsafe { Command::prepare_denial(pointer, identity, deadline) }?;
+        let (mut command, packet) = unsafe { Command::prepare_denial(pointer, identity, deadline) }?;
         let super::sle_dli::ControllerBackend::Native(controller) = &runtime.controller;
         let plan = match controller.prepare_relay(&packet) {
             Ok(p) => p,
@@ -278,6 +282,7 @@ impl super::ControllerRuntime {
                 return Err(e);
             }
         };
+        command.bind_wire_echo_index(plan.3);
         let retained = command.clone();
         let mut host = self.host.lock();
         let gate = self.schedule_gate.lock();

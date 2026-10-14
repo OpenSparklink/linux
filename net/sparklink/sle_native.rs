@@ -74,7 +74,7 @@ struct NativeConnectionRequest { operation: u32, handle: u32, reason: u32, param
 pub(crate) struct NativeConnectionPlan { pub operation: u32, pub opcode: u16, pub length: u16, pub params: [u8; 32] }
 extern "C" {
     fn sparklink_native_transport_prepare_relay(transport:*mut c_void, handle:u16, index:u16,
-        payload:*const u8, size:usize, opcode:*mut u16, params:*mut u8, capacity:usize)->i32;
+        payload:*const u8, size:usize, opcode:*mut u16, params:*mut u8, capacity:usize, echo_index:*mut u16)->i32;
     fn sparklink_native_transport_validate_relay(transport:*mut c_void, opcode:u16, params:*const u8, size:usize)->i32;
     fn sparklink_native_transport_prepare_connection(transport: *mut c_void,
         request: *const NativeConnectionRequest, plan: *mut NativeConnectionPlan) -> i32;
@@ -217,15 +217,15 @@ impl NativeController {
         Ok(plan)
     }
 
-    pub(crate) fn prepare_relay(&self, packet:&super::sle_security_relay_state::Packet)->Result<(u16,[u8;255],usize)> {
-        let mut opcode=0;let mut params=[0;255];let bytes=packet.payload();
+    pub(crate) fn prepare_relay(&self, packet:&super::sle_security_relay_state::Packet)->Result<(u16,[u8;255],usize,u16)> {
+        let mut opcode=0;let mut params=[0;255];let mut echo_index=0;let bytes=packet.payload();
         // SAFETY: retained provider; synchronous side-effect-free dialect codec.
         let size=unsafe {sparklink_native_transport_prepare_relay(self.transport,packet.ticket.identity.handle,
-            packet.index,bytes.as_ptr(),bytes.len(),&mut opcode,params.as_mut_ptr(),params.len())};
+            packet.index,bytes.as_ptr(),bytes.len(),&mut opcode,params.as_mut_ptr(),params.len(),&mut echo_index)};
         if size<0 {return Err(Error::from_errno(size));}
         if size as usize>params.len() || opcode==0 {return Err(EINVAL);}
         Self::result(unsafe {sparklink_native_transport_validate_relay(self.transport,opcode,params.as_ptr(),size as usize)})?;
-        Ok((opcode,params,size as usize))
+        Ok((opcode,params,size as usize,echo_index))
     }
 
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
