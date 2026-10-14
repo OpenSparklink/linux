@@ -170,6 +170,7 @@ int ws73_dli_validate_reply(const unsigned char *data, size_t size)
 	case 0x0c05:
 	case 0x1001:
 	case 0x1002:
+	case 0x1812: /* typed relay Complete, not raw command authorization */
 		expected = 0;
 		break;
 	default:
@@ -373,4 +374,32 @@ int ws73_dli_query(struct ws73_bsle_io *io, unsigned int *credits,
 		return -EPROTO;
 	*info = candidate;
 	return 0;
+}
+
+int ws73_dli_relay_validate(unsigned int opcode, const unsigned char *params, size_t size)
+{
+    if (!params || size < 5 || size > 255)
+        return -EINVAL;
+    if (opcode != 0x1812)
+        return -EOPNOTSUPP;
+    if (dli_u16(params) > 0x0fff || (size_t)params[4] + 5 != size)
+        return -EPROTO;
+    return 0;
+}
+int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
+    const unsigned char *payload, size_t size, unsigned short *opcode,
+    unsigned char *params, size_t capacity)
+{
+    if (!opcode || !params || handle > 0x0fff || index > 65535 || (size && !payload))
+        return -EINVAL;
+    /* Confirmed command budget includes the relay envelope. RX255 does not
+     * establish TX255; current negotiated SM messages fit, oversize rejects. */
+    if (size > 250 || capacity < size + 5)
+        return -EMSGSIZE;
+    params[0] = handle; params[1] = handle >> 8;
+    params[2] = index; params[3] = index >> 8;
+    params[4] = size;
+    if (size) memcpy(params + 5, payload, size);
+    *opcode = 0x1812;
+    return size + 5;
 }

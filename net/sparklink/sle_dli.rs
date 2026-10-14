@@ -843,6 +843,8 @@ pub enum SleEvent {
         complete: bool,
         data: KVec<u8>,
     },
+    /// Native controller relay, lifetime frozen at ingress, never security trust.
+    NativeControllerData { lifetime:u64, handle:u16, index:u16, data:KVec<u8> },
     /// Advertising / broadcast report received during scanning.
     AdvReport {
         addr: [u8; 6],

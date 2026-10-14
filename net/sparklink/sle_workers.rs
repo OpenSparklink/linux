@@ -209,6 +209,11 @@ impl WorkItem<0> for ControllerRuntime {
                 let count = sle_ingress::drain_runtime_events(&this, &mut tagged[..budget]);
                 for item in tagged.iter_mut().take(count) {
                     let (id, event) = core::mem::take(item);
+                    if let Some(sle_dli::SleEvent::NativeControllerData {lifetime,handle,index,data})=&event {
+                        if let Err(error)=this.deny_unapproved_pairing(runtime,*lifetime,*handle,*index,data.as_slice()) {
+                            pr_debug!("sparklink: relay admission refused {}\n",error.to_errno());
+                        }
+                    }
                     if event.is_some() {
                         debug_assert_eq!(id, Some(this.identity.id));
                         pumped += 1;
@@ -307,7 +312,7 @@ impl WorkItem<1> for ControllerRuntime {
             // spans a blocking transport transfer or join.
             drop(guard);
             match transport.submit(&this, request.cookie, request.opcode,
-                &request.params[..request.param_len as usize], request.recipe, request.connection) {
+                &request.params[..request.param_len as usize], request.recipe, request.connection, request.relay.is_some()) {
                 Ok(()) => {
                     if this.host.lock().transport_complete(request.cookie) { this.schedule_rx(0); }
                 }

@@ -10,6 +10,16 @@
 #include <linux/sparklink_channel.h>
 #include <uapi/linux/sparklink_ioctl.h>
 
+/* Internal opaque transport helpers called by Rust, not exported UAPI. */
+struct sparklink_native_transport;
+int sparklink_native_transport_prepare_relay(struct sparklink_native_transport *transport,
+    u16 handle, u16 index, const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity);
+int sparklink_native_transport_validate_relay(struct sparklink_native_transport *transport,
+    u16 opcode, const u8 *params, size_t size);
+bool sparklink_native_transport_has_command_ticket(struct sparklink_native_transport *transport);
+int sparklink_native_transport_command_ticketed(struct sparklink_native_transport *transport,
+    struct sparklink_native_command_ticket *ticket, u16 opcode, const u8 *params, size_t length);
+
 static_assert(sizeof(struct sparklink_native_info) == 32);
 static_assert(sizeof(struct sparklink_backend_pending) == 16);
 static_assert(sizeof(struct sparklink_native_link_evidence) == 28);
@@ -238,6 +248,23 @@ int sparklink_native_transport_validate_connection(struct sparklink_native_trans
     if (!transport->ops.validate_connection)
         return -EOPNOTSUPP;
     return transport->ops.validate_connection(transport->context, operation, opcode, params, length);
+}
+
+int sparklink_native_transport_prepare_relay(struct sparklink_native_transport *transport,
+    u16 handle, u16 index, const u8 *payload, size_t size, u16 *opcode,
+    u8 *params, size_t capacity)
+{
+    if (!transport->ops.prepare_relay)
+        return -EOPNOTSUPP;
+    return transport->ops.prepare_relay(transport->context, handle, index,
+                                      payload, size, opcode, params, capacity);
+}
+int sparklink_native_transport_validate_relay(struct sparklink_native_transport *transport,
+    u16 opcode, const u8 *params, size_t size)
+{
+    if (!transport->ops.validate_relay)
+        return -EOPNOTSUPP;
+    return transport->ops.validate_relay(transport->context, opcode, params, size);
 }
 
 int sparklink_native_transport_command(struct sparklink_native_transport *transport,

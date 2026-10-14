@@ -20,6 +20,7 @@ struct InFlight {
     deadline: u64,
     recipe: Option<RecipeTag>,
     connection: Option<u32>,
+    relay: Option<super::sle_security_relay::Command>,
     connection_reference: Option<super::sle_connection_operation::ExpectedLink>,
     transport_done: bool,
     transport_submitted: bool,
@@ -94,6 +95,26 @@ impl CommandHost {
             }),
             GFP_KERNEL,
         )
+    }
+
+    fn validate_relay(&self, command:&super::sle_security_relay::Command)->Result {
+        if let Some(e)=self.fault {return Err(e);}
+        let id=command.ticket.identity;
+        if !self.admits_data() || !self.grants.permits(id.grant_epoch) {return Err(Error::from_errno(-(kernel::bindings::EACCES as i32)));}
+        let (_,known,links)=self.links.snapshot();
+        if !known || !links.iter().flatten().any(|l|l.lifetime==id.lifetime&&l.handle==id.handle) {return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));}
+        Ok(())
+    }
+    pub(crate) fn enqueue_relay(&mut self, opcode:u16, params:&[u8], deadline:u64,
+        command:super::sle_security_relay::Command)->Result {
+        self.validate_relay(&command)?;
+        let cookie=self.next_cookie;let next=cookie.checked_add(1).ok_or(EOVERFLOW)?;
+        self.requests.push_relay(opcode,params,cookie,deadline,command).map_err(Error::from)?;
+        self.next_cookie=next;Ok(())
+    }
+    pub(crate) fn commit_relay(&self, cookie:u64, submit:impl FnOnce()->i32)->i32 {
+        let Some(active)=self.active.as_ref().filter(|a|a.cookie==cookie) else {return EINVAL.to_errno();};
+        if let Some(relay)=&active.relay {relay.commit(submit)} else {submit()}
     }
 
     pub(crate) fn enqueue(&mut self, opcode: u16, params: &[u8], seq: u32) -> Result {
@@ -286,6 +307,8 @@ impl CommandHost {
         // Actual submit takes this same lock. Already queued URBs retain debt.
         self.grants.revoke();
         self.data_revoked = true;
+        self.requests.expire_relays(u64::MAX);
+        if let Some(relay)=self.active.as_ref().and_then(|a|a.relay.as_ref()) {relay.withdraw();}
         if let Some(cookie) = self.connections.revoke() { self.requests.remove_cookie(cookie); }
     }
 
@@ -344,6 +367,7 @@ impl CommandHost {
         self.links.observe(evidence);
         // SAFETY: reads only the registration-local deadline clock.
         let now = unsafe { kernel::bindings::jiffies_64 };
+        self.requests.expire_relays(now);
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         // Independent physical obligations are updated even for unmatched,
         // cancelled, failed or evicted author results. Never infer a link from Status.
@@ -497,6 +521,7 @@ impl CommandHost {
     pub(crate) fn next(&mut self, valid_raw: impl Fn(u32) -> bool) -> Result<Option<CmdRequest>> {
         // SAFETY: read only the clock under this owner's Host lock.
         let now = unsafe { kernel::bindings::jiffies_64 };
+        self.requests.expire_relays(now);
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         if let Some(error) = self.connections.fault_reason() { return Err(Error::from_errno(error)); }
         if !self.can_send() {
@@ -511,6 +536,9 @@ impl CommandHost {
             // Disconnect at the queue front when an exact handle is available.
             if self.revoking && self.requests.first_recipe().is_some() && !self.links_clear_for_management() { return Ok(None); }
             let Some(request) = self.requests.pop() else { return Ok(None) };
+            if let Some(relay)=&request.relay {
+                if self.validate_relay(relay).is_err() || now>=request.deadline {relay.withdraw();continue;}
+            }
             if request.connection.is_some() {
                 if let Some(reference) = self.connections.reference(request.cookie) {
                     if !self.links.matches(reference.lifetime, reference.handle, reference.role,
@@ -591,6 +619,7 @@ impl CommandHost {
                 .min(request.deadline),
             recipe: request.recipe,
             connection: request.connection,
+            relay: request.relay.clone(),
             connection_reference: self.connections.reference(request.cookie),
             transport_done: false,
             transport_submitted: false,
@@ -607,6 +636,7 @@ impl CommandHost {
     pub(crate) fn validate_command_commit(&self, cookie: u64, opcode: u16) -> Result {
         if let Some(error) = self.fault { return Err(error); }
         let active = self.active.as_ref().filter(|a| a.cookie == cookie && a.opcode == opcode).ok_or(EINVAL)?;
+        if let Some(relay)=&active.relay {self.validate_relay(relay)?;}
         if active.transport_submitted { return Err(Error::from_errno(-(kernel::bindings::EALREADY as i32))); }
         // SAFETY: read-only clock under this owner's IRQ-safe Host lock.
         if unsafe { kernel::bindings::jiffies_64 } >= active.deadline { return Err(ETIMEDOUT); }
@@ -661,6 +691,7 @@ impl CommandHost {
             self.requests.remove_cookie(cookie);
             if self.recipe.as_ref().is_some_and(|(root, _)| root.cookie == cookie) { self.recipe = None; }
         }
+        if let Some(relay)=active.relay.as_ref() {relay.withdraw();}
         self.active = None;
         self.credits = credits;
         Ok(()) // no controller status, Complete or observed radio state fabricated
@@ -729,6 +760,7 @@ impl CommandHost {
         if self.fault.is_some() { return false; }
         // SAFETY: absolute admission deadline, not a new USB completion budget.
         let now = unsafe { kernel::bindings::jiffies_64 };
+        self.requests.expire_relays(now);
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         let Some(active) = self.active.as_mut() else { return false; };
         if active.cookie != cookie { return false; }
@@ -854,6 +886,9 @@ impl CommandHost {
                 }
             }
         }
+        if let Some(relay)=&active.relay {
+            if let SleEvent::NativeCommandReply {complete,status,..}=&event {relay.reply(*complete,*status);}
+        }
         Some(HostReply {
             seq: active.seq,
             event,
@@ -868,7 +903,7 @@ impl CommandHost {
         let active = self.active.as_ref()
             .filter(|active| !active.transport_done || self.reply.is_none())
             .map(|active| active.deadline);
-        [revoke, active, self.requests.first_recipe_deadline(), self.connections.next_deadline()]
+        [revoke, active, self.requests.first_recipe_deadline(), self.requests.relay_deadline(), self.connections.next_deadline()]
             .into_iter().flatten().min()
     }
 
@@ -876,6 +911,7 @@ impl CommandHost {
         if self.fault.is_some() { return false; }
         // SAFETY: reading jiffies is safe in process/IRQ context.
         let now = unsafe { kernel::bindings::jiffies_64 };
+        self.requests.expire_relays(now);
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         !self.connections.clear() && self.connections.next_deadline().is_none()
             || self.next_deadline().is_some_and(|deadline| now >= deadline)
@@ -893,7 +929,10 @@ impl CommandHost {
         self.credits = 0;
         self.reply = None;
         if let Some((_, progress)) = &mut self.recipe { progress.cancel(); }
-        self.active.take().map(|active| active.seq)
+        self.active.take().map(|active| {
+            if let Some(relay)=&active.relay {relay.failed(active.transport_submitted);}
+            active.seq
+        })
     }
 
     pub(crate) fn cancel_next(&mut self) -> Option<CmdRequest> {

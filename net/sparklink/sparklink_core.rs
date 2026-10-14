@@ -33,6 +33,8 @@ mod sle_mgmt;
 mod sle_link_observation;
 mod sle_native;
 mod sle_sessions;
+mod sle_security_relay;
+mod sle_security_relay_state;
 mod sle_data_credit;
 mod sle_native_data;
 mod sle_snoop;

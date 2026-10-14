@@ -22,6 +22,7 @@
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sle_security_relay.h"
 
 _Static_assert(SL_SESSION_CHANNELS == 2 && SL_CHANNEL_USER_SLOT == 0 && SL_CHANNEL_SMTC_SLOT == 1, "fixed channel table bounds");
 _Static_assert(SL_GRANT_TX == SPARKLINK_SOCKET_TX && SL_GRANT_RX == SPARKLINK_SOCKET_RX, "grant direction UAPI mismatch");
@@ -39,6 +40,7 @@ struct sl_basic_channel {
 };
 struct sl_connection_session {
 	struct kref refs;
+	void *security; /* pinned Rust owner; same physical Session lifetime */
 	u16 controller, handle;
 	u64 generation, lifetime, epoch;
 	spinlock_t lock; /* state + channel; never spans blocking transport */
@@ -89,7 +91,13 @@ static void sl_session_destroy(struct kref *refs)
 		skb_queue_purge(&s->channels[i].tx);
 		skb_queue_purge(&s->channels[i].rx);
 	}
+	sl_security_owner_destroy_rust(s->security);
 	kfree(s);
+}
+void *sl_connection_session_security(void *opaque)
+{
+	struct sl_connection_session *s = opaque;
+	return s->security; /* immutable, caller retains a session kref */
 }
 void sl_connection_session_get(void *opaque)
 {
@@ -408,6 +416,8 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 	unsigned int i;
 	if (!s)
 		return NULL;
+	s->security = sl_security_owner_create_rust(controller, generation, lifetime, handle, epoch);
+	if (!s->security) { kfree(s); return NULL; }
 	kref_init(&s->refs);
 	s->controller = controller; s->generation = generation; s->lifetime = lifetime; s->handle = handle; s->epoch = epoch;
 	spin_lock_init(&s->lock);
@@ -434,6 +444,7 @@ void sl_connection_session_stop(void *opaque, int error)
 	struct sock *sockets[SL_SESSION_CHANNELS];
 	unsigned int i;
 
+	sl_security_owner_stop_rust(s->security);
 	spin_lock_irqsave(&s->lock, flags);
 	sl_channel_close(&s->progress);
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {

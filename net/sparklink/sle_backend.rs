@@ -10,7 +10,7 @@ use super::sle_command_plan::RecipeTag;
 /// peer receipt. Typed tags grant no raw command/management permission.
 pub(crate) trait CommandPort {
     fn submit(&self, owner: &super::ControllerRuntime, cookie: u64, opcode: u16,
-        params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result;
+        params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>, relay:bool) -> Result;
     /// Only after submit returns Err. False includes legacy/uncertain transport.
     fn never_submitted(&self) -> bool;
 }

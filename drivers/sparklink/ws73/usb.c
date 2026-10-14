@@ -905,6 +905,16 @@ static int ws73_native_validate_connection(void *context, unsigned int operation
 }
 
 
+static int ws73_native_prepare_relay(void *context, u16 handle, u16 index,
+    const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity)
+{
+    return ws73_dli_relay_prepare(handle, index, payload, size, opcode, params, capacity);
+}
+static int ws73_native_validate_relay(void *context, u16 opcode, const u8 *params, size_t size)
+{
+    return ws73_dli_relay_validate(opcode, params, size);
+}
+
 struct ws73_acb_transfer {
 	struct completion done;
 	struct urb *urb;
@@ -1035,6 +1045,8 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.validate_discovery_step = ws73_native_validate_step,
     .prepare_connection = ws73_native_prepare_connection,
     .validate_connection = ws73_native_validate_connection,
+    .prepare_relay = ws73_native_prepare_relay,
+    .validate_relay = ws73_native_validate_relay,
 	.send_command_ticketed = ws73_native_command,
 	.send_acb = ws73_native_acb,
 };

@@ -73,6 +73,9 @@ struct NativeConnectionRequest { operation: u32, handle: u32, reason: u32, param
 #[repr(C)]
 pub(crate) struct NativeConnectionPlan { pub operation: u32, pub opcode: u16, pub length: u16, pub params: [u8; 32] }
 extern "C" {
+    fn sparklink_native_transport_prepare_relay(transport:*mut c_void, handle:u16, index:u16,
+        payload:*const u8, size:usize, opcode:*mut u16, params:*mut u8, capacity:usize)->i32;
+    fn sparklink_native_transport_validate_relay(transport:*mut c_void, opcode:u16, params:*const u8, size:usize)->i32;
     fn sparklink_native_transport_prepare_connection(transport: *mut c_void,
         request: *const NativeConnectionRequest, plan: *mut NativeConnectionPlan) -> i32;
     fn sparklink_native_transport_validate_connection(transport: *mut c_void,
@@ -214,6 +217,17 @@ impl NativeController {
         Ok(plan)
     }
 
+    pub(crate) fn prepare_relay(&self, packet:&super::sle_security_relay_state::Packet)->Result<(u16,[u8;255],usize)> {
+        let mut opcode=0;let mut params=[0;255];let bytes=packet.payload();
+        // SAFETY: retained provider; synchronous side-effect-free dialect codec.
+        let size=unsafe {sparklink_native_transport_prepare_relay(self.transport,packet.ticket.identity.handle,
+            packet.index,bytes.as_ptr(),bytes.len(),&mut opcode,params.as_mut_ptr(),params.len())};
+        if size<0 {return Err(Error::from_errno(size));}
+        if size as usize>params.len() || opcode==0 {return Err(EINVAL);}
+        Self::result(unsafe {sparklink_native_transport_validate_relay(self.transport,opcode,params.as_ptr(),size as usize)})?;
+        Ok((opcode,params,size as usize))
+    }
+
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
         // SAFETY: this Backend retains the driver/context. Validation neither
         // performs I/O nor changes transaction/credit state; the driver owns
@@ -270,10 +284,15 @@ impl super::ControllerRuntime {
 impl NativeCommandTransport {
 
     pub(crate) fn send_typed(&self, owner: &super::ControllerRuntime, cookie: u64,
-        opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
+        opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>, relay:bool) -> Result {
         self.never_submitted.set(true); // validation performs no I/O
-        if connection.is_some() && recipe.is_some() { return Err(EINVAL); }
-        if let Some(operation) = connection {
+        if connection.is_some() && recipe.is_some() || relay && (connection.is_some() || recipe.is_some()) { return Err(EINVAL); }
+        if relay {
+            // Relay ledger/debt requires the final atomic ticket, never legacy
+            // unguarded send even if a provider implements dialect callbacks.
+            if !unsafe {sparklink_native_transport_has_command_ticket(self.transport)} {return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));}
+            NativeController::result(unsafe {sparklink_native_transport_validate_relay(self.transport,opcode,params.as_ptr(),params.len())})?;
+        } else if let Some(operation) = connection {
             // SAFETY: only the typed Host creates this tag. Retained driver
             // validates its dialect; raw validate_command remains query-only.
             NativeController::result(unsafe { sparklink_native_transport_validate_connection(
@@ -331,8 +350,8 @@ impl NativeCommandTransport {
 impl super::sle_backend::CommandPort for NativeCommandTransport {
     fn never_submitted(&self) -> bool { self.never_submitted.get() }
     fn submit(&self, owner: &super::ControllerRuntime, cookie: u64, opcode: u16,
-        params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>) -> Result {
-        self.send_typed(owner, cookie, opcode, params, recipe, connection)
+        params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>, relay:bool) -> Result {
+        self.send_typed(owner, cookie, opcode, params, recipe, connection, relay)
     }
 }
 
@@ -362,7 +381,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_command_commit_rust(
     if let Err(error) = host.validate_command_commit(ticket.cookie, ticket.opcode) { return error.to_errno(); }
     // SAFETY: prepared non-sleeping queue operation; guards serialize queueing
     // with Host withdrawal/link publication. No decode, wait or Host reentry.
-    let result = unsafe { submit.unwrap()(context) };
+    let result = host.commit_relay(ticket.cookie, || unsafe { submit.unwrap()(context) });
     if result == 0 {
         host.command_committed(ticket.cookie);
         ticket.submitted.set(true);
@@ -708,13 +727,24 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
     if packet[0] != 0xa2 || count != length - 5 { return PROTOCOL_ERROR; }
     let params = &packet[5..];
     if event == 0x0014 {
-        // ControllerData has an independent u8 payload length after its
-        // five-byte handle/index/length envelope: 255 + 5 + 5 = 265 on wire.
-        // Do not apply the command-event 260-byte budget to this event.
-        // The producer validates its dialect; common framing is checked here
-        // too. No security actor is enabled yet, so a valid packet is honestly
-        // unsupported, not accepted, a fake Complete or trusted peer state.
-        return if native_controller_data_valid(params) { UNSUPPORTED } else { PROTOCOL_ERROR };
+        if !native_controller_data_valid(params) {return PROTOCOL_ERROR;}
+        let handle=u16::from_le_bytes([params[0],params[1]]);
+        let index=u16::from_le_bytes([params[2],params[3]]);
+        let mut bytes=KVec::new();
+        if bytes.extend_from_slice(&params[5..],GFP_ATOMIC).is_err() {return ENOMEM.to_errno();}
+        let lifetime={
+            let host=owner.host.lock();let (_,known,links)=host.link_snapshot();
+            let gate=owner.schedule_gate.lock();
+            if *gate {return ENODEV.to_errno();}
+            if !host.admits_data() {return -(kernel::bindings::EACCES as i32);}
+            let Some(link)=links.iter().flatten().find(|link|known&&link.handle==handle) else {return -(kernel::bindings::ESTALE as i32);};
+            link.lifetime
+        };
+        // Freeze observed lifetime BEFORE queueing; a later link publication
+        // cannot reassign this software packet. Old firmware packets after
+        // handle reuse still require the separate physical drain barrier.
+        super::sle_ingress::enqueue_rx(&owner,SleEvent::NativeControllerData {lifetime,handle,index,data:bytes});
+        return 0; // finite ingress admission, never peer acceptance/authentication
     }
     if length > 260 { return PROTOCOL_ERROR; }
     if event == 9 {

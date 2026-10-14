@@ -12,6 +12,7 @@ pub(crate) struct CmdRequest {
     pub(crate) cookie: u64,
     pub(crate) recipe: Option<RecipeTag>,
     pub(crate) connection: Option<u32>,
+    pub(crate) relay: Option<super::sle_security_relay::Command>,
     pub(crate) deadline: u64,
     pub(crate) opcode: u16,
     pub(crate) params: [u8; RECIPE_PARAMS_MAX],
@@ -77,6 +78,7 @@ impl CmdRequestQueue {
             cookie,
             recipe,
             connection: None,
+            relay: None,
             deadline,
             opcode,
             params: [0; RECIPE_PARAMS_MAX],
@@ -157,6 +159,29 @@ impl CmdRequestQueue {
             self.push_tagged(part.opcode, part.params, 0, cookie, Some(tag), deadline)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn push_relay(&mut self, opcode:u16, params:&[u8], cookie:u64,
+        deadline:u64, relay:super::sle_security_relay::Command) -> Result<(),QueueError> {
+        self.push_tagged(opcode,params,0,cookie,None,deadline)?;
+        let index=(self.tail+CMD_REQ_QUEUE_DEPTH-1)%CMD_REQ_QUEUE_DEPTH;
+        if let Some(request)=self.entries[index].as_mut() {request.relay=Some(relay);}
+        Ok(())
+    }
+    pub(crate) fn expire_relays(&mut self, now:u64) {
+        let count=self.count;
+        for _ in 0..count {
+            let Some(request)=self.pop() else {break};
+            if request.relay.is_some() && now >= request.deadline {
+                if let Some(relay)=&request.relay {relay.withdraw();}
+                continue;
+            }
+            self.entries[self.tail]=Some(request);
+            self.tail=(self.tail+1)%CMD_REQ_QUEUE_DEPTH;self.count+=1;
+        }
+    }
+    pub(crate) fn relay_deadline(&self)->Option<u64> {
+        self.entries.iter().flatten().filter(|r|r.relay.is_some()).map(|r|r.deadline).min()
     }
 
     pub(crate) fn first_recipe(&self) -> Option<RecipeTag> {

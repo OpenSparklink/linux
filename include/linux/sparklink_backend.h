@@ -53,7 +53,9 @@ static inline int sparklink_backend_validate(const struct sparklink_backend_desc
 	if (!o || !d->context || !o->get || !o->put || !o->open || !o->close ||
 	    !o->validate_command || (!o->send_command && !o->send_command_ticketed) ||
 	    !!o->prepare_discovery != !!o->validate_discovery_step ||
-	    !!o->prepare_connection != !!o->validate_connection)
+	    !!o->prepare_connection != !!o->validate_connection ||
+	    !!o->prepare_relay != !!o->validate_relay ||
+	    (o->prepare_relay && !o->send_command_ticketed))
 		return -EINVAL;
 	if (!!(d->capabilities & SPARKLINK_BACKEND_DISCOVERY) != !!o->prepare_discovery ||
 	    !!(d->capabilities & SPARKLINK_BACKEND_CONNECTION) != !!o->prepare_connection ||

@@ -69,4 +69,11 @@ int ws73_dli_link_outcome(const unsigned char *data, size_t size,
 int ws73_dli_query(struct ws73_bsle_io *io, unsigned int *credits,
 		   struct ws73_dli_info *info, struct ws73_dli_result *result);
 
+
+/* Typed relay prepare returns exact parameter bytes, no I/O or truncation. */
+int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
+    const unsigned char *payload, size_t size, unsigned short *opcode,
+    unsigned char *params, size_t capacity);
+int ws73_dli_relay_validate(unsigned int opcode, const unsigned char *params, size_t size);
+
 #endif

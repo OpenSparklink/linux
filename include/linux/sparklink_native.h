@@ -93,6 +93,11 @@ struct sparklink_native_ops {
         struct sparklink_connection_plan *plan);
     int (*validate_connection)(void *context, unsigned int operation,
         u16 opcode, const u8 *params, size_t length);
+    /* Internal Host relay only. Missing callbacks reject, never grant raw
+     * ioctl authority. Wire layout and finite parameter budget are driver-owned. */
+    int (*prepare_relay)(void *context, u16 handle, u16 index,
+        const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity);
+    int (*validate_relay)(void *context, u16 opcode, const u8 *params, size_t size);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
 	/* Optional atomic command submission. Prepare outside Host locks, then
 	 * commit exactly once; wait/kill/join after commit returns. The core checks
