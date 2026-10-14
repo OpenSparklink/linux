@@ -303,6 +303,21 @@ fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut
  a.stop_sessions(-19);b.stop_sessions(-19);
  unsafe{for pointer in [p,q,other,new]{sl_connection_session_put(pointer);}}
 }
+
+#[test] fn physical_session_birth_precedes_fd_and_reuses_one_table_owner(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ assert!(a.sessions.lock().iter().all(Option::is_none));a.reconcile_sessions();
+ assert!(a.sessions.lock()[0].is_some());
+ let(p,e)=session(0,7,1,0);assert_eq!(e,0);a.reconcile_sessions();
+ unsafe{assert_eq!((*p.cast::<FakeSession>()).refs,2);}
+ let(q,e)=session(0,7,1,0);assert_eq!(e,0);assert_eq!(q,p);
+ unsafe{assert_eq!((*p.cast::<FakeSession>()).refs,3);sl_connection_session_put(q);}
+
+ assert!(b.sessions.lock().iter().all(Option::is_none));
+ a.host.lock().grants.revoke();a.reconcile_sessions();assert!(a.sessions.lock().iter().all(Option::is_none));
+ b.reconcile_sessions();assert!(b.sessions.lock()[0].is_some());
+ unsafe{assert!((*p.cast::<FakeSession>()).stopped);sl_connection_session_put(p);}
+}
 #[test] fn actual_session_status_and_revocation_are_per_runtime_and_join_outside_locks(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
  let(p,_)=session(0,7,1,0);let(q,_)=session(1,8,1,0);

@@ -13,6 +13,8 @@
 #define msghdr fixture_msghdr
 #define MSG_CMSG_COMPAT 0x40000000
 #include "sle_channel_wire.h"
+static unsigned long jiffies = 42;
+#define msecs_to_jiffies(value) (value)
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
@@ -179,13 +181,17 @@ static void direction_tests(void){
 static void publication_tests(void){
  struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct socket sock={.sk=&b.sk};
  init_receive(&s,&b.sk);s.channels[0].sk=NULL;s.channels[0].binding=(struct sl_binding_progress){0};
+ s.progress=(struct sl_channel_progress){.phase=SL_CH_UNBOUND,.maximum=249};s.deadline=0;jiffies=10000;
  struct sl_bind_admission admission={.sock=&sock,.binding=&b,.session=&s,.grant=b.grant};
  struct sl_channel_grant before=b.grant;authority=false;
  assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EACCES);
  assert(!b.session&&!s.channels[0].binding.bound&&b.sk.refs==1&&b.grant.directions==before.directions);
+ assert(s.progress.phase==SL_CH_UNBOUND&&s.deadline==0); /* revoked never starts CMTC */
  authority=true;assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==0);
+ assert(s.progress.phase==SL_CH_NEGOTIATING&&s.deadline==15000);
  assert(b.session==&s&&s.channels[0].sk==&b.sk&&s.channels[0].binding.bound&&b.sk.refs==2&&sock.state==SS_CONNECTED);
  assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EINVAL);
+ jiffies=20000;assert(s.deadline==15000); /* physical birth/second fd cannot refresh */
  b.session=NULL;s.channels[0].binding.bound=0;s.channels[0].binding.retired=1;
  assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EOPNOTSUPP);
  s.channels[0].sk=NULL;sock_put(&b.sk);
