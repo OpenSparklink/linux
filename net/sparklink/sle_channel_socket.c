@@ -420,8 +420,11 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 		c->remote_tcid = c->local_tcid;
 		c->pi = i == SL_CHANNEL_USER_SLOT ? SPARKLINK_SOCKET_USER_PI : 0;
 	}
-	sl_channel_start(&s->progress, min_t(unsigned int, maximum - 5, 2042));
-	s->deadline = jiffies + msecs_to_jiffies(5000);
+	/* Physical session exists before any application fd. Start the sole CMTC
+	 * negotiation at the first authorized channel binding, never at allocation
+	 * or each subsequent fd open. Inactive sessions have no work/timer refs.
+	 */
+	s->progress.maximum = min_t(unsigned int, maximum - 5, 2042);
 	return s;
 }
 void sl_connection_session_stop(void *opaque, int error)
@@ -474,13 +477,17 @@ static int sl_publish_binding(void *context)
 	spin_lock_irqsave(&s->lock, flags);
 	if (binding->session)
 		ret = -EINVAL;
-	else if (!sl_channel_active(s->progress))
+	else if (s->progress.phase != SL_CH_UNBOUND && !sl_channel_active(s->progress))
 		ret = -ECONNRESET;
 	else if (c->binding.retired)
 		ret = -EOPNOTSUPP; /* no qualified same-life CUTC close/rebind barrier */
 	else if (c->binding.bound)
 		ret = -EADDRINUSE;
 	else {
+		if (s->progress.phase == SL_CH_UNBOUND) {
+			sl_channel_start(&s->progress, s->progress.maximum);
+			s->deadline = jiffies + msecs_to_jiffies(5000);
+		}
 		binding->grant = admission->grant;
 		binding->channel_slot = admission->channel_slot;
 		sl_binding_attach(&c->binding);

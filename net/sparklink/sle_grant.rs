@@ -15,6 +15,7 @@ impl LeaseAuthority {
     }
     pub(crate) fn revoke(&mut self) { self.active = 0; }
     pub(crate) fn permits(&self, epoch: u64) -> bool { epoch != 0 && self.active == epoch }
+    pub(crate) fn current_epoch(&self) -> Option<u64> { if self.active == 0 { None } else { Some(self.active) } }
 }
 #[cfg(test)]
 mod tests {
@@ -22,7 +23,9 @@ mod tests {
     #[test] fn constructor_rejects_and_successor_never_revives_old_epoch() {
         let mut authority = LeaseAuthority::new();
         assert!(!authority.permits(0)); assert!(!authority.permits(1));
+        assert_eq!(authority.current_epoch(),None);
         assert!(authority.activate(1, true)); assert!(authority.permits(1));
+        assert_eq!(authority.current_epoch(),Some(1));
         authority.revoke(); assert!(!authority.permits(1));
         assert!(!authority.activate(1, true)); assert!(authority.activate(2, true));
         assert!(!authority.permits(1)); assert!(authority.permits(2));

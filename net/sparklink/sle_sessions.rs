@@ -51,6 +51,40 @@ impl super::ControllerRuntime {
         }
         Ok(maximum)
     }
+    pub(crate) fn acquire_session(&self, lifetime: u64, handle: u16, epoch: u64) -> Result<*mut c_void> {
+        {
+            let table = self.sessions.lock();
+            self.session_limits(lifetime, handle, epoch, None)?;
+            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle && s.epoch == epoch) {
+                // SAFETY: table retains object; fd/actor receives a distinct ref.
+                unsafe { sl_connection_session_get(existing.pointer) };
+                return Ok(existing.pointer);
+            }
+        }
+        let maximum = self.session_limits(lifetime, handle, epoch, None)?;
+        if maximum <= 5 { return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))); }
+        // SAFETY: constructor allocates outside any table/IRQ locks; reference
+        // is adopted by a table entry, or dropped if another opener won.
+        let candidate = unsafe { sl_connection_session_create(self.identity.id, self.identity.generation, lifetime, handle, epoch, maximum) };
+        if candidate.is_null() { return Err(ENOMEM); }
+        let mut pending = Some(Session { lifetime, handle, epoch, pointer: candidate });
+        let lookup = (|| -> Result<*mut c_void> {
+            let mut table = self.sessions.lock();
+            self.session_limits(lifetime, handle, epoch, None)?; // withdrawal race rechecked
+            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle && s.epoch == epoch) {
+                // SAFETY: table owns a live reference; return a distinct caller ref.
+                unsafe { sl_connection_session_get(existing.pointer) };
+                return Ok(existing.pointer);
+            }
+            let slot = table.iter_mut().find(|slot| slot.is_none()).ok_or(Error::from_errno(-(kernel::bindings::ENOBUFS as i32)))?;
+            *slot = pending.take();
+            // SAFETY: table now owns constructor reference; caller gets another.
+            unsafe { sl_connection_session_get(candidate) };
+            Ok(candidate)
+        })();
+        drop(pending); // unused allocation released outside table/Host locks
+        lookup
+    }
     pub(crate) fn reconcile_sessions(&self) {
         let mut retired = [const { None }; 16];
         let error;
@@ -79,6 +113,23 @@ impl super::ControllerRuntime {
             // SAFETY: table reference retains object; stop joins work before put.
             unsafe { sl_connection_session_stop(session.pointer, error) };
         }
+        // Birth follows the canonical physical link, not first application fd.
+        // Snapshot under Host/gate; allocate outside locks and recheck at adoption.
+        let (links, epoch) = {
+            let host = self.host.lock();
+            let (_, known, links) = host.link_snapshot();
+            let gate = self.schedule_gate.lock();
+            if *gate || !known || !host.admits_data() || host.controller_status().2.is_some()
+                || !self.transport_open.load(Ordering::Acquire) { return; }
+            (links, host.grants.current_epoch())
+        };
+        let Some(epoch) = epoch else { return; };
+        for link in links.into_iter().flatten() {
+            if let Ok(session) = self.acquire_session(link.lifetime, link.handle, epoch) {
+                // SAFETY: birth owns only table ref; release transient actor ref.
+                unsafe { sl_connection_session_put(session) };
+            }
+        }
     }
     pub(crate) fn stop_sessions(&self, error: i32) {
         let retired = {
@@ -105,29 +156,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_session_get_rust(
     if error.is_null() { return core::ptr::null_mut(); }
     let result = (|| -> Result<*mut c_void> {
         let owner = super::sle_ingress::ingress_owner(super::sle_dev::DeviceIdentity { id, generation }).ok_or(ENODEV)?;
-        let maximum = owner.session_limits(lifetime, handle, epoch, None)?;
-        if maximum <= 5 { return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))); }
-        // SAFETY: constructor allocates outside any table/IRQ locks; reference
-        // is adopted by a table entry, or dropped if another opener won.
-        let candidate = unsafe { sl_connection_session_create(id, generation, lifetime, handle, epoch, maximum) };
-        if candidate.is_null() { return Err(ENOMEM); }
-        let mut pending = Some(Session { lifetime, handle, epoch, pointer: candidate });
-        let lookup = (|| -> Result<*mut c_void> {
-            let mut table = owner.sessions.lock();
-            owner.session_limits(lifetime, handle, epoch, None)?; // withdrawal race rechecked
-            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle && s.epoch == epoch) {
-                // SAFETY: table owns a live reference; return a distinct caller ref.
-                unsafe { sl_connection_session_get(existing.pointer) };
-                return Ok(existing.pointer);
-            }
-            let slot = table.iter_mut().find(|slot| slot.is_none()).ok_or(Error::from_errno(-(kernel::bindings::ENOBUFS as i32)))?;
-            *slot = pending.take();
-            // SAFETY: table now owns constructor reference; caller gets another.
-            unsafe { sl_connection_session_get(candidate) };
-            Ok(candidate)
-        })();
-        drop(pending); // unused allocation released outside table/Host locks
-        lookup
+        owner.acquire_session(lifetime, handle, epoch)
     })();
     match result {
         Ok(pointer) => { unsafe { *error = 0 }; pointer }
