@@ -3,6 +3,10 @@
 // Locks, clock, usercopy, owner lease and driver validation are dependencies.
 extern crate self as kernel;
 extern crate self as pin_init;
+#[allow(dead_code)] // Actual relay dependency; this fixture does not submit SMP.
+#[path = "sle_security_relay_state.rs"] mod sle_security_relay_state;
+#[allow(dead_code)]
+mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 pub trait Init<T> {}
 pub struct FixtureInit<T>(std::marker::PhantomData<T>);
 impl<T> Init<T> for FixtureInit<T> {}

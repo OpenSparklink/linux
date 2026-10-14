@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Actual Host deadline selection body, production queue/recipe dependencies.
 // Allocation, I/O and timers are not executed by this standalone fixture.
+#[allow(dead_code)] // Actual relay dependency; this fixture only observes deadlines.
+#[path = "sle_security_relay_state.rs"] mod sle_security_relay_state;
+#[allow(dead_code)]
+mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 #[allow(dead_code)]
 #[path="sle_command_plan.rs"] mod sle_command_plan;
 #[allow(dead_code)]

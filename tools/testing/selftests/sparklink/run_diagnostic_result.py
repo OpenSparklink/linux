@@ -10,13 +10,14 @@ import subprocess
 import tempfile
 
 from run_connection_tx import function
+from security_relay_fixture import write_fixture
 
 
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
     inputs = {name: (net / name).read_bytes() for name in
-              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']}
+              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs', 'sle_security_relay.rs', 'sle_security_relay_state.rs']}
     uapi = inputs['sle_uapi.rs'].decode()
     declaration = uapi[uapi.index('/// Owner-private bounded diagnostic result;'):
                        uapi.index('unsafe impl FromBytes for SleDiagnosticResult')]
@@ -35,6 +36,7 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     with tempfile.TemporaryDirectory(prefix='sparklink-diagnostic-admission-') as tmp:
         tmp = Path(tmp)
+        write_fixture(here.parents[3], tmp)
         for name in ['sle_mgmt.rs', 'sle_command_queue.rs', 'sle_command_plan.rs']:
             (tmp / name).write_bytes(inputs[name])
         declaration = uapi[uapi.index('/// Idempotent metadata diagnostic admission/cancel;'):
@@ -55,6 +57,7 @@ def run(output):
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     with tempfile.TemporaryDirectory(prefix='sparklink-host-deadline-') as tmp:
         tmp = Path(tmp)
+        write_fixture(here.parents[3], tmp)
         for name in ['sle_command_queue.rs', 'sle_command_plan.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']:
             (tmp / name).write_bytes(inputs[name])
         fixture = (here / 'diagnostic/host_deadline_fixture.rs').read_text()
@@ -64,10 +67,11 @@ def run(output):
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 50, 'result_tests': 14, 'admission_tests': 14, 'host_deadline_tests': 6, 'connection_dependency_tests': 11, 'link_dependency_tests': 5,
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 54, 'result_tests': 14, 'admission_tests': 14, 'host_deadline_tests': 6, 'connection_dependency_tests': 14, 'link_dependency_tests': 6,
               'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},
+              'relay_dependency_fixture_sha256': hashlib.sha256((here / 'security_relay_fixture.py').read_bytes()).hexdigest(),
               'remaining': ['Actual ioctl owner/CAP/usercopy/removal gates in qualified VM',
                             'Legacy DLI event callers and shared projection removal',
                             'Live idempotent admission/cancel/deadline syscall and on-wire late reply gates']}
