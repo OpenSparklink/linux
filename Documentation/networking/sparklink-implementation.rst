@@ -3,7 +3,7 @@ Historical implementation roadmap
 
 .. warning::
 
-    The current sole plan is sparklink/docs/IMPLEMENTATION_PLAN.md. Old implementation counts, statuses and build steps below are historical, not current qualification.
+    The current sole plan is sparklink/project/implementation-plan.md. Old implementation counts, statuses and build steps below are historical, not current qualification.
 
     Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
 
@@ -18,7 +18,7 @@ slkd/slctl discovery passes a synthetic USB integration gate; the physical
 dual-controller milestone remains unverified.
 
 The cross-repository roadmap is maintained in the userspace repository at
-``docs/IMPLEMENTATION_PLAN.md``. Existing acceptance criteria remain in
+``project/implementation-plan.md``. Existing acceptance criteria remain in
 `Linux issues <https://github.com/OpenSparklink/linux/issues>`_ and
 `userspace issues <https://github.com/OpenSparklink/sparklink/issues>`_.
 The Native WS73 tracker is

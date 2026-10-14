@@ -19,9 +19,9 @@ logic was removed, not replaced by a qualified userspace Engine.
 
 The following user repository documents are the single authoritative entries:
 
-* `Target architecture <https://github.com/OpenSparklink/sparklink/blob/codex/sparklink-ws73/docs/ARCHITECTURE.md>`_
-* `Execution plan <https://github.com/OpenSparklink/sparklink/blob/codex/sparklink-ws73/docs/IMPLEMENTATION_PLAN.md>`_
-* `Current qualification and limitations <https://github.com/OpenSparklink/sparklink/blob/codex/sparklink-ws73/docs/CURRENT_CAPABILITIES.md>`_
+* `Target architecture <https://github.com/OpenSparklink/sparklink/blob/codex/sparklink-ws73/project/architecture.md>`_
+* `Execution plan <https://github.com/OpenSparklink/sparklink/blob/codex/sparklink-ws73/project/implementation-plan.md>`_
+* `Current qualification and limitations <https://github.com/OpenSparklink/sparklink/blob/codex/sparklink-ws73/project/current-capabilities.md>`_
 
 Current interface boundaries
 ============================
