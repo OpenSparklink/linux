@@ -52,7 +52,7 @@ poweroff -f
         files=['.']+[str(x.relative_to(root)) for x in sorted(root.rglob('*'))]
         cpio=subprocess.run(['cpio','--null','-o','--format=newc','--owner=0:0'],input=('\0'.join(files)+'\0').encode(),cwd=root,capture_output=True,check=True)
         archive=a.output/'initramfs.cpio.gz';archive.write_bytes(gzip.compress(cpio.stdout,mtime=0))
-        command=[str(a.qemu.resolve()),'-machine','q35,accel=kvm','-cpu','host','-m','768','-smp','2','-nodefaults','-display','none','-serial','stdio','-no-reboot','-kernel',str(a.kernel_build/'arch/x86/boot/bzImage'),'-initrd',str(archive),'-append','console=ttyS0 rdinit=/init panic=-1 loglevel=6','-object','rng-random,id=rng0,filename=/dev/urandom','-device','virtio-rng-pci,rng=rng0']
+        command=[str(a.qemu.resolve()),'-machine','q35,accel=kvm','-cpu','host','-m','768','-smp','2','-nodefaults','-display','none','-serial','stdio','-no-reboot','-kernel',str(a.kernel_build/'arch/x86/boot/bzImage'),'-initrd',str(archive),'-append','console=ttyS0 rdinit=/init panic=-1 loglevel=7','-object','rng-random,id=rng0,filename=/dev/urandom','-device','virtio-rng-pci,rng=rng0']
         record['command']=command;record['started_ns']=time.time_ns();save()
         with (a.output/'console.log').open('w') as log:result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,timeout=a.timeout)
         text=(a.output/'console.log').read_text(errors='replace')
