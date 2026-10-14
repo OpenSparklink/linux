@@ -39,10 +39,10 @@ def run(output, command=False):
     with tempfile.TemporaryDirectory(prefix='sparklink-ticket-driver-') as directory:
         tmp = Path(directory)
         (tmp / 'test.c').write_text(fixture)
-        command = [os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
+        compile_command = [os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g',
                    '-I'+str(driver), str(tmp/'test.c'), str(driver/'wire.c'), '-o', str(tmp/'test')]
-        subprocess.run(command, check=True)
+        subprocess.run(compile_command, check=True)
         subprocess.run([str(tmp/'test')], check=True,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=1', UBSAN_OPTIONS='halt_on_error=1'))
     assert all(p.read_bytes() == b for p, b in inputs.items())

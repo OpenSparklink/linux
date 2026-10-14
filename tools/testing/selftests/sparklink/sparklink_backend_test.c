@@ -12,6 +12,9 @@ static int open_backend(void *c, u16 id, u64 generation)
 { (void)c; (void)id; (void)generation; return 0; }
 static int command(void *c, u16 op, const u8 *p, size_t n)
 { (void)c; (void)op; (void)p; (void)n; return 0; }
+static int ticketed(void *c, struct sparklink_native_command_ticket *t,
+                    u16 op, const u8 *p, size_t n)
+{ (void)t; return command(c,op,p,n); }
 static int discovery(void *c, const struct sparklink_discovery_request *r,
                      struct sparklink_discovery_plan *p)
 { (void)c; (void)r; (void)p; return 0; }
@@ -61,6 +64,9 @@ int main(void)
  MISSING(get); MISSING(put); MISSING(open); MISSING(close); MISSING(validate_command);
  MISSING(send_command); MISSING(prepare_discovery); MISSING(validate_discovery_step);
  MISSING(prepare_connection); MISSING(validate_connection); MISSING(send_acb);
+ { struct sparklink_native_ops copy=ops;copy.send_command=NULL;copy.send_command_ticketed=ticketed;
+   d=valid;d.ops=&copy;CHECK(sparklink_backend_validate(&d),0);
+   copy.send_command_ticketed=NULL;CHECK(sparklink_backend_validate(&d),-EINVAL); }
  d=valid; d.bus=SPARKLINK_BACKEND_TEST; d.capabilities=0;
  ops.prepare_discovery=NULL; ops.validate_discovery_step=NULL;
  ops.prepare_connection=NULL; ops.validate_connection=NULL; ops.send_acb=NULL;

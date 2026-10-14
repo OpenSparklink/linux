@@ -311,7 +311,7 @@ impl NativeCommandTransport {
             // and must join transfer callbacks before this stack object retires.
             let result = unsafe { sparklink_native_transport_command_ticketed(self.transport,
                 (&mut ticket as *mut NativeCommandTicket<'_>).cast(), opcode, params.as_ptr(), params.len()) };
-            if result == 0 && !ticket.submitted.get() { return Err(Error::from_errno(PROTOCOL_ERROR)); }
+            if result > 0 || (result == 0 && !ticket.submitted.get()) { return Err(Error::from_errno(PROTOCOL_ERROR)); }
             NativeController::result(result)
         } else {
             // Explicit legacy path for other providers pending migration;
