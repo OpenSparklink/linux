@@ -147,6 +147,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 		return 0;
 	raw_parsers(data, size, max);
 	raw_parsers(data, size, 254);
+	raw_parsers(data, size, 2047);
 	ret = ws73_wire_receive(data, size, consume, &o);
 	/* The first pass validates the whole aggregate before any consumer call.
 	 * A pure observer never rejects, so a structural failure exposes nothing.

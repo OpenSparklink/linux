@@ -86,7 +86,7 @@ def run(args):
             raw=e.stdout or b'';row['exit']='TIMEOUT'
         (out/(name+'.log')).write_bytes(raw)
         row.update(log_sha256=hashlib.sha256(raw).hexdigest(),end_ns=time.time_ns())
-        row['status']='COMPLETED_CHECK_PENDING' if row['exit']==0 else 'FAILED_OR_UNVERIFIED'
+        row['status']='COMMAND_COMPLETED' if row['exit']==0 else 'FAILED_OR_UNVERIFIED'
         save()
         if row['exit']!=0: raise RuntimeError(name+' failed or timed out')
         return raw.decode(errors='replace')
