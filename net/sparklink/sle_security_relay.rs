@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Physical Session owns one pinned relay ledger, independent of application fd.
 //! Host commands retain the same C kref until real reply/fault, including revoke.
-//! Manager approval enables only explicit limited capability exchange.
-//! No successful pairing, authentication, crypto or trusted installation here.
+//! Manager approval enables explicit capability or candidate proof exchange.
+//! Sleeping crypto is a dependency of this sole Session, outside IRQ locks.
+//! No Agent consent, authenticated identity, installation or encryption here.
 use super::sle_security_relay_state::{self as relay, Identity, Ticket};
 use core::{ffi::c_void, pin::Pin};
 use kernel::{prelude::*, sync::lock::Lock};

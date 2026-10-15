@@ -343,7 +343,7 @@ pub(crate) fn initial_pairing_request(role: u8, index: u16, length: usize) -> bo
 /// Paired, authenticated, trusted, encrypted, or a peer application ACK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CapabilityObservation {
-    pub(crate) state: u32, // 1 armed, 2 pending, 4 observed, 5 failed, 6 cancelled, 7 expired
+    pub(crate) state: u32, // 1 armed, 2 pending, 4 caps, 5 failed, 6 cancelled, 7 expired, 8 candidate proof
     pub(crate) flags: u32, // actual TX submit=1, real successful Complete=2, peer RX=4
     pub(crate) status: u8,
     pub(crate) local: [u8; 10],

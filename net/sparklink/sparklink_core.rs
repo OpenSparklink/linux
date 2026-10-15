@@ -1224,7 +1224,7 @@ fn ioctl_controller_snapshot(
     Ok(0)
 }
 
-/// Explicit experimental capability-only procedure. Generic ioctl dispatch
+/// Explicit experimental capability/candidate procedure. Generic ioctl dispatch
 /// holds the author's active Managed lease and CAP_NET_ADMIN throughout.
 #[inline(never)]
 fn ioctl_security_negotiation(
