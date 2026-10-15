@@ -15,7 +15,7 @@ use super::sle_security_relay_state::{self as relay,Identity,Ticket};
 impl Error {fn from_errno(n:i32)->Self{Self(n)} fn to_errno(self)->i32{self.0}}
 type Result<T=()> = std::result::Result<T,Error>;
 const ENODEV:Error=Error(-19);const EINVAL:Error=Error(-22);const EBUSY:Error=Error(-16);const EIO:Error=Error(-5);
-mod kernel {pub mod bindings {pub const EINVAL:u32=22;pub const ESTALE:u32=116;pub const ETIMEDOUT:u32=110;pub const ECANCELED:u32=125;pub const ENOBUFS:u32=105;pub const EOVERFLOW:u32=75;pub const EIO:u32=5;}}
+mod kernel {pub mod bindings {pub const EOPNOTSUPP:u32=95;pub const EINVAL:u32=22;pub const ESTALE:u32=116;pub const ETIMEDOUT:u32=110;pub const ECANCELED:u32=125;pub const ENOBUFS:u32=105;pub const EOVERFLOW:u32=75;pub const EIO:u32=5;}}
 macro_rules! pr_warn {($($arg:tt)*)=>{{}};}
 struct Lock<T>(RefCell<T>);impl<T> Lock<T>{fn lock(&self)->RefMut<'_,T>{self.0.borrow_mut()}}
 struct State {session:Option<relay::Session>,stopped:bool}

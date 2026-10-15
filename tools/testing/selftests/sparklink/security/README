@@ -38,11 +38,11 @@ Record the exact source/harness hashes, command, tool version and terminal resul
 for each run. Timeout, missing tools, unsupported or incomplete unwinding are
 NOT_PROVEN, never a hardware or pairing PASS.
 
-Staged relay Session transitions (NOT in the default kernel):
+Production relay Session transitions (no RF or trusted state qualification):
   python3 tools/testing/selftests/sparklink/run_security_relay.py --output REPORT
   python3 tools/testing/selftests/sparklink/run_security_relay.py --kani --output REPORT
 
-Verbatim source: net/sparklink/experimental/security_relay.rs. Regression uses
+Verbatim source: net/sparklink/sle_security_relay_state.rs. Regression uses
 rustc --test -Dwarnings; formal uses a private mirrored tree with the SAME source,
 not extracted/replaced state methods. Eight transition steps, two queued PDUs,
 one active packet, payload0..3 bytes in the transition harness, unwind12. A second
@@ -54,9 +54,22 @@ withdrawal, successful Status versus Complete, uncertain failure and isolation.
 No proof of fd/dup/VFS semantics, real locks, authority allocation, callback join,
 wire Complete uniqueness, retry/reuse barrier or crypto/protocol negotiation is
 claimed. The submit callback is an explicit atomic accepted/never-queued fixture;
-physical reset/barrier correctness is external and remains unproved. The staged
+physical reset/barrier correctness is external and remains unproved. The production
 constructor must be owned once by the physical Session, not recreated per fd or
 grant. Never equate the local cookie guard with generation on the actual wire.
 Missing/unsupported/timed-out tools fail this runner. Timeout kills and joins the
 verifier process group. Generated artifacts stay in a private temporary tree;
 with --output, the exact verifier log is preserved next to the report.
+
+The limited capability-only exchange adds two selectable proof harnesses:
+  python3 tools/testing/selftests/sparklink/run_security_relay.py --kani \
+    --kani-harness capability_withdraw_deadline_and_submit --output REPORT
+  python3 tools/testing/selftests/sparklink/run_security_relay.py --kani \
+    --kani-harness capability_requires_peer_and_terminal_complete --output REPORT
+
+These execute the same production methods, one fixed 10-byte offer, one command
+and terminal reply, arbitrary u64 commit time, nondeterministic accepted/NEVER
+queued callback, and both RX/Complete orders. No second Engine or trusted result.
+The caller's lock/identity and atomic driver submission contract are assumptions,
+not proofs of the actual Host/HCD implementation. Unsupported diagnostics remain
+NOT_PROVEN even if the tool exits zero and generated checks report no failures.
