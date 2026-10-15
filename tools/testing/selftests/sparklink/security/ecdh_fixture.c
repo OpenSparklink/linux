@@ -10,6 +10,7 @@ typedef uint8_t u8;
 #define ECDH_P256_PUB_SIZE 64
 #define GFP_KERNEL 0
 #define CRYPTO_TFM_REQ_MAY_BACKLOG 0
+#define CRYPTO_ALG_ASYNC 128
 #define DECLARE_CRYPTO_WAIT(v) int v=0
 #define IS_ERR(p) ((uintptr_t)(p)>=(UINTPTR_MAX-4094))
 #define PTR_ERR(p) ((int)(intptr_t)(p))
@@ -19,7 +20,7 @@ struct ecdh { char *key; unsigned short key_size; };
 struct kpp_request { struct scatterlist *destination; };
 static struct crypto_kpp context;
 static int fault, contexts, allocations, requests, random_calls, set_calls, allocator_failed;
-static struct crypto_kpp *crypto_alloc_kpp(const char *name,int a,int b){assert(!strcmp(name,"ecdh-nist-p256"));(void)a;(void)b;if(fault==1)return(void *)(intptr_t)-ENOENT;contexts++;return &context;}
+static struct crypto_kpp *crypto_alloc_kpp(const char *name,int a,int b){assert(!strcmp(name,"ecdh-nist-p256"));assert(a==0 && b==CRYPTO_ALG_ASYNC);if(fault==1)return(void *)(intptr_t)-ENOENT;contexts++;return &context;}
 static void crypto_free_kpp(void *p){assert(p==&context);contexts--;}
 static unsigned int crypto_ecdh_key_len(const struct ecdh *p){assert(p->key_size==32);return 36;}
 static void *kmalloc(unsigned int n,int flags){(void)flags;if(fault==2)return NULL;void *p=malloc(n);if(!p){allocator_failed=1;return NULL;}allocations++;return p;}

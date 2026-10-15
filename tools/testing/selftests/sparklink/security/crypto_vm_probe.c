@@ -6,6 +6,58 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include "../../../../../net/sparklink/sle_crypto_ffi.c"
+#include "../../../../../net/sparklink/sle_pair_material.c"
+
+static int pair_material_vectors(void)
+{
+	/* Toy data, independently evaluated with OpenSSL3.5.9 CMAC. This direct
+	 * fixture state validates byte order/KDF/commit, not ECDH point validity
+	 * or a standard pairing vector. Never present in the production object.
+	 */
+	static const u8 confirmation[16]={0xfd,0x93,0x4d,0xdf,0x1b,0x7a,0x4e,0x1a,0xe9,0x7e,0x1b,0xc5,0x72,0xbd,0x2c,0x2d};
+	static const u8 link[16]={0x6b,0xd8,0x4d,0x76,0xc3,0xc2,0xad,0x8d,0x88,0x7f,0x15,0x42,0x98,0xfe,0x6b,0xdc};
+	static const u8 gp[16]={0xa9,0x9f,0x50,0x22,0xc3,0x52,0x85,0x8e,0x06,0x8d,0x61,0x4c,0x23,0x7a,0x31,0x78};
+	static const u8 tp[16]={0xe7,0x8f,0x1a,0x29,0xbe,0x12,0x90,0x05,0xee,0x74,0xd7,0x0b,0x6a,0x6f,0x97,0xde};
+	struct sl_pair_material m={.role=0,.peer_valid=true};
+	u8 nonce[16], out[16], bad[16];unsigned int i;int result=-EILSEQ;
+	for(i=0;i<32;i++)m.shared[i]=i;
+	for(i=0;i<16;i++){m.nonce[i]=16+i;nonce[i]=32+i;}
+	for(i=0;i<64;i++){m.public[i]=1+i;m.peer[i]=129+i;}
+	for(i=0;i<6;i++){m.g_address[i]=1+i;m.t_address[i]=11+i;}
+	memcpy(bad,confirmation,16);bad[0]^=1;memset(out,0xa5,16);
+	if(sl_pair_material_derive(&m,nonce,bad,out)!=-EKEYREJECTED || m.derived || memchr_inv(out,0xa5,16))goto out;
+	if(sl_pair_material_derive(&m,nonce,confirmation,out) || memcmp(out,gp,16) || memcmp(m.candidate_link_key,link,16) || memcmp(m.peer_proof,tp,16))goto out;
+	memcpy(bad,tp,16);bad[0]^=1;memset(out,0xa5,16);
+	if(sl_pair_material_verify(&m,bad,out)!=-EKEYREJECTED || m.verified || memchr_inv(out,0xa5,16))goto out;
+	if(sl_pair_material_verify(&m,tp,out) || memcmp(out,gp,16) || !m.verified || memchr_inv(m.shared,0,32) || memchr_inv(m.nonce,0,16) || memchr_inv(m.own_proof,0,16))goto out;
+	result=0;
+out:
+	memzero_explicit(&m,sizeof(m));memzero_explicit(nonce,sizeof(nonce));memzero_explicit(out,sizeof(out));memzero_explicit(bad,sizeof(bad));return result;
+}
+
+static int pair_material_fresh(void)
+{
+	static const u8 ga[6]={1,2,3,4,5,6},ta[6]={11,12,13,14,15,16};
+	struct sl_pair_material *g=NULL,*t=NULL,*other=NULL;
+	u8 gpub[64],tpub[64],again[64],invalid[64]={0},gn[16],tn[16],cfm[16],gp[16],tp[16],out[16];int result;
+	result=sl_pair_material_create(0,ga,ta,&g);if(result)goto out;
+	result=sl_pair_material_create(1,ta,ga,&t);if(result)goto out;
+	result=sl_pair_material_create(0,ga,ta,&other);if(result)goto out;
+	result=-EILSEQ;
+	if(sl_pair_material_public(g,gpub)||sl_pair_material_public(t,tpub)||sl_pair_material_public(other,again)||!memcmp(gpub,tpub,64)||!memcmp(gpub,again,64))goto out;
+	if(sl_pair_material_peer(g,invalid)>=0 || g->peer_valid)goto out;
+	if(sl_pair_material_peer(g,tpub)||sl_pair_material_peer(t,gpub)||sl_pair_material_peer(g,tpub)!=-EALREADY)goto out;
+	if(sl_pair_material_nonce(g,gn)||sl_pair_material_nonce(t,tn)||!memcmp(gn,tn,16)||sl_pair_material_confirm(t,cfm))goto out;
+	if(sl_pair_material_derive(g,tn,cfm,gp)||sl_pair_material_derive(t,gn,NULL,tp)||memcmp(g->candidate_link_key,t->candidate_link_key,16))goto out;
+	memset(out,0xa5,16);invalid[0]=gp[0]^1;memcpy(invalid+1,gp+1,15);
+	if(sl_pair_material_verify(t,invalid,out)!=-EKEYREJECTED||memchr_inv(out,0xa5,16))goto out;
+	if(sl_pair_material_verify(t,gp,out)||memcmp(out,tp,16)||sl_pair_material_verify(g,tp,out)||memcmp(out,gp,16))goto out;
+	if(!g->verified||!t->verified||memchr_inv(g->private,0,32)||memchr_inv(t->private,0,32)||memchr_inv(g->nonce,0,16)||memchr_inv(t->nonce,0,16))goto out;
+	result=0;
+out:
+	sl_pair_material_destroy(g);sl_pair_material_destroy(t);sl_pair_material_destroy(other);
+	memzero_explicit(gn,sizeof(gn));memzero_explicit(tn,sizeof(tn));memzero_explicit(gp,sizeof(gp));memzero_explicit(tp,sizeof(tp));memzero_explicit(out,sizeof(out));return result;
+}
 
 static int __init security_crypto_probe_init(void)
 {
@@ -39,6 +91,8 @@ static int __init security_crypto_probe_init(void)
         result=sle_ecdh_shared_secret(a_private,b_public,a_secret);
         if(result>=0 || memcmp(a_secret,before,32)){result=-EILSEQ;goto out;}
     }
+    result=pair_material_vectors();if(result)goto out;
+    for(iteration=0;iteration<8;iteration++){result=pair_material_fresh();if(result)goto out;}
     result=0;
 out:
     memzero_explicit(digest,sizeof(digest));memzero_explicit(before,sizeof(before));
@@ -46,7 +100,7 @@ out:
     memzero_explicit(a_secret,sizeof(a_secret));memzero_explicit(b_secret,sizeof(b_secret));
     memzero_explicit(a_public,sizeof(a_public));memzero_explicit(b_public,sizeof(b_public));
     if(result)pr_err("SPARKLINK_SECURITY_CRYPTO_VM_FAIL: errno=%d\n",result);
-    else pr_info("SPARKLINK_SECURITY_CRYPTO_VM_PASS: RFC4493 empty/block;8 random P256 pair agreements;invalid-peer/zero-key atomic refusal;bounded CMAC. No pairing/auth/encryption claim.\n");
+    else pr_info("SPARKLINK_SECURITY_CRYPTO_VM_PASS: RFC4493;8 random P256 agreements;OpenSSL toy dialect KDF/confirm/proof vectors;8 fresh material pairs and tamper/zeroization. No RF/pairing/auth/install/encryption qualification.\n");
     return result;
 }
 static void __exit security_crypto_probe_exit(void){}

@@ -41,7 +41,7 @@ int sle_ecdh_generate(u8 *private_key, u8 *public_key)
 
     if (!private_key || !public_key)
         return -EINVAL;
-    tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
+    tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, CRYPTO_ALG_ASYNC);
     if (IS_ERR(tfm))
         return PTR_ERR(tfm);
     parameters.key = (char *)candidate_private;
@@ -120,7 +120,7 @@ int sle_ecdh_shared_secret(const u8 *private_key,
 
 	if (!private_key || !remote_public_key || !secret)
 		return -EINVAL;
-	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
+	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm))
 		return PTR_ERR(tfm);
 
@@ -183,7 +183,7 @@ int sle_aes_cmac(const u8 *key, const u8 *data, u32 data_len, u8 *digest)
         return -EINVAL;
     if (data_len > 160)
         return -EMSGSIZE;
-    tfm = crypto_alloc_shash("cmac(aes)", 0, 0);
+    tfm = crypto_alloc_shash("cmac(aes)", 0, CRYPTO_ALG_ASYNC);
     if (IS_ERR(tfm))
         return PTR_ERR(tfm);
     description = kmalloc(sizeof(*description) + crypto_shash_descsize(tfm), GFP_KERNEL);
