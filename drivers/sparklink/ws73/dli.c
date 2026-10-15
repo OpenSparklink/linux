@@ -394,7 +394,7 @@ int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
     const unsigned char *payload, size_t size, unsigned short *opcode,
     unsigned char *params, size_t capacity, unsigned short *echo_index)
 {
-    unsigned int wire_index = index == 0x0147 ? 0x01ff : index;
+    unsigned int wire_index = index;
 
     if (!opcode || !params || !echo_index || handle > 0x0fff || index > 65535 || (size && !payload))
         return -EINVAL;
@@ -403,8 +403,8 @@ int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
     if (size > 250 || capacity < size + 5)
         return -EMSGSIZE;
     params[0] = handle & 0xff; params[1] = handle >> 8;
-    /* SDK111 gle_sm_cmd_list[26] uses1ff/1byte, unlike standard147.
-     * Keep canonical policy in Host and correlate Complete with raw wire. */
+    /* Diagnostic branch: canonical147 against an explicitly modified receiver.
+     * Not an original111 firmware qualification or production mapping fix. */
     params[2] = wire_index & 0xff; params[3] = wire_index >> 8;
     params[4] = size;
     if (size) memcpy(params + 5, payload, size);

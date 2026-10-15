@@ -481,7 +481,7 @@ static void relay_command_tests(void)
  for(unsigned int n=0;n<=250;n++) {
   memset(params,0xcc,sizeof(params));opcode=0xaaaa;
   CHECK(ws73_dli_relay_prepare(0x0fff,0x0147,payload,n,&opcode,params,sizeof(params),&echo_index)==(int)n+5);
-  CHECK(opcode==0x1812&&u16(params)==0x0fff&&u16(params+2)==0x01ff&&echo_index==0x01ff&&params[4]==n);
+  CHECK(opcode==0x1812&&u16(params)==0x0fff&&u16(params+2)==0x0147&&echo_index==0x0147&&params[4]==n);
   CHECK(!memcmp(params+5,payload,n));CHECK(!ws73_dli_relay_validate(opcode,params,n+5));
   CHECK(ws73_dli_validate_command(opcode,params,n+5)==-EOPNOTSUPP);
  }
