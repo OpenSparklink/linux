@@ -659,6 +659,40 @@ impl super::ControllerRuntime {
         }
     }
 
+    pub(crate) fn cancel_security_author(
+        &self, author: u64, lifetime: u64, handle: u16, request: u64,
+    ) -> Result {
+        let identity = self.relay_identity(lifetime, handle)?;
+        let (pointer, epoch) = self.existing_session_for_event(lifetime, handle).ok_or(ENOENT)?;
+        // Keep the event lookup's cloned kref through validation and material
+        // destruction; cancellation must never allocate a replacement Session.
+        let (result, material) = (|| {
+            let host = self.host.lock();
+            let (_, known, links) = host.link_snapshot();
+            let gate = self.schedule_gate.lock();
+            if *gate { return (Err(ENODEV), None); }
+            if epoch != identity.grant_epoch || !host.admits_data() || !host.grants.permits(epoch) {
+                return (Err(EACCES), None);
+            }
+            if !known || !links.iter().flatten().any(|l| l.lifetime == lifetime && l.handle == handle) {
+                return (Err(Error::from_errno(-(kernel::bindings::ESTALE as i32))), None);
+            }
+            // SAFETY: lookup retains the C object and immutable security owner.
+            let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+            let mut state = owner.state.lock();
+            if owner.identity != identity || state.stopped { return (Err(ENODEV), None); }
+            if state.author != author || state.request != request { return (Err(ENOENT), None); }
+            let result = state.session.as_mut().ok_or(ENOENT)
+                .and_then(|session| session.cancel(identity, now()).map_err(error)).map(|_| ());
+            let material = if result.is_ok() { state.material.take() } else { None };
+            (result, material)
+        })();
+        drop(material); // wipe secrets outside Host/gate/Owner locks
+        // SAFETY: release exactly the existing-lookup caller ref, never table ref.
+        unsafe { sl_connection_session_put(pointer) };
+        result
+    }
+
     pub(crate) fn security_capability_observation(
         &self,
         author: u64,

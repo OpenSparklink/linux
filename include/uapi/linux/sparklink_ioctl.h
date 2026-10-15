@@ -1256,6 +1256,15 @@ struct sle_security_negotiation_submit {
     __u16 handle;
     __u8 role, address_type, address[6], reserved[2];
 };
+/* Cancel only this original Managed File's security author request. Does not
+ * release the controller lease, disconnect, clear installed keys or erase
+ * submitted physical obligations. Successful ioctl is local withdrawal only;
+ * terminal requests remain unchanged. No wire cancel/Complete is fabricated. */
+struct sle_security_negotiation_cancel {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version;
+    __u16 handle, reserved;
+};
 struct sle_security_negotiation_result {
     __aligned_u64 generation, lifetime, request_id;
     __u32 version, profile, state;
@@ -1267,5 +1276,6 @@ struct sle_security_negotiation_result {
 };
 #define SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT _IOW(SL_MAGIC, 0xd2, struct sle_security_negotiation_submit)
 #define SL_IOCTL_SECURITY_NEGOTIATION_RESULT _IOWR(SL_MAGIC, 0xd3, struct sle_security_negotiation_result)
+#define SL_IOCTL_SECURITY_NEGOTIATION_CANCEL _IOW(SL_MAGIC, 0xd4, struct sle_security_negotiation_cancel)
 
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

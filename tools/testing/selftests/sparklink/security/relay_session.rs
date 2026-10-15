@@ -875,3 +875,91 @@ fn encryption_without_current_responder_key_is_never_current_credential() {
     assert_eq!(s.phase(), Phase::Uncertain);
     assert_ne!(s.capability_observation(19).unwrap().state, 9);
 }
+
+#[test]
+fn author_cancel_validates_identity_and_requires_an_approved_request() {
+    let mut s = session();
+    let id = identity();
+    let mut stale = id;
+    stale.lifetime += 1;
+    assert_eq!(s.cancel(stale, 1), Err(Error::Stale));
+    assert_eq!(s.cancel(id, 1), Err(Error::Unsupported));
+    assert_eq!(s.phase(), Phase::Open);
+    assert!(!s.outstanding());
+}
+
+#[test]
+fn author_cancel_before_submit_rejects_old_ticket_and_keeps_one_terminal() {
+    let id = identity();
+    let mut s = session();
+    let p = s.approve_capabilities(id, 1, 0, true).unwrap().unwrap();
+    let mut stale = id;
+    stale.grant_epoch += 1;
+    assert_eq!(s.cancel(stale, 2), Err(Error::Stale));
+    assert_eq!(s.cancel(id, 2), Ok(true));
+    assert_eq!(s.phase(), Phase::Closed);
+    assert_eq!(s.capability_observation(3).unwrap().state, 6);
+    let mut called = false;
+    assert!(s.commit(p.ticket, id, 3, || { called = true; Ok(()) }).is_err());
+    assert!(!called);
+    assert_eq!(s.cancel(id, 4), Ok(false));
+    assert_eq!(s.capability_observation(101).unwrap().state, 6);
+}
+
+#[test]
+fn author_cancel_retains_submitted_relay_until_actual_reply() {
+    let id = identity();
+    let mut s = session();
+    let p = s.approve_capabilities(id, 1, 0, true).unwrap().unwrap();
+    s.commit(p.ticket, id, 2, || Ok(())).unwrap();
+    assert_eq!(s.cancel(id, 3), Ok(true));
+    assert!(s.outstanding());
+    assert_eq!(s.phase(), Phase::Closing);
+    assert!(s.reply(p.ticket, 4, true, 0).is_some());
+    assert!(!s.outstanding());
+    assert_eq!(s.phase(), Phase::Closed);
+    assert_eq!(s.capability_observation(5).unwrap().state, 6);
+    assert_eq!(s.cancel(id, 5), Ok(false));
+}
+
+#[test]
+fn author_cancel_after_install_status_keeps_async_debt_and_does_not_qualify_late_event() {
+    let mut sides = agreement_session(None, None, false, true).unwrap();
+    for (n, s) in sides.iter_mut().enumerate() {
+        let mut id = identity();
+        if n == 1 { id.controller = 2; id.generation = 3; s.installation_event(id, 17, 0xe, 0, 0).unwrap(); }
+        s.progress_installation(id, 18).unwrap();
+        let p = s.prepare(id, 19).unwrap().unwrap();
+        s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+        s.reply(p.ticket, 21, false, 0).unwrap();
+        assert!(!s.outstanding());
+        assert!(s.installation_pending());
+        assert_eq!(s.cancel(id, 22), Ok(true));
+        assert_eq!(s.phase(), Phase::Closing);
+        assert!(s.installation_pending());
+        assert_eq!(s.cancel(id, 23), Ok(false));
+        assert!(s.installation_pending());
+        assert!(s.installation_event(id, 24, 0x11, 0, 1).is_err());
+        assert!(!s.installation_pending());
+        assert_eq!(s.capability_observation(25).unwrap().state, 6);
+    }
+}
+
+#[test]
+fn author_cancel_does_not_rewrite_completed_controller_encryption_or_expired_result() {
+    let mut sides = agreement_session(None, None, false, true).unwrap();
+    let id = identity();
+    let s = &mut sides[0];
+    s.progress_installation(id, 18).unwrap();
+    let p = s.prepare(id, 19).unwrap().unwrap();
+    s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+    s.reply(p.ticket, 21, false, 0).unwrap();
+    s.installation_event(id, 22, 0x11, 0, 1).unwrap();
+    assert_eq!(s.capability_observation(23).unwrap().state, 9);
+    assert_eq!(s.cancel(id, 24), Ok(false));
+    assert_eq!(s.capability_observation(25).unwrap().state, 9);
+    let mut expired = session();
+    expired.approve_capabilities(id, 1, 1, false).unwrap();
+    assert_eq!(expired.cancel(id, 100), Ok(false));
+    assert_eq!(expired.capability_observation(101).unwrap().state, 7);
+}

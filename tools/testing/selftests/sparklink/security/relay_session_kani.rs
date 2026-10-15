@@ -54,6 +54,16 @@ pub mod relay {
             succeeds
         }
 
+        fn withdraw_install_author(s: &mut Session, now: u64) {
+            let request_cancel: bool = kani::any();
+            if request_cancel {
+                assert_eq!(s.cancel(key(), now), Ok(true));
+                assert_eq!(s.cancel(key(), now), Ok(false));
+            } else {
+                s.withdraw();
+            }
+        }
+
         #[kani::proof]
         #[kani::unwind(80)]
         fn installation_submit_cancel_accept_and_event() {
@@ -94,7 +104,7 @@ pub mod relay {
             let cancellation: u8 = kani::any();
             kani::assume(cancellation <= 5);
             if cancellation == 1 {
-                s.withdraw();
+                withdraw_install_author(&mut s, 23);
             }
             if cancellation == 2 {
                 s.expire(100);
@@ -103,7 +113,7 @@ pub mod relay {
             let material = s.installation_matches(key(), now, packet.ticket, packet.index);
             assert_eq!(material.is_ok(), cancellation != 1 && cancellation != 2);
             if cancellation == 3 {
-                s.withdraw();
+                withdraw_install_author(&mut s, 23);
             }
             let accepted: bool = kani::any();
             let mut called = false;
@@ -127,7 +137,7 @@ pub mod relay {
             }
             assert!(s.outstanding());
             if cancellation == 4 {
-                s.withdraw();
+                withdraw_install_author(&mut s, 24);
                 assert!(s.outstanding());
                 s.reply(packet.ticket, 25, false, 0).unwrap();
                 assert!(!s.outstanding());
@@ -143,7 +153,7 @@ pub mod relay {
                 if expire {
                     s.expire(100);
                 } else {
-                    s.withdraw();
+                    withdraw_install_author(&mut s, 26);
                 }
                 assert_ne!(s.phase(), Phase::Closed);
                 assert!(s.installation_pending());

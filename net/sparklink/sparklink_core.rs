@@ -1234,6 +1234,18 @@ fn ioctl_security_negotiation(
     arg: usize,
 ) -> Result<isize> {
     let owner = discovery_owner(context, me)?;
+    if cmd == SL_IOCTL_SECURITY_NEGOTIATION_CANCEL {
+        let input: SleSecurityNegotiationCancel = read_user_struct(arg)?;
+        if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+        if input.generation == 0 || input.lifetime == 0 || input.request_id == 0 || input.handle > 0x0fff {
+            return Err(EINVAL);
+        }
+        if input.generation != owner.identity.generation { return Err(ENODEV); }
+        owner.cancel_security_author(me.file_id, input.lifetime, input.handle, input.request_id)?;
+        owner.kick_commands();
+        owner.schedule_rx(0);
+        return Ok(0);
+    }
     if cmd == SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT {
         let request: SleSecurityNegotiationSubmit = read_user_struct(arg)?;
         if request.version != 1 || request.profile != owner.protocol_profile {
@@ -1739,7 +1751,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
         SL_IOCTL_DIAGNOSTIC_RESULT => ioctl_diagnostic_result(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
-        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT => ioctl_security_negotiation(context,me,cmd,arg),
+        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL => ioctl_security_negotiation(context,me,cmd,arg),
         SL_IOCTL_CONNECTION_SUBMIT => ioctl_connection_submit(context, me, arg),
         SL_IOCTL_CONNECTION_RESULT => ioctl_connection_result(context, me, arg),
         SL_IOCTL_LINK_SNAPSHOT => ioctl_link_snapshot(context, me, arg),
@@ -2119,6 +2131,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_CONTROLLER_SNAPSHOT
             | SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT
             | SL_IOCTL_SECURITY_NEGOTIATION_RESULT
+            | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL
             | SL_IOCTL_CONNECTION_SUBMIT
             | SL_IOCTL_CONNECTION_RESULT
             | SL_IOCTL_LINK_SNAPSHOT

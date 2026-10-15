@@ -2323,6 +2323,19 @@ pub(crate) struct SleSecurityNegotiationResult {
     pub version:u32,pub profile:u32,pub state:u32,pub error:i32,pub flags:u32,
     pub handle:u16,pub role:u8,pub status:u8,pub local_caps:[u8;10],pub peer_caps:[u8;10],pub reserved:[u8;4],
 }
+/// Local author withdrawal, independent of physical Session/controller ownership.
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleSecurityNegotiationCancel {
+    pub generation: u64, pub lifetime: u64, pub request_id: u64,
+    pub version: u32, pub handle: u16, pub reserved: u16,
+}
+impl_check_reserved!(SleSecurityNegotiationCancel, [reserved]);
+// SAFETY: padding-free integers, all bit patterns valid, reserved checked.
+unsafe impl FromBytes for SleSecurityNegotiationCancel {}
+const _: () = assert!(core::mem::size_of::<SleSecurityNegotiationCancel>() == 32);
+pub(crate) const SL_IOCTL_SECURITY_NEGOTIATION_CANCEL: u32 =
+    _IOW::<SleSecurityNegotiationCancel>(SL_MAGIC, 0xd4);
 impl_check_reserved!(SleSecurityNegotiationSubmit, [reserved]);
 impl_check_reserved!(SleSecurityNegotiationResult, [reserved]);
 // SAFETY: both layouts are padding-free integers/byte arrays, all bit patterns valid.

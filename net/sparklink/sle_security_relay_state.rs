@@ -301,6 +301,18 @@ impl Session {
         Some((status, author_live))
     }
 
+    /// Cancel this approved author operation, not the physical connection.
+    /// Terminal observations stay terminal (in particular completed encryption
+    /// is not reported as disabled); pending physical debt is never refunded.
+    /// The caller checks the original File/request and serializes authorization.
+    pub(crate) fn cancel(&mut self, identity: Identity, now: u64) -> Result<bool, Error> {
+        if identity != self.identity { return Err(Error::Stale); }
+        let observation = self.capability_observation(now).ok_or(Error::Unsupported)?;
+        if observation.state >= 4 { return Ok(false); }
+        self.withdraw();
+        Ok(true)
+    }
+
     /// Revoking a policy author removes only unexecuted work. Submitted
     /// commands retain their real reply reservation, even after final fd close.
     pub(crate) fn withdraw(&mut self) {

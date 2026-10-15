@@ -115,6 +115,7 @@ if formal is not None:
             'Withdraw/expiry before materialize or final submit prevents callback; cancel after submit retains obligation until matching reply',
             'Late reply or encryption event cannot revive cancelled/failed Session; post-success off invalidates even beyond original deadline',
             'Command Status pays only command obligation; pending asynchronous install survives cancel/expiry until actual domain evidence or physical retirement']
+        record['proof_scope']['request_cancel_scope'] = 'Before materialization/final submit and after actual submit/Status, nondeterministic choice of author withdraw or actual production Session.cancel; cancellation idempotence checked. Original File/request validation and Runtime locking are outside this pure harness.'
         record['proof_scope']['excluded'] += ['Actual C key copy, firmware encryption truth, independent radio cipher attestation, T role installation model and uncertain USB failure combination']
     record['regression_status'] = 'PASS'
     if formal['status'] != 'BOUNDED_PASS':
