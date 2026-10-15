@@ -81,12 +81,15 @@ if formal is not None:
     record['formal'] = formal
     record['proof_scope'] = dict(harness=args.kani_harness or 'all4', queue_depth=2,
         capability_payload_bytes=10, capability_exchanges=1, capability_terminal_replies=1,
-        arbitrary_commit_time_u64=True, unwind=12,
-        properties=['No callback after prior withdraw/expiry or foreign identity',
-                    'Submit failure is nondeterministic; only accepted callback creates obligation',
-                    'Withdraw/expiry preserve submitted obligation until matching terminal reply',
-                    'Successful Status alone cannot pay obligation or complete exchange',
-                    'Both peer ingress and real Complete required in either order; terminal failure cannot revive'],
+        arbitrary_commit_time_u64=args.kani_harness != 'capability_requires_peer_and_terminal_complete', unwind=12,
+        property_inventory_by_harness={
+            'capability_withdraw_deadline_and_submit':[
+                'No callback after prior withdraw/expiry or foreign identity',
+                'Submit failure is nondeterministic; only accepted callback creates obligation',
+                'Withdraw/expiry preserve submitted obligation until matching terminal reply'],
+            'capability_requires_peer_and_terminal_complete':[
+                'Successful Status alone cannot pay obligation or complete exchange',
+                'Both peer ingress and real Complete required in either order; terminal failure cannot revive']},
         assumptions=['Caller serializes exact production methods under Owner lock',
                      'Host/gate identity is current; driver callback atomically accepts or NEVER queues',
                      'Input reply ticket already resolved by Host; peer ingress identity already frozen'],
