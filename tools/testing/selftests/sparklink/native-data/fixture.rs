@@ -67,6 +67,7 @@ impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
  NativeCommandReply{opcode:u16,command_credits:u8,status:u8,complete:bool,data:KVec<u8>},
  HardwareError{code:u8},
  NativeControllerData{lifetime:u64,handle:u16,index:u16,data:KVec<u8>},
+ // @@SECURITY_INSTALL_EVENT@@
 }
 thread_local!{
  static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(Vec::new())};
@@ -456,4 +457,31 @@ unsafe extern "C" fn actual_inspection_callback(value:*const sle_data_credit::Cr
  assert_eq!(inspect(1,&mut count),0);assert_eq!(inspect(1,&mut count),0);assert_eq!(count,2);
  a.host.lock().grants.revoke();assert_eq!(inspect(1,&mut count),-13);assert_eq!(count,2);
  assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
+}
+
+fn security_event(event:u16,body:&[u8])->Vec<u8>{let mut v=vec![0xa2,event as u8,(event>>8)as u8,body.len()as u8,0];v.extend_from_slice(body);v}
+#[test] fn installation_event_ingress_freezes_exact_physical_lifetime_without_qualification(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ assert_eq!(receive(0,7,&security_event(0xe,&[0,0])),0);
+ assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,1])),0);
+ link(&a,0,2);link(&a,0,1);
+ assert_eq!(receive(0,7,&security_event(0x11,&[1,0,0,255])),0); // status/value stay opaque here
+ let events=a.commands.borrow();assert_eq!(events.len(),3);assert!(b.commands.borrow().is_empty());
+ for (n,e) in events.iter().enumerate(){match e{SleEvent::NativeSecurityInstallation{lifetime,handle,event,status,enabled}=>{
+  assert_eq!((*lifetime,*handle),(if n==2{3}else{1},0));
+  assert_eq!((*event,*status,*enabled),if n==0{(0xe,0,0)}else if n==1{(0x11,0,1)}else{(0x11,1,255)});
+ },_=>panic!("wrong metadata variant")}}
+}
+#[test] fn installation_event_malformed_foreign_or_unmanaged_cannot_become_receipt(){
+ let(a,_)=setup();link(&a,0,1);
+ for (event,body) in [(0xe,&[0,0][..]),(0x11,&[0,0,0,1][..])]{
+  let packet=security_event(event,body);
+  for cut in 0..packet.len(){assert_eq!(receive(0,7,&packet[..cut]),-71);}
+  let mut extra=packet.clone();extra.push(0);extra[3]+=1;assert_eq!(receive(0,7,&extra),-71);
+  assert_eq!(receive(0,8,&packet),-19);
+ }
+ assert_eq!(receive(0,7,&security_event(0xe,&[1,0])),-116);
+ assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0x10,1])),-71);
+ {let mut h=a.host.lock();h.grants.revoke();h.data_revoked=true;}assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,1])),-13);
+ assert!(a.commands.borrow().is_empty()); // Old physical work retires through actual Down, not this rejected event.
 }

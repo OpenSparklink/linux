@@ -18,9 +18,12 @@ def run(output):
     net = root / 'net/sparklink'
     files = [net / n for n in ['sle_native.rs', 'sle_link_observation.rs',
                              'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs', 'sle_sessions.rs', 'sle_grant.rs']]
+    files.append(net/'sle_dli.rs')
     files.append(here / 'native-data/fixture.rs')
     originals = {p: p.read_bytes() for p in files}
     fixture = originals[files[-1]].decode()
+    variant=re.search(r'NativeSecurityInstallation\s*\{[^}]+\},',originals[net/'sle_dli.rs'].decode()).group()
+    fixture=fixture.replace('// @@SECURITY_INSTALL_EVENT@@',variant)
     fixture = fixture.replace('// @@ADMITTED@@', function((net/'sle_host.rs').read_text(), 'admits_data'))
     # The existing balanced-body extractor accepts Rust fn signatures, not
     # extern ABI spelling. Only normalize the signature; preserve whole bodies.
@@ -44,8 +47,9 @@ def run(output):
             (tmp / p.name).write_bytes(originals[p])
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
-        result = subprocess.check_output([str(tmp / 'test'), '--test-threads=1'], text=True)
-        print(result)
+        process = subprocess.run([str(tmp / 'test'), '--test-threads=1'], text=True,capture_output=True)
+        result=process.stdout
+        print(result);print(process.stderr);process.check_returncode()
     assert all(p.read_bytes() == data for p, data in originals.items())
     count = re.search(r'test result: ok\. (\d+) passed; 0 failed;', result)
     assert count
