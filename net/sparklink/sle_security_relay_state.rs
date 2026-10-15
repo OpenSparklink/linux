@@ -650,6 +650,25 @@ impl Session {
         status: u8,
         enabled: u8,
     ) -> Result<(), Error> {
+        // Terminal success is a historical operation result, never permission
+        // to keep reporting encryption after an actual off/failure/rekey event.
+        // Revocation/physical lifetime are separately rechecked by Runtime.
+        if current != self.identity {
+            return Err(Error::Stale);
+        }
+        if event == 0x0011
+            && self.phase == Phase::Closed
+            && self.installation.is_some()
+            && self.capability.is_some_and(|c| c.observation.state == 9)
+            && (status != 0 || enabled != 1)
+        {
+            if let Some(c) = &mut self.capability {
+                c.observation.state = 5;
+                c.observation.status = status;
+                c.observation.error = if status != 0 { -5 } else { -71 };
+            }
+            return Err(Error::Closed);
+        }
         self.admission(current, now)?;
         let mut i = self.installation.ok_or(Error::Unsupported)?;
         if !self.pairing.is_some_and(|p| p.proof_verified) {

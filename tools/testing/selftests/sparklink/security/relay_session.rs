@@ -656,6 +656,18 @@ fn same_session_installation_requires_proof_role_request_actual_submit_accept_an
                 assert_eq!(s.phase(), Phase::Closed);
                 assert!(!s.outstanding());
                 assert_eq!(s.installation_event(id, 29, 0x11, 0, 1), Err(Error::Closed));
+                // An actual later off event also invalidates the observation
+                // beyond the old operation deadline; a late on cannot revive it.
+                assert_eq!(
+                    s.installation_event(id, 101, 0x11, 0, 0),
+                    Err(Error::Closed)
+                );
+                assert_eq!(s.capability_observation(102).unwrap().state, 5);
+                assert_eq!(
+                    s.installation_event(id, 103, 0x11, 0, 1),
+                    Err(Error::Expired)
+                );
+                assert_ne!(s.capability_observation(104).unwrap().state, 9);
             }
         }
     }
