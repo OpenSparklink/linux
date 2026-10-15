@@ -1,0 +1,43 @@
+WS73 production codec fuzz (offline C, not a kernel/USB test)
+==========================================================
+
+From the Linux checkout, with Clang/libFuzzer, ASAN/UBSAN, matching llvm-profdata,
+llvm-cov and nm installed:
+
+  python3 tools/testing/selftests/sparklink/fuzz/test_ws73_codec_verdict.py
+  python3 tools/testing/selftests/sparklink/run_ws73_codec_fuzz.py \
+      --output /tmp/ws73-codec-fuzz-new-run --runs 20000 --seed 730111
+
+The output directory must not exist. CC, LLVM_PROFDATA and LLVM_COV select the
+recorded tools. The runner links unchanged drivers/sparklink/ws73/wire.c and
+dli.c; it does not load kernel code, install services, read firmware or open USB.
+Host execution here is a pure-code exception to VM-only driver/device testing.
+Never send fuzzer inputs to real WS73 hardware.
+
+The fixed public-format corpus has no captures/SDK/firmware/keys. It covers empty
+and truncated input, relay/link/encryption events, ACB/PB,253/254/255/2047 lengths,
+20KiB RX budget, aggregate slots and a malformed later slot. Short exploration
+extends its own copy; preserve both corpus directories, the seed, crashes, logs,
+binary, coverage profiles/export and report.json. Minimize confirmed failures and
+turn them into fixed production regressions; reruns never erase originals.
+
+The harness uses real parser/encoder bodies, libc allocation, and an observer
+callback checking input bounds/routing plus an explicit ECANCELED alternative.
+It checks failed aggregate validation exposes no earlier valid slot, output
+capacity and failure atomicity, complete ACB roundtrips, and fresh valid parser
+reentry after arbitrary input. It intentionally does not pass invalid C pointers.
+EFAULT/bad user pointers belong to the actual syscall VM gate.
+
+The runner checks sanitizer/coverage symbols, full libFuzzer terminal summaries,
+actual execution counts of required production functions and unchanged source
+hashes. Missing tools/results/profiles, sanitizer diagnostics, a masked failure
+or truncated logs cannot pass. Five synthetic supervisor negative-control tests
+are separate from production codec exploration.
+
+BOUNDED_FUZZ_COMPLETED_NO_FINDING means only the recorded finite input budget.
+It is not a proof or a kernel KASAN/KCSAN/lockdep qualification. Query/BSLE state
+machines, stream split/reassembly, allocation failure, Session/Grant/credit,
+USB/callback/locks, security, real air traffic and hardware recovery remain in
+separate selftests/formal/VM gates. LSan under ptrace may fail in a restricted
+sandbox; retain that tool failure and rerun in an authorized ordinary process,
+without disabling the detector or treating DONE alone as success.
