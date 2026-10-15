@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 import unittest
-from run_daemon_lifecycle import assess, assess_radio, assess_management, assess_diagnostic
+from run_daemon_lifecycle import assess, assess_radio, assess_management, assess_diagnostic, kernel_authorization_counts
 
 
 def view(index, generation):
@@ -176,7 +176,8 @@ class AuthorizationVerdict(unittest.TestCase):
 class KernelAuthorizationVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected=102 denied=102 observe=35 configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
+        cls.protected_count, cls.observe_count = kernel_authorization_counts()
+        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected={cls.protected_count} denied={cls.protected_count} observe={cls.observe_count} configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
                              for uid,gid in [(1001,1001),(1000,1002),(0,0)])
         cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 observe_no_power_sync=1\n'
         cls.good = GOOD + cls.matrix + cls.state
@@ -187,7 +188,13 @@ class KernelAuthorizationVerdict(unittest.TestCase):
     def test_missing_root_without_cap(self): self.assertTrue(assess(self.good.replace('uid=0 gid=0', 'uid=1 gid=1'), 0, kernel_authorization=True))
     def test_missing_control_uid(self): self.assertTrue(assess(self.good.replace('uid=1000 gid=1002','uid=0 gid=0'),0,kernel_authorization=True))
     def test_capabilities(self): self.assertTrue(assess(self.good.replace('caps=0','caps=1',1),0,kernel_authorization=True))
-    def test_wrong_deny_count(self): self.assertTrue(assess(self.good.replace('denied=102','denied=101',1),0,kernel_authorization=True))
+    def test_wrong_deny_count(self): self.assertTrue(assess(self.good.replace(f'denied={self.protected_count}', f'denied={self.protected_count - 1}',1),0,kernel_authorization=True))
+    def test_retired_magic_totals_do_not_qualify_current_probe(self):
+        stale = self.good.replace(f'protected={self.protected_count} denied={self.protected_count} observe={self.observe_count}',
+                                  'protected=102 denied=102 observe=35')
+        self.assertNotEqual(stale, self.good)
+        self.assertTrue(assess(stale, 0, kernel_authorization=True))
+
     def test_missing_fd_inheritance(self): self.assertTrue(assess(self.good.replace('inherited_fd=1','inherited_fd=0',1),0,kernel_authorization=True))
     def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('configfs_denied=5','configfs_denied=4',1),0,kernel_authorization=True))
     def test_genl_bypass(self): self.assertTrue(assess(self.good.replace('genl_denied=5','genl_denied=4',1),0,kernel_authorization=True))

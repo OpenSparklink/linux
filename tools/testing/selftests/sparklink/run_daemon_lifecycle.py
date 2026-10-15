@@ -22,6 +22,26 @@ HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
 
 
+
+def kernel_authorization_counts():
+    """Expected totals from the same reviewed C probe compiled into this VM.
+
+    The authorization contract independently requires exact ioctl membership,
+    not just these counts. Historical console totals do not qualify new source.
+    """
+    source = (HERE / 'kernel_authorization_test.c').read_text()
+    counts = []
+    for name in ['protected', 'observe']:
+        match = re.search(rf'{name}\[\] = \{{(.*?)\}};', source, re.S)
+        if match is None:
+            raise ValueError('authorization probe array missing: ' + name)
+        entries = re.findall(r'SL_IOCTL_\w+', match[1])
+        if not entries or len(entries) != len(set(entries)):
+            raise ValueError('empty or duplicate authorization probe entries: ' + name)
+        counts.append(len(entries))
+    return tuple(counts)
+
+
 def require_config(path, authorization=False):
     config = path.read_text().splitlines()
     names = ['RUST', 'SPARKLINK', 'SPARKLINK_WS73_USB']
@@ -91,7 +111,8 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         errors.append('unexpected production authorization evidence')
     if kernel_authorization:
         matrix = re.findall(r'^KERNEL_AUTHORIZATION: (.*)$', console, re.M)
-        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected=102 denied=102 observe=35 configfs_denied=5 genl_denied=5 unknown=ENOTTY'
+        protected_count, observe_count = kernel_authorization_counts()
+        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected={protected_count} denied={protected_count} observe={observe_count} configfs_denied=5 genl_denied=5 unknown=ENOTTY'
                     for uid, gid in [(1001,1001), (1000,1002), (0,0)]]
         if matrix != expected or re.findall(r'^KERNEL_AUTHORIZATION_STATE: (.*)$', console, re.M) != ['unchanged=1 native_admission=0 observe_no_power_sync=1']:
             errors.append('kernel authorization matrix missing, duplicated or incomplete')
