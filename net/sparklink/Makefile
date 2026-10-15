@@ -6,6 +6,7 @@ sparklink-y := sparklink_core.o
 sparklink-y += sle_irq_lock.o
 sparklink-y += sle_native_ffi.o
 sparklink-y += sle_channel_wire.o sle_channel_socket.o
-# Crypto mechanism sources are retained for future per-session security and
-# dedicated fault tests; no unconnected crypto object in the default runtime.
+sparklink-y += sle_pair_crypto.o sle_pair_material.o
+# Only the used P256/CMAC Session mechanism is linked. Historical SM3/SM4 and
+# the removed security/RPA facade remain outside the default Runtime.
 sparklink-$(CONFIG_SPARKLINK_GENL) += sparklink_genl.o

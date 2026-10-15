@@ -1225,16 +1225,23 @@ struct sle_link_snapshot {
 
 /* Experimental limited security capability exchange, NOT Pair/Encrypted.
  * Both operations require the same active Managed File and CAP_NET_ADMIN.
- * flags MUST be SLE_SECURITY_CAPABILITY_ONLY; no raw TX/RX/keys supplied.
+ * flags selects CAPABILITY_ONLY or KEY_AGREEMENT_ONLY; no raw TX/RX/keys.
  * action1 arms T response; action2 starts G request. Other roles unsupported.
  * Once per physical lifetime; no same-life retry, no restart after expiry.
  * Entire original timeout1..5000ms includes policy admission/queue/replies.
  * state4 means only own real Complete plus observed peer capability bytes;
  * it is NOT an ACK that the peer processed our offer, pairing, trust or keys.
+ * state8 is unauthenticated candidate key agreement after real peer proof;
+ * all own relay Completes must drain. It does not grant trusted identity.
  * Full security facade remains EOPNOTSUPP. Client explicitly disconnects after
  * this limited exchange. Revoke/Down invalidates it and never refunds debt.
  */
 #define SLE_SECURITY_CAPABILITY_ONLY 1U
+/* Experimental no-entry/no-MITM/no-Bond candidate key agreement. state8 means
+ * fresh peer DH proof plus drained real relay Completes, NOT authenticated
+ * identity, installation, encryption, Agent consent or Bond. No raw keys/API.
+ */
+#define SLE_SECURITY_KEY_AGREEMENT_ONLY 2U
 struct sle_security_negotiation_submit {
     __aligned_u64 generation, lifetime, request_id;
     __u32 version, profile, action, flags, timeout_ms;

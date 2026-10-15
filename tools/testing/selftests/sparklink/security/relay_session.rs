@@ -16,6 +16,174 @@ fn session() -> Session {
     Session::new(identity(), 10, 100).unwrap()
 }
 
+// This is a protocol/lifetime dependency fixture, not a crypto algorithm. The
+// real C primitives/material get separate actual-kernel VM tests and RF proof.
+fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: bool) {
+    let g = identity();
+    let mut t = g;
+    t.controller = 2;
+    t.generation = 3;
+    let mut sides = [session(), Session::new(t, 10, 100).unwrap()];
+    let initial = sides[0]
+        .approve_key_agreement(g, 11, 0, true, [1; 64])
+        .unwrap()
+        .unwrap();
+    assert!(
+        sides[1]
+            .approve_key_agreement(t, 11, 1, false, [2; 64])
+            .unwrap()
+            .is_none()
+    );
+    let mut pending = std::collections::VecDeque::from([(0, initial)]);
+    let mut count = 0;
+    while let Some((source, packet)) = pending.pop_front() {
+        let identities = [g, t];
+        let target = 1 - source;
+        sides[source]
+            .commit(packet.ticket, identities[source], 12, || Ok(()))
+            .unwrap();
+        let job = sides[target]
+            .pairing_input(identities[target], 13, packet.index, packet.payload())
+            .unwrap();
+        if let Some(job) = job {
+            if packet.index == 0x136 {
+                assert_eq!(&job.data[..], &packet.payload()[6..]);
+            } else if packet.index == 0x137 {
+                assert_eq!(&job.data[..], packet.payload());
+            } else {
+                assert_eq!(&job.data[..16], packet.payload());
+            }
+            if job.kind == CryptoKind::GDerive {
+                assert_eq!(job.confirm, [3; 16]);
+            }
+            if withdraw == Some(job.kind) {
+                if expire {
+                    sides[target].expire(100);
+                } else {
+                    sides[target].withdraw();
+                }
+                assert!(
+                    sides[target]
+                        .pairing_output(
+                            identities[target],
+                            if expire { 100 } else { 14 },
+                            job,
+                            Ok([3; 16])
+                        )
+                        .is_err()
+                );
+                assert_ne!(sides[target].capability_observation(100).unwrap().state, 8);
+                return;
+            }
+            let receipt = if fail == Some(job.kind) {
+                Err(-129)
+            } else {
+                Ok([3; 16])
+            };
+            let result = sides[target].pairing_output(identities[target], 14, job, receipt);
+            if fail == Some(job.kind) {
+                assert!(result.is_err());
+                let observation = sides[target].capability_observation(14).unwrap();
+                assert_eq!((observation.state, observation.error), (5, -129));
+                return;
+            }
+            result.unwrap();
+        }
+        assert!(sides[source].reply(packet.ticket, 15, true, 0).is_some());
+        count += 1;
+        for n in [0, 1] {
+            if sides[n].phase() == Phase::Open {
+                if let Some(packet) = sides[n].prepare(identities[n], 16).unwrap() {
+                    pending.push_back((n, packet));
+                }
+            }
+        }
+        assert!(count <= 9);
+    }
+    assert_eq!(count, 9);
+    for s in &mut sides {
+        assert!(s.key_agreement());
+        assert_eq!(s.phase(), Phase::Closed);
+        assert!(!s.outstanding());
+        assert_eq!(s.queued(), 0);
+        let result = s.capability_observation(16).unwrap();
+        assert_eq!((result.state, result.flags, result.error), (8, 7, 0));
+    }
+}
+
+#[test]
+fn same_session_full_key_agreement_protocol_and_crypto_failures() {
+    agreement(None, None, false);
+    for kind in [
+        CryptoKind::GPublicAndConfirm,
+        CryptoKind::TPublic,
+        CryptoKind::GNonce,
+        CryptoKind::TDerive,
+        CryptoKind::GDerive,
+        CryptoKind::GProofAndRespond,
+        CryptoKind::TProof,
+    ] {
+        agreement(Some(kind), None, false);
+        agreement(None, Some(kind), false);
+        agreement(None, Some(kind), true);
+    }
+    let mut s = session();
+    s.approve_key_agreement(identity(), 11, 1, false, [1; 64])
+        .unwrap();
+    s.crypto_failed(-5);
+    assert_eq!(s.capability_observation(12).unwrap().error, -5);
+}
+
+#[test]
+fn crypto_job_requires_original_identity_ticket_and_nonterminal_session() {
+    let key = identity();
+    let mut s = session();
+    s.approve_key_agreement(key, 11, 1, false, [1; 64]).unwrap();
+    assert!(
+        s.pairing_input(key, 12, 0x134, &[3, 0, 0, 16, 0, 2, 2, 2, 2, 0])
+            .unwrap()
+            .is_none()
+    );
+    let response = s.prepare(key, 13).unwrap().unwrap();
+    s.commit(response.ticket, key, 14, || Ok(())).unwrap();
+    let mut message = [1; 70];
+    message[..6].copy_from_slice(&[16, 1, 2, 2, 2, 2]);
+    let job = s.pairing_input(key, 15, 0x136, &message).unwrap().unwrap();
+    assert!(s.outstanding());
+    for n in 0..6 {
+        let mut bad = job;
+        match n {
+            0 => bad.ticket.identity.controller += 1,
+            1 => bad.ticket.identity.generation += 1,
+            2 => bad.ticket.identity.lifetime += 1,
+            3 => bad.ticket.identity.handle += 1,
+            4 => bad.ticket.identity.grant_epoch += 1,
+            _ => bad.ticket.cookie += 1,
+        }
+        assert_eq!(
+            s.pairing_output(key, 16, bad, Ok([3; 16])),
+            Err(Error::Stale)
+        );
+        assert_eq!(s.queued(), 0);
+        assert!(s.outstanding());
+    }
+    let mut wrong_kind = job;
+    wrong_kind.kind = CryptoKind::TPublic;
+    assert_eq!(
+        s.pairing_output(key, 16, wrong_kind, Ok([3; 16])),
+        Err(Error::Stale)
+    );
+    s.withdraw();
+    assert!(s.outstanding());
+    assert_eq!(
+        s.pairing_output(key, 17, job, Ok([3; 16])),
+        Err(Error::Closed)
+    );
+    assert!(s.reply(response.ticket, 18, true, 0).is_some());
+    assert!(!s.outstanding());
+    assert_eq!(s.capability_observation(18).unwrap().state, 6);
+}
+
 #[test]
 fn initialization_and_lengths() {
     let mut invalid = identity();
@@ -328,9 +496,10 @@ fn approval_expiry_withdrawal_and_uncertain_failure_never_gain_capabilities() {
         s.reply(packet.ticket, 101, true, 0).unwrap();
         assert_ne!(s.capability_observation(102).unwrap().state, 4);
         assert!(!s.outstanding());
-        assert!(s
-            .receive_capabilities(id, 102, 0x135, packet.payload())
-            .is_err());
+        assert!(
+            s.receive_capabilities(id, 102, 0x135, packet.payload())
+                .is_err()
+        );
     }
 }
 
@@ -388,9 +557,11 @@ fn capability_complete_before_receive_failure_and_passive_expiry_are_terminal() 
     let mut passive = session();
     passive.approve_capabilities(id, 11, 1, false).unwrap();
     assert_eq!(passive.capability_observation(100).unwrap().state, 7);
-    assert!(passive
-        .receive_capabilities(id, 101, 0x134, &offer)
-        .is_err());
+    assert!(
+        passive
+            .receive_capabilities(id, 101, 0x134, &offer)
+            .is_err()
+    );
     assert!(!passive.outstanding());
     assert_eq!(passive.queued(), 0);
     let mut refused = session();

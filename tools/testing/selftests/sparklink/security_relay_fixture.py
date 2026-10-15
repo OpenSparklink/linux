@@ -18,7 +18,7 @@ const ENODEV:Error=Error(-19);const EINVAL:Error=Error(-22);const EBUSY:Error=Er
 mod kernel {pub mod bindings {pub const EOPNOTSUPP:u32=95;pub const EINVAL:u32=22;pub const ESTALE:u32=116;pub const ETIMEDOUT:u32=110;pub const ECANCELED:u32=125;pub const ENOBUFS:u32=105;pub const EOVERFLOW:u32=75;pub const EIO:u32=5;}}
 macro_rules! pr_warn {($($arg:tt)*)=>{{}};}
 struct Lock<T>(RefCell<T>);impl<T> Lock<T>{fn lock(&self)->RefMut<'_,T>{self.0.borrow_mut()}}
-struct State {session:Option<relay::Session>,stopped:bool}
+struct State {session:Option<relay::Session>,stopped:bool,material:Option<Box<()>>}
 struct Owner {identity:Identity,state:Lock<State>}
 struct Allocation {owner:Owner,refs:Cell<usize>}
 thread_local! {static CLOCK:Cell<u64>=const{Cell::new(1)};}
@@ -28,7 +28,7 @@ unsafe fn sl_connection_session_security(p:*mut c_void)->*mut c_void{unsafe{std:
 unsafe fn sl_connection_session_get(p:*mut c_void){let a=unsafe{&*p.cast::<Allocation>()};a.refs.set(a.refs.get()+1);}
 unsafe fn sl_connection_session_put(p:*mut c_void){let a=unsafe{&*p.cast::<Allocation>()};let n=a.refs.get();assert!(n>0);a.refs.set(n-1);if n==1 {drop(unsafe{Box::from_raw(p.cast::<Allocation>())});}}
 pub(crate) fn prepare(identity:Identity,deadline:u64)->Command {
- let p=Box::into_raw(Box::new(Allocation{owner:Owner{identity,state:Lock(RefCell::new(State{session:None,stopped:false}))},refs:Cell::new(1)})).cast();
+ let p=Box::into_raw(Box::new(Allocation{owner:Owner{identity,state:Lock(RefCell::new(State{session:None,stopped:false,material:None}))},refs:Cell::new(1)})).cast();
  unsafe{Command::prepare_denial(p,identity,deadline)}.unwrap().0
 }
 '''

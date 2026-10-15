@@ -16,7 +16,7 @@ root = here.parents[3]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path)
 parser.add_argument('--kani', action='store_true', help='verify the same production source in a private mirrored tree')
-parser.add_argument('--kani-harness', choices=['capability_withdraw_deadline_and_submit', 'capability_requires_peer_and_terminal_complete'], help='select one capability proof; requires --kani')
+parser.add_argument('--kani-harness', choices=['capability_withdraw_deadline_and_submit', 'capability_requires_peer_and_terminal_complete','key_agreement_job_cancel_and_physical_obligation'], help='select one relay proof; requires --kani')
 parser.add_argument('--timeout', type=int, default=300, help='formal tool seconds; timeout is NOT_PROVEN')
 args = parser.parse_args()
 if args.kani_harness and not args.kani:parser.error('--kani-harness requires --kani')
@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix='sparklink-relay-session-') as directory
             stdout, stderr = process.communicate(timeout=args.timeout)
             log = stdout + stderr
             status = 'BOUNDED_PASS' if process.returncode == 0 else 'NOT_PROVEN'
-            expected_harnesses=1 if args.kani_harness else 4
+            expected_harnesses=1 if args.kani_harness else 5
             verdict=re.findall(r'Complete - (\d+) successfully verified harnesses, (\d+) failures, (\d+) total\.',log)
             if verdict!=[(str(expected_harnesses),'0',str(expected_harnesses))]:status='NOT_PROVEN_INCOMPLETE'
             if 'unsupported' in log.lower():
@@ -79,9 +79,9 @@ record = dict(status='PRODUCTION_RELAY_SESSION_REGRESSION_PASS', tests=test_coun
               sources={str(p.relative_to(root)): hashlib.sha256(data).hexdigest() for p, data in originals.items()})
 if formal is not None:
     record['formal'] = formal
-    record['proof_scope'] = dict(harness=args.kani_harness or 'all4', queue_depth=2,
+    record['proof_scope'] = dict(harness=args.kani_harness or 'all5', queue_depth=2,
         capability_payload_bytes=10, capability_exchanges=1, capability_terminal_replies=1,
-        arbitrary_commit_time_u64=args.kani_harness != 'capability_requires_peer_and_terminal_complete', unwind=12,
+        arbitrary_commit_time_u64=args.kani_harness in [None,'capability_withdraw_deadline_and_submit'], unwind=80 if args.kani_harness in [None,'key_agreement_job_cancel_and_physical_obligation'] else 12,
         property_inventory_by_harness={
             'capability_withdraw_deadline_and_submit':[
                 'No callback after prior withdraw/expiry or foreign identity',
@@ -89,7 +89,11 @@ if formal is not None:
                 'Withdraw/expiry preserve submitted obligation until matching terminal reply'],
             'capability_requires_peer_and_terminal_complete':[
                 'Successful Status alone cannot pay obligation or complete exchange',
-                'Both peer ingress and real Complete required in either order; terminal failure cannot revive']},
+                'Both peer ingress and real Complete required in either order; terminal failure cannot revive'],
+            'key_agreement_job_cancel_and_physical_obligation':[
+                'G public crypto job cannot be created before T response actually submits',
+                'Withdraw/expiry reject either successful or failed crypto receipt and create no continuation',
+                'Submitted T response obligation remains until its actual matching terminal reply']},
         assumptions=['Caller serializes exact production methods under Owner lock',
                      'Host/gate identity is current; driver callback atomically accepts or NEVER queues',
                      'Input reply ticket already resolved by Host; peer ingress identity already frozen'],

@@ -15,6 +15,80 @@ pub mod relay {
             }
         }
 
+        #[kani::proof]
+        #[kani::unwind(80)]
+        fn key_agreement_job_cancel_and_physical_obligation() {
+            let mut s = match Session::new(key(), 0, 100) {
+                Ok(value) => value,
+                Err(_) => {
+                    assert!(false);
+                    return;
+                }
+            };
+            assert!(s.approve_key_agreement(key(), 1, 1, false, [1; 64]).is_ok());
+            assert!(
+                s.pairing_input(key(), 2, 0x134, &[3, 0, 0, 16, 0, 2, 2, 2, 2, 0])
+                    .is_ok()
+            );
+            let packet = match s.prepare(key(), 3) {
+                Ok(Some(value)) => value,
+                _ => {
+                    assert!(false);
+                    return;
+                }
+            };
+            let accepted: bool = kani::any();
+            let committed = s.commit(packet.ticket, key(), 4, || {
+                if accepted { Ok(()) } else { Err(()) }
+            });
+            assert!(committed.is_ok() == accepted);
+            let mut body = [1; 70];
+            body[..6].copy_from_slice(&[16, 1, 2, 2, 2, 2]);
+            let result = s.pairing_input(key(), 5, 0x136, &body);
+            if !accepted {
+                assert!(result.is_err());
+                assert!(!s.outstanding());
+                return;
+            }
+            let job = match result {
+                Ok(Some(value)) => value,
+                _ => {
+                    assert!(false);
+                    return;
+                }
+            };
+            let expire: bool = kani::any();
+            let crypto_success: bool = kani::any();
+            if expire {
+                s.expire(100);
+            } else {
+                s.withdraw();
+            }
+            assert!(s.outstanding());
+            let bytes: [u8; 16] = kani::any();
+            assert!(
+                s.pairing_output(
+                    key(),
+                    if expire { 100 } else { 6 },
+                    job,
+                    if crypto_success { Ok(bytes) } else { Err(-129) }
+                )
+                .is_err()
+            );
+            assert!(s.queued() == 0);
+            assert!(s.outstanding());
+            assert!(s.reply(packet.ticket, 101, true, 0).is_some());
+            assert!(!s.outstanding());
+            let observation = match s.capability_observation(102) {
+                Some(value) => value,
+                None => {
+                    assert!(false);
+                    return;
+                }
+            };
+            assert!(observation.state != 4 && observation.state != 8);
+        }
+
         // Exact production transitions, one capability request and one real
         // reply. The callback is nondeterministic accepted/NEVER queued; it
         // does not model HCD locks, callback draining or wire uniqueness.

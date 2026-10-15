@@ -80,6 +80,7 @@ pub(crate) struct Session {
     active: Option<Active>,
     reset_required: bool,
     capability: Option<CapabilityExchange>,
+    pairing: Option<Pairing>,
 }
 
 impl Session {
@@ -106,6 +107,7 @@ impl Session {
             active: None,
             reset_required: false,
             capability: None,
+            pairing: None,
         })
     }
     pub(crate) fn phase(&self) -> Phase {
@@ -207,6 +209,9 @@ impl Session {
             return Err(Error::NeverSubmitted);
         }
         active.submitted = true;
+        if let Some(pair) = &mut self.pairing {
+            pair.last_submitted = active.packet.index;
+        }
         if let Some(c) = &mut self.capability {
             c.observation.flags |= 1;
         }
@@ -263,12 +268,13 @@ impl Session {
                 c.observation.status = status;
                 if complete && status == 0 {
                     c.observation.flags |= 2;
-                    if c.observation.flags & 4 != 0 {
+                    if c.observation.flags & 4 != 0 && self.pairing.is_none() {
                         c.observation.state = 4;
                         self.phase = Phase::Closed;
                     }
                 } else {
                     c.observation.state = 5;
+                    self.queue.fill(None);
                     self.phase = Phase::Closed;
                 }
             }
@@ -276,6 +282,7 @@ impl Session {
         if self.phase == Phase::Closing {
             self.phase = Phase::Closed;
         }
+        self.finish_pairing_if_drained();
         Some((status, author_live))
     }
 
@@ -341,6 +348,7 @@ pub(crate) struct CapabilityObservation {
     pub(crate) status: u8,
     pub(crate) local: [u8; 10],
     pub(crate) peer: [u8; 10],
+    pub(crate) error: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -390,6 +398,7 @@ impl Session {
                 status: 0,
                 local: CAPABILITY_OFFER,
                 peer: [0; 10],
+                error: 0,
             },
         });
         if initiate {
@@ -442,5 +451,255 @@ impl Session {
     pub(crate) fn capability_observation(&mut self, now: u64) -> Option<CapabilityObservation> {
         self.expire(now);
         self.capability.map(|c| c.observation)
+    }
+}
+
+// The same relay Session owns the protocol order. Sleeping crypto returns a
+// typed job receipt; it neither owns wire progress nor creates trusted state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CryptoKind {
+    GPublicAndConfirm,
+    TPublic,
+    GNonce,
+    TDerive,
+    GDerive,
+    GProofAndRespond,
+    TProof,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct CryptoJob {
+    pub(crate) ticket: Ticket,
+    pub(crate) kind: CryptoKind,
+    pub(crate) data: [u8; 64],
+    pub(crate) confirm: [u8; 16],
+}
+#[derive(Clone, Copy)]
+struct Pairing {
+    expected: u16,
+    last_submitted: u16,
+    public: [u8; 64],
+    confirm: [u8; 16],
+    job: Option<(Ticket, CryptoKind)>,
+    proof_verified: bool,
+}
+
+impl Session {
+    pub(crate) fn key_agreement(&self) -> bool {
+        self.pairing.is_some()
+    }
+    pub(crate) fn crypto_failed(&mut self, error: i32) {
+        self.fail_pairing(error);
+    }
+
+    pub(crate) fn approve_key_agreement(
+        &mut self,
+        current: Identity,
+        now: u64,
+        role: u8,
+        initiate: bool,
+        public: [u8; 64],
+    ) -> Result<Option<Packet>, Error> {
+        let packet = self.approve_capabilities(current, now, role, initiate)?;
+        self.pairing = Some(Pairing {
+            expected: if initiate { 0x135 } else { 0x134 },
+            last_submitted: 0,
+            public,
+            confirm: [0; 16],
+            job: None,
+            proof_verified: false,
+        });
+        Ok(packet)
+    }
+
+    fn fail_pairing(&mut self, error: i32) {
+        if let Some(c) = &mut self.capability {
+            if c.observation.state < 4 {
+                c.observation.state = 5;
+                c.observation.error = error;
+            }
+        }
+        self.withdraw();
+    }
+    fn finish_pairing_if_drained(&mut self) {
+        if self.phase == Phase::Open
+            && self.active.is_none()
+            && self.queued() == 0
+            && self
+                .pairing
+                .is_some_and(|p| p.proof_verified && p.job.is_none())
+        {
+            if let Some(c) = &mut self.capability {
+                c.observation.state = 8;
+            }
+            self.phase = Phase::Closed;
+        }
+    }
+
+    /// G-initiated no-entry/no-MITM/no-Bond only. Every receive requires the
+    /// prerequisite local packet to have ACTUALLY submitted, not just queued.
+    /// No crypto is performed here or under the caller's IRQ lock.
+    pub(crate) fn pairing_input(
+        &mut self,
+        current: Identity,
+        now: u64,
+        index: u16,
+        bytes: &[u8],
+    ) -> Result<Option<CryptoJob>, Error> {
+        self.admission(current, now)?;
+        let mut p = self.pairing.ok_or(Error::Unsupported)?;
+        if p.job.is_some() {
+            return Err(Error::Full);
+        }
+        if index != p.expected {
+            self.fail_pairing(-71);
+            return Err(Error::Unsupported);
+        }
+        let previous = match index {
+            0x134 => 0,
+            0x135 => 0x134,
+            0x136 => 0x135,
+            0x137 | 0x138 => 0x136,
+            0x139 => 0x138,
+            0x13a => 0x139,
+            0x141 => 0x13a,
+            0x142 => 0x141,
+            _ => return Err(Error::Unsupported),
+        };
+        if p.last_submitted != previous {
+            return Err(Error::Stale);
+        }
+        let mut data = [0; 64];
+        let kind = match index {
+            0x134 | 0x135 => {
+                if bytes != CAPABILITY_OFFER {
+                    self.fail_pairing(-95);
+                    return Err(Error::Unsupported);
+                }
+                if let Some(c) = &mut self.capability {
+                    c.observation.peer.copy_from_slice(bytes);
+                    c.observation.flags |= 4;
+                    c.observation.state = 2;
+                }
+                if index == 0x134 {
+                    self.enqueue(current, now, 0x135, &CAPABILITY_OFFER)?;
+                    p.expected = 0x136;
+                } else {
+                    let mut message = [0; 70];
+                    message[..6].copy_from_slice(&[16, 1, 2, 2, 2, 2]);
+                    message[6..].copy_from_slice(&p.public);
+                    self.enqueue(current, now, 0x136, &message)?;
+                    p.expected = 0x137;
+                }
+                self.pairing = Some(p);
+                return Ok(None);
+            }
+            0x136 => {
+                if bytes.len() != 70 || bytes[..6] != [16, 1, 2, 2, 2, 2] {
+                    self.fail_pairing(-95);
+                    return Err(Error::Unsupported);
+                }
+                data.copy_from_slice(&bytes[6..]);
+                CryptoKind::GPublicAndConfirm
+            }
+            0x137 => {
+                if bytes.len() != 64 {
+                    self.fail_pairing(-22);
+                    return Err(Error::Invalid);
+                }
+                data.copy_from_slice(bytes);
+                CryptoKind::TPublic
+            }
+            0x138 | 0x139 | 0x13a | 0x141 | 0x142 => {
+                if bytes.len() != 16 {
+                    self.fail_pairing(-22);
+                    return Err(Error::Invalid);
+                }
+                data[..16].copy_from_slice(bytes);
+                match index {
+                    0x138 => {
+                        p.confirm.copy_from_slice(bytes);
+                        CryptoKind::GNonce
+                    }
+                    0x139 => CryptoKind::TDerive,
+                    0x13a => CryptoKind::GDerive,
+                    0x141 => CryptoKind::GProofAndRespond,
+                    _ => CryptoKind::TProof,
+                }
+            }
+            _ => return Err(Error::Unsupported),
+        };
+        let cookie = self.next_cookie;
+        self.next_cookie = cookie.checked_add(1).ok_or(Error::Overflow)?;
+        let ticket = Ticket {
+            identity: self.identity,
+            cookie,
+        };
+        p.job = Some((ticket, kind));
+        self.pairing = Some(p);
+        Ok(Some(CryptoJob {
+            ticket,
+            kind,
+            data,
+            confirm: p.confirm,
+        }))
+    }
+
+    /// The real crypto caller supplies this receipt, then Runtime still checks
+    /// the real Host/gate at enqueue AND the final driver submission. A late
+    /// job can never revive a cancelled/expired/foreign Session.
+    pub(crate) fn pairing_output(
+        &mut self,
+        current: Identity,
+        now: u64,
+        job: CryptoJob,
+        result: Result<[u8; 16], i32>,
+    ) -> Result<(), Error> {
+        self.admission(current, now)?;
+        let mut p = self.pairing.ok_or(Error::Unsupported)?;
+        if p.job != Some((job.ticket, job.kind)) || job.ticket.identity != current {
+            return Err(Error::Stale);
+        }
+        p.job = None;
+        let output = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail_pairing(error);
+                return Err(Error::Closed);
+            }
+        };
+        match job.kind {
+            CryptoKind::GPublicAndConfirm => {
+                self.enqueue(current, now, 0x137, &p.public)?;
+                self.enqueue(current, now, 0x138, &output)?;
+                p.expected = 0x139;
+            }
+            CryptoKind::TPublic => {
+                p.expected = 0x138;
+            }
+            CryptoKind::GNonce => {
+                self.enqueue(current, now, 0x139, &output)?;
+                p.expected = 0x13a;
+            }
+            CryptoKind::TDerive => {
+                self.enqueue(current, now, 0x13a, &output)?;
+                p.expected = 0x141;
+            }
+            CryptoKind::GDerive => {
+                self.enqueue(current, now, 0x141, &output)?;
+                p.expected = 0x142;
+            }
+            CryptoKind::GProofAndRespond => {
+                self.enqueue(current, now, 0x142, &output)?;
+                p.expected = 0;
+                p.proof_verified = true;
+            }
+            CryptoKind::TProof => {
+                p.expected = 0;
+                p.proof_verified = true;
+            }
+        }
+        self.pairing = Some(p);
+        self.finish_pairing_if_drained();
+        Ok(())
     }
 }

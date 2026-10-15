@@ -35,6 +35,7 @@ mod sle_native;
 mod sle_sessions;
 mod sle_security_relay;
 mod sle_security_relay_state;
+mod sle_pair_material;
 mod sle_data_credit;
 mod sle_native_data;
 mod sle_snoop;
@@ -1238,7 +1239,7 @@ fn ioctl_security_negotiation(
         if request.version != 1 || request.profile != owner.protocol_profile {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
-        if request.flags != 1
+        if !matches!(request.flags,1|2)
             || request.generation == 0
             || request.lifetime == 0
             || request.request_id == 0
@@ -1303,7 +1304,7 @@ fn ioctl_security_negotiation(
     output.status = observation.status;
     output.local_caps = observation.local;
     output.peer_caps = observation.peer;
-    output.error = match observation.state {
+    output.error = if observation.error!=0 {observation.error}else{match observation.state {
         5 => {
             if observation.status == 0 {
                 -(bindings::EOPNOTSUPP as i32)
@@ -1314,7 +1315,7 @@ fn ioctl_security_negotiation(
         6 => -(bindings::ECANCELED as i32),
         7 => ETIMEDOUT.to_errno(),
         _ => 0,
-    };
+    }};
     write_user_struct(arg, &output)?;
     Ok(0)
 }

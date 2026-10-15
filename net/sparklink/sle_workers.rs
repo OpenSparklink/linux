@@ -220,6 +220,7 @@ impl WorkItem<0> for ControllerRuntime {
                         drained += 1;
                     }
                 }
+                this.progress_security(runtime);
                 if drained == 0 || pumped >= 256 {
                     if let Err(error) = progress_connection_cleanup(&this, runtime) {
                         fail_host(&this, runtime, error);

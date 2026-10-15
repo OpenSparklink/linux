@@ -5,6 +5,10 @@ menuconfig SPARKLINK
 	depends on RUST
 	depends on NET
 	select CONFIGFS_FS
+	select CRYPTO
+	select CRYPTO_AES
+	select CRYPTO_CMAC
+	select CRYPTO_ECDH
 	help
 	  SparkLink (also known as NearLink / 星闪) is a short-range wireless
 	  communication technology designed for low-latency, low-power, and
@@ -15,7 +19,7 @@ menuconfig SPARKLINK
 	    - SCI (SparkLink Controller Interface) device management
 	    - SLE (Synchronous Low Energy) air interface support
 	    - Native discovery, physical links and application channels
-	    - Security mechanisms planned; legacy local models are unsupported
+	    - Limited per-Session security mechanism; full Pair/install still pending
 
 	  Say Y here to compile SparkLink support into the kernel or say M
 	  to compile it as a module.

@@ -18,6 +18,7 @@ struct State {
     author: u64,
     request: u64,
     role: u8,
+    material: Option<super::sle_pair_material::Material>,
 }
 #[pin_data]
 struct Owner {
@@ -57,7 +58,7 @@ unsafe extern "C" fn sl_security_owner_create_rust(
     let actor = KBox::pin_init(
         pin_init!(Owner {
             identity: Identity {controller:id,generation,lifetime,handle,grant_epoch:epoch},
-            state <- super::sle_irq_lock::new_irq_lock!(State {session:None,stopped:false,author:0,request:0,role:0}, "sparklink_security_relay"),
+            state <- super::sle_irq_lock::new_irq_lock!(State {session:None,stopped:false,author:0,request:0,role:0,material:None}, "sparklink_security_relay"),
         }),
         GFP_KERNEL,
     );
@@ -80,6 +81,9 @@ unsafe extern "C" fn sl_security_owner_stop_rust(raw: *mut c_void) {
     if let Some(session) = &mut state.session {
         session.withdraw();
     }
+    let material = state.material.take();
+    drop(state);
+    drop(material);
 }
 #[no_mangle]
 unsafe extern "C" fn sl_security_owner_destroy_rust(raw: *mut c_void) {
@@ -187,11 +191,7 @@ impl Command {
         let mut result = EINVAL.to_errno();
         match session.commit(self.ticket, owner.identity, now(), || {
             result = submit();
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(())
-            }
+            if result == 0 { Ok(()) } else { Err(()) }
         }) {
             Ok(()) => 0,
             Err(relay::Error::NeverSubmitted) => result,
@@ -217,6 +217,9 @@ impl Command {
         if let Some(session) = &mut state.session {
             session.withdraw();
         }
+        let material = state.material.take();
+        drop(state);
+        drop(material);
     }
     pub(crate) fn failed(&self, submitted: bool) {
         let mut state = self.owner().state.lock();
@@ -230,6 +233,9 @@ impl Command {
                 pr_warn!("sparklink: security relay uncertain; physical barrier required\n");
             }
         }
+        let material = state.material.take();
+        drop(state);
+        drop(material);
     }
     pub(crate) fn reply(&self, complete: bool, status: u8) {
         let mut state = self.owner().state.lock();
@@ -243,6 +249,13 @@ impl Command {
                 session.withdraw();
             }
         }
+        let material = if status != 0 {
+            state.material.take()
+        } else {
+            None
+        };
+        drop(state);
+        drop(material);
     }
 }
 
@@ -307,6 +320,8 @@ impl Command {
         role: u8,
         initiate: bool,
         deadline: u64,
+        mut material: Option<super::sle_pair_material::Material>,
+        public: [u8; 64],
     ) -> Result<Option<(Self, relay::Packet)>> {
         let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
         let mut state = owner.state.lock();
@@ -318,13 +333,17 @@ impl Command {
                 return Err(EBUSY);
             }
             let mut session = relay::Session::new(identity, now(), deadline).map_err(error)?;
-            let packet = session
-                .approve_capabilities(identity, now(), role, initiate)
-                .map_err(error)?;
+            let packet = if material.is_some() {
+                session.approve_key_agreement(identity, now(), role, initiate, public)
+            } else {
+                session.approve_capabilities(identity, now(), role, initiate)
+            }
+            .map_err(error)?;
             state.session = Some(session);
             state.author = author;
             state.request = request;
             state.role = role;
+            state.material = material.take();
             Ok(packet)
         })();
         drop(state);
@@ -352,9 +371,78 @@ impl Command {
         identity: Identity,
         index: u16,
         bytes: &[u8],
+        runtime: &super::ControllerRuntime,
     ) -> Result<(bool, Option<(Self, relay::Packet)>)> {
         let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
         let mut state = owner.state.lock();
+        if state.session.as_ref().is_some_and(|s| s.key_agreement()) {
+            let job = if state.stopped || identity != owner.identity {
+                Err(ENODEV)
+            } else {
+                state.session.as_mut().ok_or(ENODEV).and_then(|s| {
+                    s.pairing_input(identity, now(), index, bytes)
+                        .map_err(error)
+                })
+            };
+            let result = match job {
+                Ok(Some(job)) => {
+                    let material = state.material.take();
+                    drop(state);
+                    let result = if let Some(mut material) = material {
+                        // Actual P256/CMAC may sleep. No Owner/Host/gate guard
+                        // or unretained C pointer crosses this operation.
+                        let receipt = material.execute(&job);
+                        let host = runtime.host.lock();
+                        let gate = runtime.schedule_gate.lock();
+                        let (_, known, links) = host.link_snapshot();
+                        let live = !*gate
+                            && host.admits_data()
+                            && host.grants.permits(identity.grant_epoch)
+                            && known
+                            && links.iter().flatten().any(|l| {
+                                l.lifetime == identity.lifetime && l.handle == identity.handle
+                            });
+                        let mut state = owner.state.lock();
+                        let result = if !live || state.stopped {
+                            Err(EACCES)
+                        } else {
+                            state.session.as_mut().ok_or(ENODEV).and_then(|s| {
+                                s.pairing_output(identity, now(), job, receipt)
+                                    .map_err(error)
+                            })
+                        };
+                        if result.is_ok() {
+                            state.material = Some(material);
+                        } else if let Some(s) = &mut state.session {
+                            s.withdraw();
+                        }
+                        drop(state);
+                        drop(gate);
+                        drop(host);
+                        result
+                    } else {
+                        let mut state = owner.state.lock();
+                        if let Some(s) = &mut state.session {
+                            s.crypto_failed(EIO.to_errno());
+                        }
+                        Err(EIO)
+                    };
+                    result
+                }
+                Ok(None) => {
+                    drop(state);
+                    Ok(())
+                }
+                Err(e) => {
+                    let material = state.material.take();
+                    drop(state);
+                    drop(material);
+                    Err(e)
+                }
+            };
+            unsafe { sl_connection_session_put(pointer) };
+            return result.map(|()| (true, None));
+        }
         let result = (|| {
             if state.stopped || identity != owner.identity {
                 return Err(ENODEV);
@@ -451,7 +539,26 @@ impl super::ControllerRuntime {
         author: u64,
         request: &super::sle_uapi::SleSecurityNegotiationSubmit,
     ) -> Result {
+        // This original deadline also covers entropy/crypto preparation, not
+        // a fresh timeout granted after the expensive work finishes.
+        let deadline = now()
+            .checked_add(kernel::time::msecs_to_jiffies(request.timeout_ms) as u64)
+            .ok_or(EOVERFLOW)?;
         let identity = self.relay_identity(request.lifetime, request.handle)?;
+        let (material, public) = if request.flags == 2 {
+            let mut snapshot: super::sle_uapi::SleControllerSnapshot =
+                unsafe { core::mem::zeroed() };
+            runtime.controller.provider().fill_snapshot(&mut snapshot);
+            let mut material = super::sle_pair_material::Material::new(
+                request.role,
+                &snapshot.address,
+                &request.address,
+            )?;
+            let public = material.public()?;
+            (Some(material), public)
+        } else {
+            (None, [0; 64])
+        };
         let pointer =
             self.acquire_session(identity.lifetime, identity.handle, identity.grant_epoch)?;
         let mut transferred = false;
@@ -476,9 +583,6 @@ impl super::ControllerRuntime {
             {
                 return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
             }
-            let deadline = now()
-                .checked_add(kernel::time::msecs_to_jiffies(request.timeout_ms) as u64)
-                .ok_or(EOVERFLOW)?;
             // SAFETY: transfer exactly our caller ref after all validation.
             transferred = true;
             unsafe {
@@ -490,6 +594,8 @@ impl super::ControllerRuntime {
                     request.role,
                     request.action == 2,
                     deadline,
+                    material,
+                    public,
                 )
             }
         })();
@@ -563,7 +669,7 @@ impl super::ControllerRuntime {
     ) -> Result {
         let identity = self.relay_identity(lifetime, handle)?;
         let pointer = self.acquire_session(lifetime, handle, identity.grant_epoch)?;
-        let (handled, packet) = unsafe { Command::receive(pointer, identity, index, bytes) }?;
+        let (handled, packet) = unsafe { Command::receive(pointer, identity, index, bytes, self) }?;
         if let Some((command, packet)) = packet {
             return self.enqueue_security(runtime, command, packet);
         }
@@ -571,6 +677,69 @@ impl super::ControllerRuntime {
             Ok(())
         } else {
             self.deny_unapproved_pairing(runtime, lifetime, handle, index, bytes)
+        }
+    }
+
+    /// RX/Complete may queue more than one PDU (T public then confirm). Advance
+    /// the same bounded ledger only after its previous actual reply is paid.
+    pub(crate) fn progress_security(&self, runtime: &super::ControllerState) {
+        let (_, known, links) = self.host.lock().link_snapshot();
+        if !known {
+            return;
+        }
+        for link in links.iter().flatten() {
+            let Ok(identity) = self.relay_identity(link.lifetime, link.handle) else {
+                continue;
+            };
+            let Ok(pointer) =
+                self.acquire_session(link.lifetime, link.handle, identity.grant_epoch)
+            else {
+                continue;
+            };
+            let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+            let mut state = owner.state.lock();
+            let keep_material = state
+                .session
+                .as_mut()
+                .and_then(|s| s.capability_observation(now()))
+                .is_some_and(|o| matches!(o.state, 1 | 2 | 8));
+            let retired = if keep_material {
+                None
+            } else {
+                state.material.take()
+            };
+            let packet = if state.stopped {
+                None
+            } else {
+                state.session.as_mut().and_then(|s| {
+                    if !s.key_agreement() || s.phase() != relay::Phase::Open {
+                        None
+                    } else {
+                        s.prepare(identity, now())
+                            .ok()
+                            .flatten()
+                            .map(|p| (p, s.deadline()))
+                    }
+                })
+            };
+            drop(state);
+            drop(retired);
+            if let Some((packet, deadline)) = packet {
+                let command = Command {
+                    pointer,
+                    ticket: packet.ticket,
+                    index: packet.index,
+                    deadline,
+                };
+                if let Err(e) = self.enqueue_security(runtime, command, packet) {
+                    pr_debug!(
+                        "sparklink: security continuation refused {}\n",
+                        e.to_errno()
+                    );
+                }
+            } else {
+                unsafe { sl_connection_session_put(pointer) };
+            }
         }
     }
 }
