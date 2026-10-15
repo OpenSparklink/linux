@@ -15,6 +15,147 @@ pub mod relay {
             }
         }
 
+        // All helpers below invoke the same production transitions. Fixed
+        // public-body fixtures do not prove crypto; each crypto/submit result
+        // and each actual controller status has failure branches.
+        fn finish_local_relay(s: &mut Session, packet: Packet, now: u64) -> bool {
+            let queued: bool = kani::any();
+            let result = s.commit(packet.ticket, key(), now, || {
+                if queued { Ok(()) } else { Err(()) }
+            });
+            assert_eq!(result.is_ok(), queued);
+            if !queued {
+                s.withdraw();
+                assert!(!s.outstanding());
+                return false;
+            }
+            let status: u8 = kani::any();
+            assert!(s.reply(packet.ticket, now + 1, true, status).is_some());
+            assert!(!s.outstanding());
+            if status != 0 {
+                assert_ne!(s.capability_observation(now + 1).unwrap().state, 9);
+                return false;
+            }
+            true
+        }
+        fn receive_crypto(s: &mut Session, index: u16, body: &[u8], now: u64) -> bool {
+            let job = s.pairing_input(key(), now, index, body).unwrap().unwrap();
+            let succeeds: bool = kani::any();
+            let result = s.pairing_output(
+                key(),
+                now + 1,
+                job,
+                if succeeds { Ok([2; 16]) } else { Err(-129) },
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            if !succeeds {
+                assert_ne!(s.capability_observation(now + 1).unwrap().state, 9);
+            }
+            succeeds
+        }
+
+        #[kani::proof]
+        #[kani::unwind(80)]
+        fn installation_submit_cancel_accept_and_event() {
+            let mut s = Session::new(key(), 0, 100).unwrap();
+            let first = s
+                .approve_key_agreement(key(), 1, 0, true, [1; 64])
+                .unwrap()
+                .unwrap();
+            s.enable_installation(key(), 1, 0).unwrap();
+            if !finish_local_relay(&mut s, first, 2) {
+                return;
+            }
+            s.pairing_input(key(), 4, 0x135, &CAPABILITY_OFFER).unwrap();
+            let public = s.prepare(key(), 5).unwrap().unwrap();
+            if !finish_local_relay(&mut s, public, 6) {
+                return;
+            }
+            if !receive_crypto(&mut s, 0x137, &[1; 64], 8) {
+                return;
+            }
+            for (incoming, now) in [(0x138, 10), (0x13a, 14)] {
+                if !receive_crypto(&mut s, incoming, &[1; 16], now) {
+                    return;
+                }
+                let packet = s.prepare(key(), now + 2).unwrap().unwrap();
+                if !finish_local_relay(&mut s, packet, now + 2) {
+                    return;
+                }
+            }
+            if !receive_crypto(&mut s, 0x142, &[1; 16], 18) {
+                return;
+            }
+            assert_ne!(s.capability_observation(20).unwrap().state, 9);
+            s.progress_installation(key(), 21).unwrap();
+            let packet = s.prepare(key(), 22).unwrap().unwrap();
+            assert_eq!(packet.index, 0x1c03);
+            assert!(packet.payload().is_empty());
+            let cancellation: u8 = kani::any();
+            kani::assume(cancellation <= 4);
+            if cancellation == 1 {
+                s.withdraw();
+            }
+            if cancellation == 2 {
+                s.expire(100);
+            }
+            let now = if cancellation == 2 { 100 } else { 23 };
+            let material = s.installation_matches(key(), now, packet.ticket, packet.index);
+            assert_eq!(material.is_ok(), cancellation != 1 && cancellation != 2);
+            if cancellation == 3 {
+                s.withdraw();
+            }
+            let accepted: bool = kani::any();
+            let mut called = false;
+            let submit = s.commit(packet.ticket, key(), now, || {
+                called = true;
+                if accepted { Ok(()) } else { Err(()) }
+            });
+            if (1..=3).contains(&cancellation) {
+                assert!(!called);
+                assert!(submit.is_err());
+                assert!(!s.outstanding());
+                assert!(s.installation_event(key(), now, 0x11, 0, 1).is_err());
+                return;
+            }
+            assert!(called);
+            assert_eq!(submit.is_ok(), accepted);
+            if !accepted {
+                s.withdraw();
+                assert!(!s.outstanding());
+                return;
+            }
+            assert!(s.outstanding());
+            if cancellation == 4 {
+                s.withdraw();
+                assert!(s.outstanding());
+                s.reply(packet.ticket, 25, false, 0).unwrap();
+                assert!(!s.outstanding());
+                assert!(s.installation_event(key(), 26, 0x11, 0, 1).is_err());
+                assert_ne!(s.capability_observation(27).unwrap().state, 9);
+                return;
+            }
+            let event_first: bool = kani::any();
+            let status: u8 = kani::any();
+            let enabled: u8 = kani::any();
+            let command_status: u8 = kani::any();
+            if event_first {
+                let _ = s.installation_event(key(), 25, 0x11, status, enabled);
+            }
+            s.reply(packet.ticket, 26, false, command_status).unwrap();
+            if !event_first {
+                let _ = s.installation_event(key(), 27, 0x11, status, enabled);
+            }
+            assert!(!s.outstanding());
+            let good = status == 0 && enabled == 1 && command_status == 0;
+            assert_eq!(s.capability_observation(28).unwrap().state == 9, good);
+            if good {
+                assert!(s.installation_event(key(), 101, 0x11, 0, 0).is_err());
+                assert!(s.installation_event(key(), 102, 0x11, 0, 1).is_err());
+                assert_ne!(s.capability_observation(103).unwrap().state, 9);
+            }
+        }
+
         #[kani::proof]
         #[kani::unwind(80)]
         fn key_agreement_job_cancel_and_physical_obligation() {

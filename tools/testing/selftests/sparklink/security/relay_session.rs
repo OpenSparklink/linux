@@ -733,3 +733,23 @@ fn failed_or_disabled_encryption_never_qualifies_and_keeps_inflight_acceptance_d
         assert_ne!(s.capability_observation(24).unwrap().state, 9);
     }
 }
+
+#[test]
+fn uncertain_install_write_retains_obligation_and_requires_physical_barrier() {
+    let mut sides = agreement_session(None, None, false, true).unwrap();
+    let s = &mut sides[0];
+    let id = identity();
+    s.progress_installation(id, 18).unwrap();
+    let p = s.prepare(id, 19).unwrap().unwrap();
+    s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+    s.transport_failed(p.ticket).unwrap();
+    assert!(s.outstanding());
+    assert!(s.reset_required());
+    assert_eq!(s.phase(), Phase::Uncertain);
+    assert!(s.installation_event(id, 21, 0x11, 0, 1).is_err());
+    assert!(s.installation_matches(id, 21, p.ticket, p.index).is_err());
+    s.reply(p.ticket, 22, false, 0).unwrap();
+    assert!(!s.outstanding());
+    assert_ne!(s.capability_observation(23).unwrap().state, 9);
+    assert_eq!(s.phase(), Phase::Uncertain);
+}
