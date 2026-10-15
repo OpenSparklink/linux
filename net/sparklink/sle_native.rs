@@ -773,10 +773,12 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         let (status,handle,enabled)=if event==0x000e {(0,u16::from_le_bytes([params[0],params[1]]),0)}
             else {(params[0],u16::from_le_bytes([params[1],params[2]]),params[3])};
         if handle>0x0fff {return PROTOCOL_ERROR;}
+        // Installation receipts may settle an existing physical obligation
+        // after grant withdrawal. The worker only targets the original Session;
+        // this metadata path neither creates one nor admits application data.
         let lifetime={
             let host=owner.host.lock();let (_,known,links)=host.link_snapshot();let gate=owner.schedule_gate.lock();
             if *gate {return ENODEV.to_errno();}
-            if !host.admits_data() {return -(kernel::bindings::EACCES as i32);}
             let Some(link)=links.iter().flatten().find(|l|known&&l.handle==handle) else {return -(kernel::bindings::ESTALE as i32);};
             link.lifetime
         };

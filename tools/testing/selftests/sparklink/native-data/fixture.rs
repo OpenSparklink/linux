@@ -319,7 +319,8 @@ fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut
  unsafe{assert_eq!((*p.cast::<FakeSession>()).refs,3);sl_connection_session_put(q);}
 
  assert!(b.sessions.lock().iter().all(Option::is_none));
- a.host.lock().grants.revoke();a.reconcile_sessions();assert!(a.sessions.lock().iter().all(Option::is_none));
+ a.host.lock().grants.revoke();a.reconcile_sessions();assert_eq!(a.sessions.lock().iter().flatten().count(),1);
+ link(&a,0,2);a.reconcile_sessions();assert!(a.sessions.lock().iter().all(Option::is_none));
  b.reconcile_sessions();assert!(b.sessions.lock()[0].is_some());
  unsafe{assert!((*p.cast::<FakeSession>()).stopped);sl_connection_session_put(p);}
 }
@@ -482,6 +483,26 @@ fn security_event(event:u16,body:&[u8])->Vec<u8>{let mut v=vec![0xa2,event as u8
  }
  assert_eq!(receive(0,7,&security_event(0xe,&[1,0])),-116);
  assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0x10,1])),-71);
- {let mut h=a.host.lock();h.grants.revoke();h.data_revoked=true;}assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,1])),-13);
- assert!(a.commands.borrow().is_empty()); // Old physical work retires through actual Down, not this rejected event.
+ {let mut h=a.host.lock();h.grants.revoke();h.data_revoked=true;}assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,1])),0);
+ assert_eq!(a.commands.borrow().len(),1); // Metadata survives revoke; it is not data/credential admission.
+}
+
+#[test] fn revoked_physical_session_keeps_one_owner_until_real_down_and_cannot_be_replaced_by_new_epoch(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);b.reconcile_sessions();
+ let(peer,_)=b.existing_session_for_event(1,0).unwrap();
+ let(p,_)=session(0,7,1,0);
+ {let mut h=a.host.lock();h.grants.revoke();assert!(h.grants.activate(2,true));}
+ a.reconcile_sessions();
+ assert_eq!(a.sessions.lock().iter().flatten().count(),1);
+ let(q,epoch)=a.existing_session_for_event(1,0).unwrap();assert_eq!(q,p);assert_eq!(epoch,1);
+ unsafe{assert!((*p.cast::<FakeSession>()).stopped);sl_connection_session_put(q);}
+ let mut error=0;let new=unsafe{sle_sessions::sparklink_native_session_get_rust(0,7,1,0,2,&mut error)};
+ assert!(new.is_null());assert_eq!(error,-116);assert_eq!(a.sessions.lock().iter().flatten().count(),1);
+ link(&a,0,2);a.reconcile_sessions();assert!(a.existing_session_for_event(1,0).is_none());
+ assert_eq!(a.sessions.lock().iter().flatten().count(),0);
+ unsafe{sl_connection_session_put(p);}
+ assert_eq!(b.sessions.lock().iter().flatten().count(),1);
+ let(peer_after,_)=b.existing_session_for_event(1,0).unwrap();assert_eq!(peer,peer_after);
+ unsafe{assert!(!(*peer.cast::<FakeSession>()).stopped);sl_connection_session_put(peer);sl_connection_session_put(peer_after);}
+ b.stop_sessions(-19);
 }

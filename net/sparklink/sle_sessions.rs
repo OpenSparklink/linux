@@ -16,6 +16,7 @@ pub(crate) struct Session {
     pub(crate) handle: u16,
     pub(crate) epoch: u64,
     pointer: *mut c_void,
+    stopped: bool,
 }
 // SAFETY: C kref and session/channel spinlocks protect the referenced object.
 unsafe impl Send for Session {}
@@ -66,7 +67,8 @@ impl super::ControllerRuntime {
         {
             let table = self.sessions.lock();
             self.session_limits(lifetime, handle, epoch, None)?;
-            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle && s.epoch == epoch) {
+            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle) {
+                if existing.epoch!=epoch || existing.stopped {return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));}
                 // SAFETY: table retains object; fd/actor receives a distinct ref.
                 unsafe { sl_connection_session_get(existing.pointer) };
                 return Ok(existing.pointer);
@@ -78,11 +80,12 @@ impl super::ControllerRuntime {
         // is adopted by a table entry, or dropped if another opener won.
         let candidate = unsafe { sl_connection_session_create(self.identity.id, self.identity.generation, lifetime, handle, epoch, maximum) };
         if candidate.is_null() { return Err(ENOMEM); }
-        let mut pending = Some(Session { lifetime, handle, epoch, pointer: candidate });
+        let mut pending = Some(Session { lifetime, handle, epoch, pointer: candidate, stopped:false });
         let lookup = (|| -> Result<*mut c_void> {
             let mut table = self.sessions.lock();
             self.session_limits(lifetime, handle, epoch, None)?; // withdrawal race rechecked
-            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle && s.epoch == epoch) {
+            if let Some(existing) = table.iter().flatten().find(|s| s.lifetime == lifetime && s.handle == handle) {
+                if existing.epoch!=epoch || existing.stopped {return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));}
                 // SAFETY: table owns a live reference; return a distinct caller ref.
                 unsafe { sl_connection_session_get(existing.pointer) };
                 return Ok(existing.pointer);
@@ -96,33 +99,74 @@ impl super::ControllerRuntime {
         drop(pending); // unused allocation released outside table/Host locks
         lookup
     }
+    /// Existing physical receipt target only. Never allocates, grants access
+    /// or admits data; stopped old-epoch entries remain until actual link Down.
+    pub(crate) fn existing_session_for_event(
+        &self, lifetime: u64, handle: u16,
+    ) -> Option<(*mut c_void, u64)> {
+        let table = self.sessions.lock();
+        let entry = table.iter().flatten().find(|s|
+            s.lifetime == lifetime && s.handle == handle)?;
+        // SAFETY: the table retains the object until this distinct ref is taken.
+        unsafe { sl_connection_session_get(entry.pointer) };
+        Some((entry.pointer, entry.epoch))
+    }
     pub(crate) fn reconcile_sessions(&self) {
-        let mut retired = [const { None }; 16];
-        let error;
+        enum Action {
+            Stop(*mut c_void, i32),
+            Retire(Session, i32),
+        }
+        let mut actions: [Option<Action>; 16] = [const { None }; 16];
         {
             let mut table = self.sessions.lock();
-            // Fresh canonical state while the table is locked: an earlier
-            // snapshot must never remove a concurrently inserted new session.
             let host = self.host.lock();
             let (_, known, links) = host.link_snapshot();
             let gate = self.schedule_gate.lock();
-            error = if *gate { ENODEV.to_errno() }
+            let error = if *gate { ENODEV.to_errno() }
                 else if let Some(fault) = host.controller_status().2 { fault.to_errno() }
                 else if !host.admits_data() { -(kernel::bindings::EACCES as i32) }
                 else { -(kernel::bindings::ECONNRESET as i32) };
             for (index, entry) in table.iter_mut().enumerate() {
-                if entry.as_ref().is_some_and(|session| !host.grants.permits(session.epoch) || *gate || error != -(kernel::bindings::ECONNRESET as i32)
-                    || (known && !links.iter().flatten().any(|link|
-                        link.lifetime == session.lifetime && link.handle == session.handle))) {
-                    let denied = entry.as_ref().is_some_and(|session| !host.grants.permits(session.epoch));
-                    retired[index] = entry.take().map(|session| (session,
-                        if denied && error == -(kernel::bindings::ECONNRESET as i32) { -(kernel::bindings::EACCES as i32) } else { error }));
+                let Some(session) = entry.as_mut() else { continue; };
+                let denied = !host.grants.permits(session.epoch);
+                let physical_down = known && !links.iter().flatten().any(|link|
+                    link.lifetime == session.lifetime && link.handle == session.handle);
+                let reason = if denied && error == -(kernel::bindings::ECONNRESET as i32) {
+                    -(kernel::bindings::EACCES as i32)
+                } else { error };
+                if physical_down || *gate {
+                    actions[index] = entry.take().map(|s| Action::Retire(s, reason));
+                } else if !session.stopped && (denied || !known
+                    || error != -(kernel::bindings::ECONNRESET as i32)) {
+                    // Stop author/data work once, but KEEP the table reference
+                    // to the same physical object through async receipts/Down.
+                    session.stopped = true;
+                    // SAFETY: table reference is live; action owns another ref
+                    // across any concurrent physical retirement and stop/join.
+                    unsafe { sl_connection_session_get(session.pointer) };
+                    actions[index] = Some(Action::Stop(session.pointer, reason));
                 }
             }
         }
-        for (session, error) in retired.into_iter().flatten() {
-            // SAFETY: table reference retains object; stop joins work before put.
-            unsafe { sl_connection_session_stop(session.pointer, error) };
+        for action in actions.into_iter().flatten() {
+            match action {
+                Action::Stop(pointer, error) => {
+                    // SAFETY: action's cloned ref survives stop/join, outside
+                    // table/Host/gate locks, then is released exactly once.
+                    unsafe {
+                        sl_connection_session_stop(pointer, error);
+                        sl_connection_session_put(pointer);
+                    }
+                }
+                Action::Retire(session, error) => {
+                    if !session.stopped {
+                        // SAFETY: detached table entry still owns its C ref.
+                        unsafe { sl_connection_session_stop(session.pointer, error) };
+                    }
+                    // Actual Down or retiring registration, not author cancel.
+                    drop(session);
+                }
+            }
         }
         // Birth follows the canonical physical link, not first application fd.
         // Snapshot under Host/gate; allocate outside locks and recheck at adoption.

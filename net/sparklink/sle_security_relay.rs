@@ -737,16 +737,23 @@ impl super::ControllerRuntime {
         status: u8,
         enabled: u8,
     ) -> Result {
-        let identity = self.relay_identity(lifetime, handle)?;
-        let pointer = self.acquire_session(lifetime, handle, identity.grant_epoch)?;
+        // This lookup never creates a Session and grants no new authorization.
+        let (pointer, epoch) = self
+            .existing_session_for_event(lifetime, handle)
+            .ok_or(Error::from_errno(-(kernel::bindings::ESTALE as i32)))?;
+        let identity = Identity {
+            controller: self.identity.id,
+            generation: self.identity.generation,
+            lifetime,
+            handle,
+            grant_epoch: epoch,
+        };
         let result = (|| {
             let host = self.host.lock();
             let gate = self.schedule_gate.lock();
             let (_, known, links) = host.link_snapshot();
-            if *gate || !host.admits_data() || !host.grants.permits(identity.grant_epoch) {
-                return Err(EACCES);
-            }
-            if !known
+            if *gate
+                || !known
                 || !links
                     .iter()
                     .flatten()
@@ -755,14 +762,21 @@ impl super::ControllerRuntime {
                 return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
             }
             let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
-            let mut state = owner.state.lock();
-            if state.stopped || owner.identity != identity {
+            if owner.identity != identity {
                 return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
             }
-            state
+            let mut state = owner.state.lock();
+            let live = !state.stopped && host.admits_data() && host.grants.permits(epoch);
+            let session = state
                 .session
                 .as_mut()
-                .ok_or(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))?
+                .ok_or(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))?;
+            if !live {
+                session.withdraw();
+            }
+            // Old physical receipt may pay old obligation; cannot recreate keys,
+            // authorize the successor epoch or publish a new successful result.
+            session
                 .installation_event(identity, now(), event, status, enabled)
                 .map_err(error)
         })();
