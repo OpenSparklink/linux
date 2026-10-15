@@ -1096,6 +1096,8 @@ struct sle_management_query {
 #define SLE_SNOOP_WS73_DLI 1U
 #define SLE_SNOOP_STANDARD_DLI 2U
 #define SLE_SNOOP_TRUNCATED 1U
+/* Sensitive parameters omitted; original length retained, header only captured. */
+#define SLE_SNOOP_REDACTED 2U
 struct sle_snoop_record {
     __aligned_u64 seq, generation, timestamp_ns, lost;
     __u32 profile, original_length;
@@ -1223,9 +1225,9 @@ struct sle_link_snapshot {
 };
 #define SL_IOCTL_LINK_SNAPSHOT _IOWR(SL_MAGIC, 0x9e, struct sle_link_snapshot)
 
-/* Experimental limited security capability exchange, NOT Pair/Encrypted.
+/* Experimental manager-approved security mechanism; NOT authenticated Pair.
  * Both operations require the same active Managed File and CAP_NET_ADMIN.
- * flags selects CAPABILITY_ONLY or KEY_AGREEMENT_ONLY; no raw TX/RX/keys.
+ * flags selects exactly one mode1/2/3 below; no raw TX/RX/keys.
  * action1 arms T response; action2 starts G request. Other roles unsupported.
  * Once per physical lifetime; no same-life retry, no restart after expiry.
  * Entire original timeout1..5000ms includes policy admission/queue/replies.
@@ -1233,6 +1235,8 @@ struct sle_link_snapshot {
  * it is NOT an ACK that the peer processed our offer, pairing, trust or keys.
  * state8 is unauthenticated candidate key agreement after real peer proof;
  * all own relay Completes must drain. It does not grant trusted identity.
+ * state3 is pending install; state9 requires real own command acceptance and
+ * lifetime-bound0011 initial encryption-on, NOT Agent/identity/trusted Grant.
  * Full security facade remains EOPNOTSUPP. Client explicitly disconnects after
  * this limited exchange. Revoke/Down invalidates it and never refunds debt.
  */
@@ -1242,6 +1246,10 @@ struct sle_link_snapshot {
  * identity, installation, encryption, Agent consent or Bond. No raw keys/API.
  */
 #define SLE_SECURITY_KEY_AGREEMENT_ONLY 2U
+/* Explicit manager policy: no-MITM/no-Bond candidate then real role-specific
+ * installation. state9 is observed UNAUTHENTICATED encryption, never Agent
+ * approval, authenticated peer identity, trusted Grant or Bond. */
+#define SLE_SECURITY_UNAUTHENTICATED_ENCRYPTION 3U
 struct sle_security_negotiation_submit {
     __aligned_u64 generation, lifetime, request_id;
     __u32 version, profile, action, flags, timeout_ms;

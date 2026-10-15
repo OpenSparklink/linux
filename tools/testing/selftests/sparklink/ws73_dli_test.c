@@ -494,8 +494,30 @@ static void relay_command_tests(void)
  CHECK(ws73_dli_relay_prepare(0,0x0147,payload,1,&opcode,params,5,&echo_index)==-EMSGSIZE);
  CHECK(ws73_dli_relay_validate(0x1812,NULL,5)==-EINVAL);
  CHECK(ws73_dli_relay_validate(0x1812,params,256)==-EINVAL);
- CHECK(ws73_dli_relay_validate(0x1c03,params,6)==-EOPNOTSUPP);
+ CHECK(ws73_dli_relay_validate(0x1c03,params,6)==-EPROTO);
  params[0]=params[1]=0;params[4]=2;CHECK(ws73_dli_relay_validate(0x1812,params,6)==-EPROTO);
+}
+
+static void installation_intent_tests(void)
+{
+ unsigned char params[255], original[255]; unsigned short opcode, echo;
+ for(unsigned int kind=0x1c03;kind<=0x1c05;kind+=2) {
+  size_t length=kind==0x1c03?21:20;
+  memset(params,0xcc,sizeof(params));
+  CHECK(ws73_dli_relay_prepare(0xfff,kind,NULL,0,&opcode,params,sizeof(params),&echo)==(int)length);
+  CHECK(opcode==kind&&echo==kind&&u16(params)==0xfff&&params[18]==1&&params[19]==1);
+  for(unsigned int n=2;n<18;n++)CHECK(params[n]==0);
+  CHECK(!ws73_dli_relay_validate(kind,params,length));
+  CHECK(ws73_dli_validate_command(kind,params,length)==-EOPNOTSUPP);
+  for(unsigned int n=0;n<26;n++)if(n!=length)CHECK(ws73_dli_relay_validate(kind,params,n)==-EPROTO);
+  params[2]=1;CHECK(ws73_dli_relay_validate(kind,params,length)==-EPROTO);params[2]=0;
+  params[18]=2;CHECK(ws73_dli_relay_validate(kind,params,length)==-EPROTO);params[18]=1;
+  if(kind==0x1c03){params[20]=1;CHECK(ws73_dli_relay_validate(kind,params,length)==-EPROTO);params[20]=0;}
+  memcpy(original,params,sizeof(params));
+  CHECK(ws73_dli_relay_prepare(0xfff,kind,NULL,0,&opcode,params,length-1,&echo)==-EMSGSIZE);
+  CHECK(!memcmp(params,original,sizeof(params)));
+  CHECK(ws73_dli_relay_prepare(0xfff,kind,original,1,&opcode,params,sizeof(params),&echo)==-EINVAL);
+ }
 }
 
 static void relay_index_tests(void)
@@ -547,6 +569,7 @@ int main(void)
 	link_event_tests();
 	security_event_tests();
 	relay_command_tests();
+ installation_intent_tests();
 	relay_index_tests();
 	reply_tests();
 	command_tests();

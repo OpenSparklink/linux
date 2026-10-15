@@ -382,7 +382,19 @@ int ws73_dli_query(struct ws73_bsle_io *io, unsigned int *credits,
 
 int ws73_dli_relay_validate(unsigned int opcode, const unsigned char *params, size_t size)
 {
-    if (!params || size < 5 || size > 255)
+    if (!params)
+        return -EINVAL;
+    if (opcode == 0x1c03 || opcode == 0x1c05) {
+        size_t expected = opcode == 0x1c03 ? 21 : 20;
+        if (size != expected || dli_u16(params) > 0x0fff ||
+            params[18] != 1 || params[19] != 1 ||
+            (opcode == 0x1c03 && params[20] != 0))
+            return -EPROTO;
+        /* Queue/prepare contains NO key. The retained final ticket copies the
+         * verified Session key directly into the driver's temporary frame. */
+        return memcmp(params + 2, (const unsigned char[16]){0}, 16) ? -EPROTO : 0;
+    }
+    if (size < 5 || size > 255)
         return -EINVAL;
     if (opcode != 0x1812)
         return -EOPNOTSUPP;
@@ -398,6 +410,18 @@ int ws73_dli_relay_prepare(unsigned int handle, unsigned int index,
 
     if (!opcode || !params || !echo_index || handle > 0x0fff || index > 65535 || (size && !payload))
         return -EINVAL;
+    /* Reserved internal installation intents, never on-wire SMP indices or
+     * raw UAPI commands. Only the physical Session can construct these. */
+    if (index == 0x1c03 || index == 0x1c05) {
+        size_t length = index == 0x1c03 ? 21 : 20;
+        if (size) return -EINVAL;
+        if (capacity < length) return -EMSGSIZE;
+        memset(params, 0, length);
+        params[0] = handle & 0xff; params[1] = handle >> 8;
+        params[18] = 1; params[19] = 1;
+        *opcode = index; *echo_index = index;
+        return length;
+    }
     /* Confirmed command budget includes the relay envelope. RX255 does not
      * establish TX255; current negotiated SM messages fit, oversize rejects. */
     if (size > 250 || capacity < size + 5)

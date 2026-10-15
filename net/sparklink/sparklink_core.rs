@@ -1239,7 +1239,7 @@ fn ioctl_security_negotiation(
         if request.version != 1 || request.profile != owner.protocol_profile {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
-        if !matches!(request.flags,1|2)
+        if !matches!(request.flags,1|2|3)
             || request.generation == 0
             || request.lifetime == 0
             || request.request_id == 0

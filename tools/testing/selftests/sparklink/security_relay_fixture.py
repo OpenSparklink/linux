@@ -12,13 +12,17 @@ def write_fixture(root, directory):
 use std::{ffi::c_void,cell::{Cell,RefCell,RefMut}};
 use super::sle_security_relay_state::{self as relay,Identity,Ticket};
 #[derive(Clone,Copy,Debug)] pub(crate) struct Error(i32);
-impl Error {fn from_errno(n:i32)->Self{Self(n)} fn to_errno(self)->i32{self.0}}
+impl Error {fn from_errno(n:i32)->Self{Self(n)} pub(crate) fn to_errno(self)->i32{self.0}}
 type Result<T=()> = std::result::Result<T,Error>;
 const ENODEV:Error=Error(-19);const EINVAL:Error=Error(-22);const EBUSY:Error=Error(-16);const EIO:Error=Error(-5);
 mod kernel {pub mod bindings {pub const EOPNOTSUPP:u32=95;pub const EINVAL:u32=22;pub const ESTALE:u32=116;pub const ETIMEDOUT:u32=110;pub const ECANCELED:u32=125;pub const ENOBUFS:u32=105;pub const EOVERFLOW:u32=75;pub const EIO:u32=5;}}
 macro_rules! pr_warn {($($arg:tt)*)=>{{}};}
 struct Lock<T>(RefCell<T>);impl<T> Lock<T>{fn lock(&self)->RefMut<'_,T>{self.0.borrow_mut()}}
-struct State {session:Option<relay::Session>,stopped:bool,material:Option<Box<()>>}
+// This fixture cannot materialize any key: real crypto/installation gets its
+// own actual-kernel VM and real USB gates; unsupported never becomes success.
+struct Material;
+impl Material {fn fill_install(&mut self,_role:u8,_out:&mut [u8;16])->Result{Err(Error(-95))}}
+struct State {session:Option<relay::Session>,stopped:bool,material:Option<Box<Material>>}
 struct Owner {identity:Identity,state:Lock<State>}
 struct Allocation {owner:Owner,refs:Cell<usize>}
 thread_local! {static CLOCK:Cell<u64>=const{Cell::new(1)};}

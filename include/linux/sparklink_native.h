@@ -65,6 +65,10 @@ struct sparklink_native_command_ticket;
 int sparklink_native_command_commit(struct sparklink_native_command_ticket *ticket,
                                    u16 id, u64 generation,
                                    int (*submit)(void *context), void *context);
+/* Kernel-private late materialization into a driver-owned temporary buffer.
+ * No I/O; actual commit must separately revalidate. Driver wipes after join. */
+int sparklink_native_command_materialize(struct sparklink_native_command_ticket *ticket,
+                                   u16 id, u64 generation, u8 *params, size_t length);
 int sparklink_native_tx_commit(struct sparklink_native_tx_ticket *ticket,
                               int (*submit)(void *context), void *context);
 

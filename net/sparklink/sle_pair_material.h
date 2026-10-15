@@ -14,4 +14,5 @@ int sl_pair_material_derive(struct sl_pair_material *material, const u8 *nonce,
 			    const u8 *confirm, u8 *out);
 int sl_pair_material_verify(struct sl_pair_material *material, const u8 *proof,
 			    u8 *out);
+int sl_pair_material_install(struct sl_pair_material *material, u8 role, u8 *out);
 #endif

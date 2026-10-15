@@ -3,7 +3,7 @@
 //! Host commands retain the same C kref until real reply/fault, including revoke.
 //! Manager approval enables explicit capability or candidate proof exchange.
 //! Sleeping crypto is a dependency of this sole Session, outside IRQ locks.
-//! No Agent consent, authenticated identity, installation or encryption here.
+//! Explicit no-MITM install is distinct from Agent consent/trusted identity/Bond.
 use super::sle_security_relay_state::{self as relay, Identity, Ticket};
 use core::{ffi::c_void, pin::Pin};
 use kernel::{prelude::*, sync::lock::Lock};
@@ -207,11 +207,51 @@ impl Command {
         self.index = index;
     }
     pub(crate) fn reply_matches(&self, complete: bool, status: u8, data: &[u8]) -> bool {
+        if self.accepts_status() {
+            return !complete
+                || status != 0
+                || data.is_empty()
+                || (data.len() == 2
+                    && u16::from_le_bytes([data[0], data[1]]) == self.ticket.identity.handle);
+        }
         !complete
             || status != 0
             || (data.len() == 4
                 && u16::from_le_bytes([data[0], data[1]]) == self.ticket.identity.handle
                 && u16::from_le_bytes([data[2], data[3]]) == self.index)
+    }
+    pub(crate) fn accepts_status(&self) -> bool {
+        matches!(self.index, 0x1c03 | 0x1c05)
+    }
+    /// Only a retained synchronous driver ticket can call this. The Host queue
+    /// holds zero placeholders; the private key is copied to a driver buffer.
+    pub(crate) fn materialize(&self, params: &mut [u8]) -> Result {
+        if !self.accepts_status() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        let role = if self.index == 0x1c03 { 0 } else { 1 };
+        let length = if role == 0 { 21 } else { 20 };
+        if params.len() != length
+            || params[..2] != self.ticket.identity.handle.to_le_bytes()
+            || params[2..18].iter().any(|b| *b != 0)
+            || params[18..20] != [1, 1]
+            || (role == 0 && params[20] != 0)
+        {
+            return Err(EINVAL);
+        }
+        let owner = self.owner();
+        let mut state = owner.state.lock();
+        if state.stopped {
+            return Err(ENODEV);
+        }
+        state
+            .session
+            .as_mut()
+            .ok_or(ENODEV)?
+            .installation_matches(owner.identity, now(), self.ticket, self.index)
+            .map_err(error)?;
+        let out: &mut [u8; 16] = (&mut params[2..18]).try_into().map_err(|_| EINVAL)?;
+        state.material.as_mut().ok_or(EIO)?.fill_install(role, out)
     }
     pub(crate) fn withdraw(&self) {
         let mut state = self.owner().state.lock();
@@ -323,6 +363,7 @@ impl Command {
         deadline: u64,
         mut material: Option<super::sle_pair_material::Material>,
         public: [u8; 64],
+        install: bool,
     ) -> Result<Option<(Self, relay::Packet)>> {
         let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
         let mut state = owner.state.lock();
@@ -340,6 +381,11 @@ impl Command {
                 session.approve_capabilities(identity, now(), role, initiate)
             }
             .map_err(error)?;
+            if install {
+                session
+                    .enable_installation(identity, now(), role)
+                    .map_err(error)?;
+            }
             state.session = Some(session);
             state.author = author;
             state.request = request;
@@ -546,7 +592,7 @@ impl super::ControllerRuntime {
             .checked_add(kernel::time::msecs_to_jiffies(request.timeout_ms) as u64)
             .ok_or(EOVERFLOW)?;
         let identity = self.relay_identity(request.lifetime, request.handle)?;
-        let (material, public) = if request.flags == 2 {
+        let (material, public) = if matches!(request.flags, 2 | 3) {
             let mut snapshot: super::sle_uapi::SleControllerSnapshot =
                 unsafe { core::mem::zeroed() };
             runtime.controller.provider().fill_snapshot(&mut snapshot);
@@ -597,6 +643,7 @@ impl super::ControllerRuntime {
                     deadline,
                     material,
                     public,
+                    request.flags == 3,
                 )
             }
         })();
@@ -681,6 +728,47 @@ impl super::ControllerRuntime {
         }
     }
 
+    pub(crate) fn receive_security_installation(
+        &self,
+        lifetime: u64,
+        handle: u16,
+        event: u16,
+        status: u8,
+        enabled: u8,
+    ) -> Result {
+        let identity = self.relay_identity(lifetime, handle)?;
+        let pointer = self.acquire_session(lifetime, handle, identity.grant_epoch)?;
+        let result = (|| {
+            let host = self.host.lock();
+            let gate = self.schedule_gate.lock();
+            let (_, known, links) = host.link_snapshot();
+            if *gate || !host.admits_data() || !host.grants.permits(identity.grant_epoch) {
+                return Err(EACCES);
+            }
+            if !known
+                || !links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.lifetime == lifetime && l.handle == handle)
+            {
+                return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+            }
+            let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+            let mut state = owner.state.lock();
+            if state.stopped || owner.identity != identity {
+                return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+            }
+            state
+                .session
+                .as_mut()
+                .ok_or(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))?
+                .installation_event(identity, now(), event, status, enabled)
+                .map_err(error)
+        })();
+        unsafe { sl_connection_session_put(pointer) };
+        result
+    }
+
     /// RX/Complete may queue more than one PDU (T public then confirm). Advance
     /// the same bounded ledger only after its previous actual reply is paid.
     pub(crate) fn progress_security(&self, runtime: &super::ControllerState) {
@@ -703,7 +791,7 @@ impl super::ControllerRuntime {
                 .session
                 .as_mut()
                 .and_then(|s| s.capability_observation(now()))
-                .is_some_and(|o| matches!(o.state, 1 | 2 | 8));
+                .is_some_and(|o| matches!(o.state, 1 | 2 | 3 | 8));
             let retired = if keep_material {
                 None
             } else {
@@ -716,6 +804,7 @@ impl super::ControllerRuntime {
                     if !s.key_agreement() || s.phase() != relay::Phase::Open {
                         None
                     } else {
+                        let _ = s.progress_installation(identity, now());
                         s.prepare(identity, now())
                             .ok()
                             .flatten()

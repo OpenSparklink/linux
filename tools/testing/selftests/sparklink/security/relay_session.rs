@@ -19,6 +19,14 @@ fn session() -> Session {
 // This is a protocol/lifetime dependency fixture, not a crypto algorithm. The
 // real C primitives/material get separate actual-kernel VM tests and RF proof.
 fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: bool) {
+    let _ = agreement_session(fail, withdraw, expire, false);
+}
+fn agreement_session(
+    fail: Option<CryptoKind>,
+    withdraw: Option<CryptoKind>,
+    expire: bool,
+    install: bool,
+) -> Option<[Session; 2]> {
     let g = identity();
     let mut t = g;
     t.controller = 2;
@@ -34,6 +42,10 @@ fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: boo
             .unwrap()
             .is_none()
     );
+    if install {
+        sides[0].enable_installation(g, 11, 0).unwrap();
+        sides[1].enable_installation(t, 11, 1).unwrap();
+    }
     let mut pending = std::collections::VecDeque::from([(0, initial)]);
     let mut count = 0;
     while let Some((source, packet)) = pending.pop_front() {
@@ -73,7 +85,7 @@ fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: boo
                         .is_err()
                 );
                 assert_ne!(sides[target].capability_observation(100).unwrap().state, 8);
-                return;
+                return None;
             }
             let receipt = if fail == Some(job.kind) {
                 Err(-129)
@@ -85,7 +97,7 @@ fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: boo
                 assert!(result.is_err());
                 let observation = sides[target].capability_observation(14).unwrap();
                 assert_eq!((observation.state, observation.error), (5, -129));
-                return;
+                return None;
             }
             result.unwrap();
         }
@@ -103,12 +115,16 @@ fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: boo
     assert_eq!(count, 9);
     for s in &mut sides {
         assert!(s.key_agreement());
-        assert_eq!(s.phase(), Phase::Closed);
+        assert_eq!(s.phase(), if install { Phase::Open } else { Phase::Closed });
         assert!(!s.outstanding());
         assert_eq!(s.queued(), 0);
         let result = s.capability_observation(16).unwrap();
-        assert_eq!((result.state, result.flags, result.error), (8, 7, 0));
+        assert_eq!(
+            (result.state, result.flags, result.error),
+            (if install { 2 } else { 8 }, 7, 0)
+        );
     }
+    Some(sides)
 }
 
 #[test]
@@ -576,4 +592,132 @@ fn capability_complete_before_receive_failure_and_passive_expiry_are_terminal() 
     refused.withdraw();
     assert!(!refused.outstanding());
     assert_eq!(refused.capability_observation(13).unwrap().state, 6);
+}
+
+#[test]
+fn same_session_installation_requires_proof_role_request_actual_submit_accept_and_event() {
+    for event_first in [false, true] {
+        for complete in [false, true] {
+            let mut sides = agreement_session(None, None, false, true).unwrap();
+            let mut ids = [identity(), identity()];
+            ids[1].controller = 2;
+            ids[1].generation = 3;
+            for n in 0..2 {
+                let s = &mut sides[n];
+                let id = ids[n];
+                assert_eq!(s.installation_event(id, 17, 0x11, 0, 1), Err(Error::Stale));
+                if n == 1 {
+                    s.progress_installation(id, 17).unwrap();
+                    assert!(s.prepare(id, 17).unwrap().is_none());
+                    let mut old = id;
+                    old.lifetime += 1;
+                    assert_eq!(s.installation_event(old, 17, 0xe, 0, 0), Err(Error::Stale));
+                    s.installation_event(id, 17, 0xe, 0, 0).unwrap();
+                    assert_eq!(
+                        s.installation_event(id, 17, 0xe, 0, 0),
+                        Err(Error::Unsupported)
+                    );
+                } else {
+                    assert_eq!(
+                        s.installation_event(id, 17, 0xe, 0, 0),
+                        Err(Error::Unsupported)
+                    );
+                }
+                s.progress_installation(id, 18).unwrap();
+                let p = s.prepare(id, 19).unwrap().unwrap();
+                assert_eq!(p.index, if n == 0 { 0x1c03 } else { 0x1c05 });
+                assert!(p.payload().is_empty());
+                s.installation_matches(id, 20, p.ticket, p.index).unwrap();
+                assert_eq!(
+                    s.installation_matches(id, 20, p.ticket, 0x134),
+                    Err(Error::Stale)
+                );
+                let mut wrong = p.ticket;
+                wrong.cookie += 1;
+                assert_eq!(
+                    s.installation_matches(id, 20, wrong, p.index),
+                    Err(Error::Stale)
+                );
+                s.commit(p.ticket, id, 21, || Ok(())).unwrap();
+                assert_eq!(
+                    s.installation_matches(id, 22, p.ticket, p.index),
+                    Err(Error::Stale)
+                );
+                if event_first {
+                    s.installation_event(id, 23, 0x11, 0, 1).unwrap();
+                }
+                assert_eq!(s.capability_observation(24).unwrap().state, 3);
+                s.reply(p.ticket, 25, complete, 0).unwrap();
+                if !event_first {
+                    assert_eq!(s.capability_observation(26).unwrap().state, 3);
+                    s.installation_event(id, 27, 0x11, 0, 1).unwrap();
+                }
+                assert_eq!(s.capability_observation(28).unwrap().state, 9);
+                assert_eq!(s.phase(), Phase::Closed);
+                assert!(!s.outstanding());
+                assert_eq!(s.installation_event(id, 29, 0x11, 0, 1), Err(Error::Closed));
+            }
+        }
+    }
+}
+
+#[test]
+fn installation_withdraw_expiry_reject_late_materialization_and_preserve_physical_debt() {
+    for expire in [false, true] {
+        for submitted in [false, true] {
+            let mut sides = agreement_session(None, None, false, true).unwrap();
+            let s = &mut sides[0];
+            let id = identity();
+            s.progress_installation(id, 18).unwrap();
+            let p = s.prepare(id, 19).unwrap().unwrap();
+            if submitted {
+                s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+            }
+            if expire {
+                s.expire(100);
+            } else {
+                s.withdraw();
+            }
+            assert!(
+                s.installation_matches(id, if expire { 100 } else { 21 }, p.ticket, p.index)
+                    .is_err()
+            );
+            assert!(
+                s.installation_event(id, if expire { 100 } else { 21 }, 0x11, 0, 1)
+                    .is_err()
+            );
+            let mut callback = false;
+            assert!(
+                s.commit(p.ticket, id, if expire { 100 } else { 22 }, || {
+                    callback = true;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert!(!callback);
+            assert_eq!(s.outstanding(), submitted);
+            if submitted {
+                s.reply(p.ticket, 101, false, 0).unwrap();
+                assert!(!s.outstanding());
+            }
+            assert_ne!(s.capability_observation(102).unwrap().state, 9);
+        }
+    }
+}
+
+#[test]
+fn failed_or_disabled_encryption_never_qualifies_and_keeps_inflight_acceptance_debt() {
+    for (status, enabled) in [(1, 1), (0, 0), (0, 2)] {
+        let mut sides = agreement_session(None, None, false, true).unwrap();
+        let s = &mut sides[0];
+        let id = identity();
+        s.progress_installation(id, 18).unwrap();
+        let p = s.prepare(id, 19).unwrap().unwrap();
+        s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+        assert!(s.installation_event(id, 21, 0x11, status, enabled).is_err());
+        assert!(s.outstanding());
+        assert_eq!(s.capability_observation(22).unwrap().state, 5);
+        s.reply(p.ticket, 23, false, 0).unwrap();
+        assert_ne!(s.capability_observation(24).unwrap().state, 9);
+    }
 }

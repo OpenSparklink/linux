@@ -15,7 +15,7 @@ def run(output=None):
     constructor=function(source,'new_boxed');source=source.replace(constructor,'')
     # Kernel errno is the dependency adapter; all business predicates/methods
     # and queue/storage/link modules remain verbatim.
-    source=source.replace('Error::from_errno(','error_from_errno(')
+    source=source.replace('Error::from_errno(','error_from_errno(').replace('.materialize(params)','.materialize(params).map_err(|e|e.to_errno())')
     fixture=(here/'connection/native_host_fixture.rs').read_text().replace('// @@ACTUAL_HOST@@',source).replace('// @@PUSH_COOKIE@@',function(inputs['sle_mgmt.rs'].decode(),'push_cookie'))
     variants='\n'.join(re.search(r'(?m)^    '+name+r' = 0x[0-9A-F]+,',inputs['sle_dli.rs'].decode()).group() for name in ['CreateConnection','EnableBroadcast','EnableScan','SetScanParam'])
     fixture=fixture.replace('// @@OPCODES@@',variants).replace('// @@TIMEOUT@@',re.search(r'(?m)^pub\(crate\) const CMD_TIMEOUT_MS: u32 = [0-9_]+;',inputs['sle_mgmt.rs'].decode()).group())

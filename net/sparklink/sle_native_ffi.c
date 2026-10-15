@@ -298,6 +298,15 @@ int sparklink_native_command_commit(struct sparklink_native_command_ticket *tick
 }
 EXPORT_SYMBOL_GPL(sparklink_native_command_commit);
 
+extern int sparklink_native_command_materialize_rust(void *ticket, u16 id, u64 generation,
+    u8 *params, size_t length);
+int sparklink_native_command_materialize(struct sparklink_native_command_ticket *ticket,
+    u16 id, u64 generation, u8 *params, size_t length)
+{
+    return sparklink_native_command_materialize_rust(ticket,id,generation,params,length);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_command_materialize);
+
 void sparklink_native_unregister(u16 id, u64 generation)
 {
 	sparklink_native_unregister_rust(id, generation);

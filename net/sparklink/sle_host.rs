@@ -112,6 +112,14 @@ impl CommandHost {
         self.requests.push_relay(opcode,params,cookie,deadline,command).map_err(Error::from)?;
         self.next_cookie=next;Ok(())
     }
+    pub(crate) fn needs_materialization(&self,cookie:u64)->bool {
+        self.active.as_ref().is_some_and(|a|a.cookie==cookie && a.relay.as_ref().is_some_and(|r|r.accepts_status()))
+    }
+    pub(crate) fn materialize_relay(&self, cookie:u64, opcode:u16, params:&mut [u8])->Result {
+        self.validate_command_commit(cookie,opcode)?;
+        let active=self.active.as_ref().ok_or(EINVAL)?;
+        active.relay.as_ref().ok_or(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)))?.materialize(params)
+    }
     pub(crate) fn commit_relay(&self, cookie:u64, submit:impl FnOnce()->i32)->i32 {
         let Some(active)=self.active.as_ref().filter(|a|a.cookie==cookie) else {return EINVAL.to_errno();};
         if let Some(relay)=&active.relay {relay.commit(submit)} else {submit()}
@@ -738,7 +746,7 @@ impl CommandHost {
                 // Native query Status only acknowledges acceptance. Keep the
                 // active slot/deadline until matching Complete or failure.
                 if !complete && *status == 0
-                    && !self.active.as_ref().is_some_and(|active| active.opcode == *opcode && active.connection.is_some()) {
+                    && !self.active.as_ref().is_some_and(|active| active.opcode == *opcode && (active.connection.is_some() || active.relay.as_ref().is_some_and(|r|r.accepts_status()))) {
                     return Some(event);
                 }
                 *opcode

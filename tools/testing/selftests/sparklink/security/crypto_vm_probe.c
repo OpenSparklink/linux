@@ -28,8 +28,12 @@ static int pair_material_vectors(void)
 	if(sl_pair_material_derive(&m,nonce,bad,out)!=-EKEYREJECTED || m.derived || memchr_inv(out,0xa5,16))goto out;
 	if(sl_pair_material_derive(&m,nonce,confirmation,out) || memcmp(out,gp,16) || memcmp(m.candidate_link_key,link,16) || memcmp(m.peer_proof,tp,16))goto out;
 	memcpy(bad,tp,16);bad[0]^=1;memset(out,0xa5,16);
+	if(sl_pair_material_install(&m,0,out)!=-EINVAL || memchr_inv(out,0xa5,16))goto out;
 	if(sl_pair_material_verify(&m,bad,out)!=-EKEYREJECTED || m.verified || memchr_inv(out,0xa5,16))goto out;
 	if(sl_pair_material_verify(&m,tp,out) || memcmp(out,gp,16) || !m.verified || memchr_inv(m.shared,0,32) || memchr_inv(m.nonce,0,16) || memchr_inv(m.own_proof,0,16))goto out;
+	memset(out,0xa5,16);
+	if(sl_pair_material_install(&m,1,out)!=-EINVAL || memchr_inv(out,0xa5,16))goto out;
+	if(sl_pair_material_install(&m,0,out) || memcmp(out,link,16))goto out;
 	result=0;
 out:
 	memzero_explicit(&m,sizeof(m));memzero_explicit(nonce,sizeof(nonce));memzero_explicit(out,sizeof(out));memzero_explicit(bad,sizeof(bad));return result;

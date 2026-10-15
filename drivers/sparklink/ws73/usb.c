@@ -954,8 +954,10 @@ static int ws73_native_command(void *context, struct sparklink_native_command_ti
 	struct ws73_usb *ws = context;
 	struct ws73_acb_transfer transfer;
 	bool queued = false;
+	bool installation = opcode == 0x1c03 || opcode == 0x1c05;
+	u8 installation_params[21] = {0};
 	unsigned int timeout;
-	int ret, wire_length;
+	int ret, wire_length = 0;
 
 	mutex_lock(&ws->tx_lock);
 	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) || !READ_ONCE(ws->streaming)) {
@@ -964,7 +966,15 @@ static int ws73_native_command(void *context, struct sparklink_native_command_ti
 	}
 	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
 	if (!timeout) { ret = -ETIMEDOUT; goto out; }
-	wire_length = ws73_wire_command(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, opcode, params, length);
+	if (installation) {
+		ret = ws73_dli_relay_validate(opcode, params, length);
+		if (ret) goto out;
+		memcpy(installation_params, params, length);
+		ret = sparklink_native_command_materialize(ticket, ws->native_id,
+			ws->native_generation, installation_params, length);
+		if (ret) goto out;
+	}
+	wire_length = ws73_wire_command(ws->tx, WS73_FW_CHUNK, ws->tx_sequence, opcode, installation ? installation_params : params, length);
 	if (wire_length < 0) { ret = wire_length; goto out; }
 	transfer.urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!transfer.urb) { ret = -ENOMEM; goto out; }
@@ -991,7 +1001,15 @@ static int ws73_native_command(void *context, struct sparklink_native_command_ti
 	if (ret && queued && !READ_ONCE(ws->stopping))
 		ws73_async_failure(ws, ret);
 out:
-	sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
+	if (installation) {
+		/* Core marks these commands REDACTED, preserving actual original
+		 * length and only the header. No key or zero fake payload is copied. */
+		sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
+		memzero_explicit(installation_params, sizeof(installation_params));
+		if (wire_length > 0) memzero_explicit(ws->tx, wire_length);
+	} else {
+		sparklink_native_snoop_tx(ws->native_id, ws->native_generation, opcode, params, length, ret);
+	}
 	mutex_unlock(&ws->tx_lock);
 	return ret;
 }

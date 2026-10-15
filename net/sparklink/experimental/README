@@ -34,9 +34,11 @@ Integration requirements, still MISSING:
   ticket API rejects local mismatches, but does NOT prove late/duplicate wire
   replies cannot pay a newer same-opcode reservation. Firmware/hardware barrier
   assumptions require dedicated models and VM-only controlled real tests.
-* Protocol negotiation, fresh nonces/ECDH, peer proof, Agent, security levels,
-  role-bound1c03/1c05 key installation/matching0011 and Bond remain unconnected.
-  No authenticated/encrypted state or remote CCC capability may be published.
+* Native same-Session candidate proof has a separate exact-source real qualification.
+  Explicit manager-only role-bound1c03/1c05/matching0011 implementation is under
+  new qualification; it is not Agent consent/authenticated identity/security
+  levels/Bond or remote CCC. Current status belongs to the userspace canonical
+  capability matrix, never this historical experiment directory.
 
 Exit staging only when the sole Host/Session producer and consumer are wired,
 strict builds/regressions and relevant implementation proofs pass, and exact

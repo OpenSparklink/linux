@@ -328,7 +328,7 @@ impl NativeCommandTransport {
         if unsafe { sparklink_native_transport_has_command_ticket(self.transport) } {
             self.never_submitted.set(false);
             let mut ticket = NativeCommandTicket { owner, cookie, opcode,
-                attempted: Cell::new(false), submitted: Cell::new(false) };
+                attempted: Cell::new(false), submitted: Cell::new(false), materialized:Cell::new(false) };
             // SAFETY: driver may use the borrowed ticket only synchronously,
             // and must join transfer callbacks before this stack object retires.
             let result = unsafe { sparklink_native_transport_command_ticketed(self.transport,
@@ -361,6 +361,27 @@ struct NativeCommandTicket<'a> {
     opcode: u16,
     attempted: Cell<bool>,
     submitted: Cell<bool>,
+    materialized: Cell<bool>,
+}
+
+/// Driver preparation, not a submission. No material can leave through UAPI;
+/// final commit revalidates the same Host/gate after this copy.
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_command_materialize_rust(
+    opaque:*mut c_void, id:u16, generation:u64, params:*mut u8, length:usize,
+)->i32 {
+    if opaque.is_null() || params.is_null() || !(20..=21).contains(&length) {return EINVAL.to_errno();}
+    let ticket=unsafe {&*opaque.cast::<NativeCommandTicket<'_>>()};
+    if ticket.attempted.get() {return -(kernel::bindings::EALREADY as i32);}
+    let owner=ticket.owner;
+    if owner.identity!=(DeviceIdentity{id,generation}) {return -(kernel::bindings::ESTALE as i32);}
+    let host=owner.host.lock();let gate=owner.schedule_gate.lock();
+    if *gate || !owner.transport_open.load(Ordering::Acquire) {return ENODEV.to_errno();}
+    let output=unsafe {core::slice::from_raw_parts_mut(params,length)};
+    if ticket.materialized.get() {return -(kernel::bindings::EALREADY as i32);}
+    match host.materialize_relay(ticket.cookie,ticket.opcode,output) {
+        Ok(())=>{ticket.materialized.set(true);0}, Err(e)=>e.to_errno(),
+    }
 }
 
 #[no_mangle]
@@ -379,6 +400,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_command_commit_rust(
     if *gate { return ENODEV.to_errno(); }
     if !owner.transport_open.load(Ordering::Acquire) { return EAGAIN.to_errno(); }
     if let Err(error) = host.validate_command_commit(ticket.cookie, ticket.opcode) { return error.to_errno(); }
+    if host.needs_materialization(ticket.cookie) && !ticket.materialized.get() {return -(kernel::bindings::EACCES as i32);}
     // SAFETY: prepared non-sleeping queue operation; guards serialize queueing
     // with Host withdrawal/link publication. No decode, wait or Host reentry.
     let result = host.commit_relay(ticket.cookie, || unsafe { submit.unwrap()(context) });
@@ -745,6 +767,21 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         // handle reuse still require the separate physical drain barrier.
         super::sle_ingress::enqueue_rx(&owner,SleEvent::NativeControllerData {lifetime,handle,index,data:bytes});
         return 0; // finite ingress admission, never peer acceptance/authentication
+    }
+    if matches!(event, 0x000e | 0x0011) {
+        if (event==0x000e && params.len()!=2) || (event==0x0011 && params.len()!=4) {return PROTOCOL_ERROR;}
+        let (status,handle,enabled)=if event==0x000e {(0,u16::from_le_bytes([params[0],params[1]]),0)}
+            else {(params[0],u16::from_le_bytes([params[1],params[2]]),params[3])};
+        if handle>0x0fff {return PROTOCOL_ERROR;}
+        let lifetime={
+            let host=owner.host.lock();let (_,known,links)=host.link_snapshot();let gate=owner.schedule_gate.lock();
+            if *gate {return ENODEV.to_errno();}
+            if !host.admits_data() {return -(kernel::bindings::EACCES as i32);}
+            let Some(link)=links.iter().flatten().find(|l|known&&l.handle==handle) else {return -(kernel::bindings::ESTALE as i32);};
+            link.lifetime
+        };
+        super::sle_ingress::enqueue_rx(&owner,SleEvent::NativeSecurityInstallation{lifetime,handle,event,status,enabled});
+        return 0;
     }
     if length > 260 { return PROTOCOL_ERROR; }
     if event == 9 {

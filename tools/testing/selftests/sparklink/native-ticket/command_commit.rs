@@ -19,7 +19,7 @@ unsafe extern "C" fn atomic_submit(context:*mut c_void)->i32 {
 #[test] fn command_ticket_atomic_callback_once_under_actual_host_gate(){
  clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();
  let owner=ControllerRuntime{identity:DeviceIdentity{id:1,generation:2},host:FixtureLock(std::sync::Mutex::new(h)),schedule_gate:FixtureLock(std::sync::Mutex::new(false)),transport_open:AtomicBool::new(true)};
- let mut ticket=NativeCommandTicket{owner:&owner,cookie:r.cookie,opcode:r.opcode,attempted:Cell::new(false),submitted:Cell::new(false)};
+ let mut ticket=NativeCommandTicket{owner:&owner,cookie:r.cookie,opcode:r.opcode,attempted:Cell::new(false),submitted:Cell::new(false),materialized:Cell::new(false)};
  let mut context=Submit{owner:&owner,calls:Cell::new(0),result:0};
  let pointer=(&mut ticket as *mut NativeCommandTicket<'_>).cast();let ctx=(&mut context as *mut Submit<'_>).cast();
  assert_eq!(unsafe{sparklink_native_command_commit_rust(pointer,1,2,Some(atomic_submit),ctx)},0);
@@ -31,7 +31,7 @@ unsafe extern "C" fn atomic_submit(context:*mut c_void)->i32 {
   clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],9,100).unwrap();let r=h.next(|_|true).unwrap().unwrap();
   if case==3 {h.cancel_diagnostic(9);}if case==4 {clock(100);}
   let owner=ControllerRuntime{identity:DeviceIdentity{id:1,generation:2},host:FixtureLock(std::sync::Mutex::new(h)),schedule_gate:FixtureLock(std::sync::Mutex::new(case==1)),transport_open:AtomicBool::new(case!=2)};
-  let mut ticket=NativeCommandTicket{owner:&owner,cookie:r.cookie,opcode:r.opcode,attempted:Cell::new(false),submitted:Cell::new(false)};
+  let mut ticket=NativeCommandTicket{owner:&owner,cookie:r.cookie,opcode:r.opcode,attempted:Cell::new(false),submitted:Cell::new(false),materialized:Cell::new(false)};
   let mut context=Submit{owner:&owner,calls:Cell::new(0),result:if case==5{-12}else{0}};
   let ret=unsafe{sparklink_native_command_commit_rust((&mut ticket as *mut NativeCommandTicket<'_>).cast(),1,if case==0{3}else{2},Some(atomic_submit),(&mut context as *mut Submit<'_>).cast())};
   assert_eq!(ret,[-116,-19,-11,-125,-110,-12][case]);assert!(!ticket.submitted.get());

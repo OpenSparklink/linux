@@ -81,6 +81,7 @@ pub(crate) struct Session {
     reset_required: bool,
     capability: Option<CapabilityExchange>,
     pairing: Option<Pairing>,
+    installation: Option<Installation>,
 }
 
 impl Session {
@@ -108,6 +109,7 @@ impl Session {
             reset_required: false,
             capability: None,
             pairing: None,
+            installation: None,
         })
     }
     pub(crate) fn phase(&self) -> Phase {
@@ -258,16 +260,24 @@ impl Session {
         {
             return None;
         }
-        if !complete && status == 0 {
+        let installation = matches!(self.active.as_ref()?.packet.index, 0x1c03 | 0x1c05);
+        if !complete && status == 0 && !installation {
             return None;
         }
         self.active = None;
+        if installation && status == 0 && self.phase == Phase::Open {
+            if let Some(i) = &mut self.installation {
+                i.accepted = true;
+            }
+        }
         let author_live = self.phase == Phase::Open;
         if let Some(c) = &mut self.capability {
             if author_live && c.observation.state < 4 {
                 c.observation.status = status;
-                if complete && status == 0 {
-                    c.observation.flags |= 2;
+                if status == 0 && (complete || installation) {
+                    if complete {
+                        c.observation.flags |= 2;
+                    }
                     if c.observation.flags & 4 != 0 && self.pairing.is_none() {
                         c.observation.state = 4;
                         self.phase = Phase::Closed;
@@ -483,6 +493,15 @@ struct Pairing {
     proof_verified: bool,
 }
 
+#[derive(Clone, Copy)]
+struct Installation {
+    role: u8,
+    requested: bool,
+    queued: bool,
+    accepted: bool,
+    encrypted: bool,
+}
+
 impl Session {
     pub(crate) fn key_agreement(&self) -> bool {
         self.pairing.is_some()
@@ -521,18 +540,141 @@ impl Session {
         self.withdraw();
     }
     fn finish_pairing_if_drained(&mut self) {
-        if self.phase == Phase::Open
-            && self.active.is_none()
-            && self.queued() == 0
-            && self
+        if self.phase != Phase::Open
+            || self.active.is_some()
+            || self.queued() != 0
+            || !self
                 .pairing
                 .is_some_and(|p| p.proof_verified && p.job.is_none())
         {
+            return;
+        }
+        if let Some(install) = self.installation {
+            if install.accepted && install.encrypted {
+                if let Some(c) = &mut self.capability {
+                    c.observation.state = 9;
+                }
+                self.phase = Phase::Closed;
+            }
+            // Queueing uses the ORIGINAL deadline, never a fresh install timer.
+            // No key is stored in this pure ledger, packet or Host queue.
+        } else {
             if let Some(c) = &mut self.capability {
                 c.observation.state = 8;
             }
             self.phase = Phase::Closed;
         }
+    }
+
+    pub(crate) fn enable_installation(
+        &mut self,
+        current: Identity,
+        now: u64,
+        role: u8,
+    ) -> Result<(), Error> {
+        self.admission(current, now)?;
+        if self.pairing.is_none() || self.installation.is_some() || role > 1 {
+            return Err(Error::Invalid);
+        }
+        self.installation = Some(Installation {
+            role,
+            requested: false,
+            queued: false,
+            accepted: false,
+            encrypted: false,
+        });
+        Ok(())
+    }
+
+    /// Called by the same worker after proof/physical relay debt drains. T
+    /// additionally needs its actual controller request, never a guessed event.
+    pub(crate) fn progress_installation(
+        &mut self,
+        current: Identity,
+        now: u64,
+    ) -> Result<(), Error> {
+        self.admission(current, now)?;
+        let Some(i) = self.installation else {
+            return Ok(());
+        };
+        if i.queued
+            || self.active.is_some()
+            || self.queued() != 0
+            || !self
+                .pairing
+                .is_some_and(|p| p.proof_verified && p.job.is_none())
+            || (i.role == 1 && !i.requested)
+        {
+            return Ok(());
+        }
+        self.enqueue(current, now, if i.role == 0 { 0x1c03 } else { 0x1c05 }, &[])?;
+        if let Some(i) = &mut self.installation {
+            i.queued = true;
+        }
+        if let Some(c) = &mut self.capability {
+            c.observation.state = 3;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn installation_matches(
+        &mut self,
+        current: Identity,
+        now: u64,
+        ticket: Ticket,
+        index: u16,
+    ) -> Result<(), Error> {
+        self.admission(current, now)?;
+        let i = self.installation.ok_or(Error::Unsupported)?;
+        if !i.queued
+            || ticket.identity != current
+            || index != if i.role == 0 { 0x1c03 } else { 0x1c05 }
+            || !self.active.is_some_and(|a| {
+                a.packet.ticket == ticket && a.packet.index == index && !a.submitted
+            })
+            || !self.pairing.is_some_and(|p| p.proof_verified)
+        {
+            return Err(Error::Stale);
+        }
+        Ok(())
+    }
+
+    /// Ingress has frozen the physical lifetime. A bare event or successful
+    /// Status cannot create proof or an encryption result. Early0011 is kept
+    /// only after this exact install actually submitted, then waits for accept.
+    pub(crate) fn installation_event(
+        &mut self,
+        current: Identity,
+        now: u64,
+        event: u16,
+        status: u8,
+        enabled: u8,
+    ) -> Result<(), Error> {
+        self.admission(current, now)?;
+        let mut i = self.installation.ok_or(Error::Unsupported)?;
+        if !self.pairing.is_some_and(|p| p.proof_verified) {
+            return Err(Error::Stale);
+        }
+        match event {
+            0x000e if i.role == 1 && !i.requested && !i.queued => {
+                i.requested = true;
+            }
+            0x0011 => {
+                let expected = if i.role == 0 { 0x1c03 } else { 0x1c05 };
+                if !i.queued || !self.pairing.is_some_and(|p| p.last_submitted == expected) {
+                    return Err(Error::Stale);
+                }
+                if status != 0 || enabled != 1 {
+                    self.fail_pairing(if status != 0 { -5 } else { -71 });
+                    return Err(Error::Closed);
+                }
+                i.encrypted = true;
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        self.installation = Some(i);
+        self.finish_pairing_if_drained();
+        Ok(())
     }
 
     /// G-initiated no-entry/no-MITM/no-Bond only. Every receive requires the

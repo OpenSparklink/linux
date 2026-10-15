@@ -13,6 +13,7 @@ extern "C" {
         out: *mut *mut c_void,
     ) -> i32;
     fn sl_pair_material_destroy(material: *mut c_void);
+    fn sl_pair_material_install(material: *mut c_void, role: u8, out: *mut u8) -> i32;
     fn sl_pair_material_public(material: *mut c_void, out: *mut u8) -> i32;
     fn sl_pair_material_peer(material: *mut c_void, peer: *const u8) -> i32;
     fn sl_pair_material_confirm(material: *mut c_void, out: *mut u8) -> i32;
@@ -50,6 +51,13 @@ impl Material {
             sl_pair_material_public(self.0.as_ptr(), out.as_mut_ptr())
         })?;
         Ok(out)
+    }
+    /// Only the final driver preparation uses this non-sleeping copy. No
+    /// private key crosses the generic Host queue or a public observation.
+    pub(crate) fn fill_install(&mut self, role: u8, out: &mut [u8; 16]) -> Result {
+        kernel::error::to_result(unsafe {
+            sl_pair_material_install(self.0.as_ptr(), role, out.as_mut_ptr())
+        })
     }
     pub(crate) fn execute(&mut self, job: &CryptoJob) -> core::result::Result<[u8; 16], i32> {
         let mut out = [0; 16];

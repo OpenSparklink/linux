@@ -27,6 +27,8 @@ def run(output, command=False):
     root = here.parents[3]
     driver = root / 'drivers/sparklink/ws73'
     files = [driver / 'usb.c', driver / 'wire.c', driver / 'wire.h', here / ('native-ticket/command_driver_fixture.c' if command else 'native-ticket/driver_fixture.c')]
+    if command:files += [driver/'dli.c',driver/'dli.h']
+    fixture_file=here / ('native-ticket/command_driver_fixture.c' if command else 'native-ticket/driver_fixture.c')
     inputs = {p: p.read_bytes() for p in files}
     source = inputs[files[0]].decode()
     start = source.index('struct ws73_acb_transfer {')
@@ -36,18 +38,18 @@ def run(output, command=False):
          ['ws73_acb_complete', 'ws73_acb_submit', 'ws73_native_acb_fragment', 'ws73_native_acb']))
     defines = '\n'.join(re.search(r'^#define '+name+r'\s+.*$', source, re.M)[0]
                         for name in ['WS73_FW_CHUNK', 'WS73_TX_TIMEOUT'])
-    fixture = inputs[files[-1]].decode().replace('/* @@DEFINES@@ */', defines).replace('/* @@DRIVER@@ */', code)
+    fixture = inputs[fixture_file].decode().replace('/* @@DEFINES@@ */', defines).replace('/* @@DRIVER@@ */', code)
     with tempfile.TemporaryDirectory(prefix='sparklink-ticket-driver-') as directory:
         tmp = Path(directory)
         (tmp / 'test.c').write_text(fixture)
         compile_command = [os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g',
-                   '-I'+str(driver), str(tmp/'test.c'), str(driver/'wire.c'), '-o', str(tmp/'test')]
+                   '-I'+str(driver), str(tmp/'test.c'), str(driver/'wire.c'), *([str(driver/'dli.c')] if command else []), '-o', str(tmp/'test')]
         subprocess.run(compile_command, check=True)
         subprocess.run([str(tmp/'test')], check=True,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=1', UBSAN_OPTIONS='halt_on_error=1'))
     assert all(p.read_bytes() == b for p, b in inputs.items())
-    result = {'status': 'WS73_ACTUAL_COMMAND_TICKET_DRIVER_FAULTS_PASS' if command else 'WS73_ACTUAL_TICKET_DRIVER_FAULTS_PASS', 'cases': 11,
+    result = {'status': 'WS73_ACTUAL_COMMAND_TICKET_DRIVER_FAULTS_PASS' if command else 'WS73_ACTUAL_TICKET_DRIVER_FAULTS_PASS', 'cases': 21 if command else 11,
               'scope': 'actual C preparation/atomic submit/completion/finite wait/kill/join bodies + wire codec; USB/lock/time are explicit dependencies',
               'physical_acceptance': False, 'whole_ticket_proof': False,
               'production_bodies_sha256': hashlib.sha256(code.encode()).hexdigest(),

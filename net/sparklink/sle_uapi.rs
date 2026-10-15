@@ -2150,6 +2150,7 @@ const _: () = assert!(core::mem::size_of::<SleManagementQuery>() == 48);
 pub(crate) const SNOOP_VERSION: u32 = 1;
 pub(crate) const SNOOP_PAYLOAD_MAX: usize = 320;
 pub(crate) const SNOOP_TRUNCATED: u16 = 1;
+pub(crate) const SNOOP_REDACTED: u16 = 2;
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 pub(crate) struct SleSnoopRecord {

@@ -845,6 +845,8 @@ pub enum SleEvent {
     },
     /// Native controller relay, lifetime frozen at ingress, never security trust.
     NativeControllerData { lifetime:u64, handle:u16, index:u16, data:KVec<u8> },
+    /// Native schema validated; actual lifetime frozen before RX queueing. Not trust.
+    NativeSecurityInstallation {lifetime:u64, handle:u16, event:u16, status:u8, enabled:u8},
     /// Advertising / broadcast report received during scanning.
     AdvReport {
         addr: [u8; 6],

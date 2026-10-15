@@ -242,3 +242,14 @@ int sl_pair_material_verify(struct sl_pair_material *m, const u8 *proof, u8 *out
 	m->verified = true;
 	return 0;
 }
+
+/* Non-sleeping, kernel-private installation dependency. The physical Session
+ * checks policy/ticket/lifetime first; no user-provided key or export ioctl.
+ * Output is atomic on error and only the role-exact prepared16-byte slot. */
+int sl_pair_material_install(struct sl_pair_material *m, u8 role, u8 *out)
+{
+    if (!m || !out || role > 1 || role != m->role || !m->verified)
+        return -EINVAL;
+    memcpy(out, m->candidate_link_key, 16);
+    return 0;
+}

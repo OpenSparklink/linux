@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //! Bounded per-registration trace. No allocation or protocol admission in RX.
 use kernel::prelude::*;
-use super::{sle_dev::DeviceIdentity, sle_uapi::{SleSnoopRecord,SNOOP_PAYLOAD_MAX,SNOOP_TRUNCATED}};
+use super::{sle_dev::DeviceIdentity, sle_uapi::{SleSnoopRecord,SNOOP_PAYLOAD_MAX,SNOOP_TRUNCATED,SNOOP_REDACTED}};
 
 const CAPACITY: usize = 64;
 pub(crate) struct SnoopLog {
@@ -44,6 +44,11 @@ impl SnoopLog {
             let offset = if profile == 0 {0} else {record.payload[0]=0xa1; 1};
             record.payload[offset..offset+2].copy_from_slice(&opcode.to_le_bytes());
             record.payload[offset+2..offset+4].copy_from_slice(&(params.len() as u16).to_le_bytes());
+            if profile==1 && matches!(opcode,0x1c03|0x1c05) {
+                record.flags |= SNOOP_REDACTED;
+                record.captured_length=header as u16;
+                return;
+            }
             let n=(record.captured_length as usize).saturating_sub(header);
             record.payload[header..header+n].copy_from_slice(&params[..n]);
         }
