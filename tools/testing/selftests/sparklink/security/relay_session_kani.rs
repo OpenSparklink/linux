@@ -5,6 +5,37 @@ pub mod relay {
     #[cfg(kani)]
     mod verification {
         use super::*;
+        /// Verify production deadline arithmetic over all input bit patterns,
+        /// including expired/oversized budgets and overflow, without a clock
+        /// or always-successful USB dependency fixture.
+        #[kani::proof]
+        fn absolute_policy_deadline_and_host_timer() {
+            let now: u64 = kani::any();
+            let deadline: u64 = kani::any();
+            let maximum_ms: u32 = kani::any();
+            if let Ok(accepted) = original_deadline(now, deadline, maximum_ms) {
+                assert_eq!(accepted, deadline);
+                assert!(deadline > now);
+                assert!((1..=5000).contains(&maximum_ms));
+                assert!(deadline - now <= u64::from(maximum_ms) * 1_000_000);
+            }
+            if deadline <= now || maximum_ms == 0 || maximum_ms > 5000 {
+                assert!(original_deadline(now, deadline, maximum_ms).is_err());
+            }
+            let ticks: u64 = kani::any();
+            // Scope: x86 supported CONFIG_HZ choices. The qualified VM config
+            // is1000; production obtains its rate from msecs_to_jiffies(1000),
+            // never from userspace HZ. Timer argument is not a UAPI input.
+            let hz: u32 = match kani::any::<u8>() {0 => 100, 1 => 250, 2 => 300, _ => 1000};
+            if let Ok(wake) = host_wake_deadline(now, deadline, ticks, hz) {
+                assert!(deadline > now && deadline - now <= 5_000_000_000 && hz != 0);
+                let scaled = (deadline - now).checked_mul(u64::from(hz)).unwrap();
+                let rounded = scaled.checked_add(999_999_999).unwrap() / 1_000_000_000;
+                assert!(wake > ticks);
+                assert_eq!(wake - ticks, rounded + 1);
+            }
+        }
+
         fn key() -> Identity {
             Identity {
                 controller: 1,

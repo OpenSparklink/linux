@@ -16,6 +16,43 @@ fn session() -> Session {
     Session::new(identity(), 10, 100).unwrap()
 }
 
+#[test]
+fn caller_absolute_deadline_never_restarts_after_policy_wait() {
+    let original = 5_000_000_010;
+    assert_eq!(original_deadline(10, original, 5000), Ok(original));
+    assert_eq!(original_deadline(4_000_000_010, original, 5000), Ok(original));
+    assert_eq!(original_deadline(original, original, 5000), Err(Error::Expired));
+    assert_eq!(original_deadline(original + 1, original, 5000), Err(Error::Expired));
+    assert_eq!(original_deadline(10, original + 1, 5000), Err(Error::Invalid));
+    assert_eq!(original_deadline(10, original, 0), Err(Error::Invalid));
+    assert_eq!(original_deadline(10, original, 5001), Err(Error::Invalid));
+}
+
+#[test]
+fn coarse_host_cleanup_does_not_extend_session_submission_right() {
+    let id = identity();
+    let deadline = original_deadline(1_000_000_000, 1_010_000_001, 5000).unwrap();
+    assert_eq!(host_wake_deadline(1_000_000_000, deadline, 100, 100), Ok(103));
+    let mut session = Session::new(id, 1_000_000_000, deadline).unwrap();
+    let packet = session.approve_capabilities(id, 1_000_000_000, 0, true).unwrap().unwrap();
+    let mut called = false;
+    assert!(session.commit(packet.ticket, id, deadline, || {called = true; Ok(())}).is_err());
+    assert!(!called);
+    assert!(!session.outstanding());
+}
+
+#[test]
+fn host_conversion_checks_zero_subtick_overflow_and_real_tick_rates() {
+    assert_eq!(host_wake_deadline(0, 1, 9, 100), Ok(11));
+    assert_eq!(host_wake_deadline(1, 1, 9, 100), Err(Error::Expired));
+    assert_eq!(host_wake_deadline(0, 1, 9, 0), Err(Error::Invalid));
+    assert_eq!(host_wake_deadline(0, 1, u64::MAX, 100), Err(Error::Overflow));
+    assert_eq!(host_wake_deadline(u64::MAX-1, u64::MAX, 1, 1000), Ok(3));
+    for hz in [100, 250, 300, 1000] {
+        assert_eq!(host_wake_deadline(1, 5_000_000_001, 10, hz), Ok(11+5*u64::from(hz)));
+    }
+}
+
 // This is a protocol/lifetime dependency fixture, not a crypto algorithm. The
 // real C primitives/material get separate actual-kernel VM tests and RF proof.
 fn agreement(fail: Option<CryptoKind>, withdraw: Option<CryptoKind>, expire: bool) {

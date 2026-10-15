@@ -1248,7 +1248,7 @@ fn ioctl_security_negotiation(
     }
     if cmd == SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT {
         let request: SleSecurityNegotiationSubmit = read_user_struct(arg)?;
-        if request.version != 1 || request.profile != owner.protocol_profile {
+        if request.version != 2 || request.profile != owner.protocol_profile {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
         if !matches!(request.flags,1|2|3)

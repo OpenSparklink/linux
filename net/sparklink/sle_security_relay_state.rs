@@ -27,6 +27,27 @@ pub(crate) enum Error {
     NeverSubmitted,
 }
 
+/// Unreleased ABI carries the caller's original CLOCK_MONOTONIC deadline,
+/// including policy/Agent waiting. Never grant a fresh relative budget here.
+pub(crate) fn original_deadline(now_ns: u64, deadline_ns: u64, maximum_ms: u32) -> Result<u64, Error> {
+    if !(1..=5000).contains(&maximum_ms) { return Err(Error::Invalid); }
+    let remaining = deadline_ns.checked_sub(now_ns).filter(|v| *v != 0).ok_or(Error::Expired)?;
+    if remaining > u64::from(maximum_ms) * 1_000_000 { return Err(Error::Invalid); }
+    Ok(deadline_ns)
+}
+
+/// Host has a jiffies cleanup timer, distinct from Session's exact nanosecond
+/// authorization deadline. Sample jiffies AFTER monotonic time: a delayed
+/// conversion may delay cleanup but never authorizes a late USB submission.
+/// One extra tick avoids expiring the Host command before the sub-tick edge.
+pub(crate) fn host_wake_deadline(now_ns: u64, deadline_ns: u64, jiffies_after: u64, hz: u32) -> Result<u64, Error> {
+    original_deadline(now_ns, deadline_ns, 5000)?;
+    if hz == 0 { return Err(Error::Invalid); }
+    let scaled = (deadline_ns - now_ns).checked_mul(u64::from(hz)).ok_or(Error::Overflow)?;
+    let ticks = scaled.checked_add(999_999_999).ok_or(Error::Overflow)? / 1_000_000_000;
+    jiffies_after.checked_add(ticks).and_then(|v| v.checked_add(1)).ok_or(Error::Overflow)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Open,

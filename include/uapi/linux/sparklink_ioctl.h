@@ -1251,7 +1251,11 @@ struct sle_link_snapshot {
  * approval, authenticated peer identity, trusted Grant or Bond. */
 #define SLE_SECURITY_UNAUTHENTICATED_ENCRYPTION 3U
 struct sle_security_negotiation_submit {
-    __aligned_u64 generation, lifetime, request_id;
+    /* version2; absolute CLOCK_MONOTONIC ns, set before policy/Agent waiting.
+     * timeout_ms bounds the remaining budget (1..5000), never resets it.
+     * Session checks this original deadline through crypto and final submit.
+     * Host coarse cleanup ticks do not extend authorization. */
+    __aligned_u64 generation, lifetime, request_id, deadline_monotonic_ns;
     __u32 version, profile, action, flags, timeout_ms;
     __u16 handle;
     __u8 role, address_type, address[6], reserved[2];

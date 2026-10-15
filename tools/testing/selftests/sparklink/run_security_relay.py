@@ -16,7 +16,7 @@ root = here.parents[3]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path)
 parser.add_argument('--kani', action='store_true', help='verify the same production source in a private mirrored tree')
-parser.add_argument('--kani-harness', choices=['capability_withdraw_deadline_and_submit', 'capability_requires_peer_and_terminal_complete','key_agreement_job_cancel_and_physical_obligation','installation_submit_cancel_accept_and_event'], help='select one relay proof; requires --kani')
+parser.add_argument('--kani-harness', choices=['absolute_policy_deadline_and_host_timer','capability_withdraw_deadline_and_submit', 'capability_requires_peer_and_terminal_complete','key_agreement_job_cancel_and_physical_obligation','installation_submit_cancel_accept_and_event'], help='select one relay proof; requires --kani')
 parser.add_argument('--timeout', type=int, default=300, help='formal tool seconds; timeout is NOT_PROVEN')
 args = parser.parse_args()
 if args.kani_harness and not args.kani:parser.error('--kani-harness requires --kani')
@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix='sparklink-relay-session-') as directory
             stdout, stderr = process.communicate(timeout=args.timeout)
             log = stdout + stderr
             status = 'BOUNDED_PASS' if process.returncode == 0 else 'NOT_PROVEN'
-            expected_harnesses=1 if args.kani_harness else 6
+            expected_harnesses=1 if args.kani_harness else 7
             verdict=re.findall(r'Complete - (\d+) successfully verified harnesses, (\d+) failures, (\d+) total\.',log)
             if verdict!=[(str(expected_harnesses),'0',str(expected_harnesses))]:status='NOT_PROVEN_INCOMPLETE'
             if 'unsupported' in log.lower():
@@ -81,7 +81,7 @@ record = dict(status='PRODUCTION_RELAY_SESSION_REGRESSION_PASS', tests=test_coun
               sources={str(p.relative_to(root)): hashlib.sha256(data).hexdigest() for p, data in originals.items()})
 if formal is not None:
     record['formal'] = formal
-    record['proof_scope'] = dict(harness=args.kani_harness or 'all6', queue_depth=2,
+    record['proof_scope'] = dict(harness=args.kani_harness or 'all7', queue_depth=2,
         capability_payload_bytes=10, capability_exchanges=1, capability_terminal_replies=1,
         arbitrary_commit_time_u64=args.kani_harness in [None,'capability_withdraw_deadline_and_submit'], unwind=80 if args.kani_harness in [None,'key_agreement_job_cancel_and_physical_obligation','installation_submit_cancel_accept_and_event'] else 12,
         property_inventory_by_harness={
@@ -117,6 +117,20 @@ if formal is not None:
             'Command Status pays only command obligation; pending asynchronous install survives cancel/expiry until actual domain evidence or physical retirement']
         record['proof_scope']['request_cancel_scope'] = 'Before materialization/final submit and after actual submit/Status, nondeterministic choice of author withdraw or actual production Session.cancel; cancellation idempotence checked. Original File/request validation and Runtime locking are outside this pure harness.'
         record['proof_scope']['excluded'] += ['Actual C key copy, firmware encryption truth, independent radio cipher attestation, T role installation model and uncertain USB failure combination']
+    if args.kani_harness == 'absolute_policy_deadline_and_host_timer':
+        record['proof_scope'] = dict(
+            harness=args.kani_harness, loop_free=True,
+            production_functions=['original_deadline', 'host_wake_deadline'],
+            input_space='allu64 now/deadline/jiffies and allu32 maximum_ms; timer rates100/250/300/1000',
+            timer_scope='x86 CONFIG_HZ choices; current VM CONFIG_HZ=1000. Production rate comes from actual msecs_to_jiffies(1000); not bindgen userspace HZ.',
+            properties=['Accepted deadline equals original caller deadline, future and bounded1..5000ms',
+                        'Expired or invalid budgets reject; arithmetic never wraps',
+                        'Accepted Host wake equals checked ceiling timer conversion plus one tick; no overflow'],
+            assumptions=['Unsigned integer/Rust checked-arithmetic semantics as encoded by Kani/CBMC',
+                         'Timer argument matches stated actual kernel CONFIG_HZ; this is not a UAPI argument'],
+            excluded=['Kernel clock sampling/correspondence, suspend, scheduling and Host timer execution',
+                      'Session transitions/final USB submission, File/grant authorization and locks/references',
+                      'Cryptography, firmware/NOCP/peer behavior, Agent and natural recovery'])
     record['regression_status'] = 'PASS'
     if formal['status'] != 'BOUNDED_PASS':
         record['status'] = 'PRODUCTION_RELAY_SESSION_FORMAL_NOT_PROVEN'

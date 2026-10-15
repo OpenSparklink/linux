@@ -2312,7 +2312,7 @@ const _: () = assert!(core::mem::size_of::<SleLinkSnapshot>() == 432);
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub(crate) struct SleSecurityNegotiationSubmit {
-    pub generation:u64,pub lifetime:u64,pub request_id:u64,
+    pub generation:u64,pub lifetime:u64,pub request_id:u64,pub deadline_monotonic_ns:u64,
     pub version:u32,pub profile:u32,pub action:u32,pub flags:u32,pub timeout_ms:u32,
     pub handle:u16,pub role:u8,pub address_type:u8,pub address:[u8;6],pub reserved:[u8;2],
 }
@@ -2342,7 +2342,7 @@ impl_check_reserved!(SleSecurityNegotiationResult, [reserved]);
 unsafe impl FromBytes for SleSecurityNegotiationSubmit {}
 // SAFETY: padding-free integer/byte layout, initialized output only.
 unsafe impl FromBytes for SleSecurityNegotiationResult {}
-const _: ()=assert!(core::mem::size_of::<SleSecurityNegotiationSubmit>()==56);
+const _: ()=assert!(core::mem::size_of::<SleSecurityNegotiationSubmit>()==64);
 const _: ()=assert!(core::mem::size_of::<SleSecurityNegotiationResult>()==72);
 pub(crate) const SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT:u32=_IOW::<SleSecurityNegotiationSubmit>(SL_MAGIC,0xd2);
 pub(crate) const SL_IOCTL_SECURITY_NEGOTIATION_RESULT:u32=_IOWR::<SleSecurityNegotiationResult>(SL_MAGIC,0xd3);

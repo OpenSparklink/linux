@@ -29,8 +29,9 @@ struct Owner {
     state: Lock<State, super::sle_irq_lock::IrqLockBackend>,
 }
 fn now() -> u64 {
-    // SAFETY: read-only kernel clock; all relay deadlines use jiffies.
-    unsafe { kernel::bindings::jiffies_64 }
+    // SAFETY: read-only CLOCK_MONOTONIC, same domain as the caller's original
+    // deadline. Host jiffies are only a cleanup timer, never this authorization.
+    (unsafe { kernel::bindings::ktime_get() }) as u64
 }
 fn error(e: relay::Error) -> Error {
     Error::from_errno(
@@ -257,6 +258,7 @@ impl Command {
     pub(crate) fn withdraw(&self) {
         let mut state = self.owner().state.lock();
         if let Some(session) = &mut state.session {
+            session.expire(now());
             session.withdraw();
         }
         let material = state.material.take();
@@ -337,7 +339,7 @@ impl super::ControllerRuntime {
             grant_epoch: epoch,
         };
         let deadline = now()
-            .checked_add(kernel::time::msecs_to_jiffies(5000) as u64)
+            .checked_add(5_000_000_000)
             .ok_or(EOVERFLOW);
         let deadline = match deadline {
             Ok(d) => d,
@@ -565,7 +567,15 @@ impl super::ControllerRuntime {
         };
         command.bind_wire_echo_index(plan.3);
         let retained = command.clone();
-        let deadline = command.deadline;
+        let sampled_ns = now();
+        // SAFETY: read-only coarse Host clock, sampled after monotonic time.
+        let jiffies_after = unsafe { kernel::bindings::jiffies_64 };
+        // Use the actual kernel timer rate, not bindgen's userspace HZ macro.
+        let hz = kernel::time::msecs_to_jiffies(1000) as u32;
+        let deadline = match relay::host_wake_deadline(sampled_ns, command.deadline, jiffies_after, hz) {
+            Ok(value) => value,
+            Err(e) => { retained.withdraw(); return Err(error(e)); }
+        };
         let mut host = self.host.lock();
         let gate = self.schedule_gate.lock();
         let result = if *gate {
@@ -587,11 +597,10 @@ impl super::ControllerRuntime {
         author: u64,
         request: &super::sle_uapi::SleSecurityNegotiationSubmit,
     ) -> Result {
-        // This original deadline also covers entropy/crypto preparation, not
-        // a fresh timeout granted after the expensive work finishes.
-        let deadline = now()
-            .checked_add(kernel::time::msecs_to_jiffies(request.timeout_ms) as u64)
-            .ok_or(EOVERFLOW)?;
+        // The immutable caller deadline also covers policy/Agent/queue/crypto.
+        // Session's every prepare/commit/input/query uses this same ns domain;
+        // no conversion to Host timer ticks can extend authorization.
+        let deadline = relay::original_deadline(now(), request.deadline_monotonic_ns, request.timeout_ms).map_err(error)?;
         let identity = self.relay_identity(request.lifetime, request.handle)?;
         let (material, public) = if matches!(request.flags, 2 | 3) {
             let mut snapshot: super::sle_uapi::SleControllerSnapshot =
