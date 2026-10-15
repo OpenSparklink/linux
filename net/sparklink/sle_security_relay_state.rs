@@ -211,6 +211,11 @@ impl Session {
             return Err(Error::NeverSubmitted);
         }
         active.submitted = true;
+        if matches!(active.packet.index, 0x1c03 | 0x1c05) {
+            if let Some(i) = &mut self.installation {
+                i.pending = true;
+            }
+        }
         if let Some(pair) = &mut self.pairing {
             pair.last_submitted = active.packet.index;
         }
@@ -289,7 +294,7 @@ impl Session {
                 }
             }
         }
-        if self.phase == Phase::Closing {
+        if self.phase == Phase::Closing && !self.installation_pending() {
             self.phase = Phase::Closed;
         }
         self.finish_pairing_if_drained();
@@ -308,7 +313,7 @@ impl Session {
         if self.phase == Phase::Uncertain {
             return;
         }
-        if self.outstanding() {
+        if self.outstanding() || self.installation_pending() {
             self.phase = Phase::Closing;
         } else {
             self.active = None;
@@ -325,7 +330,7 @@ impl Session {
             }
         }
         self.queue.fill(None);
-        if self.outstanding() {
+        if self.outstanding() || self.installation_pending() {
             self.phase = Phase::Uncertain;
             self.reset_required = true;
         } else if self.phase != Phase::Uncertain {
@@ -339,6 +344,9 @@ impl Session {
     pub(crate) fn retired_after_barrier(&mut self) {
         self.queue.fill(None);
         self.active = None;
+        if let Some(i) = &mut self.installation {
+            i.pending = false;
+        }
         self.phase = Phase::Closed;
         // Retained diagnostic: an uncertain generation cannot be reused.
     }
@@ -500,6 +508,7 @@ struct Installation {
     queued: bool,
     accepted: bool,
     encrypted: bool,
+    pending: bool,
 }
 
 impl Session {
@@ -566,6 +575,12 @@ impl Session {
         }
     }
 
+    /// Command credit/obligation is separate: successful Status pays the
+    /// command reservation, never this asynchronous physical procedure.
+    pub(crate) fn installation_pending(&self) -> bool {
+        self.installation.is_some_and(|i| i.pending)
+    }
+
     pub(crate) fn enable_installation(
         &mut self,
         current: Identity,
@@ -582,6 +597,7 @@ impl Session {
             queued: false,
             accepted: false,
             encrypted: false,
+            pending: false,
         });
         Ok(())
     }
@@ -656,6 +672,47 @@ impl Session {
         if current != self.identity {
             return Err(Error::Stale);
         }
+        self.expire(now);
+        if event == 0x0011 && self.installation_pending() {
+            // Correlated physical terminal evidence can drain old obligation
+            // after cancellation/expiry, but can never grant a new result.
+            let i = self.installation.ok_or(Error::Unsupported)?;
+            let expected = if i.role == 0 { 0x1c03 } else { 0x1c05 };
+            let submitted = self.pairing.is_some_and(|p| p.last_submitted == expected);
+            if !submitted && !(i.role == 1 && i.requested) {
+                return Err(Error::Stale);
+            }
+            if !submitted && status == 0 && enabled == 1 {
+                self.fail_pairing(-71);
+                self.phase = Phase::Uncertain;
+                self.reset_required = true;
+                return Err(Error::Stale);
+            }
+            let known_terminal = status != 0 || enabled <= 2;
+            if !known_terminal {
+                self.fail_pairing(-71);
+                self.phase = Phase::Uncertain;
+                self.reset_required = true;
+                return Err(Error::Unsupported);
+            }
+            if let Some(i) = &mut self.installation {
+                i.pending = false;
+            }
+            if !submitted && self.phase == Phase::Open {
+                self.fail_pairing(if status != 0 { -5 } else { -71 });
+                return Err(Error::Closed);
+            }
+            if self.phase != Phase::Open {
+                if self.phase == Phase::Closing && !self.outstanding() {
+                    self.phase = Phase::Closed;
+                }
+                return Err(if now >= self.deadline {
+                    Error::Expired
+                } else {
+                    Error::Closed
+                });
+            }
+        }
         if event == 0x0011
             && self.phase == Phase::Closed
             && self.installation.is_some()
@@ -677,6 +734,7 @@ impl Session {
         match event {
             0x000e if i.role == 1 && !i.requested && !i.queued => {
                 i.requested = true;
+                i.pending = true; // Controller waiting for params is already a physical procedure.
             }
             0x0011 => {
                 let expected = if i.role == 0 { 0x1c03 } else { 0x1c05 };

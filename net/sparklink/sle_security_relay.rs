@@ -19,6 +19,7 @@ struct State {
     author: u64,
     request: u64,
     role: u8,
+    reset_reported: bool,
     material: Option<super::sle_pair_material::Material>,
 }
 #[pin_data]
@@ -59,7 +60,7 @@ unsafe extern "C" fn sl_security_owner_create_rust(
     let actor = KBox::pin_init(
         pin_init!(Owner {
             identity: Identity {controller:id,generation,lifetime,handle,grant_epoch:epoch},
-            state <- super::sle_irq_lock::new_irq_lock!(State {session:None,stopped:false,author:0,request:0,role:0,material:None}, "sparklink_security_relay"),
+            state <- super::sle_irq_lock::new_irq_lock!(State {session:None,stopped:false,author:0,request:0,role:0,reset_reported:false,material:None}, "sparklink_security_relay"),
         }),
         GFP_KERNEL,
     );
@@ -792,6 +793,11 @@ impl super::ControllerRuntime {
                 .as_mut()
                 .and_then(|s| s.capability_observation(now()))
                 .is_some_and(|o| matches!(o.state, 1 | 2 | 3 | 8));
+            let warn_reset =
+                !state.reset_reported && state.session.as_ref().is_some_and(|s| s.reset_required());
+            if warn_reset {
+                state.reset_reported = true;
+            }
             let retired = if keep_material {
                 None
             } else {
@@ -814,6 +820,15 @@ impl super::ControllerRuntime {
             };
             drop(state);
             drop(retired);
+            if warn_reset {
+                pr_warn!(
+                    "sparklink: sle{} generation={} lifetime={} handle={} security outcome uncertain; physical link retirement required\n",
+                    identity.controller,
+                    identity.generation,
+                    identity.lifetime,
+                    identity.handle
+                );
+            }
             if let Some((packet, deadline)) = packet {
                 let command = Command {
                     pointer,

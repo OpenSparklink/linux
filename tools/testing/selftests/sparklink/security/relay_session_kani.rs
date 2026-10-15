@@ -92,7 +92,7 @@ pub mod relay {
             assert_eq!(packet.index, 0x1c03);
             assert!(packet.payload().is_empty());
             let cancellation: u8 = kani::any();
-            kani::assume(cancellation <= 4);
+            kani::assume(cancellation <= 5);
             if cancellation == 1 {
                 s.withdraw();
             }
@@ -133,6 +133,26 @@ pub mod relay {
                 assert!(!s.outstanding());
                 assert!(s.installation_event(key(), 26, 0x11, 0, 1).is_err());
                 assert_ne!(s.capability_observation(27).unwrap().state, 9);
+                return;
+            }
+            if cancellation == 5 {
+                s.reply(packet.ticket, 25, false, 0).unwrap();
+                assert!(!s.outstanding());
+                assert!(s.installation_pending());
+                let expire: bool = kani::any();
+                if expire {
+                    s.expire(100);
+                } else {
+                    s.withdraw();
+                }
+                assert_ne!(s.phase(), Phase::Closed);
+                assert!(s.installation_pending());
+                assert!(
+                    s.installation_event(key(), if expire { 101 } else { 26 }, 0x11, 0, 1)
+                        .is_err()
+                );
+                assert!(!s.installation_pending());
+                assert_ne!(s.capability_observation(102).unwrap().state, 9);
                 return;
             }
             let event_first: bool = kani::any();

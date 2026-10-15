@@ -753,3 +753,125 @@ fn uncertain_install_write_retains_obligation_and_requires_physical_barrier() {
     assert_ne!(s.capability_observation(23).unwrap().state, 9);
     assert_eq!(s.phase(), Phase::Uncertain);
 }
+
+#[test]
+fn command_status_does_not_retire_async_installation_on_cancel_or_original_expiry() {
+    for expire in [false, true] {
+        let mut sides = agreement_session(None, None, false, true).unwrap();
+        let s = &mut sides[0];
+        let id = identity();
+        s.progress_installation(id, 18).unwrap();
+        let p = s.prepare(id, 19).unwrap().unwrap();
+        s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+        assert!(s.installation_pending());
+        s.reply(p.ticket, 21, false, 0).unwrap();
+        assert!(!s.outstanding());
+        assert!(s.installation_pending());
+        if expire {
+            s.expire(100);
+        } else {
+            s.withdraw();
+        }
+        assert_eq!(
+            s.phase(),
+            if expire {
+                Phase::Uncertain
+            } else {
+                Phase::Closing
+            }
+        );
+        assert!(s.installation_pending());
+        assert_ne!(
+            s.capability_observation(if expire { 100 } else { 22 })
+                .unwrap()
+                .state,
+            9
+        );
+        assert!(
+            s.installation_event(id, if expire { 101 } else { 23 }, 0x11, 0, 1)
+                .is_err()
+        );
+        assert!(!s.installation_pending());
+        assert_ne!(s.capability_observation(102).unwrap().state, 9);
+        assert_eq!(
+            s.phase(),
+            if expire {
+                Phase::Uncertain
+            } else {
+                Phase::Closed
+            }
+        );
+        if expire {
+            assert!(s.reset_required());
+        }
+    }
+}
+
+#[test]
+fn unknown_installation_event_never_discharges_physical_debt() {
+    let mut sides = agreement_session(None, None, false, true).unwrap();
+    let s = &mut sides[0];
+    let id = identity();
+    s.progress_installation(id, 18).unwrap();
+    let p = s.prepare(id, 19).unwrap().unwrap();
+    s.commit(p.ticket, id, 20, || Ok(())).unwrap();
+    s.reply(p.ticket, 21, false, 0).unwrap();
+    assert_eq!(
+        s.installation_event(id, 22, 0x11, 0, 255),
+        Err(Error::Unsupported)
+    );
+    assert!(s.installation_pending());
+    assert!(s.reset_required());
+    assert_eq!(s.phase(), Phase::Uncertain);
+    s.retired_after_barrier();
+    assert!(!s.installation_pending());
+    assert_eq!(s.phase(), Phase::Closed);
+}
+
+#[test]
+fn responder_key_request_already_owns_physical_debt_before_local_submission() {
+    for expire in [false, true] {
+        let mut sides = agreement_session(None, None, false, true).unwrap();
+        let s = &mut sides[1];
+        let mut id = identity();
+        id.controller = 2;
+        id.generation = 3;
+        s.installation_event(id, 17, 0xe, 0, 0).unwrap();
+        assert!(s.installation_pending());
+        assert!(!s.outstanding());
+        assert_eq!(s.queued(), 0);
+        if expire {
+            s.expire(100);
+        } else {
+            s.withdraw();
+        }
+        assert_eq!(
+            s.phase(),
+            if expire {
+                Phase::Uncertain
+            } else {
+                Phase::Closing
+            }
+        );
+        assert!(s.installation_pending());
+        assert!(s.progress_installation(id, 101).is_err());
+        assert!(s.installation_event(id, 102, 0x11, 1, 0).is_err());
+        assert!(!s.installation_pending());
+        assert_ne!(s.capability_observation(103).unwrap().state, 9);
+    }
+}
+
+#[test]
+fn encryption_without_current_responder_key_is_never_current_credential() {
+    let mut sides = agreement_session(None, None, false, true).unwrap();
+    let s = &mut sides[1];
+    let mut id = identity();
+    id.controller = 2;
+    id.generation = 3;
+    s.installation_event(id, 17, 0xe, 0, 0).unwrap();
+    assert_eq!(s.installation_event(id, 18, 0x11, 0, 1), Err(Error::Stale));
+    assert!(s.installation_pending());
+    assert!(s.reset_required());
+    assert_eq!(s.phase(), Phase::Uncertain);
+    assert_ne!(s.capability_observation(19).unwrap().state, 9);
+}
