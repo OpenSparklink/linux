@@ -1223,6 +1223,102 @@ fn ioctl_controller_snapshot(
     Ok(0)
 }
 
+/// Explicit experimental capability-only procedure. Generic ioctl dispatch
+/// holds the author's active Managed lease and CAP_NET_ADMIN throughout.
+#[inline(never)]
+fn ioctl_security_negotiation(
+    context: &RuntimeContext,
+    me: Pin<&SparkLinkCtl>,
+    cmd: u32,
+    arg: usize,
+) -> Result<isize> {
+    let owner = discovery_owner(context, me)?;
+    if cmd == SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT {
+        let request: SleSecurityNegotiationSubmit = read_user_struct(arg)?;
+        if request.version != 1 || request.profile != owner.protocol_profile {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
+        if request.flags != 1
+            || request.generation == 0
+            || request.lifetime == 0
+            || request.request_id == 0
+            || request.handle > 0x0fff
+            || !(1..=5000).contains(&request.timeout_ms)
+        {
+            return Err(EINVAL);
+        }
+        if !matches!((request.role, request.action), (1, 1) | (0, 2)) {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
+        if request.generation != owner.identity.generation {
+            return Err(ENODEV);
+        }
+        let guard = context.lock()?;
+        let runtime = guard.as_ref().ok_or(ENODEV)?;
+        owner.approve_security_capabilities(runtime, me.file_id, &request)?;
+        drop(guard);
+        owner.kick_commands();
+        owner.schedule_rx(0);
+        return Ok(0);
+    }
+    let input: SleSecurityNegotiationResult = read_user_struct(arg)?;
+    if input.version != 1 {
+        return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+    }
+    if input.generation == 0
+        || input.lifetime == 0
+        || input.request_id == 0
+        || input.handle > 0x0fff
+        || input.profile != 0
+        || input.state != 0
+        || input.error != 0
+        || input.flags != 0
+        || input.role != 0
+        || input.status != 0
+        || input.local_caps != [0; 10]
+        || input.peer_caps != [0; 10]
+    {
+        return Err(EINVAL);
+    }
+    if input.generation != owner.identity.generation {
+        return Err(ENODEV);
+    }
+    let (observation, role) = owner.security_capability_observation(
+        me.file_id,
+        input.lifetime,
+        input.handle,
+        input.request_id,
+    )?;
+    // SAFETY: padding-free ABI; zero every output/reserved byte before copyout.
+    let mut output: SleSecurityNegotiationResult = unsafe { core::mem::zeroed() };
+    output.version = 1;
+    output.profile = owner.protocol_profile;
+    output.generation = owner.identity.generation;
+    output.lifetime = input.lifetime;
+    output.request_id = input.request_id;
+    output.handle = input.handle;
+    output.role = role;
+    output.state = observation.state;
+    output.flags = observation.flags;
+    output.status = observation.status;
+    output.local_caps = observation.local;
+    output.peer_caps = observation.peer;
+    output.error = match observation.state {
+        5 => {
+            if observation.status == 0 {
+                -(bindings::EOPNOTSUPP as i32)
+            } else {
+                EIO.to_errno()
+            }
+        }
+        6 => -(bindings::ECANCELED as i32),
+        7 => ETIMEDOUT.to_errno(),
+        _ => 0,
+    };
+    write_user_struct(arg, &output)?;
+    Ok(0)
+}
+
 /// Typed native connection, all driver field validation before Host mutation.
 /// Dispatch already holds file operation and Managed lease locks throughout admission.
 #[inline(never)]
@@ -1642,6 +1738,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
         SL_IOCTL_DIAGNOSTIC_RESULT => ioctl_diagnostic_result(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
+        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT => ioctl_security_negotiation(context,me,cmd,arg),
         SL_IOCTL_CONNECTION_SUBMIT => ioctl_connection_submit(context, me, arg),
         SL_IOCTL_CONNECTION_RESULT => ioctl_connection_result(context, me, arg),
         SL_IOCTL_LINK_SNAPSHOT => ioctl_link_snapshot(context, me, arg),
@@ -2019,6 +2116,8 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_DIAGNOSTIC_RESULT
             | SL_IOCTL_SNOOP_GET
             | SL_IOCTL_CONTROLLER_SNAPSHOT
+            | SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT
+            | SL_IOCTL_SECURITY_NEGOTIATION_RESULT
             | SL_IOCTL_CONNECTION_SUBMIT
             | SL_IOCTL_CONNECTION_RESULT
             | SL_IOCTL_LINK_SNAPSHOT

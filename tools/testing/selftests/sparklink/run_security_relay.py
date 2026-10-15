@@ -25,7 +25,11 @@ originals = {p: p.read_bytes() for p in paths}
 with tempfile.TemporaryDirectory(prefix='sparklink-relay-session-') as directory:
     binary = str(Path(directory) / 'regression')
     subprocess.run(['rustc', '--edition=2024', '--test', '-Dwarnings', str(paths[1]), '-o', binary], check=True)
-    subprocess.run([binary], check=True)
+    regression=subprocess.run([binary],check=True,text=True,capture_output=True)
+    print(regression.stdout,end="")
+    counts=re.findall(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",regression.stdout)
+    if len(counts)!=1 or int(counts[0])==0:raise ValueError("complete nonempty regression verdict required")
+    test_count=int(counts[0])
     formal = None
     if args.kani:
         mirror = Path(directory) / 'linux'
@@ -59,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix='sparklink-relay-session-') as directory
         if args.output:
             args.output.with_suffix('.kani.log').write_text(log)
 assert all(p.read_bytes() == data for p, data in originals.items())
-record = dict(status='PRODUCTION_RELAY_SESSION_REGRESSION_PASS', tests=9,
+record = dict(status='PRODUCTION_RELAY_SESSION_REGRESSION_PASS', tests=test_count,
               default_kernel_implementation=True, rf_acceptance=False,
               rustc=subprocess.check_output(['rustc', '--version'], text=True).strip(),
               sources={str(p.relative_to(root)): hashlib.sha256(data).hexdigest() for p, data in originals.items()})

@@ -241,13 +241,168 @@ fn certain_submit_refusal_is_not_a_controller_completion() {
 
 #[test]
 fn payload_view_is_exact_without_driver_envelope() {
- let mut s=session();s.enqueue(identity(),10,0x0147,&[2]).unwrap();
- let p=s.prepare(identity(),11).unwrap().unwrap();assert_eq!(p.payload(),&[2]);
+    let mut s = session();
+    s.enqueue(identity(), 10, 0x0147, &[2]).unwrap();
+    let p = s.prepare(identity(), 11).unwrap().unwrap();
+    assert_eq!(p.payload(), &[2]);
 }
 
-#[test] fn initial_request_role_and_length_are_exact() {
- for role in 0..=2 {for length in 0..=255 {for index in [0x0133,0x0134,0x0135,0x0147] {
-  let expected=(role==0&&index==0x0133&&length==1)||(role==1&&index==0x0134&&length==10);
-  assert_eq!(initial_pairing_request(role,index,length),expected);
- }}}
+#[test]
+fn initial_request_role_and_length_are_exact() {
+    for role in 0..=2 {
+        for length in 0..=255 {
+            for index in [0x0133, 0x0134, 0x0135, 0x0147] {
+                let expected = (role == 0 && index == 0x0133 && length == 1)
+                    || (role == 1 && index == 0x0134 && length == 10);
+                assert_eq!(initial_pairing_request(role, index, length), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_approved_capabilities_reuse_real_ticket_ledger() {
+    let id = identity();
+    let mut g = session();
+    let mut t = session();
+    let request = g.approve_capabilities(id, 11, 0, true).unwrap().unwrap();
+    assert_eq!(request.index, 0x134);
+    assert_eq!(request.payload(), [3, 0, 0, 16, 0, 2, 2, 2, 2, 0]);
+    assert!(g.capability_exchange());
+    assert_eq!(g.deadline(), 100);
+    assert!(t.approve_capabilities(id, 11, 1, false).unwrap().is_none());
+    // Before actual submission an unsolicited response cannot finish G.
+    assert!(matches!(
+        g.receive_capabilities(id, 12, 0x135, request.payload()),
+        Err(Error::Stale)
+    ));
+    g.commit(request.ticket, id, 12, || Ok(())).unwrap();
+    let response = t
+        .receive_capabilities(id, 13, 0x134, request.payload())
+        .unwrap()
+        .unwrap();
+    t.commit(response.ticket, id, 14, || Ok(())).unwrap();
+    assert_eq!(g.capability_observation(15).unwrap().state, 2);
+    assert_eq!(g.reply(request.ticket, 15, false, 0), None); // Status isn't Complete.
+    g.receive_capabilities(id, 16, 0x135, response.payload())
+        .unwrap();
+    assert_eq!(g.capability_observation(16).unwrap().flags, 5);
+    g.reply(request.ticket, 17, true, 0).unwrap();
+    t.reply(response.ticket, 18, true, 0).unwrap();
+    for s in [&mut g, &mut t] {
+        let observation = s.capability_observation(19).unwrap();
+        assert_eq!(observation.state, 4);
+        assert_eq!(observation.flags, 7);
+        assert_eq!(observation.peer, observation.local);
+        assert_eq!(s.phase(), Phase::Closed);
+        assert!(!s.outstanding());
+        assert!(matches!(
+            s.approve_capabilities(id, 20, 0, true),
+            Err(Error::Closed)
+        ));
+        assert!(matches!(
+            s.receive_capabilities(id, 20, 0x135, response.payload()),
+            Err(Error::Closed)
+        ));
+    }
+}
+
+#[test]
+fn approval_expiry_withdrawal_and_uncertain_failure_never_gain_capabilities() {
+    for cause in 0..3 {
+        let id = identity();
+        let mut s = session();
+        let packet = s.approve_capabilities(id, 11, 0, true).unwrap().unwrap();
+        s.commit(packet.ticket, id, 12, || Ok(())).unwrap();
+        match cause {
+            0 => s.expire(100),
+            1 => s.withdraw(),
+            _ => {
+                s.transport_failed(packet.ticket).unwrap();
+            }
+        }
+        let before = s.capability_observation(100).unwrap();
+        assert_ne!(before.state, 4);
+        assert_eq!(before.flags, 1);
+        assert!(s.outstanding());
+        s.reply(packet.ticket, 101, true, 0).unwrap();
+        assert_ne!(s.capability_observation(102).unwrap().state, 4);
+        assert!(!s.outstanding());
+        assert!(s
+            .receive_capabilities(id, 102, 0x135, packet.payload())
+            .is_err());
+    }
+}
+
+#[test]
+fn stale_identity_wrong_role_and_unsupported_capabilities_do_not_send() {
+    let id = identity();
+    let mut s = session();
+    assert!(matches!(
+        s.approve_capabilities(id, 11, 1, true),
+        Err(Error::Unsupported)
+    ));
+    let mut old = id;
+    old.grant_epoch += 1;
+    assert!(matches!(
+        s.approve_capabilities(old, 11, 0, true),
+        Err(Error::Stale)
+    ));
+    s.approve_capabilities(id, 11, 1, false).unwrap();
+    assert!(matches!(
+        s.receive_capabilities(old, 12, 0x134, &[3, 0, 0, 16, 0, 2, 2, 2, 2, 0]),
+        Err(Error::Stale)
+    ));
+    assert!(matches!(
+        s.receive_capabilities(id, 13, 0x134, &[3, 0, 5, 16, 0, 2, 2, 2, 2, 0]),
+        Err(Error::Unsupported)
+    ));
+    let observation = s.capability_observation(14).unwrap();
+    assert_eq!(observation.state, 5);
+    assert_eq!(observation.flags, 0);
+    assert!(!s.outstanding());
+    assert!(matches!(s.prepare(id, 15), Err(Error::Closed)));
+}
+
+#[test]
+fn capability_complete_before_receive_failure_and_passive_expiry_are_terminal() {
+    let id = identity();
+    let offer = [3, 0, 0, 16, 0, 2, 2, 2, 2, 0];
+    let mut good = session();
+    let p = good.approve_capabilities(id, 11, 0, true).unwrap().unwrap();
+    good.commit(p.ticket, id, 12, || Ok(())).unwrap();
+    good.reply(p.ticket, 13, true, 0).unwrap();
+    assert_eq!(good.capability_observation(14).unwrap().flags, 3);
+    good.receive_capabilities(id, 15, 0x135, &offer).unwrap();
+    assert_eq!(good.capability_observation(16).unwrap().state, 4);
+    let mut failed = session();
+    let p = failed
+        .approve_capabilities(id, 11, 0, true)
+        .unwrap()
+        .unwrap();
+    failed.commit(p.ticket, id, 12, || Ok(())).unwrap();
+    failed.reply(p.ticket, 13, false, 0x0c).unwrap();
+    assert_eq!(failed.capability_observation(14).unwrap().state, 5);
+    assert!(failed.receive_capabilities(id, 15, 0x135, &offer).is_err());
+    assert_eq!(failed.capability_observation(16).unwrap().status, 0x0c);
+    let mut passive = session();
+    passive.approve_capabilities(id, 11, 1, false).unwrap();
+    assert_eq!(passive.capability_observation(100).unwrap().state, 7);
+    assert!(passive
+        .receive_capabilities(id, 101, 0x134, &offer)
+        .is_err());
+    assert!(!passive.outstanding());
+    assert_eq!(passive.queued(), 0);
+    let mut refused = session();
+    let p = refused
+        .approve_capabilities(id, 11, 0, true)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        refused.commit(p.ticket, id, 12, || Err(())),
+        Err(Error::NeverSubmitted)
+    ));
+    refused.withdraw();
+    assert!(!refused.outstanding());
+    assert_eq!(refused.capability_observation(13).unwrap().state, 6);
 }

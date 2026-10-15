@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Physical Session owns one pinned relay ledger, independent of application fd.
 //! Host commands retain the same C kref until real reply/fault, including revoke.
-//! No crypto, policy approval, successful pairing or trusted installation here.
+//! Manager approval enables only explicit limited capability exchange.
+//! No successful pairing, authentication, crypto or trusted installation here.
 use super::sle_security_relay_state::{self as relay, Identity, Ticket};
 use core::{ffi::c_void, pin::Pin};
 use kernel::{prelude::*, sync::lock::Lock};
@@ -14,6 +15,9 @@ extern "C" {
 struct State {
     session: Option<relay::Session>,
     stopped: bool,
+    author: u64,
+    request: u64,
+    role: u8,
 }
 #[pin_data]
 struct Owner {
@@ -28,6 +32,7 @@ fn now() -> u64 {
 fn error(e: relay::Error) -> Error {
     Error::from_errno(
         -(match e {
+            relay::Error::Unsupported => kernel::bindings::EOPNOTSUPP,
             relay::Error::Invalid => kernel::bindings::EINVAL,
             relay::Error::Stale => kernel::bindings::ESTALE,
             relay::Error::Expired => kernel::bindings::ETIMEDOUT,
@@ -52,7 +57,7 @@ unsafe extern "C" fn sl_security_owner_create_rust(
     let actor = KBox::pin_init(
         pin_init!(Owner {
             identity: Identity {controller:id,generation,lifetime,handle,grant_epoch:epoch},
-            state <- super::sle_irq_lock::new_irq_lock!(State {session:None,stopped:false}, "sparklink_security_relay"),
+            state <- super::sle_irq_lock::new_irq_lock!(State {session:None,stopped:false,author:0,request:0,role:0}, "sparklink_security_relay"),
         }),
         GFP_KERNEL,
     );
@@ -92,6 +97,7 @@ pub(crate) struct Command {
     pointer: *mut c_void,
     pub(crate) ticket: Ticket,
     index: u16,
+    deadline: u64,
 }
 // SAFETY: C kref protects lifetime, pinned IRQ lock serializes all ledger access.
 unsafe impl Send for Command {}
@@ -104,6 +110,7 @@ impl Clone for Command {
             pointer: self.pointer,
             ticket: self.ticket,
             index: self.index,
+            deadline: self.deadline,
         }
     }
 }
@@ -151,7 +158,15 @@ impl Command {
         })();
         drop(state);
         match prepared {
-            Ok((ticket, packet)) => Ok((Self { pointer, ticket, index: packet.index }, packet)),
+            Ok((ticket, packet)) => Ok((
+                Self {
+                    pointer,
+                    ticket,
+                    index: packet.index,
+                    deadline,
+                },
+                packet,
+            )),
             Err(e) => {
                 unsafe { sl_connection_session_put(pointer) };
                 Err(e)
@@ -191,9 +206,11 @@ impl Command {
         self.index = index;
     }
     pub(crate) fn reply_matches(&self, complete: bool, status: u8, data: &[u8]) -> bool {
-        !complete || status != 0 || (data.len() == 4
-            && u16::from_le_bytes([data[0], data[1]]) == self.ticket.identity.handle
-            && u16::from_le_bytes([data[2], data[3]]) == self.index)
+        !complete
+            || status != 0
+            || (data.len() == 4
+                && u16::from_le_bytes([data[0], data[1]]) == self.ticket.identity.handle
+                && u16::from_le_bytes([data[2], data[3]]) == self.index)
     }
     pub(crate) fn withdraw(&self) {
         let mut state = self.owner().state.lock();
@@ -220,6 +237,7 @@ impl Command {
             if session
                 .reply(self.ticket, now(), complete, status)
                 .is_some()
+                && !session.capability_exchange()
                 && session.phase() == relay::Phase::Open
             {
                 session.withdraw();
@@ -273,7 +291,134 @@ impl super::ControllerRuntime {
                 return Err(e);
             }
         };
-        let (mut command, packet) = unsafe { Command::prepare_denial(pointer, identity, deadline) }?;
+        let (command, packet) = unsafe { Command::prepare_denial(pointer, identity, deadline) }?;
+        self.enqueue_security(runtime, command, packet)
+    }
+}
+
+impl Command {
+    /// Caller gives a distinct physical Session ref. Approval is under the
+    /// Runtime Host/gate locks, never supplied by an ordinary application fd.
+    unsafe fn approve(
+        pointer: *mut c_void,
+        identity: Identity,
+        author: u64,
+        request: u64,
+        role: u8,
+        initiate: bool,
+        deadline: u64,
+    ) -> Result<Option<(Self, relay::Packet)>> {
+        let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+        let mut state = owner.state.lock();
+        let result = (|| {
+            if state.stopped || identity != owner.identity {
+                return Err(ENODEV);
+            }
+            if state.session.is_some() {
+                return Err(EBUSY);
+            }
+            let mut session = relay::Session::new(identity, now(), deadline).map_err(error)?;
+            let packet = session
+                .approve_capabilities(identity, now(), role, initiate)
+                .map_err(error)?;
+            state.session = Some(session);
+            state.author = author;
+            state.request = request;
+            state.role = role;
+            Ok(packet)
+        })();
+        drop(state);
+        match result {
+            Ok(Some(packet)) => Ok(Some((
+                Self {
+                    pointer,
+                    ticket: packet.ticket,
+                    index: packet.index,
+                    deadline,
+                },
+                packet,
+            ))),
+            other => {
+                unsafe { sl_connection_session_put(pointer) };
+                other.map(|_| None)
+            }
+        }
+    }
+
+    /// Returns handled=true for an approved lifetime even on failure. Such a
+    /// packet must not fall through and manufacture another denial procedure.
+    unsafe fn receive(
+        pointer: *mut c_void,
+        identity: Identity,
+        index: u16,
+        bytes: &[u8],
+    ) -> Result<(bool, Option<(Self, relay::Packet)>)> {
+        let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+        let mut state = owner.state.lock();
+        let result = (|| {
+            if state.stopped || identity != owner.identity {
+                return Err(ENODEV);
+            }
+            let Some(session) = &mut state.session else {
+                return Ok((false, None));
+            };
+            if !session.capability_exchange() {
+                return Ok((false, None));
+            }
+            let packet = session
+                .receive_capabilities(identity, now(), index, bytes)
+                .map_err(error)?;
+            Ok((true, packet.map(|p| (p, session.deadline()))))
+        })();
+        drop(state);
+        match result {
+            Ok((handled, Some((packet, deadline)))) => Ok((
+                handled,
+                Some((
+                    Self {
+                        pointer,
+                        ticket: packet.ticket,
+                        index: packet.index,
+                        deadline,
+                    },
+                    packet,
+                )),
+            )),
+            other => {
+                unsafe { sl_connection_session_put(pointer) };
+                other.map(|(handled, _)| (handled, None))
+            }
+        }
+    }
+}
+
+impl super::ControllerRuntime {
+    fn relay_identity(&self, lifetime: u64, handle: u16) -> Result<Identity> {
+        let host = self.host.lock();
+        let (_, known, links) = host.link_snapshot();
+        if !known
+            || !links
+                .iter()
+                .flatten()
+                .any(|l| l.lifetime == lifetime && l.handle == handle)
+        {
+            return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+        }
+        Ok(Identity {
+            controller: self.identity.id,
+            generation: self.identity.generation,
+            lifetime,
+            handle,
+            grant_epoch: host.grants.current_epoch().ok_or(EACCES)?,
+        })
+    }
+
+    fn enqueue_security(
+        &self,
+        runtime: &super::ControllerState,
+        mut command: Command,
+        packet: relay::Packet,
+    ) -> Result {
         let super::sle_dli::ControllerBackend::Native(controller) = &runtime.controller;
         let plan = match controller.prepare_relay(&packet) {
             Ok(p) => p,
@@ -284,6 +429,7 @@ impl super::ControllerRuntime {
         };
         command.bind_wire_echo_index(plan.3);
         let retained = command.clone();
+        let deadline = command.deadline;
         let mut host = self.host.lock();
         let gate = self.schedule_gate.lock();
         let result = if *gate {
@@ -297,5 +443,134 @@ impl super::ControllerRuntime {
             retained.withdraw();
         }
         result
+    }
+
+    pub(crate) fn approve_security_capabilities(
+        &self,
+        runtime: &super::ControllerState,
+        author: u64,
+        request: &super::sle_uapi::SleSecurityNegotiationSubmit,
+    ) -> Result {
+        let identity = self.relay_identity(request.lifetime, request.handle)?;
+        let pointer =
+            self.acquire_session(identity.lifetime, identity.handle, identity.grant_epoch)?;
+        let mut transferred = false;
+        let result = (|| {
+            let host = self.host.lock();
+            let (_, known, links) = host.link_snapshot();
+            let gate = self.schedule_gate.lock();
+            if *gate {
+                return Err(ENODEV);
+            }
+            if !host.grants.permits(identity.grant_epoch) {
+                return Err(EACCES);
+            }
+            if !known
+                || !links.iter().flatten().any(|l| {
+                    l.lifetime == identity.lifetime
+                        && l.handle == identity.handle
+                        && l.role == request.role
+                        && l.address_type == request.address_type
+                        && l.address == request.address
+                })
+            {
+                return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+            }
+            let deadline = now()
+                .checked_add(kernel::time::msecs_to_jiffies(request.timeout_ms) as u64)
+                .ok_or(EOVERFLOW)?;
+            // SAFETY: transfer exactly our caller ref after all validation.
+            transferred = true;
+            unsafe {
+                Command::approve(
+                    pointer,
+                    identity,
+                    author,
+                    request.request_id,
+                    request.role,
+                    request.action == 2,
+                    deadline,
+                )
+            }
+        })();
+        if !transferred {
+            unsafe { sl_connection_session_put(pointer) };
+        }
+        // Command::approve consumes the caller ref even on error.
+        match result {
+            Ok(Some((command, packet))) => self.enqueue_security(runtime, command, packet),
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(crate) fn security_capability_observation(
+        &self,
+        author: u64,
+        lifetime: u64,
+        handle: u16,
+        request: u64,
+    ) -> Result<(relay::CapabilityObservation, u8)> {
+        let identity = self.relay_identity(lifetime, handle)?;
+        let pointer = self.acquire_session(lifetime, handle, identity.grant_epoch)?;
+        let result = (|| {
+            let host = self.host.lock();
+            let (_, known, links) = host.link_snapshot();
+            let gate = self.schedule_gate.lock();
+            if *gate {
+                return Err(ENODEV);
+            }
+            if !host.grants.permits(identity.grant_epoch) {
+                return Err(EACCES);
+            }
+            if !known
+                || !links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.lifetime == lifetime && l.handle == handle)
+            {
+                return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+            }
+            let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+            let mut state = owner.state.lock();
+            let result = if state.stopped {
+                Err(ENODEV)
+            } else if state.author != author || state.request != request {
+                Err(ENOENT)
+            } else {
+                let role = state.role;
+                state
+                    .session
+                    .as_mut()
+                    .and_then(|s| s.capability_observation(now()))
+                    .map(|o| (o, role))
+                    .ok_or(ENOENT)
+            };
+            drop(state);
+            result
+        })();
+        unsafe { sl_connection_session_put(pointer) };
+        result
+    }
+
+    pub(crate) fn receive_security_data(
+        &self,
+        runtime: &super::ControllerState,
+        lifetime: u64,
+        handle: u16,
+        index: u16,
+        bytes: &[u8],
+    ) -> Result {
+        let identity = self.relay_identity(lifetime, handle)?;
+        let pointer = self.acquire_session(lifetime, handle, identity.grant_epoch)?;
+        let (handled, packet) = unsafe { Command::receive(pointer, identity, index, bytes) }?;
+        if let Some((command, packet)) = packet {
+            return self.enqueue_security(runtime, command, packet);
+        }
+        if handled {
+            Ok(())
+        } else {
+            self.deny_unapproved_pairing(runtime, lifetime, handle, index, bytes)
+        }
     }
 }

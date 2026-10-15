@@ -18,6 +18,7 @@ pub(crate) struct Identity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
     Invalid,
+    Unsupported,
     Stale,
     Expired,
     Closed,
@@ -78,6 +79,7 @@ pub(crate) struct Session {
     queue: [Option<Packet>; QUEUE_DEPTH],
     active: Option<Active>,
     reset_required: bool,
+    capability: Option<CapabilityExchange>,
 }
 
 impl Session {
@@ -103,6 +105,7 @@ impl Session {
             queue: [None; QUEUE_DEPTH],
             active: None,
             reset_required: false,
+            capability: None,
         })
     }
     pub(crate) fn phase(&self) -> Phase {
@@ -204,6 +207,9 @@ impl Session {
             return Err(Error::NeverSubmitted);
         }
         active.submitted = true;
+        if let Some(c) = &mut self.capability {
+            c.observation.flags |= 1;
+        }
         Ok(())
     }
 
@@ -218,6 +224,11 @@ impl Session {
             return Err(Error::Stale);
         }
         self.queue.fill(None);
+        if let Some(c) = &mut self.capability {
+            if c.observation.state < 4 {
+                c.observation.state = 5;
+            }
+        }
         self.phase = Phase::Uncertain;
         self.reset_required = true;
         Ok(())
@@ -247,6 +258,21 @@ impl Session {
         }
         self.active = None;
         let author_live = self.phase == Phase::Open;
+        if let Some(c) = &mut self.capability {
+            if author_live && c.observation.state < 4 {
+                c.observation.status = status;
+                if complete && status == 0 {
+                    c.observation.flags |= 2;
+                    if c.observation.flags & 4 != 0 {
+                        c.observation.state = 4;
+                        self.phase = Phase::Closed;
+                    }
+                } else {
+                    c.observation.state = 5;
+                    self.phase = Phase::Closed;
+                }
+            }
+        }
         if self.phase == Phase::Closing {
             self.phase = Phase::Closed;
         }
@@ -256,6 +282,11 @@ impl Session {
     /// Revoking a policy author removes only unexecuted work. Submitted
     /// commands retain their real reply reservation, even after final fd close.
     pub(crate) fn withdraw(&mut self) {
+        if let Some(c) = &mut self.capability {
+            if c.observation.state < 4 {
+                c.observation.state = 6;
+            }
+        }
         self.queue.fill(None);
         if self.phase == Phase::Uncertain {
             return;
@@ -270,6 +301,11 @@ impl Session {
     pub(crate) fn expire(&mut self, now: u64) {
         if now < self.deadline || self.phase == Phase::Closed {
             return;
+        }
+        if let Some(c) = &mut self.capability {
+            if c.observation.state < 4 {
+                c.observation.state = 7;
+            }
         }
         self.queue.fill(None);
         if self.outstanding() {
@@ -294,4 +330,117 @@ impl Session {
 /// Initial request direction/length, independent of crypto or policy approval.
 pub(crate) fn initial_pairing_request(role: u8, index: u16, length: usize) -> bool {
     matches!((role, index, length), (0, 0x0133, 1) | (1, 0x0134, 10))
+}
+
+/// Explicit limited exchange. These are local protocol observations, never
+/// Paired, authenticated, trusted, encrypted, or a peer application ACK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CapabilityObservation {
+    pub(crate) state: u32, // 1 armed, 2 pending, 4 observed, 5 failed, 6 cancelled, 7 expired
+    pub(crate) flags: u32, // actual TX submit=1, real successful Complete=2, peer RX=4
+    pub(crate) status: u8,
+    pub(crate) local: [u8; 10],
+    pub(crate) peer: [u8; 10],
+}
+
+#[derive(Clone, Copy)]
+struct CapabilityExchange {
+    role: u8,
+    observation: CapabilityObservation,
+}
+
+// SDK111 limited JustWorks capability offer. No IRK/address distribution,
+// PSK/OOB/MITM or trusted result. Higher authentication/install stages remain
+// unsupported; entering this exchange requires explicit manager approval.
+const CAPABILITY_OFFER: [u8; 10] = [3, 0, 0, 16, 0, 2, 2, 2, 2, 0];
+
+impl Session {
+    pub(crate) fn deadline(&self) -> u64 {
+        self.deadline
+    }
+    pub(crate) fn capability_exchange(&self) -> bool {
+        self.capability.is_some()
+    }
+
+    /// One exchange per physical lifetime; the outer owner enforces no restart.
+    /// Only G-initiated 134/135 is supported in this limited first mechanism.
+    pub(crate) fn approve_capabilities(
+        &mut self,
+        current: Identity,
+        now: u64,
+        role: u8,
+        initiate: bool,
+    ) -> Result<Option<Packet>, Error> {
+        self.admission(current, now)?;
+        if self.capability.is_some()
+            || self.active.is_some()
+            || self.queued() != 0
+            || self.next_cookie != 1
+        {
+            return Err(Error::Invalid);
+        }
+        if !matches!((role, initiate), (0, true) | (1, false)) {
+            return Err(Error::Unsupported);
+        }
+        self.capability = Some(CapabilityExchange {
+            role,
+            observation: CapabilityObservation {
+                state: if initiate { 2 } else { 1 },
+                flags: 0,
+                status: 0,
+                local: CAPABILITY_OFFER,
+                peer: [0; 10],
+            },
+        });
+        if initiate {
+            self.enqueue(current, now, 0x134, &CAPABILITY_OFFER)?;
+            self.prepare(current, now)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Only real, identity-frozen ingress calls this; no user-supplied RX bytes.
+    /// Late/wrong role/duplicate traffic cannot replace the observed peer offer.
+    pub(crate) fn receive_capabilities(
+        &mut self,
+        current: Identity,
+        now: u64,
+        index: u16,
+        bytes: &[u8],
+    ) -> Result<Option<Packet>, Error> {
+        self.admission(current, now)?;
+        let exchange = self.capability.as_mut().ok_or(Error::Unsupported)?;
+        if exchange.observation.state >= 4
+            || exchange.observation.flags & 4 != 0
+            || (exchange.role == 0 && exchange.observation.flags & 1 == 0)
+        {
+            return Err(Error::Stale);
+        }
+        if !matches!((exchange.role, index), (0, 0x135) | (1, 0x134)) || bytes != CAPABILITY_OFFER {
+            exchange.observation.state = 5;
+            self.withdraw();
+            return Err(Error::Unsupported);
+        }
+        exchange.observation.peer.copy_from_slice(bytes);
+        exchange.observation.flags |= 4;
+        let respond = exchange.role == 1;
+        if exchange.observation.flags & 2 != 0 {
+            exchange.observation.state = 4;
+            self.phase = Phase::Closed;
+        } else {
+            exchange.observation.state = 2;
+        }
+        if respond {
+            self.enqueue(current, now, 0x135, &CAPABILITY_OFFER)?;
+            self.prepare(current, now)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn capability_observation(&mut self, now: u64) -> Option<CapabilityObservation> {
+        self.expire(now);
+        self.capability.map(|c| c.observation)
+    }
 }

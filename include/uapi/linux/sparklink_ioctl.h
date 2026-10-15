@@ -1223,4 +1223,34 @@ struct sle_link_snapshot {
 };
 #define SL_IOCTL_LINK_SNAPSHOT _IOWR(SL_MAGIC, 0x9e, struct sle_link_snapshot)
 
+/* Experimental limited security capability exchange, NOT Pair/Encrypted.
+ * Both operations require the same active Managed File and CAP_NET_ADMIN.
+ * flags MUST be SLE_SECURITY_CAPABILITY_ONLY; no raw TX/RX/keys supplied.
+ * action1 arms T response; action2 starts G request. Other roles unsupported.
+ * Once per physical lifetime; no same-life retry, no restart after expiry.
+ * Entire original timeout1..5000ms includes policy admission/queue/replies.
+ * state4 means only own real Complete plus observed peer capability bytes;
+ * it is NOT an ACK that the peer processed our offer, pairing, trust or keys.
+ * Full security facade remains EOPNOTSUPP. Client explicitly disconnects after
+ * this limited exchange. Revoke/Down invalidates it and never refunds debt.
+ */
+#define SLE_SECURITY_CAPABILITY_ONLY 1U
+struct sle_security_negotiation_submit {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version, profile, action, flags, timeout_ms;
+    __u16 handle;
+    __u8 role, address_type, address[6], reserved[2];
+};
+struct sle_security_negotiation_result {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version, profile, state;
+    __s32 error;
+    __u32 flags;
+    __u16 handle;
+    __u8 role, status;
+    __u8 local_caps[10], peer_caps[10], reserved[4];
+};
+#define SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT _IOW(SL_MAGIC, 0xd2, struct sle_security_negotiation_submit)
+#define SL_IOCTL_SECURITY_NEGOTIATION_RESULT _IOWR(SL_MAGIC, 0xd3, struct sle_security_negotiation_result)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

@@ -26,6 +26,7 @@ static const unsigned long protected[] = {
     /* Capability-requiring passive trace, without Managed writer ownership. */
     SL_IOCTL_SNOOP_GET,
     SL_IOCTL_DIAGNOSTIC_RESULT,
+    SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT, SL_IOCTL_SECURITY_NEGOTIATION_RESULT,
     SL_IOCTL_DIAGNOSTIC_SUBMIT,
     SL_IOCTL_MANAGEMENT_ACQUIRE, SL_IOCTL_MANAGEMENT_RELEASE,
 	SL_IOCTL_AFH_CLASSIFY,

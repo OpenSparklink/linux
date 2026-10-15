@@ -210,7 +210,7 @@ impl WorkItem<0> for ControllerRuntime {
                 for item in tagged.iter_mut().take(count) {
                     let (id, event) = core::mem::take(item);
                     if let Some(sle_dli::SleEvent::NativeControllerData {lifetime,handle,index,data})=&event {
-                        if let Err(error)=this.deny_unapproved_pairing(runtime,*lifetime,*handle,*index,data.as_slice()) {
+                        if let Err(error)=this.receive_security_data(runtime,*lifetime,*handle,*index,data.as_slice()) {
                             pr_debug!("sparklink: relay admission refused {}\n",error.to_errno());
                         }
                     }
