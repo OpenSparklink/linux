@@ -11,7 +11,7 @@ def main():
     parser.add_argument('--cbmc',action='store_true',help='Verify the same generated production bodies with CBMC; retain all checks.')
     args=parser.parse_args()
     here=Path(__file__).resolve().parent
-    source=here.parents[3]/'net/sparklink/sle_crypto_ffi.c'
+    source=here.parents[3]/'net/sparklink/sle_pair_crypto.c'
     original=source.read_bytes()
     fixture=(here/'security/ecdh_fixture.c').read_text()
     fixture=fixture.replace('@@PRODUCTION_GENERATE@@',function(original.decode(),'sle_ecdh_generate')).replace('@@PRODUCTION_SHARED@@',function(original.decode(),'sle_ecdh_shared_secret'))
