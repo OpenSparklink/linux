@@ -44,6 +44,20 @@ struct sock {struct socket *sk_socket;unsigned int refs,wakes;int sk_rmem_alloc,
 struct kref {unsigned int refs;};
 struct delayed_work {int unused;};
 static unsigned int allocations,submitted;
+static u64 fixture_now_ns, fragment_cost_ns;
+static u64 ktime_get_ns(void){return fixture_now_ns;}
+#include "sle_tx_budget.h"
+struct observed_tx {u64 sequence;unsigned int offset,length,boundary;int slot,result;u8 stage;};
+static struct observed_tx observed_tx[4096];static unsigned int observed_count,observed_queue[3];
+/* Tracepoint API dependency: record arguments only; no Ready/credit or data.
+ * Real tracepoint registration/format/loss/overhead requires the kernel VM. */
+static void trace_sparklink_session_tx(u16 id,u64 gen,u64 life,u64 service,u64 sequence,int slot,unsigned int pb,unsigned int length,unsigned int offset,int result,u32 wait,u8 stage){
+ (void)id;(void)gen;(void)life;(void)service;(void)wait;assert(observed_count<4096);
+ observed_tx[observed_count++]=(struct observed_tx){sequence,offset,length,pb,slot,result,stage};
+}
+static void trace_sparklink_session_queue(u16 id,u64 gen,u64 life,u64 epoch,u64 sequence,int slot,unsigned int length,unsigned long deadline,u8 stage){
+ (void)id;(void)gen;(void)life;(void)epoch;(void)sequence;(void)slot;(void)length;(void)deadline;assert(stage<3);observed_queue[stage]++;
+}
 static struct sk_buff *alloc_skb(unsigned int length,int flags){(void)flags;assert(length<=2047);allocations++;struct sk_buff *skb=calloc(1,sizeof(struct sk_buff));skb->truesize=512;skb->users=1;return skb;}
 static void *skb_put(struct sk_buff *skb,unsigned int length){assert(length<=sizeof(skb->data));skb->len=length;return skb->data;}
 static void kfree_skb(struct sk_buff *skb){if(skb){assert(skb->users);if(--skb->users)return;allocations--;if(skb->owner)skb->owner->sk_rmem_alloc-=skb->truesize;free(skb);}}
@@ -144,9 +158,10 @@ static void skb_queue_purge(struct sk_buff_head *q){struct sk_buff *skb;while((s
 static void skb_queue_head(struct sk_buff_head *q,struct sk_buff *skb){
  spin_lock(&q->lock);skb->next=q->head;q->head=skb;if(!q->tail)q->tail=skb;q->qlen++;spin_unlock(&q->lock);
 }
-static unsigned int packet_budget,fragment_count,fragment_pb[16],fragment_size[16];
-static u8 fragment_bytes[4096];static unsigned int fragment_bytes_count;
+static unsigned int packet_budget,fragment_count,fragment_pb[64],fragment_size[64];
+static u8 fragment_bytes[16384];static unsigned int fragment_bytes_count;
 static int fragment_failure;static bool retire_after_fragment, retire_before_fragment;
+static bool revoke_after_fragment,expire_before_fragment;
 static int fragment_submit(void *context){
  (void)context;assert(irq_disabled);if(!packet_budget)return -EAGAIN;
  if(fragment_failure)return fragment_failure;
@@ -157,17 +172,21 @@ static int fixture_fragment_send(u16 id,u64 generation,u64 lifetime,u16 handle,u
  struct sl_submit_scope *permission=scope;int result;unsigned long flags;
  assert(id==permission->session->controller&&generation==permission->session->generation);
  assert(lifetime==permission->session->lifetime&&handle==permission->session->handle&&epoch==permission->session->epoch);
- assert(!permission->session->lock.held&&length<=254&&boundary<=3);
+ assert(!permission->session->lock.held&&length<=permission->session->acb_maximum&&length<=2047&&boundary<=3);
  if(retire_before_fragment){sl_binding_retire(&permission->channel->binding);permission->channel->sk=NULL;}
+ if(!authority)return -EACCES;
+ if(expire_before_fragment)jiffies=((struct sl_fragment_cursor *)permission->operation->cb)->deadline;
  /* Host/data/gate and credit are dependencies here, separately tested in Rust.
   * Invoke the actual Session consent before accepting a fragment. */
  flags=irq_disabled;irq_disabled=true;result=consent(scope,fragment_submit,NULL);irq_disabled=flags;
- if(!result){assert(fragment_count<16&&fragment_bytes_count+length<=sizeof(fragment_bytes));
+ if(!result){assert(fragment_count<64&&fragment_bytes_count+length<=sizeof(fragment_bytes));
   fragment_pb[fragment_count]=boundary;fragment_size[fragment_count++]=length;
   memcpy(fragment_bytes+fragment_bytes_count,bytes,length);fragment_bytes_count+=length;
+  if(revoke_after_fragment)authority=false;
   if(retire_after_fragment){spin_lock_irqsave(&permission->session->lock,flags);
    sl_binding_retire(&permission->channel->binding);permission->channel->sk=NULL;spin_unlock_irqrestore(&permission->session->lock,flags);}
  }
+ fixture_now_ns+=fragment_cost_ns;
  return result;
 }
 /* Deliberately replace only Runtime/USB; actual worker/consent/codec remain.
@@ -206,6 +225,12 @@ static int sparklink_native_acb_send_deferred(u16 id,u64 generation,u64 lifetime
  return result;
 }
 /* @@FUNCTIONS@@ */
+/* Old one-fragment tests call the actual step with a fresh real budget. */
+static int one_transmit(struct sl_connection_session *s,struct sl_basic_channel *c){
+ struct sl_tx_budget b=sl_tx_budget_begin(ktime_get_ns());struct sl_tx_step step;
+ sl_expire_queued_channel(s,c);return sl_transmit_channel(s,c,&b,&step);
+}
+
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
 static void route(struct sl_connection_session *s,unsigned int tcid,unsigned int pi,const char *message){u8 wire[300];int n=sl_channel_frame_encode(wire,sizeof(wire),tcid,pi,(const u8 *)message,strlen(message));assert(n>0);sl_route(s,wire,n);assert(!s->lock.held&&!irq_disabled);}
 static void init_grant(struct sl_connection_session *s,struct sock *sk,unsigned int directions){
@@ -367,44 +392,44 @@ static void fragment_worker_tests(void){
  bindings[1].channel_slot=1;assert(sl_binding_attach(&s.channels[1].binding));init_grant(&s,&bindings[1].sk,SL_GRANT_TX);
  fragment_count=fragment_bytes_count=0;packet_budget=2;fragment_failure=0;retire_after_fragment=false;jiffies=42;
  enqueue_fragment_test(&s.channels[0],2047);enqueue_fragment_test(&s.channels[1],4);
- assert(!sl_transmit_channel(&s,&s.channels[0]));assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!one_transmit(&s,&s.channels[0]));assert(!one_transmit(&s,&s.channels[0]));
  assert(fragment_count==2&&s.fragment_slot==0&&!s.channels[0].tx.qlen&&s.tx_inflight&&s.channels[0].binding.busy);
- assert(!sl_transmit_channel(&s,&s.channels[0]));assert(fragment_count==2);
- assert(!sl_transmit_channel(&s,&s.channels[1]));assert(s.channels[1].tx.qlen==1);
- packet_budget=7;for(unsigned int i=0;i<7;i++)assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!one_transmit(&s,&s.channels[0]));assert(fragment_count==2);
+ assert(!one_transmit(&s,&s.channels[1]));assert(s.channels[1].tx.qlen==1);
+ packet_budget=7;for(unsigned int i=0;i<7;i++)assert(!one_transmit(&s,&s.channels[0]));
  assert(fragment_count==9&&fragment_bytes_count==2047&&s.fragment_slot==-1&&!s.channels[0].tx.qlen);
  assert(fragment_pb[0]==1&&fragment_pb[8]==3&&fragment_size[8]==15);
  for(unsigned int i=1;i<8;i++)assert(fragment_pb[i]==2);
  for(unsigned int i=0;i<2047;i++)assert(fragment_bytes[i]==((i*37+11)&255));
- packet_budget=1;assert(!sl_transmit_channel(&s,&s.channels[1]));assert(fragment_pb[9]==0);
+ packet_budget=1;assert(!one_transmit(&s,&s.channels[1]));assert(fragment_pb[9]==0);
  /* Successful first fragment followed by last-fd retirement: do not allow
   * another PDU to replace the controller's uncompleted stream. */
  enqueue_fragment_test(&s.channels[0],255);packet_budget=1;retire_after_fragment=true;
- assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!one_transmit(&s,&s.channels[0]));
  assert(!s.channels[0].sk&&s.tx_inflight&&s.tx_started&&s.channels[0].binding.busy);
  retire_after_fragment=false;packet_budget=1;
- assert(!sl_transmit_channel(&s,&s.channels[0]));
+ assert(!one_transmit(&s,&s.channels[0]));
  assert(!s.tx_inflight&&!s.channels[0].binding.busy&&s.progress.phase==SL_CH_OPEN);
  assert(sl_binding_live(s.channels[1].binding));assert(!allocations);
  /* Last close wins before first atomic submit: actual consent denies it. */
  init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;
  enqueue_fragment_test(&s.channels[0],255);retire_before_fragment=true;
  unsigned int before=fragment_count;
- assert(!sl_transmit_channel(&s,&s.channels[0]));assert(fragment_count==before&&!s.tx_inflight&&!allocations);
+ assert(!one_transmit(&s,&s.channels[0]));assert(fragment_count==before&&!s.tx_inflight&&!allocations);
  retire_before_fragment=false;
  init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;
- enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
+ enqueue_fragment_test(&s.channels[0],255);assert(!one_transmit(&s,&s.channels[0]));
  jiffies+=5000;packet_budget=1;
- assert(sl_transmit_channel(&s,&s.channels[0])==-ETIMEDOUT);assert(!allocations);
+ assert(one_transmit(&s,&s.channels[0])==-ETIMEDOUT);assert(!allocations);
  /* Even a started operation's frozen authority must match its Session. */
  init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=1;jiffies=42;
- enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
+ enqueue_fragment_test(&s.channels[0],255);assert(!one_transmit(&s,&s.channels[0]));
  s.tx_grant.scope.lifetime++;packet_budget=1;before=fragment_count;
- assert(sl_transmit_channel(&s,&s.channels[0])==-EACCES);
+ assert(one_transmit(&s,&s.channels[0])==-EACCES);
  assert(fragment_count==before&&!s.tx_inflight&&!allocations);
  /* Deadline also rechecked at the actual commit callback after preparation. */
  init_receive(&s,&bindings[0].sk);s.acb_maximum=254;s.fragment_slot=-1;packet_budget=0;
- enqueue_fragment_test(&s.channels[0],255);assert(!sl_transmit_channel(&s,&s.channels[0]));
+ enqueue_fragment_test(&s.channels[0],255);assert(!one_transmit(&s,&s.channels[0]));
  assert(!s.tx_inflight&&s.channels[0].tx.qlen==1);
  struct sk_buff *deadline_skb=skb_dequeue(&s.channels[0].tx);
  s.tx_inflight=deadline_skb;s.fragment_slot=0;s.tx_grant=bindings[0].grant;
@@ -422,7 +447,7 @@ static void fragment_worker_tests(void){
  struct sl_admission admission={&s,&s.channels[0],queued,4};
  assert(!sl_admit(&admission));
  assert(((struct sl_fragment_cursor *)queued->cb)->deadline==5042);
- jiffies=5042;assert(!sl_transmit_channel(&s,&s.channels[0]));
+ jiffies=5042;assert(!one_transmit(&s,&s.channels[0]));
  assert(bindings[0].sk.sk_err==ETIMEDOUT&&bindings[0].sk.sk_shutdown==SHUTDOWN_MASK);
  assert(sl_binding_live(s.channels[1].binding)&&s.progress.phase==SL_CH_OPEN&&!allocations);
 }
@@ -609,9 +634,9 @@ static void scheduling_tests(void) {
  enqueue_fragment_test(&s.channels[0],255);
  p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000);
  packet_budget=0;s.work_retry=false;s.work_progress=false;
- assert(!sl_transmit_channel(&s,&s.channels[0]));assert(!s.work_progress&&!s.work_retry);
+ assert(!one_transmit(&s,&s.channels[0]));assert(!s.work_progress&&!s.work_retry);
  p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000); /* full pool: no10ms timer */
- packet_budget=2;assert(!sl_transmit_channel(&s,&s.channels[0]));
+ packet_budget=2;assert(!one_transmit(&s,&s.channels[0]));
  p=sl_next_schedule(&s);assert(p.pending&&p.delay==0); /* bounded next fragment */
  s.work_progress=false;s.work_retry=false;
  p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000);
@@ -643,11 +668,11 @@ static void blocked_original_deadlines_tests(void) {
  fragment_count=fragment_bytes_count=0;packet_budget=1;fragment_failure=0;
  enqueue_fragment_test(&s.channels[0],255);
  ((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline=6000;
- assert(!sl_transmit_channel(&s,&s.channels[0]));assert(s.tx_inflight&&s.tx_started);
+ assert(!one_transmit(&s,&s.channels[0]));assert(s.tx_inflight&&s.tx_started);
  struct sk_buff *physical=s.tx_inflight;unsigned int count=fragment_count;
  enqueue_fragment_test(other,64);((struct sl_fragment_cursor *)other->tx.head->cb)->deadline=100;
  jiffies=100;s.work_progress=s.work_retry=false;
- assert(!sl_transmit_channel(&s,other));assert(!other->tx.qlen&&!sl_binding_live(other->binding));
+ assert(!one_transmit(&s,other));assert(!other->tx.qlen&&!sl_binding_live(other->binding));
  assert(s.tx_inflight==physical&&s.tx_started&&fragment_count==count&&allocations==1);
  s.work_progress=false;struct sl_session_schedule p=sl_next_schedule(&s);
  assert(p.pending&&p.delay==5900); /* expired queued channel cannot spin */
@@ -655,6 +680,111 @@ static void blocked_original_deadlines_tests(void) {
  sl_dynamic_work(&s);assert(!s.rejection_count&&s.tx_inflight==physical);
  s.work_progress=false;p=sl_next_schedule(&s);assert(p.delay==5900);
  sl_retire_tx(&s);assert(!allocations);jiffies=42;
+}
+/* Actual batch + actual fragment/consent bodies. Time, Host authorization,
+ * USB result and reference operations remain explicit controllable dependencies. */
+static void init_batch(struct sl_connection_session *s,struct sl_socket_binding *b){
+ /* A live kernel socket has these callbacks and an owning reference. The
+  * timeout path invokes both; a zeroed sock is not a valid dependency. */
+ *b=(struct sl_socket_binding){.sk={.refs=1,.sk_rcvbuf=100000,
+  .sk_data_ready=data_ready,.sk_error_report=data_ready,.sk_state_change=data_ready}};
+ init_receive(s,&b->sk);s->acb_maximum=254;s->fragment_slot=-1;
+ s->progress.maximum=s->progress.mtu=2042;s->progress.maximum_mps=s->progress.mps=2047;
+ s->channels[0].mtu=2042;s->channels[0].mps=2047;
+ fixture_now_ns=1000;fragment_cost_ns=0;jiffies=42;
+ fragment_count=fragment_bytes_count=0;packet_budget=128;fragment_failure=0;
+ retire_after_fragment=retire_before_fragment=revoke_after_fragment=expire_before_fragment=false;
+}
+static void second_batch_channel(struct sl_connection_session *s,struct sl_socket_binding *b){
+ *b=(struct sl_socket_binding){.sk={.refs=1,.sk_rcvbuf=100000,
+  .sk_data_ready=data_ready,.sk_error_report=data_ready,.sk_state_change=data_ready}};
+ struct sl_basic_channel *c=&s->channels[1];
+ c->sk=&b->sk;c->local_tcid=c->remote_tcid=10;c->mtu=2042;c->mps=2047;b->channel_slot=1;
+ assert(sl_binding_attach(&c->binding));init_grant(s,&b->sk,SL_GRANT_TX|SL_GRANT_RX);
+}
+static void batch_worker_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding b[2]={0};struct sl_tx_budget q;
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);
+ enqueue_fragment_test(&s.channels[0],2047);enqueue_fragment_test(&s.channels[1],4);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(q.packets==8&&q.bytes==2032&&q.stop==SL_TX_BUDGET_PACKETS&&s.tx_budget_exhausted);
+ assert(fragment_count==8&&s.tx_started&&s.fragment_slot==0&&s.channels[1].tx.qlen==1);
+ unsigned long original=((struct sl_fragment_cursor *)s.tx_inflight->cb)->deadline;
+ s.work_progress=false;struct sl_session_schedule plan=sl_next_schedule(&s);assert(plan.pending&&plan.delay==0);
+ s.tx_budget_exhausted=false;q=sl_tx_budget_begin(fixture_now_ns);
+ assert(!sl_transmit_batch(&s,&q));assert(q.packets==2&&fragment_count==10&&!s.tx_inflight&&!allocations);
+ assert(fragment_pb[0]==1&&fragment_pb[8]==3&&fragment_pb[9]==0);
+ assert(original==5042&&s.tx_next==2); /* only complete-PDU boundaries rotate */
+ /* Byte budget is independent of packet credit, including large other backends. */
+ init_batch(&s,&b[0]);s.acb_maximum=2047;
+ for(unsigned int i=0;i<3;i++)enqueue_fragment_test(&s.channels[0],2047);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(q.packets==2&&q.bytes==4094&&q.stop==SL_TX_BUDGET_BYTES&&fragment_count==2);
+ assert(s.tx_inflight&&!s.tx_started&&((struct sl_fragment_cursor *)s.tx_inflight->cb)->offset==0);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));assert(q.packets==1&&!allocations);
+ /* A budget boundary is not a permission: last close before the next pass
+  * cancels the held zero-prefix operation, never sends it with a stale grant. */
+ init_batch(&s,&b[0]);s.acb_maximum=2047;
+ for(unsigned int i=0;i<3;i++)enqueue_fragment_test(&s.channels[0],2047);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(q.stop==SL_TX_BUDGET_BYTES&&s.tx_inflight&&!s.tx_started&&fragment_count==2);
+ sl_binding_retire(&s.channels[0].binding);s.channels[0].sk=NULL;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(q.packets==1&&fragment_count==2&&!s.tx_inflight&&!allocations);
+ /* Nor does a new service budget refresh the original held PDU deadline. */
+ init_batch(&s,&b[0]);s.acb_maximum=2047;
+ for(unsigned int i=0;i<3;i++)enqueue_fragment_test(&s.channels[0],2047);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));jiffies=5042;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(!q.packets&&fragment_count==2&&!s.tx_inflight&&!allocations&&b[0].sk.sk_err==ETIMEDOUT);
+ /* A synchronous call can exceed2ms; budget denies starting the NEXT call. */
+ init_batch(&s,&b[0]);fragment_cost_ns=3000000;enqueue_fragment_test(&s.channels[0],255);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(q.packets==1&&q.stop==SL_TX_BUDGET_ELAPSED&&s.tx_started&&fragment_count==1);
+ assert(((struct sl_fragment_cursor *)s.tx_inflight->cb)->deadline==5042);
+ fragment_cost_ns=0;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
+ /* Real reserve-wait dependency consumes one software attempt, no empty spin. */
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);packet_budget=0;
+ enqueue_fragment_test(&s.channels[0],255);enqueue_fragment_test(&s.channels[1],4);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(q.packets==1&&fragment_count==0&&!s.tx_inflight&&s.tx_next==1);
+ assert(!s.work_retry&&!s.work_progress&&!s.tx_budget_exhausted);
+ plan=sl_next_schedule(&s);assert(plan.pending&&plan.delay==5000);
+ packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==2&&fragment_pb[0]==0&&fragment_pb[1]==1); /* channel1 got next first */
+ assert(s.work_progress&&s.tx_blocked&&!s.work_retry);
+ plan=sl_next_schedule(&s);assert(plan.pending&&plan.delay==5000); /* progress before CREDIT is not readiness now */
+ packet_budget=1;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
+ /* Last author close after first acceptance cannot erase a begun physical PDU. */
+ init_batch(&s,&b[0]);enqueue_fragment_test(&s.channels[0],2047);retire_after_fragment=true;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&fragment_count==8&&s.tx_started);
+ assert(!s.channels[0].sk&&s.tx_inflight);retire_after_fragment=false;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&fragment_count==9&&!allocations);
+ /* Conversely, real Host withdrawal or original deadline denies another submit. */
+ init_batch(&s,&b[0]);revoke_after_fragment=true;enqueue_fragment_test(&s.channels[0],2047);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(sl_transmit_batch(&s,&q)==-EACCES);
+ assert(fragment_count==1&&q.packets==2&&!allocations);authority=true;revoke_after_fragment=false;
+ init_batch(&s,&b[0]);expire_before_fragment=true;enqueue_fragment_test(&s.channels[0],255);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==0&&!allocations&&!sl_binding_live(s.channels[0].binding));expire_before_fragment=false;
+ assert(b[0].sk.sk_err==ETIMEDOUT&&b[0].sk.sk_shutdown==SHUTDOWN_MASK&&b[0].sk.wakes==2&&b[0].sk.refs==1);
+ /* Expire a different unsubmitted queue even when the active stream has no credit. */
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);enqueue_fragment_test(&s.channels[0],255);
+ packet_budget=1;assert(!one_transmit(&s,&s.channels[0]));struct sk_buff *physical=s.tx_inflight;
+ enqueue_fragment_test(&s.channels[1],4);((struct sl_fragment_cursor *)s.channels[1].tx.head->cb)->deadline=50;
+ jiffies=50;packet_budget=0;q=sl_tx_budget_begin(fixture_now_ns);
+ assert(!sl_transmit_batch(&s,&q));assert(s.tx_inflight==physical&&s.tx_started&&!s.channels[1].tx.qlen&&!sl_binding_live(s.channels[1].binding));
+ assert(b[1].sk.sk_err==ETIMEDOUT&&b[1].sk.wakes==2&&b[1].sk.refs==1&&!b[0].sk.sk_err);
+ sl_retire_tx(&s);assert(!allocations);jiffies=42;
+ /* Actual admission IDs are trace-only and do not replace deadline/grant checks. */
+ init_batch(&s,&b[0]);unsigned int before=observed_queue[0];
+ struct sl_admission a={&s,&s.channels[0],alloc_skb(4,0),4};skb_put(a.skb,4);
+ assert(!sl_admit(&a)&&!a.skb&&observed_queue[0]==before+1);
+ assert(((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->observation==1);
+ q=sl_tx_budget_begin(fixture_now_ns);before=observed_count;assert(!sl_transmit_batch(&s,&q));
+ assert(observed_count==before+3&&observed_tx[before].stage==0&&observed_tx[before+1].stage==2&&observed_tx[before+2].stage==1);
+ assert(observed_tx[before].sequence==1&&observed_tx[before+1].sequence==1&&observed_tx[before+2].sequence==1&&!allocations);
+ fixture_now_ns=fragment_cost_ns=0;
 }
 int main(void){
  identifier_zero_request_tests();negotiated_limit_tests();
@@ -691,6 +821,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- scheduling_tests();blocked_original_deadlines_tests();receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
+ batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

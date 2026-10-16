@@ -253,3 +253,50 @@ empty completions for both selected identities, ordinary-user discovery
 and independent raw snoop. A kernel that faults the first empty completion
 cannot reach Ready or pass this gate. These are transport regression
 fixtures; real firmware, physical passthrough, RF and PM remain unverified.
+
+Session service budget and passive timing
+----------------------------------------
+
+The single connection Session worker services data with at most eight attempted
+fragments and 4096 attempted bytes per quantum. It checks a two-millisecond
+elapsed budget before starting the next transport call; a synchronous USB call
+may itself take longer. This is not a worst-case execution time guarantee.
+Failed attempts consume software budget, never manufacture protocol credit.
+Queued original deadlines are checked across all channels before transmission.
+An active PB stream is not interleaved; round-robin advances at complete PDU
+boundaries. A real blocked attempt stops the pass, even after earlier progress;
+actual reserve-credit exhaustion waits for an event or the original deadline,
+whereas other EAGAIN results retain the bounded retry policy. Receive exhaustion
+can independently request a new pass. Every actual fragment still crosses the
+existing lifetime, Grant, original deadline and atomic submission-ticket gates.
+
+The default-disabled ``sparklink`` trace system exposes three observations:
+
+* ``sparklink_session_work``: stages 0/1 bracket a worker service. Attempt/byte
+  counts and stop reason cover its data phase, while elapsed time covers the
+  complete worker. Planned delay does not prove work was queued.
+* ``sparklink_session_queue``: stages 0/1/2 mean software admission, dequeue and
+  operation retirement. Bytes include the DTAP header; deadline is the original
+  jiffies value. Retirement is not controller or peer completion.
+* ``sparklink_session_tx``: stages 0/1 surround the joined Native call; stage 2
+  records its atomic consent callback. Only stage 2 with result 0 means the USB
+  queue accepted submission. Neither USB success nor NOCP proves peer delivery.
+
+Join controller/generation/lifetime, service and the trace-only admission
+sequence, with per-fragment offset/PB. Control slot -1 has a separate sequence
+namespace; do not equate counters across namespaces or ambiguous wrap. Dynamic
+CMTC consent currently uses its existing separate callback and is not covered
+by this TX event. No payload, credentials, keys or kernel pointers are logged.
+Enable observations only in the dedicated VM trace instance, check per-CPU loss,
+and bind capture, source, configuration and application receipts independently.
+Tracing is not an authorization, Ready publication or physical RF measurement.
+
+``run_session_dispatch.py`` extracts actual C dispatch/consent/batch bodies with
+explicit allocation, lock, Host, time, trace and USB dependencies under host
+sanitizers. ``run_tx_budget.py --output NEW_DIRECTORY`` checks the actual budget
+header with CBMC: 12 transitions, arbitrary lengths, absolute clock wrap and
+bounded monotonic elapsed. Deliberate packet/byte/time/latch defects and short
+unwind must be rejected. This does not prove real concurrency, reference drain,
+scheduling fairness, protocol credit, firmware behavior or end-to-end latency.
+The physical VM gates and accurate source identities remain separate; see the
+user repository's sole current-capabilities and implementation-plan entries.

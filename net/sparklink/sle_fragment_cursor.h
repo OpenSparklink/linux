@@ -7,7 +7,11 @@
  * One connection-wide cursor excludes CMTC/other channels until completion.
  */
 #define SL_FRAGMENT_PDU_MAX 2047U
-struct sl_fragment_cursor { unsigned int offset; unsigned long deadline; };
+struct sl_fragment_cursor {
+    unsigned int offset;
+    unsigned long deadline;
+    unsigned long long observation; /* trace-only ID; never authorization */
+};
 static inline int sl_fragment_next(unsigned int total, unsigned int offset,
     unsigned int maximum, unsigned int *length, unsigned int *boundary)
 {

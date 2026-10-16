@@ -7,6 +7,7 @@
 #include <linux/errno.h>
 #include <linux/kref.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/net.h>
 #include <linux/poll.h>
@@ -27,7 +28,12 @@
 #include "sle_fragment_cursor.h"
 #include "sle_security_relay.h"
 #include "sle_session_schedule.h"
+#include "sle_tx_budget.h"
+#define CREATE_TRACE_POINTS
+#include <trace/events/sparklink.h>
 
+_Static_assert(sizeof(struct sl_fragment_cursor) <= sizeof_field(struct sk_buff, cb),
+	       "fragment cursor fits private skb control buffer");
 _Static_assert(sizeof(struct sockaddr_sparklink_dynamic) == 64,
 	       "dynamic address layout");
 _Static_assert(SL_FIXED_CHANNELS == 2 && SL_CHANNEL_USER_SLOT == 0 &&
@@ -71,7 +77,10 @@ struct sl_connection_session {
 	unsigned long rejection_deadline[4];
 	unsigned long response_deadline;
 	bool work_progress, work_retry; /* serialized worker-only send results */
-	bool rx_budget_exhausted;
+	bool rx_budget_exhausted, tx_budget_exhausted;
+	bool tx_blocked; /* last data attempt could not progress; worker-only */
+	u64 service_sequence, tx_sequence; /* worker-only observer IDs, not authority */
+	u64 admission_sequence; /* Session lock; trace-only, never authorization */
 	unsigned int tx_next; /* serialized worker-only round-robin start */
 	u16 acb_maximum; /* controller packet size, distinct from DTAP MTU */
 	int fragment_slot; /* sole operation slot; Session lock protects ownership */
@@ -90,7 +99,14 @@ struct sl_socket_binding {
 	struct sl_connection_session *session;
 	unsigned int channel_slot; /* immutable after binding publication */
 };
-struct sl_submit_scope { struct sl_connection_session *session; struct sl_basic_channel *channel; struct sk_buff *operation; };
+struct sl_submit_scope {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+	struct sk_buff *operation;
+	u64 sequence;
+	unsigned int boundary, length, offset;
+};
+struct sl_tx_step { bool attempted, submitted; int result; u32 wait; };
 static struct proto sl_channel_proto;
 
 static struct sl_socket_binding *sl_sk(struct sock *sk)
@@ -322,6 +338,10 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 		ret = -EACCES;
 	else
 		ret = submit(context); /* atomic queue only; no wait or protocol reentry */
+	trace_sparklink_session_tx(s->controller, s->generation, s->lifetime,
+		s->service_sequence, permission->sequence, c ? c - s->channels : -1,
+		permission->boundary, permission->length, permission->offset, ret,
+		SPARKLINK_ACB_WAIT_NONE, 2);
 	spin_unlock(&s->lock);
 	return ret;
 }
@@ -336,10 +356,19 @@ static void sl_send_result(struct sl_connection_session *s, int ret, u32 wait)
 }
 static int sl_send(struct sl_connection_session *s, struct sl_basic_channel *c, const u8 *data, size_t length)
 {
-	struct sl_submit_scope permission = { .session = s, .channel = c };
+	struct sl_submit_scope permission = { .session = s, .channel = c,
+		.sequence = ++s->tx_sequence, .length = length };
 	u32 wait = SPARKLINK_ACB_WAIT_RETRY;
-	int ret = sparklink_native_acb_send_deferred(s->controller, s->generation, s->lifetime,
+	int ret;
+
+	trace_sparklink_session_tx(s->controller, s->generation, s->lifetime,
+		s->service_sequence, permission.sequence, c ? c - s->channels : -1,
+		0, length, 0, -EINPROGRESS, SPARKLINK_ACB_WAIT_NONE, 0);
+	ret = sparklink_native_acb_send_deferred(s->controller, s->generation, s->lifetime,
 		s->handle, 0, data, length, s->epoch, sl_session_submit, &permission, &wait);
+	trace_sparklink_session_tx(s->controller, s->generation, s->lifetime,
+		s->service_sequence, permission.sequence, c ? c - s->channels : -1,
+		0, length, 0, ret, wait, 1);
 	sl_send_result(s, ret, wait);
 	return ret;
 }
@@ -703,6 +732,10 @@ static void sl_retire_tx(struct sl_connection_session *s)
 	spin_lock_irqsave(&s->lock, flags);
 	skb = s->tx_inflight;
 	if (skb) {
+		struct sl_fragment_cursor *cursor = (void *)skb->cb;
+		trace_sparklink_session_queue(s->controller, s->generation, s->lifetime,
+			s->epoch, cursor->observation, s->fragment_slot, skb->len,
+			cursor->deadline, 2);
 		sl_binding_finish_tx(&s->channels[s->fragment_slot].binding);
 		s->tx_inflight = NULL;
 		s->tx_started = false;
@@ -711,7 +744,28 @@ static void sl_retire_tx(struct sl_connection_session *s)
 	spin_unlock_irqrestore(&s->lock, flags);
 	kfree_skb(skb);
 }
-static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_channel *c)
+static void sl_expire_queued_channel(struct sl_connection_session *s, struct sl_basic_channel *c)
+{
+	unsigned long flags;
+	struct sk_buff *skb;
+	bool expired;
+
+	/* A queued channel's original deadline cannot be hidden behind another
+	 * channel's begun PB sequence. Expire only its unsubmitted local queue. */
+	spin_lock_irqsave(&s->lock, flags);
+	spin_lock(&c->tx.lock);
+	skb = skb_peek(&c->tx);
+	expired = skb && time_after_eq(jiffies,
+		((struct sl_fragment_cursor *)skb->cb)->deadline);
+	spin_unlock(&c->tx.lock);
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (expired) {
+		sl_fail_channel(s, c, -ETIMEDOUT);
+		s->work_progress = true;
+	}
+}
+static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_channel *c,
+			       struct sl_tx_budget *budget, struct sl_tx_step *step)
 {
 	unsigned long flags;
 	struct sk_buff *skb;
@@ -722,19 +776,7 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	bool started, local_timeout;
 	u32 wait = SPARKLINK_ACB_WAIT_RETRY;
 
-	/* A queued channel's original deadline cannot be hidden behind another
-	 * channel's begun PB sequence. Expire only its unsubmitted local queue. */
-	spin_lock_irqsave(&s->lock, flags);
-	spin_lock(&c->tx.lock);
-	skb = skb_peek(&c->tx);
-	local_timeout = skb && time_after_eq(jiffies,
-		((struct sl_fragment_cursor *)skb->cb)->deadline);
-	spin_unlock(&c->tx.lock);
-	spin_unlock_irqrestore(&s->lock, flags);
-	if (local_timeout) {
-		sl_fail_channel(s, c, -ETIMEDOUT);
-		s->work_progress = true;
-	}
+	*step = (struct sl_tx_step){ 0 };
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->tx_inflight && s->fragment_slot != slot) {
 		spin_unlock_irqrestore(&s->lock, flags);
@@ -744,6 +786,10 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	    sl_binding_live(c->binding) && sl_permits(s, c, SL_GRANT_TX) && !c->binding.busy) {
 		s->tx_inflight = skb_dequeue(&c->tx);
 		if (s->tx_inflight) {
+			struct sl_fragment_cursor *observed = (void *)s->tx_inflight->cb;
+			trace_sparklink_session_queue(s->controller, s->generation, s->lifetime,
+				s->epoch, observed->observation, slot, s->tx_inflight->len,
+				observed->deadline, 1);
 			sl_binding_start_tx(&c->binding);
 			s->fragment_slot = slot;
 			s->tx_started = false;
@@ -761,9 +807,24 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	else if (!sl_fragment_next(skb->len, cursor->offset, s->acb_maximum, &length, &boundary))
 		ret = -EPROTO;
 	else {
+		if (!sl_tx_budget_charge(budget, length, ktime_get_ns())) {
+			s->tx_budget_exhausted = true;
+			return 0; /* Keep this operation and its original deadline. */
+		}
+		permission.sequence = cursor->observation;
+		permission.boundary = boundary; permission.length = length;
+		permission.offset = cursor->offset;
+		step->attempted = true;
+		trace_sparklink_session_tx(s->controller, s->generation, s->lifetime,
+			s->service_sequence, permission.sequence, slot, boundary, length,
+			cursor->offset, -EINPROGRESS, SPARKLINK_ACB_WAIT_NONE, 0);
 		ret = sparklink_native_acb_send_deferred(s->controller, s->generation,
 			s->lifetime, s->handle, boundary, skb->data + cursor->offset, length,
 			s->epoch, sl_session_submit, &permission, &wait);
+		step->result = ret; step->wait = wait; step->submitted = !ret;
+		trace_sparklink_session_tx(s->controller, s->generation, s->lifetime,
+			s->service_sequence, permission.sequence, slot, boundary, length,
+			cursor->offset, ret, wait, 1);
 	}
 	sl_send_result(s, ret, wait);
 	spin_lock_irqsave(&s->lock, flags);
@@ -800,6 +861,43 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	}
 	sl_wake(s);
 	return ret == -EAGAIN ? 0 : ret;
+}
+/* At most six empty visits between budgeted attempts. A begun PB stream
+ * retains the physical connection until its PDU ends, then rotate channels.
+ * This loop owns no new references and never creates or refunds credit. */
+static int sl_transmit_batch(struct sl_connection_session *s, struct sl_tx_budget *budget)
+{
+	unsigned long flags;
+	unsigned int i, idle = 0;
+	int slot, ret;
+	struct sl_tx_step step;
+
+	s->tx_blocked = false;
+	for (i = 0; i < SL_SESSION_CHANNELS; i++)
+		sl_expire_queued_channel(s, &s->channels[i]);
+	while (sl_channel_active(sl_snapshot(s))) {
+		spin_lock_irqsave(&s->lock, flags);
+		slot = s->fragment_slot >= 0 ? s->fragment_slot : s->tx_next;
+		spin_unlock_irqrestore(&s->lock, flags);
+		ret = sl_transmit_channel(s, &s->channels[slot], budget, &step);
+		if (ret || budget->stop != SL_TX_BUDGET_NONE)
+			return ret;
+		/* All channels share this physical pool/transport. Return to original
+		 * event/deadline scheduling at a real credit wait or other retry. */
+		if (step.attempted && step.result == -EAGAIN) {
+			s->tx_blocked = true;
+			if (s->fragment_slot < 0)
+				s->tx_next = (slot + 1) % SL_SESSION_CHANNELS;
+			break;
+		}
+		if (s->fragment_slot < 0)
+			s->tx_next = (slot + 1) % SL_SESSION_CHANNELS;
+		if (step.submitted)
+			idle = 0;
+		else if (++idle == SL_SESSION_CHANNELS)
+			break;
+	}
+	return 0;
 }
 static void sl_shift_rejection(struct sl_connection_session *s)
 {
@@ -1019,7 +1117,8 @@ static struct sl_session_schedule sl_next_schedule(struct sl_connection_session 
 		}
 		spin_unlock(&c->tx.lock);
 	}
-	if (s->rx_budget_exhausted || (runnable && s->work_progress))
+	if (s->rx_budget_exhausted ||
+	    (runnable && !s->tx_blocked && (s->work_progress || s->tx_budget_exhausted)))
 		sl_session_schedule_delay(&plan, 0);
 	else if ((runnable || s->unknown_deadline) && s->work_retry)
 		sl_session_schedule_delay(&plan, msecs_to_jiffies(10));
@@ -1032,11 +1131,17 @@ static void sl_work(struct work_struct *work)
 	struct sl_connection_session *s = container_of(to_delayed_work(work), struct sl_connection_session, work);
 	u8 signal[32], wire[36];
 	size_t size;
-	int ret, n;
+	int ret = 0, n;
 	unsigned int i;
-	struct sl_session_schedule plan;
+	struct sl_session_schedule plan = { 0 };
+	struct sl_tx_budget budget = { 0 };
+	u64 began = ktime_get_ns();
 
-	s->work_progress = s->work_retry = s->rx_budget_exhausted = false;
+	s->service_sequence++;
+	trace_sparklink_session_work(s->controller, s->generation, s->lifetime,
+		s->epoch, s->service_sequence, 0, 0, 0, 0, 0, ~0UL, 0);
+	s->work_progress = s->work_retry = s->rx_budget_exhausted = s->tx_budget_exhausted = false;
+	s->tx_blocked = false;
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
 	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
@@ -1094,12 +1199,9 @@ static void sl_work(struct work_struct *work)
 		sl_progress_event(s, 3, 0, 0);
 	}
 	sl_dynamic_work(s);
-	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
-		unsigned int slot = (s->tx_next + i) % SL_SESSION_CHANNELS;
-		ret = sl_transmit_channel(s, &s->channels[slot]);
-		if (ret) { sl_fault(s, ret); goto put; }
-	}
-	s->tx_next = (s->tx_next + 1) % SL_SESSION_CHANNELS;
+	budget = sl_tx_budget_begin(ktime_get_ns());
+	ret = sl_transmit_batch(s, &budget);
+	if (ret) { sl_fault(s, ret); goto put; }
 again:
 	sl_progress_event(s, 0, 0, 0);
 	plan = sl_next_schedule(s);
@@ -1108,6 +1210,9 @@ again:
 put:
 	if (!sl_channel_active(sl_snapshot(s)))
 		sl_retire_tx(s);
+	trace_sparklink_session_work(s->controller, s->generation, s->lifetime,
+		s->epoch, s->service_sequence, 1, budget.packets, budget.bytes,
+		budget.stop, ktime_get_ns() - began, plan.pending ? plan.delay : ~0UL, ret);
 	sl_connection_session_put(s);
 }
 void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch, u16 maximum)
@@ -1445,7 +1550,12 @@ static int sl_admit(void *context)
 		else {
 			((struct sl_fragment_cursor *)skb->cb)->deadline =
 				jiffies + msecs_to_jiffies(5000);
+			((struct sl_fragment_cursor *)skb->cb)->observation = ++s->admission_sequence;
 			__skb_queue_tail(&c->tx, skb);
+			trace_sparklink_session_queue(s->controller, s->generation, s->lifetime,
+				s->epoch, ((struct sl_fragment_cursor *)skb->cb)->observation,
+				c - s->channels, skb->len,
+				((struct sl_fragment_cursor *)skb->cb)->deadline, 0);
 			admission->skb = NULL;
 			ret = 0;
 		}
