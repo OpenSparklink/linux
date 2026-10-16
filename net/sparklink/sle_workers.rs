@@ -269,6 +269,7 @@ impl WorkItem<0> for ControllerRuntime {
         }
         // Session ownership follows canonical physical links/withdrawal.
         this.reconcile_sessions();
+        this.notify_session_data();
         // An inline drain may already have taken the grant; check the owner
         // state even on an empty RX pass. Queue TX after releasing its mutex.
         let can_send = {

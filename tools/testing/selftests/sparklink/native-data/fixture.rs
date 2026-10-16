@@ -17,6 +17,7 @@ pub const ENOMEM:Error=Error(-12);pub const EOVERFLOW:Error=Error(-75);pub const
 pub mod bindings {pub const EPROTO:i32=71;pub const EALREADY:i32=114;pub const ECONNRESET:i32=104;pub const EACCES:i32=13;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
 pub unsafe fn ktime_get_boottime()->i64{super::NOW.with(|n|*n.borrow() as i64)}}
 pub mod prelude {pub use crate::{Error,Result,KVec,ENODEV,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO,ENOMEM,GFP_ATOMIC};}
+pub mod sync {pub use std::rc::Rc as Arc;}
 #[derive(Debug)] pub struct KVec<T>(Vec<T>);
 impl<T> KVec<T> {
  fn new()->Self{Self(Vec::new())}
@@ -54,12 +55,14 @@ struct Owner{
  identity:DeviceIdentity,host:Lock<Host>,data:Lock<sle_native_data::NativeData>,data_poll:Poll,
  sessions:Lock<[Option<sle_sessions::Session>;16]>,schedule_gate:Lock<bool>,native_lifecycle:Lock<()>,state:Lock<Option<State>>,transport_open:AtomicBool,
  commands:RefCell<Vec<SleEvent>>,
+ session_data_pending:AtomicBool,
 }
 impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  identity:DeviceIdentity{id,generation},host:Lock::new(Host{grants:{let mut g=sle_grant::LeaseAuthority::new();assert!(g.activate(1,true));g},links:LinkObservation::new(),data_revoked:false,fault:None}),
  data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll,sessions:Lock::new([const{None};16]),schedule_gate:Lock::new(false),
  native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Native(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
+ session_data_pending:AtomicBool::new(false),
 })}}
 impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
 #[derive(Debug)] enum SleEvent{
@@ -280,9 +283,9 @@ unsafe extern "C" fn consent_scope(scope:*mut c_void,submit:unsafe extern "C" fn
  assert_eq!(a.data.lock().credits.maximum(),Ok(254));
 }
 
-struct FakeSession {refs:usize, stopped:bool, id:u16, generation:u64, lifetime:u64, handle:u16}
+struct FakeSession {refs:usize, stopped:bool, id:u16, generation:u64, lifetime:u64, handle:u16, kicks:usize}
 #[no_mangle] unsafe extern "C" fn sl_connection_session_create(id:u16,generation:u64,lifetime:u64,handle:u16,epoch:u64,maximum:u16)->*mut c_void {
- assert!(maximum>5);assert_ne!(epoch,0);Box::into_raw(Box::new(FakeSession{refs:1,stopped:false,id,generation,lifetime,handle})).cast()
+ assert!(maximum>5);assert_ne!(epoch,0);Box::into_raw(Box::new(FakeSession{refs:1,stopped:false,id,generation,lifetime,handle,kicks:0})).cast()
 }
 #[no_mangle] unsafe extern "C" fn sl_connection_session_get(p:*mut c_void){unsafe{(*p.cast::<FakeSession>()).refs+=1;}}
 #[no_mangle] unsafe extern "C" fn sl_connection_session_put(p:*mut c_void){unsafe{
@@ -298,6 +301,32 @@ struct FakeSession {refs:usize, stopped:bool, id:u16, generation:u64, lifetime:u
 }}
 fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut error=0;
  let p=unsafe{sle_sessions::sparklink_native_session_get_rust(id,generation,life,handle,1,&mut error)};(p,error)}
+// C queue/worker is an explicit dependency here, tested by its own extracted
+// production body and later in a running VM. This receipt grants no credit.
+#[no_mangle] unsafe extern "C" fn sl_connection_session_kick(p:*mut c_void){unsafe{
+ let s=&mut *p.cast::<FakeSession>();assert!(s.refs>1&&!s.stopped);
+ let owner=sle_ingress::ingress_owner(DeviceIdentity{id:s.id,generation:s.generation}).unwrap();
+ assert!(owner.sessions.0.try_borrow_mut().is_ok());
+ assert!(owner.host.0.try_borrow_mut().is_ok());
+ assert!(owner.data.0.try_borrow_mut().is_ok());
+ assert!(owner.schedule_gate.0.try_borrow_mut().is_ok());
+ s.kicks+=1;
+}}
+#[test] fn actual_runtime_data_hint_coalesces_after_unlock_without_peer_or_stale_grants(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);let(p,_)=session(0,7,1,0);let(q,_)=session(1,8,1,0);
+ a.notify_session_data();unsafe{assert_eq!((*p.cast::<FakeSession>()).kicks,0);}
+ assert_eq!(receive(0,6,&acb(0,&[1])),-19);assert!(!a.session_data_pending.load(Ordering::Acquire));
+ assert_eq!(receive(0,7,&acb(0,&[1])),0);
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,0]),0);
+ assert!(a.session_data_pending.load(Ordering::Acquire));
+ a.notify_session_data();assert!(!a.session_data_pending.load(Ordering::Acquire));
+ unsafe{assert_eq!((*p.cast::<FakeSession>()).kicks,1);assert_eq!((*p.cast::<FakeSession>()).refs,2);assert_eq!((*q.cast::<FakeSession>()).kicks,0);}
+ assert_eq!(take(0,7,1,0,1),(0,vec![1])); // hint did not steal RX
+ {a.host.lock().grants.revoke();}a.reconcile_sessions();
+ a.kick_session_data();a.notify_session_data();
+ unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert_eq!((*p.cast::<FakeSession>()).kicks,1);}
+ a.stop_sessions(-19);b.stop_sessions(-19);unsafe{sl_connection_session_put(p);sl_connection_session_put(q);}
+}
 #[test] fn actual_runtime_session_get_shares_one_owner_and_preserves_lifetime(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
  let(p,e)=session(0,7,1,0);assert_eq!(e,0);assert!(!p.is_null());

@@ -64,6 +64,30 @@ Managed revocation and physical disconnect retain their existing failure
 semantics and cannot renew an old fd. Reliable/security-protected modes and
 blocking channel setup are explicitly unsupported.
 
+Session event wakeup staging
+===========================
+
+Software TX admission, initial binding and final channel release now request
+immediate execution of the existing unique Session worker. Native ACB ingress
+and actual NOCP accounting publish a coalesced per-controller hint, then wake
+the Runtime worker; it takes Session references in process context and notifies
+them outside table/Host/data/gate locks. USB callbacks do not take the Session
+table mutex or execute sleeping channel work. A notification grants neither
+credit, Ready, authorization nor physical delivery.
+
+The Session lock serializes enqueue with stop's close-before-cancel/join. A
+new queue, including a requeue while running, retains one reference; modifying
+an already pending queue keeps its existing reference. Closed Sessions reject
+further enqueue. Actual submit still revalidates Grant, generation, lifetime
+and Ticket. The atomic hint is not a replacement for these locked states.
+
+This is an incremental wakeup stage: the original 10 ms maintenance fallback
+still runs. Separating original-deadline timers and removing periodic polling,
+bounded continuous TX, no-lost-wakeup/drain interleaving validation and same
+configuration real-device comparisons remain required. No latency improvement
+or complete event-driven/performance qualification is claimed from source or
+sequential dependency fixtures alone.
+
 UAPI has not been published: callers, Rust/C/Python bindings and tests may be
 migrated together without an old ABI compatibility period. Match actual headers
 and source revisions; reserved-field checks and errors vary by request and must

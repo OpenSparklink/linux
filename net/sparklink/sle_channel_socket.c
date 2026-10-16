@@ -191,6 +191,25 @@ static void sl_schedule(struct sl_connection_session *s)
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
 }
+/* Event hint only: state/credit/grant remain authoritative at actual use.
+ * The Session lock serializes queue admission with stop's close-before-join.
+ * A fresh queue owns one kref, including a requeue while the callback runs;
+ * modifying an already pending item keeps its original queue reference.
+ * Unlike the temporary deadline fallback, an event never waits for 10 ms.
+ */
+void sl_connection_session_kick(void *opaque)
+{
+	struct sl_connection_session *s = opaque;
+	unsigned long flags;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (sl_channel_active(s->progress)) {
+		sl_connection_session_get(s);
+		if (mod_delayed_work(system_unbound_wq, &s->work, 0))
+			sl_connection_session_put(s);
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+}
 static void sl_socket_fault(struct sock *sk, int error)
 {
 	WRITE_ONCE(sk->sk_err, -error);
@@ -1194,7 +1213,7 @@ static int sl_dynamic_attach(struct socket *sock,
 	if (ret)
 		sl_connection_session_put(s);
 	else
-		sl_schedule(s);
+		sl_connection_session_kick(s);
 	return ret;
 }
 static int sl_connect(struct socket *sock, struct sockaddr_unsized *address,
@@ -1246,7 +1265,7 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 	if (ret)
 		sl_connection_session_put(s);
 	else
-		sl_schedule(s);
+		sl_connection_session_kick(s);
 	return ret;
 }
 static int sl_can_write(struct sl_connection_session *s,
@@ -1363,8 +1382,10 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
         ret = sparklink_native_session_admit(s->controller, s->generation, s->lifetime,
             s->handle, s->epoch, sl_admit, &admission);
         skb = admission.skb;
-        if (!ret)
+        if (!ret) {
+            sl_connection_session_kick(s); /* Host/data/gate admission has returned */
             ret = length;
+        }
     }
 put:
 	kfree_skb(skb);
@@ -1678,6 +1699,7 @@ static int sl_release(struct socket *sock)
 		skb_queue_purge(&c->rx);
 		if (held)
 			sock_put(held);
+		sl_connection_session_kick(s); /* dynamic close or begun physical PDU */
 		sl_connection_session_put(s); /* binding ownership */
 		sl_connection_session_put(s); /* temporary operation reference */
 	}

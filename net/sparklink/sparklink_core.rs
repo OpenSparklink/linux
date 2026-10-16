@@ -263,6 +263,8 @@ pub(crate) struct ControllerRuntime {
     pub(crate) data_poll: PollCondVar,
     #[pin]
     pub(crate) sessions: Mutex<[Option<sle_sessions::Session>; 16]>,
+    /// Coalesced data hint only; actual state remains protected by its locks.
+    pub(crate) session_data_pending: core::sync::atomic::AtomicBool,
     #[pin]
     pub(crate) rx_work: DelayedWork<ControllerRuntime, 0>,
     #[pin]
@@ -315,6 +317,7 @@ impl ControllerRuntime {
             data <- new_irq_lock!(sle_native_data::NativeData::new(data_length, data_count), "sparklink_runtime_data"),
             data_poll <- new_poll_condvar!("sparklink_native_data"),
             sessions <- new_mutex!([const { None }; 16], "sparklink_sessions"),
+            session_data_pending: core::sync::atomic::AtomicBool::new(false),
             rx_work <- new_delayed_work!("sparklink_runtime_rx_work"),
             tx_work <- new_delayed_work!("sparklink_runtime_tx_work"),
             schedule_gate <- new_irq_lock!(false, "sparklink_runtime_schedule"),

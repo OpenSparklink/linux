@@ -743,7 +743,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         drop(gate); drop(data); drop(host);
         drop(retired);
         owner.data_poll.notify_all();
-        owner.schedule_rx(0);
+        owner.kick_session_data();
         return 0; // bounded ingress drop is not a USB/device recovery request
     }
     if packet[0] != 0xa2 || count != length - 5 { return PROTOCOL_ERROR; }
@@ -795,6 +795,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         data.completed(handle, params[2]);
         drop(gate); drop(data);
         owner.data_poll.notify_all();
+        owner.kick_session_data(); // real data accounting, never command credit
         return 0; // data accounting never changes command credit
     }
     let event = match event {

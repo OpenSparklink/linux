@@ -7,6 +7,7 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 void sl_connection_session_get(void *session);
 void sl_connection_session_put(void *session);
 void sl_connection_session_stop(void *session, int error);
+void sl_connection_session_kick(void *session);
 void *sparklink_native_session_get(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch, int *error);
 int sparklink_native_session_status(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch);
 int sparklink_native_session_admit(u16 id, u64 generation, u64 lifetime, u16 handle,

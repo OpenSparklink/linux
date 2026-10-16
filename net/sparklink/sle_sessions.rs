@@ -10,6 +10,7 @@ extern "C" {
     fn sl_connection_session_get(session: *mut c_void);
     fn sl_connection_session_put(session: *mut c_void);
     fn sl_connection_session_stop(session: *mut c_void, error: i32);
+    fn sl_connection_session_kick(session: *mut c_void);
 }
 pub(crate) struct Session {
     pub(crate) lifetime: u64,
@@ -33,6 +34,37 @@ enum Admission {
     Inspect(unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,*mut c_void)->i32,*mut c_void),
 }
 impl super::ControllerRuntime {
+    /// IRQ callers publish only a hint and queue the existing Runtime worker.
+    /// No Session table mutex, sleeping work or raw C pointer in USB callbacks.
+    pub(crate) fn kick_session_data(self: &kernel::sync::Arc<Self>) {
+        self.session_data_pending.store(true, Ordering::Release);
+        self.schedule_rx(0);
+    }
+    /// Process context after reconcile, outside Host/data/gate locks. A hint
+    /// never grants a lifetime permission. Each pointer has a temporary kref;
+    /// concurrent stop closes admission before joining the C work item.
+    pub(crate) fn notify_session_data(&self) {
+        if !self.session_data_pending.swap(false, Ordering::AcqRel) { return; }
+        let mut targets = [core::ptr::null_mut(); 16];
+        {
+            let table = self.sessions.lock();
+            for (slot, session) in targets.iter_mut().zip(table.iter()) {
+                if let Some(session) = session.as_ref().filter(|s| !s.stopped) {
+                    // SAFETY: table owns a reference; transfer one to targets.
+                    unsafe { sl_connection_session_get(session.pointer) };
+                    *slot = session.pointer;
+                }
+            }
+        }
+        for pointer in targets.into_iter().filter(|p| !p.is_null()) {
+            // SAFETY: temporary ref survives retirement; C rechecks closed
+            // state under its publication lock before retaining any queue ref.
+            unsafe {
+                sl_connection_session_kick(pointer);
+                sl_connection_session_put(pointer);
+            }
+        }
+    }
     /// Session table -> Host -> data -> scheduling is process-context order.
     /// Driver atomic commit never takes the session table mutex.
     fn session_limits(&self, lifetime: u64, handle: u16, epoch: u64, admission: Option<Admission>) -> Result<u16> {
