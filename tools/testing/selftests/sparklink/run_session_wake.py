@@ -82,6 +82,8 @@ def function(source, name):
 
 
 def run(output, cbmc_output=None):
+    if not __debug__:
+        raise RuntimeError('verification requires Python assertions;optimized mode is not a proof')
     here = Path(__file__).resolve().parent
     root = here.parents[3]
     net = root / 'net/sparklink'
@@ -89,6 +91,7 @@ def run(output, cbmc_output=None):
     if cbmc_output:
         paths.append(here / 'session/wake_cbmc.c')
     paths.append(net / 'sle_channel_state.h')
+    paths.append(Path(__file__).resolve())
     originals = {p: p.read_bytes() for p in paths}
     source = originals[paths[0]].decode()
     bodies = '\n'.join(function(source, name) for name in ['sl_schedule', 'sl_connection_session_kick'])
