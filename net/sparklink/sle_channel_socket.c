@@ -56,6 +56,7 @@ struct sl_connection_session {
 	struct sk_buff *tx_inflight; /* Session-owned, never in an fd queue */
 	struct sl_channel_grant tx_grant; /* immutable bounded operation scope */
 	bool tx_started; /* set at first successful actual atomic USB submit */
+	bool response_pending; /* identifier zero is valid; serialized worker-only */
 	u8 response_id;
 	u32 response_mask; /* only serialized session worker writes these */
 	u8 rx_buffer[2047]; /* sole connection consumer, fixed budget */
@@ -292,13 +293,14 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 		if (sl_channel_cap_decode(frame.data, frame.length, &code, &identifier, &mask, &cap))
 			return;
 		if (code == 1) {
-			if (s->response_id && s->response_id != identifier) {
+			if (s->response_pending && s->response_id != identifier) {
 				sl_fault(s, -EPROTO);
 				return;
 			}
+			s->response_pending = true;
 			s->response_id = identifier;
 			s->response_mask = mask;
-		} else if (identifier == 1 && sl_snapshot(s).request_submitted) {
+		} else if (identifier == SL_CHANNEL_CAP_IDENTIFIER && sl_snapshot(s).request_submitted) {
 			struct sl_channel_progress view = sl_snapshot(s);
 			sl_progress_event(s, 2, min_t(unsigned int, view.maximum, min(cap.mtu, cap.mps)));
 		}
@@ -472,7 +474,7 @@ static void sl_work(struct work_struct *work)
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
 	if (!sl_snapshot(s).request_submitted) {
-		n = sl_channel_cap_request(signal, sizeof(signal), 1);
+		n = sl_channel_cap_request(signal, sizeof(signal), SL_CHANNEL_CAP_IDENTIFIER);
 		if (n >= 0)
 			n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
 		if (n < 0) { sl_fault(s, n); goto put; }
@@ -492,7 +494,7 @@ static void sl_work(struct work_struct *work)
 	}
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
-	if (s->response_id && s->fragment_slot < 0) {
+	if (s->response_pending && s->fragment_slot < 0) {
 		n = sl_channel_cap_response(signal, sizeof(signal), s->response_id, s->response_mask, sl_snapshot(s).maximum);
 		if (n >= 0)
 			n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
@@ -501,7 +503,7 @@ static void sl_work(struct work_struct *work)
 		if (ret == -EAGAIN)
 			goto again;
 		if (ret) { sl_fault(s, ret); goto put; }
-		s->response_id = 0;
+		s->response_pending = false;
 		sl_progress_event(s, 3, 0);
 	}
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {

@@ -404,7 +404,18 @@ static void tx_status_tests(void){
  for(unsigned int i=0;i<sizeof(value);i++)assert(((u8 *)&value)[i]==0x5a);
  authority=true;sl_retire_tx(&s);assert(!allocations);copy_limit=40;
 }
+static void identifier_zero_request_tests(void){
+ struct sl_connection_session s={0};u8 request[8],frame[12];
+ sl_channel_start(&s.progress,249);
+ assert(sl_channel_cap_request(request,sizeof(request),0)==8);
+ assert(sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,request,8)==12);
+ sl_route(&s,frame,sizeof(frame));assert(s.response_pending&&s.response_id==0&&s.progress.phase==SL_CH_NEGOTIATING);
+ sl_route(&s,frame,sizeof(frame));assert(s.response_pending&&s.response_id==0); /* same pending request */
+ request[1]=7;assert(sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,request,8)==12);
+ sl_route(&s,frame,sizeof(frame));assert(s.progress.phase==SL_CH_FAILED); /* existing bounded single-query contract */
+}
 int main(void){
+ identifier_zero_request_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
  sl_channel_start(&s.progress,249);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress,249,0);sl_channel_response_submitted(&s.progress,0);
  s.channels[0].local_tcid=SL_CHANNEL_CUTC;s.channels[0].remote_tcid=SL_CHANNEL_CUTC;s.channels[0].pi=241;s.channels[0].mtu=249;s.channels[0].sk=sk;

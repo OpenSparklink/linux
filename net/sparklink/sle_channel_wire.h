@@ -9,6 +9,7 @@
 
 #define SL_CHANNEL_CMTC 2U
 #define SL_CHANNEL_CUTC 31U
+#define SL_CHANNEL_CAP_IDENTIFIER 0U /* valid identifier; independent of pending state */
 #define SL_CHANNEL_CAP_QUERY 0xe2U /* basic only, MTU/MPS/version */
 struct sl_channel_frame {
 	unsigned int tcid, pi;

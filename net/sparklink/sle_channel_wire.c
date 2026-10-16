@@ -61,7 +61,7 @@ int sl_channel_frame_encode(unsigned char *out, size_t capacity,
 
 int sl_channel_cap_request(unsigned char *out, size_t capacity, unsigned int identifier)
 {
-	if (!out || !identifier || identifier > 255 || capacity < 8)
+	if (!out || identifier > 255 || capacity < 8)
 		return -EINVAL;
 	out[0] = 1; out[1] = identifier; put16(out + 2, 4);
 	put32(out + 4, SL_CHANNEL_CAP_QUERY);
@@ -74,7 +74,7 @@ int sl_channel_cap_response(unsigned char *out, size_t capacity, unsigned int id
 	unsigned int accepted = requested & SL_CHANNEL_CAP_QUERY;
 	size_t n = 8;
 
-	if (!out || !identifier || identifier > 255 || !maximum || maximum > 2042 || capacity < 16)
+	if (!out || identifier > 255 || !maximum || maximum > 2042 || capacity < 16)
 		return -EINVAL;
 	out[0] = 2; out[1] = identifier; put32(out + 4, accepted);
 	if (accepted & 2) { put16(out + n, 0); n += 2; } /* no optional modes */
@@ -94,7 +94,7 @@ int sl_channel_cap_decode(const unsigned char *data, size_t length,
 	size_t n = 8;
 
 	if (!data || !code || !identifier || !requested || !cap || length < 8 ||
-	    !data[1] || get16(data + 2) != length - 4)
+	    get16(data + 2) != length - 4)
 		return -EPROTO;
 	mask = get32(data + 4);
 	if (data[0] == 1) {
