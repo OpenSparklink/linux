@@ -12,7 +12,7 @@ import tempfile
 import time
 
 
-def check_cbmc(directory, fixture, bodies, harness):
+def check_cbmc(directory, fixture, bodies, harness, net):
     directory.mkdir()
     report = dict(status='RUNNING_NOT_PROVEN', bound=20, runs=[],
                   scope='Actual C enqueue bodies with explicit sequential Linux API dependencies;not kernel implementation,concurrency,drain,unbounded or RF proof.')
@@ -27,7 +27,7 @@ def check_cbmc(directory, fixture, bodies, harness):
         for kind, body in variants:
             source = directory / (kind + '.c')
             source.write_text(fixture.replace('/* @@FUNCTIONS@@ */', body) + harness)
-            command = ['cbmc', str(source), '--function', 'verify_wake_sequences', '--unwind',
+            command = ['cbmc', '-I', str(net), str(source), '--function', 'verify_wake_sequences', '--unwind',
                        '5' if kind == 'short-unwind-negative' else '21',
                        '--unwinding-assertions', '--bounds-check', '--pointer-check', '--pointer-overflow-check',
                        '--signed-overflow-check', '--unsigned-overflow-check', '--json-ui', '--trace']
@@ -84,9 +84,11 @@ def function(source, name):
 def run(output, cbmc_output=None):
     here = Path(__file__).resolve().parent
     root = here.parents[3]
-    paths = [root / 'net/sparklink/sle_channel_socket.c', here / 'session/wake_fixture.c']
+    net = root / 'net/sparklink'
+    paths = [net / 'sle_channel_socket.c', here / 'session/wake_fixture.c']
     if cbmc_output:
         paths.append(here / 'session/wake_cbmc.c')
+    paths.append(net / 'sle_channel_state.h')
     originals = {p: p.read_bytes() for p in paths}
     source = originals[paths[0]].decode()
     bodies = '\n'.join(function(source, name) for name in ['sl_schedule', 'sl_connection_session_kick'])
@@ -97,11 +99,11 @@ def run(output, cbmc_output=None):
         tmp = Path(directory)
         (tmp / 'test.c').write_text(fixture)
         subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
-                        '-fsanitize=address,undefined', '-g', str(tmp / 'test.c'), '-o', str(tmp / 'test')], check=True)
+                        '-fsanitize=address,undefined', '-g', '-I' + str(net), str(tmp / 'test.c'), '-o', str(tmp / 'test')], check=True)
         subprocess.run([str(tmp / 'test')], check=True,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=1', UBSAN_OPTIONS='halt_on_error=1'))
     formal = check_cbmc(cbmc_output, originals[paths[1]].decode(), bodies,
-                        originals[paths[2]].decode()) if cbmc_output else None
+                        originals[paths[2]].decode(), net) if cbmc_output else None
     assert all(p.read_bytes() == data for p, data in originals.items())
     report = dict(status='ACTUAL_SESSION_WAKE_SEQUENTIAL_DEPENDENCIES_PASS',
                   scope='Actual C enqueue bodies;explicit single-thread workqueue/spinlock/kref API dependencies. Pending coalescence,running requeue,earlier event not postponed,closed admission,queue ref settlement. Not Linux workqueue correctness,concurrent callback UAF,formal or real-device qualification.',

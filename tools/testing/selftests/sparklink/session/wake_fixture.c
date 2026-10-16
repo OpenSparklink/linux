@@ -5,11 +5,12 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "sle_channel_state.h"
 typedef struct { bool held; } spinlock_t;
 struct delayed_work { bool pending, running; unsigned long delay; };
 struct sl_connection_session {
 	spinlock_t lock;
-	struct { bool active; } progress;
+	struct sl_channel_progress progress;
 	struct delayed_work work;
 	unsigned int refs;
 };
@@ -18,7 +19,6 @@ static struct sl_connection_session *owner;
 static void *system_unbound_wq;
 #define spin_lock_irqsave(l, f) do { (f) = irq_disabled; irq_disabled = true; assert(!(l)->held); (l)->held = true; } while (0)
 #define spin_unlock_irqrestore(l, f) do { assert((l)->held); (l)->held = false; irq_disabled = (f); } while (0)
-#define sl_channel_active(p) ((p).active)
 #define msecs_to_jiffies(ms) (ms)
 static void sl_connection_session_get(void *p)
 {
@@ -60,7 +60,7 @@ static void stop(struct sl_connection_session *s)
 {
 	/* Production stop closes under Session lock, then cancel/join outside it.
 	 * Sequential fixture has no actual kernel worker/callback concurrency. */
-	s->progress.active = false;
+	sl_channel_close(&s->progress);
 	if (s->work.pending) {
 		s->work.pending = false; sl_connection_session_put(s);
 	}
@@ -70,7 +70,7 @@ int main(void)
 	struct sl_connection_session s = { .refs = 1 };
 	owner = &s;
 	sl_connection_session_kick(&s); assert(s.refs == 1 && !s.work.pending);
-	s.progress.active = true;
+	sl_channel_start(&s.progress, 2042, 2047);
 	sl_schedule(&s); assert(s.refs == 2 && s.work.delay == 10);
 	sl_connection_session_kick(&s); assert(s.refs == 2 && s.work.delay == 0);
 	for (unsigned int i = 0; i < 32; i++) sl_connection_session_kick(&s);
