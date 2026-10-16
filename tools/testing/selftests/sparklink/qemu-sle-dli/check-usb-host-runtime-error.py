@@ -18,7 +18,7 @@ def check(args):
     boundary = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(boundary)
     source = args.source.read_text()
-    names = ['usb_host_get_test_runtime_in_error', 'usb_host_set_test_runtime_in_error',
+    names = ['usb_host_test_le16', 'usb_host_test_le32', 'usb_host_test_install_reply', 'usb_host_get_test_runtime_in_error', 'usb_host_set_test_runtime_in_error',
              'usb_host_req_complete_data']
     production = '\n\n'.join(boundary.body(source, name) for name in names)
     (args.output / 'production.h').write_text(production + '\n')
@@ -42,6 +42,7 @@ typedef struct USBHostDevice {
     void *test_runtime_hold_timer;
     uint64_t test_runtime_holds;
     uint64_t test_runtime_skip_requested, test_runtime_skip_remaining, test_runtime_skipped;
+    uint64_t test_runtime_install_opcode;
     uint64_t test_runtime_in_errors;
     void *dh;
     struct { unsigned idVendor, idProduct; } ddesc;

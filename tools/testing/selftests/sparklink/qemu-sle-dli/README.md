@@ -375,3 +375,43 @@ chain with ASan/UBSan/LSan; every prior complete patch prefix is supported, and
 DROP log context drift must be rejected without mutating the caller's source.
 Actual cancellation/removal, physical hotplug and natural nonmanual recovery
 still require separate VM/hardware gates.
+
+### SDK111 installation-reply selection (test fixture)
+
+`usb-host-runtime-install.patch` adds default-disabled `test-runtime-install-g`
+(0x1c03) / `test-runtime-install-t` (0x1c05) selectors and the read-only
+`test-runtime-install-opcode`. Configure only an idle, attached ffff:3733
+controller with every reset/detach opt-out. The selector and frame-skip/error
+injection are mutually exclusive. Then arm the existing
+`test-runtime-in-hold-once` mechanism. Nonmatches use the unchanged ordinary
+callback; this is not an event generator or a second Host.
+
+The selector validates the complete bounded HCC aggregate, not a byte substring
+or frame number. It retains the original successful IN81 transfer containing an
+SDK111 service-A/queue-8 A2 Status or Complete with exactly four parameter bytes:
+selected opcode, credit 1, status 0. Other completion layouts are deliberately
+not selected. Malformed aggregates, padding, other opcodes/roles and failed
+Status do not consume the arm. The existing two-second REALTIME fallback,
+explicit release, cancellation, drop and close/drain ownership remain in use.
+Close clears selection before aborting transfers. Selection identifies an
+opcode, **not** generation/lifetime: the eventual VM witness must independently
+correlate the original request, actual installation submission, exact held
+transfer hash, release and terminal observations. Coalesced events in that same
+transfer are delayed together, never split or reordered by the fixture.
+
+Run the actual callback/setter body checks with counted dependencies:
+
+```sh
+python3 check-usb-host-runtime-hold.py --cc clang --sanitize \
+  --source /absolute/patched-qemu/hw/usb/host-libusb.c \
+  --output /absolute/private/fresh-install-selector-check
+```
+
+This includes both role selectors, unchanged nonmatching callbacks, truncated
+exact allocations, aggregate-tail validation and existing release/cancel/abort
+checks. Timers, QEMU scheduling, digest, USB and allocator integration remain
+outside the counted fixture. Run `check-usb-host-boundary.py` separately for
+fresh/prefix/idempotent patch application and drift refusal, optionally against
+the actual binary in a paused TCG guest matching no physical device. Neither
+check qualifies live in-flight cancellation, encryption, peer delivery or
+natural recovery; those need separate VM-only real-device gates.

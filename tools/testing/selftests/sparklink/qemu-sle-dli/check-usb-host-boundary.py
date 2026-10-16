@@ -18,7 +18,7 @@ import time
 
 
 def body(source, name):
-    match = re.search(r'static (?:void|int|bool) (?:LIBUSB_CALL )?'+re.escape(name)+r'\([^;]*?\)\n\{', source)
+    match = re.search(r'static (?:void|int|bool|unsigned|uint32_t) (?:LIBUSB_CALL )?'+re.escape(name)+r'\([^;]*?\)\n\{', source)
     if not match:
         raise ValueError('missing production function: '+name)
     depth = 1
@@ -80,12 +80,13 @@ def qmp_properties(args):
                     raise AssertionError('unattached fault pulse accepted')
                 assert monitor.execute('qom-get',{'path':path,'property':'test-runtime-in-error-once'}) is False
                 for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release',
-                             'test-runtime-in-skip-one','test-runtime-in-skip-two']:
+                             'test-runtime-in-skip-one','test-runtime-in-skip-two',
+                             'test-runtime-install-g','test-runtime-install-t']:
                     assert monitor.execute('qom-get',{'path':path,'property':name}) is False
                 for name in ['test-runtime-in-holds','test-runtime-in-releases',
                              'test-runtime-in-bounded-releases','test-runtime-in-hold-drops',
                              'test-runtime-in-skip-requested','test-runtime-in-skip-remaining',
-                             'test-runtime-in-skipped']:
+                             'test-runtime-in-skipped','test-runtime-install-opcode']:
                     assert monitor.execute('qom-get',{'path':path,'property':name}) == 0
                     try:
                         monitor.execute('qom-set',{'path':path,'property':name,'value':1})
@@ -94,7 +95,8 @@ def qmp_properties(args):
                     else:
                         raise AssertionError('read-only hold counter accepted a write')
                 for name in ['test-runtime-in-hold-once','test-runtime-in-held','test-runtime-in-release',
-                             'test-runtime-in-skip-one','test-runtime-in-skip-two']:
+                             'test-runtime-in-skip-one','test-runtime-in-skip-two',
+                             'test-runtime-install-g','test-runtime-install-t']:
                     try:
                         monitor.execute('qom-set',{'path':path,'property':name,'value':True})
                     except ValueError:
@@ -269,7 +271,7 @@ int main(void)
                ['usb-host-boundary.patch','usb-host-retry.patch','usb-host-reenumeration.patch',
                 'usb-host-autoscan.patch','usb-host-runtime-error.patch', 'usb-host-runtime-hold.patch',
                 'usb-host-enumeration-once.patch','usb-host-runtime-selector.patch',
-                'usb-host-runtime-drop.patch']]
+                'usb-host-runtime-drop.patch','usb-host-runtime-install.patch']]
     apply = Path(__file__).with_name('apply-usb-host-boundary.py').resolve()
     tree=args.output/'patch-tree';(tree/'hw/usb').mkdir(parents=True)
     copy=tree/'hw/usb/host-libusb.c';shutil.copy2(host,copy)
@@ -299,6 +301,8 @@ int main(void)
         assert denied.returncode!=0 and copy.read_bytes()==drift
         for before, after in [
             ('WS73_TEST_RUNTIME_HOLD_DROP:', 'unexpected-hold-drop:'),
+            ('test-runtime-install-opcode', 'unexpected-install-opcode'),
+            ('!usb_host_test_install_reply(r->buffer', 'usb_host_test_install_reply(r->buffer'),
             ('"test-runtime-in-held"','"unexpected-held"'),
             ('timer_mod(s->test_runtime_hold_timer,',
              'timer_mod(s->test_runtime_hold_timer_drift,'),
@@ -331,7 +335,8 @@ int main(void)
         assert denied.returncode!=0 and copy.read_bytes()==drift
     summary={'status':'PASS','scope':'QEMU production guard bodies and patch mechanics only',
              'physical_acceptance':False,'guard_cases':7,'retry_cases':5,'reenumeration_cases':6,
-             'host_lifecycle_sites':3,'patch_cases':20,
+             'host_lifecycle_sites':3,'patch_cases':2+(len(patches)+1)+1+12,
+             'installation_selector_source_drift_cases':2,
              'supported_patch_prefixes':list(range(len(patches)+1)),
              'hold_source_drift_cases':3,
              'enumeration_budget_source_drift_cases':1,
