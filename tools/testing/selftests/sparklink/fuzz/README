@@ -41,3 +41,17 @@ USB/callback/locks, security, real air traffic and hardware recovery remain in
 separate selftests/formal/VM gates. LSan under ptrace may fail in a restricted
 sandbox; retain that tool failure and rerun in an authorized ordinary process,
 without disabling the detector or treating DONE alone as success.
+
+Dynamic basic CMTC codec uses the same fail-closed supervisor (not a second
+protocol Engine):
+
+  python3 tools/testing/selftests/sparklink/run_ws73_codec_fuzz.py \
+      --contract cmtc --output /tmp/sparklink-cmtc-fuzz-new-run \
+      --runs 20000 --seed 730111
+
+This variant links actual sle_channel_wire.c and channel/signal_fuzz.c, keeps
+hand-authored seeds in channel/signal_corpus.json, bounds input to64 bytes, and
+requires both actual signaling decoder and encoder to execute. It checks decode
+failure atomicity and exact legal roundtrip bytes/fields. It does not prove
+Runtime credit, Session/Grant lifecycle, concurrency, firmware or peer delivery.
+The fixed channel codec and WS73 transport targets retain their own coverage.
