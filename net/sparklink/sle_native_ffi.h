@@ -25,8 +25,9 @@ void sparklink_native_snoop_tx_rust(u16 id, u64 generation, u16 opcode, const u8
 int sparklink_native_receive_rust(u16 id, u64 generation, const u8 *data, size_t length);
 int sparklink_native_acb_send_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
 				 const u8 *data, size_t length);
-int sparklink_native_acb_take_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
-				 u8 *data, size_t capacity, size_t *length);
+int sparklink_native_acb_take_rust(u16 id, u64 generation, u64 lifetime,
+				   u16 handle, u8 *data, size_t capacity,
+				   size_t *length, u64 *security_revision);
 int sparklink_native_acb_limits_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
 				   u16 *maximum);
 int sparklink_native_event_rust(u16 id, u64 generation, u32 profile, u16 event_code,

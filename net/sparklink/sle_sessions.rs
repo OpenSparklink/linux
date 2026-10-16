@@ -30,8 +30,8 @@ impl Drop for Session {
     }
 }
 enum Admission {
-    Queue(unsafe extern "C" fn(*mut c_void)->i32, *mut c_void),
-    Inspect(unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,*mut c_void)->i32,*mut c_void),
+    Queue(unsafe extern "C" fn(*mut c_void,u64)->i32, *mut c_void),
+    Inspect(unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,u64,*mut c_void)->i32,*mut c_void),
 }
 impl super::ControllerRuntime {
     /// IRQ callers publish only a hint and queue the existing Runtime worker.
@@ -76,19 +76,18 @@ impl super::ControllerRuntime {
         if let Some(error) = host.controller_status().2 { return Err(error); }
         if !self.transport_open.load(Ordering::Acquire) || !known { return Err(EAGAIN); }
         if !host.admits_data() || !host.grants.permits(epoch) { return Err(Error::from_errno(-(kernel::bindings::EACCES as i32))); }
-        if !links.iter().flatten().any(|link| link.lifetime == lifetime && link.handle == handle) {
-            return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
-        }
+        let link = links.iter().flatten().find(|link| link.lifetime == lifetime && link.handle == handle)
+            .ok_or(Error::from_errno(-(kernel::bindings::ESTALE as i32)))?;
         let maximum = data.credits.maximum().map_err(super::sle_native_data::error)?;
         if let Some(admission) = admission {
             // SAFETY: callback is synchronous, atomic Session queue admission.
             // Host/data/gate remain locked; no allocation, wait or Host reentry.
             let result = match admission {
-                Admission::Queue(admit,context) => unsafe { admit(context) },
+                Admission::Queue(admit,context) => unsafe { admit(context,link.security_revision) },
                 Admission::Inspect(inspect,context) => {
                     let snapshot=data.credits.snapshot(lifetime,handle);
                     // SAFETY: copied immutable value lives until synchronous callback returns.
-                    unsafe { inspect(&snapshot,context) }
+                    unsafe { inspect(&snapshot,link.security_revision,context) }
                 }
             };
             if result < 0 { return Err(Error::from_errno(result)); }
@@ -256,7 +255,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_session_get_rust(
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_session_admit_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, epoch: u64,
-    admit: Option<unsafe extern "C" fn(*mut c_void) -> i32>, context: *mut c_void,
+    admit: Option<unsafe extern "C" fn(*mut c_void,u64) -> i32>, context: *mut c_void,
 ) -> i32 {
     let Some(admit) = admit else { return EINVAL.to_errno(); };
     if context.is_null() { return EINVAL.to_errno(); }
@@ -267,7 +266,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_session_admit_rust(
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_session_inspect_rust(
     id:u16,generation:u64,lifetime:u64,handle:u16,epoch:u64,
-    inspect:Option<unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,*mut c_void)->i32>,context:*mut c_void,
+    inspect:Option<unsafe extern "C" fn(*const super::sle_data_credit::CreditSnapshot,u64,*mut c_void)->i32>,context:*mut c_void,
 )->i32 {
     let Some(inspect)=inspect else {return EINVAL.to_errno();};
     if context.is_null(){return EINVAL.to_errno();}

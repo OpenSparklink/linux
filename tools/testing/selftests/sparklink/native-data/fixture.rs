@@ -149,8 +149,8 @@ fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
 fn link(owner:&Owner,handle:u16,kind:u32){owner.host.lock().links.observe(&LinkEvidence{kind,status:0,handle:handle as u32,role:1,address_type:0,address:[1;6],reserved:[0;2]});}
 fn receive(id:u16,g:u64,bytes:&[u8])->i32{unsafe{under_test::sparklink_native_receive_rust(id,g,bytes.as_ptr(),bytes.len())}}
 fn send(id:u16,g:u64,life:u64,handle:u16,bytes:&[u8])->i32{unsafe{under_test::sparklink_native_acb_send_rust(id,g,life,handle,bytes.as_ptr(),bytes.len())}}
-fn take(id:u16,g:u64,life:u64,handle:u16,capacity:usize)->(i32,Vec<u8>){let mut out=vec![0;capacity];let mut n=0;
- let ret=unsafe{under_test::sparklink_native_acb_take_rust(id,g,life,handle,out.as_mut_ptr(),capacity,&mut n)};out.truncate(n);(ret,out)}
+fn take(id:u16,g:u64,life:u64,handle:u16,capacity:usize)->(i32,Vec<u8>){let mut out=vec![0;capacity];let mut n=0;let mut security_revision=0;
+ let ret=unsafe{under_test::sparklink_native_acb_take_rust(id,g,life,handle,out.as_mut_ptr(),capacity,&mut n,&mut security_revision)};out.truncate(n);(ret,out)}
 fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(handle>>8)as u8,payload.len()as u8,(payload.len()>>8)as u8];p.extend_from_slice(payload);p}
 #[test] fn actual_receive_binds_controller_generation_lifetime_and_preserves_fifo(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
@@ -269,13 +269,13 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
 // Test argument adapter only: no alternative send/credit/transition logic.
 unsafe fn test_guarded(id:u16,generation:u64,lifetime:u64,handle:u16,boundary:u8,
  data:*const u8,length:usize,epoch:u64,
- consent:Option<unsafe extern "C" fn(*mut c_void,unsafe extern "C" fn(*mut c_void)->i32,*mut c_void)->i32>,scope:*mut c_void)->i32 {
+ consent:Option<unsafe extern "C" fn(*mut c_void,u64,unsafe extern "C" fn(*mut c_void)->i32,*mut c_void)->i32>,scope:*mut c_void)->i32 {
  let mut wait=0;
  unsafe{under_test::sparklink_native_acb_send_deferred_rust(id,generation,lifetime,handle,boundary,
   data,length,epoch,consent,scope,&mut wait)}
 }
 struct ConsentScope { live: bool }
-unsafe extern "C" fn consent_scope(scope:*mut c_void,submit:unsafe extern "C" fn(*mut c_void)->i32,context:*mut c_void)->i32 {
+unsafe extern "C" fn consent_scope(scope:*mut c_void,_revision:u64,submit:unsafe extern "C" fn(*mut c_void)->i32,context:*mut c_void)->i32 {
  let scope=unsafe{&*scope.cast::<ConsentScope>()};
  if !scope.live {-125} else {unsafe{submit(context)}}
 }
@@ -407,7 +407,7 @@ fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut
  a.stop_sessions(-19);b.stop_sessions(-19);
 }
 
-unsafe extern "C" fn actual_admission_callback(context:*mut c_void)->i32 {
+unsafe extern "C" fn actual_admission_callback(context:*mut c_void,_revision:u64)->i32 {
  let count=unsafe{&mut *context.cast::<usize>()};
  let owner=OWNERS.with(|o|o.borrow()[0].clone());
  assert!(owner.host.0.try_borrow_mut().is_err());
@@ -499,7 +499,7 @@ fn actual_fragment_entry_uses_individual_credit_and_rejects_invalid_pb() {
  assert_eq!(call(3,&mut scope),-13);
 }
 
-unsafe extern "C" fn actual_inspection_callback(value:*const sle_data_credit::CreditSnapshot,context:*mut c_void)->i32 {
+unsafe extern "C" fn actual_inspection_callback(value:*const sle_data_credit::CreditSnapshot,_revision:u64,context:*mut c_void)->i32 {
  let snapshot=unsafe{&*value};let count=unsafe{&mut *context.cast::<usize>()};
  let owner=OWNERS.with(|o|o.borrow()[0].clone());
  assert!(owner.host.0.try_borrow_mut().is_err()&&owner.data.0.try_borrow_mut().is_err()&&owner.schedule_gate.0.try_borrow_mut().is_err());
@@ -691,4 +691,37 @@ fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u6
  a.commands.borrow_mut().clear();
  assert_eq!(a.host.lock().link_snapshot().2[0].unwrap().security_revision,2);
  assert_eq!(b.host.lock().link_snapshot().2[0].unwrap().security_revision,1);
+}
+
+#[test] fn acb_security_revision_is_frozen_before_take_and_never_crosses_pb_reassembly() {
+ let(a,_)=setup();link(&a,0,1);
+ assert_eq!(receive(0,7,&acb(0,b"old")),0);
+ assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,1])),0);
+ let mut out=[0;64];let mut n=0;let mut revision=0;
+ assert_eq!(unsafe{under_test::sparklink_native_acb_take_rust(0,7,1,0,out.as_mut_ptr(),64,&mut n,&mut revision)},0);
+ assert_eq!((revision,&out[..n]),(1,&b"old"[..]));
+ assert_eq!(receive(0,7,&acb(0x1000,b"prefix")),0);
+ assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,0])),0);
+ assert_eq!(receive(0,7,&acb(0x3000,b"old continuation")),0);
+ assert_eq!(take(0,7,1,0,64).0,-11);
+ assert_eq!(a.data.lock().dropped,1);
+ assert_eq!(receive(0,7,&acb(0,b"current")),0);
+ assert_eq!(unsafe{under_test::sparklink_native_acb_take_rust(0,7,1,0,out.as_mut_ptr(),64,&mut n,&mut revision)},0);
+ assert_eq!((revision,&out[..n]),(3,&b"current"[..]));
+}
+struct RevisionReceipt { observed:u64, result:i32 }
+unsafe extern "C" fn revision_consent(scope:*mut c_void,revision:u64,submit:unsafe extern "C" fn(*mut c_void)->i32,context:*mut c_void)->i32 {
+ let scope=unsafe{&mut *scope.cast::<RevisionReceipt>()};scope.observed=revision;
+ if scope.result!=0 {scope.result} else {unsafe{submit(context)}}
+}
+#[test] fn actual_atomic_submit_supplies_current_receipt_and_rejection_keeps_prior_credit() {
+ let(a,_)=setup();link(&a,0,1);let bytes=b"prepared";
+ let mut scope=RevisionReceipt{observed:0,result:0};
+ assert_eq!(unsafe{test_guarded(0,7,1,0,0,bytes.as_ptr(),bytes.len(),1,Some(revision_consent),(&mut scope as *mut RevisionReceipt).cast())},0);
+ assert_eq!(scope.observed,1);
+ a.host.lock().security_receipt(0).unwrap();scope.result=-13;
+ assert_eq!(unsafe{test_guarded(0,7,1,0,0,bytes.as_ptr(),bytes.len(),1,Some(revision_consent),(&mut scope as *mut RevisionReceipt).cast())},-13);
+ assert_eq!(scope.observed,2);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
+ assert_eq!(TX.with(|t|t.borrow().len()),1);
 }

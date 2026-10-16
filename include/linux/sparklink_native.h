@@ -148,7 +148,8 @@ int sparklink_native_receive(u16 id, u64 generation, const u8 *data, size_t leng
 int sparklink_native_acb_send(u16 id, u64 generation, u64 lifetime, u16 handle,
 			    const u8 *data, size_t length);
 int sparklink_native_acb_take(u16 id, u64 generation, u64 lifetime, u16 handle,
-			    u8 *data, size_t capacity, size_t *length);
+			      u8 *data, size_t capacity, size_t *length,
+			      u64 *security_revision);
 int sparklink_native_acb_limits(u16 id, u64 generation, u64 lifetime, u16 handle,
 			      u16 *maximum);
 
@@ -191,6 +192,9 @@ void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
 enum sparklink_acb_wait { SPARKLINK_ACB_WAIT_NONE = 0, SPARKLINK_ACB_WAIT_CREDIT = 1,
                          SPARKLINK_ACB_WAIT_RETRY = 2 };
 int sparklink_native_acb_send_deferred(u16 id, u64 generation, u64 lifetime,
-    u16 handle, u8 boundary, const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *, int (*)(void *), void *), void *scope, u32 *wait);
+				       u16 handle, u8 boundary, const u8 *data,
+				       size_t length, u64 epoch,
+				       int (*consent)(void *, u64,
+						      int (*)(void *), void *),
+				       void *scope, u32 *wait);
 #endif

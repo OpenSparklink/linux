@@ -12,7 +12,7 @@ import tempfile
 
 
 def function(source, name):
-    m = re.search(r'^static [^{;\n]+?\b'+name+r'\([^;{]*\)\s*\{', source, re.M)
+    m = re.search(r'^static [^{;]+?\b'+name+r'\([^;{]*\)\s*\{', source, re.M)
     assert m
     i=m.end();depth=1
     while depth:
@@ -35,10 +35,11 @@ def run(output):
     structs+=re.search(r'struct sl_tx_status_read \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sparklink_credit_snapshot \{[^}]+\};',(root/'include/linux/sparklink_channel.h').read_text())[0]
     structs+=re.search(r'struct sl_receive \{[^}]+\};',source)[0]
+    for name in ['sl_poll_read','sl_security_probe']:structs+=re.search(r'struct '+name+r' \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sl_admission \{[^}]+\};',source)[0]
     defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX','SL_CHANNEL_TX'])
     defines+='\n'+re.search(r'enum sparklink_acb_wait \{[^}]+\};',(root/'include/linux/sparklink_native.h').read_text())[0]
-    bodies='\n'.join(function(source,n) for n in ['sl_dynamic_publish','sl_dynamic_status','sl_dynamic_grant','sl_dynamic_open','sl_dynamic_closing','sl_dynamic_receive','sl_dynamic_consent','sl_progress_event','sl_bound_channel','sl_permits','sl_session_submit','sl_send_result','sl_send','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll','sl_tx_access','sl_publish_binding','sl_view_access','sl_read_info','sl_read_tx_status','sl_read_session_status','sl_ioctl','sl_socket_fault','sl_fail_channel','sl_retire_tx','sl_expire_queued_channel','sl_transmit_channel','sl_transmit_batch','sl_shift_rejection','sl_dynamic_work','sl_next_schedule'])
+    bodies='\n'.join(function(source,n) for n in ['sl_grant_current','sl_security_check','sl_security_probe','sl_dynamic_publish','sl_dynamic_status','sl_dynamic_grant','sl_dynamic_open','sl_dynamic_closing','sl_dynamic_receive','sl_dynamic_consent','sl_progress_event','sl_bound_channel','sl_permits','sl_session_submit','sl_send_result','sl_send','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll_admit','sl_poll','sl_tx_access','sl_publish_binding','sl_view_access','sl_read_info','sl_read_tx_status','sl_read_session_status','sl_ioctl','sl_socket_fault','sl_fail_channel','sl_retire_tx','sl_expire_queued_channel','sl_transmit_channel','sl_transmit_batch','sl_shift_rejection','sl_dynamic_work','sl_next_schedule'])
     fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
     with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
         tmp=Path(directory);(tmp/'test.c').write_text(fixture)

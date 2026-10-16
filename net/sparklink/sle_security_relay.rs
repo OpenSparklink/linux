@@ -98,6 +98,22 @@ unsafe extern "C" fn sl_security_owner_destroy_rust(raw: *mut c_void) {
     drop(unsafe { KBox::from_raw(raw.cast::<Owner>()) });
 }
 
+/// Internal authority read, never a caller-supplied security grade. Host/gate
+/// guards already freeze link/lease and receipt revision; caller retains the
+/// physical Session kref. No allocation, wait, Host reentry or copied trust.
+#[no_mangle]
+unsafe extern "C" fn sl_security_owner_level_rust(raw: *mut c_void, revision: u64) -> i32 {
+    if raw.is_null() || revision == 0 { return EACCES.to_errno(); }
+    let owner = unsafe { &*raw.cast::<Owner>() };
+    let state = owner.state.lock();
+    if state.stopped { return EACCES.to_errno(); }
+    match &state.session {
+        Some(session) => session.security_observation(owner.identity, revision)
+            .map_or_else(|e| error(e).to_errno(), |s| s.level as i32),
+        None => 0,
+    }
+}
+
 /// Owning reference follows an internal command, not a caller's fd. Dropping
 /// it is nonblocking: final C free has no work join or Host callback.
 pub(crate) struct Command {

@@ -113,19 +113,25 @@ static void sl_connection_session_put(struct sl_connection_session *s){assert(s-
 static int sparklink_native_session_status(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch){
  assert(id==1&&generation==7&&lifetime==11&&handle==3&&epoch==1);return authority?status_error:-EACCES;
 }
-static int sparklink_native_session_admit(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,int (*callback)(void *),void *context){
+static u64 fixture_security_revision=1;
+static int fixture_security_level;
+static int sl_security_owner_level_rust(void *owner,u64 revision) {
+ (void)owner;assert(host_locked&&irq_disabled);
+ return revision==fixture_security_revision ? fixture_security_level : 0;
+}
+static int sparklink_native_session_admit(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,int (*callback)(void *,u64),void *context){
  int ret=sparklink_native_session_status(id,generation,lifetime,handle,epoch);if(ret)return ret;
  assert(!host_locked&&!irq_disabled);host_locked=true;irq_disabled=true;
- ret=callback(context);assert(!current_session->lock.held&&!current_session->channels[0].rx.lock.held);
+ ret=callback(context,fixture_security_revision);assert(!current_session->lock.held&&!current_session->channels[0].rx.lock.held);
  irq_disabled=false;host_locked=false;return ret;
 }
 static int sparklink_native_session_inspect(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,
- int (*callback)(const struct sparklink_credit_snapshot *,void *),void *context){
+ int (*callback)(const struct sparklink_credit_snapshot *,u64,void *),void *context){
  int ret=sparklink_native_session_status(id,generation,lifetime,handle,epoch);if(ret)return ret;
  const struct sparklink_credit_snapshot snapshot={.maximum=254,.capacity=5,.outstanding=3,
   .connection_debt=2,.peak_reserved=5,.pool_exhaustions=17};
  assert(!host_locked&&!irq_disabled);host_locked=true;irq_disabled=true;
- ret=callback(&snapshot,context);assert(!current_session->lock.held);
+ ret=callback(&snapshot,fixture_security_revision,context);assert(!current_session->lock.held);
  irq_disabled=false;host_locked=false;return ret;
 }
 static void route(struct sl_connection_session *,unsigned int,unsigned int,const char *);
@@ -174,7 +180,7 @@ static int fragment_submit(void *context){
  packet_budget--;return 0;
 }
 static int fixture_fragment_send(u16 id,u64 generation,u64 lifetime,u16 handle,u8 boundary,
- const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope){
+ const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,u64,int (*)(void *),void *),void *scope){
  struct sl_submit_scope *permission=scope;int result;unsigned long flags;
  assert(id==permission->session->controller&&generation==permission->session->generation);
  assert(lifetime==permission->session->lifetime&&handle==permission->session->handle&&epoch==permission->session->epoch);
@@ -184,7 +190,7 @@ static int fixture_fragment_send(u16 id,u64 generation,u64 lifetime,u16 handle,u
  if(expire_before_fragment)jiffies=((struct sl_fragment_cursor *)permission->operation->cb)->deadline;
  /* Host/data/gate and credit are dependencies here, separately tested in Rust.
   * Invoke the actual Session consent before accepting a fragment. */
- flags=irq_disabled;irq_disabled=true;result=consent(scope,fragment_submit,NULL);irq_disabled=flags;
+ flags=irq_disabled;irq_disabled=true;result=consent(scope,fixture_security_revision,fragment_submit,NULL);irq_disabled=flags;
  if(!result){assert(fragment_count<64&&fragment_bytes_count+length<=sizeof(fragment_bytes));
   fragment_pb[fragment_count]=boundary;fragment_size[fragment_count++]=length;
   memcpy(fragment_bytes+fragment_bytes_count,bytes,length);fragment_bytes_count+=length;
@@ -212,16 +218,16 @@ static int control_submit(void *context){
  return 0;
 }
 static int fixture_control_send(u16 id,u64 generation,u64 lifetime,u16 handle,
- const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope){
+ const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,u64,int (*)(void *),void *),void *scope){
  int result=sparklink_native_session_status(id,generation,lifetime,handle,epoch);
  if(result)return result;
  struct control_submission submission={bytes,length};
  assert(!host_locked&&!irq_disabled);host_locked=true;irq_disabled=true;
- result=consent(scope,control_submit,&submission);
+ result=consent(scope,fixture_security_revision,control_submit,&submission);
  assert(!current_session->lock.held);host_locked=false;irq_disabled=false;return result;
 }
 static int sparklink_native_acb_send_deferred(u16 id,u64 generation,u64 lifetime,u16 handle,u8 boundary,
- const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope,u32 *wait){
+ const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,u64,int (*)(void *),void *),void *scope,u32 *wait){
  /* Configurable Runtime/USB dependency. Classification is tested on actual
   * Rust reserve/commit separately, not proven by this C fixture. */
  bool control=!boundary&&length>1&&bytes[0]==2&&bytes[1]==0;
@@ -238,7 +244,7 @@ static int one_transmit(struct sl_connection_session *s,struct sl_basic_channel 
 }
 
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
-static void route(struct sl_connection_session *s,unsigned int tcid,unsigned int pi,const char *message){u8 wire[300];int n=sl_channel_frame_encode(wire,sizeof(wire),tcid,pi,(const u8 *)message,strlen(message));assert(n>0);sl_route(s,wire,n);assert(!s->lock.held&&!irq_disabled);}
+static void route(struct sl_connection_session *s,unsigned int tcid,unsigned int pi,const char *message){u8 wire[300];int n=sl_channel_frame_encode(wire,sizeof(wire),tcid,pi,(const u8 *)message,strlen(message));assert(n>0);sl_route(s,wire,n,fixture_security_revision);assert(!s->lock.held&&!irq_disabled);}
 static void init_grant(struct sl_connection_session *s,struct sock *sk,unsigned int directions){
  struct sl_basic_channel *c=&s->channels[sl_sk(sk)->channel_slot];
  struct sl_grant_scope scope={.controller=s->controller,.generation=s->generation,.lifetime=s->lifetime,.epoch=s->epoch,.handle=s->handle,.local_tcid=c->local_tcid,.remote_tcid=c->remote_tcid,.pi=c->pi};
@@ -282,19 +288,19 @@ static void direction_tests(void){
  route(&s,31,241,"forbidden RX");assert(s.channels[0].rx.qlen==0&&s.channels[0].rx_dropped==1);
  assert(sl_recvmsg(&sock,&msg,100,0)==-EACCES&&wait_calls==0);
  init_grant(&s,sk,SL_GRANT_RX);
- struct sl_admission access={.session=&s,.channel=&s.channels[0]};assert(sl_tx_access(&access)==-EACCES);
+ struct sl_admission access={.session=&s,.channel=&s.channels[0]};assert(sl_tx_access(&access,fixture_security_revision)==-EACCES);
  assert(sl_poll(NULL,&sock,NULL)==0);
- struct sl_admission admission={&s,&s.channels[0],alloc_skb(1,0),1};assert(sl_admit(&admission)==-EACCES&&admission.skb);kfree_skb(admission.skb);
+ struct sl_admission admission={&s,&s.channels[0],alloc_skb(1,0),1};assert(sl_admit(&admission,fixture_security_revision)==-EACCES&&admission.skb);kfree_skb(admission.skb);
  struct sl_submit_scope scope={.session=&s,.channel=&s.channels[0]};unsigned int before=submitted;irq_disabled=true;
- assert(sl_session_submit(&scope,atomic_submit,&s)==-EACCES&&submitted==before);
- scope.channel=NULL;assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==before+1);irq_disabled=false;
+ assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==-EACCES&&submitted==before);
+ scope.channel=NULL;assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==0&&submitted==before+1);irq_disabled=false;
  route(&s,31,241,"allowed RX");assert(sl_poll(NULL,&sock,NULL)==(EPOLLIN|EPOLLRDNORM));assert(sl_recvmsg(&sock,&msg,100,0)==10);
  for(unsigned int field=0;field<8;field++){
   init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);struct sl_grant_scope *g=&socket_binding.grant.scope;
   switch(field){case 0:g->controller++;break;case 1:g->generation++;break;case 2:g->lifetime++;break;case 3:g->epoch++;break;case 4:g->handle++;break;case 5:g->local_tcid++;break;case 6:g->remote_tcid++;break;default:g->pi++;break;}
   assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);
   assert(sl_poll(NULL,&sock,NULL)==(EPOLLERR|EPOLLHUP));
-  irq_disabled=true;scope.channel=&s.channels[0];assert(sl_session_submit(&scope,atomic_submit,&s)==-EACCES);irq_disabled=false;
+  irq_disabled=true;scope.channel=&s.channels[0];assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==-EACCES);irq_disabled=false;
  }
  init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);socket_binding.grant.security=1;
  assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);
@@ -330,22 +336,22 @@ static void two_channel_tests(void)
  assert(sl_binding_attach(&s.channels[1].binding));init_grant(&s,&service.sk,3);
  u8 bytes[]={2,3,254,0,1,2},wire[10];
  assert(sl_channel_frame_encode(wire,sizeof(wire),10,0,bytes,sizeof(bytes))==10);
- sl_route(&s,wire,sizeof(wire));route(&s,31,241,"user first");
+ sl_route(&s,wire,sizeof(wire),fixture_security_revision);route(&s,31,241,"user first");
  assert(s.channels[0].rx.qlen==1&&s.channels[1].rx.qlen==1);
  assert(sl_recvmsg(&ss,&msg,100,0)==6&&!memcmp(msg.bytes,bytes,6));
  assert(s.channels[0].rx.qlen==1&&s.channels[1].rx.qlen==0);
- for(unsigned int i=0;i<SL_CHANNEL_RX;i++)sl_route(&s,wire,sizeof(wire));
- sl_route(&s,wire,sizeof(wire));assert(s.channels[1].rx.qlen==SL_CHANNEL_RX&&s.channels[1].rx_dropped==1);
+ for(unsigned int i=0;i<SL_CHANNEL_RX;i++)sl_route(&s,wire,sizeof(wire),fixture_security_revision);
+ sl_route(&s,wire,sizeof(wire),fixture_security_revision);assert(s.channels[1].rx.qlen==SL_CHANNEL_RX&&s.channels[1].rx_dropped==1);
  route(&s,31,241,"user second");assert(s.channels[0].rx.qlen==2);
  assert(sl_recvmsg(&us,&msg,100,0)==10&&!memcmp(msg.bytes,"user first",10));
  assert(sl_recvmsg(&us,&msg,100,0)==11&&!memcmp(msg.bytes,"user second",11));
  struct sl_submit_scope service_scope={.session=&s,.channel=&s.channels[1]},user_scope={.session=&s,.channel=&s.channels[0]};
  sl_binding_retire(&s.channels[1].binding);s.channels[1].sk=NULL;
  irq_disabled=true;
- assert(sl_session_submit(&service_scope,atomic_submit,&s)==-ECANCELED);
- assert(sl_session_submit(&user_scope,atomic_submit,&s)==0);
+ assert(sl_session_submit(&service_scope,fixture_security_revision,atomic_submit,&s)==-ECANCELED);
+ assert(sl_session_submit(&user_scope,fixture_security_revision,atomic_submit,&s)==0);
  irq_disabled=false;
- sl_route(&s,wire,sizeof(wire));assert(s.channels[1].rx_dropped==2);
+ sl_route(&s,wire,sizeof(wire),fixture_security_revision);assert(s.channels[1].rx_dropped==2);
  route(&s,31,241,"after service close");
  assert(sl_recvmsg(&us,&msg,100,0)==19&&!memcmp(msg.bytes,"after service close",19));
  assert(sl_poll(NULL,&us,NULL)==(EPOLLOUT|EPOLLWRNORM));
@@ -442,7 +448,7 @@ static void fragment_worker_tests(void){
  assert(sl_binding_start_tx(&s.channels[0].binding));
  struct sl_submit_scope expired_scope={.session=&s,.channel=&s.channels[0],.operation=deadline_skb};
  jiffies=5042;irq_disabled=true;before=submitted;
- assert(sl_session_submit(&expired_scope,atomic_submit,&s)==-ETIMEDOUT&&submitted==before);
+ assert(sl_session_submit(&expired_scope,fixture_security_revision,atomic_submit,&s)==-ETIMEDOUT&&submitted==before);
  irq_disabled=false;sl_retire_tx(&s);assert(!allocations);
  /* A queue-only timeout uses actual socket error publication and retains the
   * second Channel/Session. Deadline comes from actual admission, not dequeue. */
@@ -451,7 +457,7 @@ static void fragment_worker_tests(void){
  s.channels[1].sk=&bindings[1].sk;assert(sl_binding_attach(&s.channels[1].binding));
  struct sk_buff *queued=alloc_skb(4,0);skb_put(queued,4);
  struct sl_admission admission={&s,&s.channels[0],queued,4};
- assert(!sl_admit(&admission));
+ assert(!sl_admit(&admission,fixture_security_revision));
  assert(((struct sl_fragment_cursor *)queued->cb)->deadline==5042);
  jiffies=5042;assert(!one_transmit(&s,&s.channels[0]));
  assert(bindings[0].sk.sk_err==ETIMEDOUT&&bindings[0].sk.sk_shutdown==SHUTDOWN_MASK);
@@ -565,10 +571,10 @@ static void identifier_zero_request_tests(void){
  sl_channel_start(&s.progress, 249, 254);
  assert(sl_channel_cap_request(request,sizeof(request),0)==8);
  assert(sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,request,8)==12);
- sl_route(&s,frame,sizeof(frame));assert(s.response_pending&&s.response_id==0&&s.progress.phase==SL_CH_NEGOTIATING);
- sl_route(&s,frame,sizeof(frame));assert(s.response_pending&&s.response_id==0); /* same pending request */
+ sl_route(&s,frame,sizeof(frame),fixture_security_revision);assert(s.response_pending&&s.response_id==0&&s.progress.phase==SL_CH_NEGOTIATING);
+ sl_route(&s,frame,sizeof(frame),fixture_security_revision);assert(s.response_pending&&s.response_id==0); /* same pending request */
  request[1]=7;assert(sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,request,8)==12);
- sl_route(&s,frame,sizeof(frame));assert(s.progress.phase==SL_CH_FAILED); /* existing bounded single-query contract */
+ sl_route(&s,frame,sizeof(frame),fixture_security_revision);assert(s.progress.phase==SL_CH_FAILED); /* existing bounded single-query contract */
 }
 static void negotiated_limit_tests(void){
  struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
@@ -578,17 +584,17 @@ static void negotiated_limit_tests(void){
  u8 signal[16],wire[255],payload[250]={0};
  assert(sl_channel_cap_response(signal,sizeof(signal),SL_CHANNEL_CAP_IDENTIFIER,SL_CHANNEL_CAP_QUERY,2042,254)==16);
  assert(sl_channel_frame_encode(wire,sizeof(wire),SL_CHANNEL_CMTC,0,signal,16)==20);
- sl_route(&s,wire,20); /* Actual route -> locked publication -> per-channel limit. */
+ sl_route(&s,wire,20,fixture_security_revision); /* Actual route -> locked publication -> per-channel limit. */
  assert(s.progress.phase==SL_CH_OPEN&&s.progress.mtu==2042&&s.progress.mps==254);
  assert(s.channels[0].mtu==249&&s.channels[0].mps==254&&s.channels[1].mtu==250&&s.channels[1].mps==254);
  struct sl_admission too_large={&s,&s.channels[0],alloc_skb(255,0),250};
- assert(sl_admit(&too_large)==-EMSGSIZE&&too_large.skb&&s.channels[0].tx.qlen==0);kfree_skb(too_large.skb);
+ assert(sl_admit(&too_large,fixture_security_revision)==-EMSGSIZE&&too_large.skb&&s.channels[0].tx.qlen==0);kfree_skb(too_large.skb);
  struct sl_admission boundary={&s,&s.channels[0],alloc_skb(254,0),249};
- assert(sl_admit(&boundary)==0&&!boundary.skb&&s.channels[0].tx.qlen==1);skb_queue_purge(&s.channels[0].tx);
+ assert(sl_admit(&boundary,fixture_security_revision)==0&&!boundary.skb&&s.channels[0].tx.qlen==1);skb_queue_purge(&s.channels[0].tx);
  assert(sl_channel_frame_encode(wire,sizeof(wire),31,241,payload,250)==255);
- sl_route(&s,wire,255);assert(s.channels[0].rx.qlen==0&&s.channels[0].rx_dropped==1);
+ sl_route(&s,wire,255,fixture_security_revision);assert(s.channels[0].rx.qlen==0&&s.channels[0].rx_dropped==1);
  assert(sl_channel_frame_encode(wire,sizeof(wire),31,241,payload,249)==254);
- sl_route(&s,wire,254);assert(s.channels[0].rx.qlen==1);skb_queue_purge(&s.channels[0].rx);
+ sl_route(&s,wire,254,fixture_security_revision);assert(s.channels[0].rx.qlen==1);skb_queue_purge(&s.channels[0].rx);
  assert(allocations==0&&b.sk.sk_rmem_alloc==0);
 }
 static void dynamic_publication_tests(void){
@@ -613,7 +619,7 @@ static void dynamic_publication_tests(void){
 static int credit_blocked_submit(void *context){(void)context;return -EAGAIN;}
 static void route_signal(struct sl_connection_session *s,struct sl_channel_signal m){
  u8 bytes[32],frame[36];int n=sl_channel_signal_encode(bytes,sizeof(bytes),&m);assert(n>0);
- n=sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,bytes,n);assert(n>0);sl_route(s,frame,n);
+ n=sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,bytes,n);assert(n>0);sl_route(s,frame,n,fixture_security_revision);
 }
 static void dynamic_protocol_tests(void){
  struct sl_connection_session s;
@@ -630,9 +636,9 @@ static void dynamic_protocol_tests(void){
  authority=true;route_signal(&s,request);assert(c->negotiation.phase==SL_DYN_RESPONSE&&c->remote_tcid==0x95&&!app.grant.scope.lifetime);
  assert(sl_poll(NULL,&sock,NULL)==0&&!sl_permits(&s,c,SL_GRANT_TX));
  struct sl_dynamic_submit consent={.session=&s,.channel=c,.phase=SL_DYN_RESPONSE,.pdu_bytes=12};unsigned int before=submitted;
- irq_disabled=true;assert(sl_dynamic_consent(&consent,credit_blocked_submit,&s)==-EAGAIN);irq_disabled=false;
+ irq_disabled=true;assert(sl_dynamic_consent(&consent,fixture_security_revision,credit_blocked_submit,&s)==-EAGAIN);irq_disabled=false;
  assert(submitted==before&&c->negotiation.phase==SL_DYN_RESPONSE&&!app.grant.scope.lifetime);
- irq_disabled=true;assert(sl_dynamic_consent(&consent,atomic_submit,&s)==0);irq_disabled=false;
+ irq_disabled=true;assert(sl_dynamic_consent(&consent,fixture_security_revision,atomic_submit,&s)==0);irq_disabled=false;
  assert(c->negotiation.phase==SL_DYN_OPEN&&app.grant.scope.local_tcid==0x83&&app.grant.scope.remote_tcid==0x95&&app.grant.scope.epoch==1);
  assert(sock.state==SS_CONNECTED&&sl_poll(NULL,&sock,NULL)==(EPOLLOUT|EPOLLWRNORM));
  route(&s,0x95,241,"remote TCID is not local");route(&s,0x83,242,"wrong PI");assert(!c->rx.qlen);
@@ -642,7 +648,7 @@ static void dynamic_protocol_tests(void){
  route(&s,0x83,241,"late after logical close");assert(c->rx.qlen==1);
  struct msghdr message={0};assert(sl_recvmsg(&sock,&message,100,MSG_DONTWAIT)==12&&!memcmp(message.bytes,"dynamic peer",12));
  assert(sl_recvmsg(&sock,&message,100,MSG_DONTWAIT)==-ENOTCONN&&sl_poll(NULL,&sock,NULL)==EPOLLHUP);
- consent.phase=SL_DYN_CLOSE_RESPONSE;irq_disabled=true;assert(!sl_dynamic_consent(&consent,atomic_submit,&s));irq_disabled=false;
+ consent.phase=SL_DYN_CLOSE_RESPONSE;irq_disabled=true;assert(!sl_dynamic_consent(&consent,fixture_security_revision,atomic_submit,&s));irq_disabled=false;
  assert(c->negotiation.phase==SL_DYN_RETIRED&&sl_permits(&s,&s.channels[0],SL_GRANT_RX));
  skb_queue_purge(&c->rx);skb_queue_purge(&s.channels[0].rx);assert(!allocations);
  /* Reusing a peer TCID cannot bind a new authorized endpoint in this lifetime. */
@@ -651,7 +657,7 @@ static void dynamic_protocol_tests(void){
  memset(&app.grant,0,sizeof(app.grant));c->remote_tcid=0;c->binding=(struct sl_binding_progress){.bound=1};
  c->negotiation=(struct sl_dynamic_progress){.phase=SL_DYN_RESPONSE};consent.phase=SL_DYN_RESPONSE;
  sl_dynamic_detach(&c->negotiation);sl_binding_retire(&c->binding);before=submitted;
- irq_disabled=true;assert(sl_dynamic_consent(&consent,atomic_submit,&s)==-ECANCELED);irq_disabled=false;
+ irq_disabled=true;assert(sl_dynamic_consent(&consent,fixture_security_revision,atomic_submit,&s)==-ECANCELED);irq_disabled=false;
  assert(submitted==before&&!app.grant.scope.lifetime&&c->negotiation.phase==SL_DYN_REJECT);
  /* An already submitted request remains a physical obligation after detach.
   * Its late valid reply queues a real close, never a new application grant. */
@@ -659,7 +665,7 @@ static void dynamic_protocol_tests(void){
  sl_dynamic_detach(&c->negotiation);assert(c->negotiation.phase==SL_DYN_ABANDONED);
  struct sl_channel_signal response={.code=SL_CMTC_CONNECT_RSP,.identifier=5,.source=0x83,.destination=0x95};
  route_signal(&s,response);assert(c->negotiation.phase==SL_DYN_CLOSE&&c->negotiation.identifier==6&&!app.grant.scope.lifetime);
- consent.phase=SL_DYN_CLOSE;irq_disabled=true;assert(!sl_dynamic_consent(&consent,atomic_submit,&s));irq_disabled=false;
+ consent.phase=SL_DYN_CLOSE;irq_disabled=true;assert(!sl_dynamic_consent(&consent,fixture_security_revision,atomic_submit,&s));irq_disabled=false;
  response.code=SL_CMTC_CLOSE_RSP;response.identifier=6;route_signal(&s,response);
  assert(c->negotiation.phase==SL_DYN_RETIRED&&!app.grant.scope.lifetime);
  assert(sl_permits(&s,&s.channels[0],SL_GRANT_TX));
@@ -869,12 +875,66 @@ static void batch_worker_tests(void){
  /* Actual admission IDs are trace-only and do not replace deadline/grant checks. */
  init_batch(&s,&b[0]);unsigned int before=observed_queue[0];
  struct sl_admission a={&s,&s.channels[0],alloc_skb(4,0),4};skb_put(a.skb,4);
- assert(!sl_admit(&a)&&!a.skb&&observed_queue[0]==before+1);
+ assert(!sl_admit(&a,fixture_security_revision)&&!a.skb&&observed_queue[0]==before+1);
  assert(((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->observation==1);
  q=sl_tx_budget_begin(fixture_now_ns);before=observed_count;assert(!sl_transmit_batch(&s,&q));
  assert(observed_count==before+3&&observed_tx[before].stage==0&&observed_tx[before+1].stage==2&&observed_tx[before+2].stage==1);
  assert(observed_tx[before].sequence==1&&observed_tx[before+1].sequence==1&&observed_tx[before+2].sequence==1&&!allocations);
  fixture_now_ns=fragment_cost_ns=0;
+}
+/* Kernel/crypto/Host are visible dependencies. Exercise the actual C Grant,
+ * publication, syscall authorization, route and final USB-consent functions. */
+static void protected_grant_tests(void) {
+ struct sl_connection_session s;
+ struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready,.sk_error_report=data_ready,.sk_state_change=data_ready}};
+ struct sl_socket_binding other={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready},.channel_slot=1};
+ struct socket sock={.sk=&b.sk};struct msghdr msg={0};
+ init_receive(&s,&b.sk);fixture_security_revision=2;fixture_security_level=2;
+ assert(sl_grant_init_security(&b.grant,b.grant.scope,3,2,2,2));
+ struct sl_admission access={.session=&s,.channel=&s.channels[0]};
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&access));
+ u8 frame[32];int size=sl_channel_frame_encode(frame,sizeof(frame),31,241,(const u8 *)"old",3);
+ sl_route(&s,frame,size,1);assert(!s.channels[0].rx.qlen&&s.channels[0].rx_dropped==1);
+ sl_route(&s,frame,size,2);assert(s.channels[0].rx.qlen==1);
+ assert(sl_recvmsg(&sock,&msg,sizeof(msg.bytes),MSG_PEEK)==3&&s.channels[0].rx.qlen==1);
+ assert(sl_poll(NULL,&sock,NULL)&EPOLLOUT);
+ struct sl_submit_scope submit={.session=&s,.channel=&s.channels[0]};unsigned int before=submitted;
+ host_locked=true;irq_disabled=true;
+ assert(!sl_session_submit(&submit,2,atomic_submit,&s)&&submitted==before+1);
+ host_locked=false;irq_disabled=false;
+ fixture_security_level=1;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&access)==-EACCES);
+ assert(sl_recvmsg(&sock,&msg,sizeof(msg.bytes),MSG_DONTWAIT)==-EACCES&&s.channels[0].rx.qlen==1);
+ assert(sl_poll(NULL,&sock,NULL)==(EPOLLERR|EPOLLHUP));
+ fixture_security_level=2;fixture_security_revision=3;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&access)==-EACCES);
+ struct sl_security_probe probe={&s,&s.channels[0]};
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_security_probe,&probe)==-EACCES);
+ host_locked=true;irq_disabled=true;
+ assert(sl_session_submit(&submit,3,atomic_submit,&s)==-EACCES&&submitted==before+1);
+ host_locked=false;irq_disabled=false;
+ sl_fail_channel(&s,&s.channels[0],-EACCES);
+ assert(s.progress.phase==SL_CH_OPEN&&!s.channels[0].rx.qlen&&b.sk.sk_err==EACCES);
+ s.channels[1].local_tcid=s.channels[1].remote_tcid=10;s.channels[1].pi=0;
+ s.channels[1].mtu=249;s.channels[1].mps=254;s.channels[1].sk=&other.sk;
+ assert(sl_binding_attach(&s.channels[1].binding));init_grant(&s,&other.sk,3);
+ struct sl_admission peer={.session=&s,.channel=&s.channels[1]};
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&peer));
+ route(&s,10,0,"unaffected");assert(s.channels[1].rx.qlen==1);skb_queue_purge(&s.channels[1].rx);
+ assert(!allocations);
+ /* Binding mints only under the original Runtime admission, never a caller's
+  * supplied epoch or a copied local approval. Failure leaves it unpublished. */
+ b.session=NULL;init_receive(&s,&b.sk);s.channels[0].sk=NULL;
+ s.channels[0].binding=(struct sl_binding_progress){0};
+ struct sl_bind_admission binding={.sock=&sock,.binding=&b,.session=&s,.grant=b.grant};
+ binding.grant.security=2;fixture_security_revision=9;fixture_security_level=1;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&binding)==-EACCES);
+ assert(!b.session&&!s.channels[0].binding.bound&&b.sk.refs==1);
+ fixture_security_level=2;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&binding));
+ assert(b.grant.security==2&&b.grant.security_epoch==9&&b.session==&s);
+ s.channels[0].sk=NULL;b.session=NULL;sock_put(&b.sk);
+ fixture_security_revision=1;fixture_security_level=0;
 }
 int main(void){
  identifier_zero_request_tests();negotiated_limit_tests();
@@ -888,30 +948,31 @@ int main(void){
  for(unsigned int i=1;i<SL_CHANNEL_RX;i++)route(&s,SL_CHANNEL_CUTC,241,"bounded");
  route(&s,SL_CHANNEL_CUTC,241,"full queue");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==1);
  struct sl_submit_scope scope={.session=&s,.channel=&s.channels[0]};irq_disabled=true;
- assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==1);
+ assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==0&&submitted==1);
 
  irq_disabled=false;
  for(unsigned i=0;i<SL_CHANNEL_TX;i++) {
   struct sl_admission admission={&s,&s.channels[0],alloc_skb(1,0),1};
-  assert(sl_admit(&admission)==0&&admission.skb==NULL);
+  assert(sl_admit(&admission,fixture_security_revision)==0&&admission.skb==NULL);
  }
  struct sl_admission extra={&s,&s.channels[0],alloc_skb(1,0),1};
- assert(sl_admit(&extra)==-EAGAIN&&extra.skb);kfree_skb(extra.skb);
+ assert(sl_admit(&extra,fixture_security_revision)==-EAGAIN&&extra.skb);kfree_skb(extra.skb);
  struct sl_admission large={&s,&s.channels[0],alloc_skb(250,0),250};
- assert(sl_admit(&large)==-EMSGSIZE&&large.skb);kfree_skb(large.skb);
+ assert(sl_admit(&large,fixture_security_revision)==-EMSGSIZE&&large.skb);kfree_skb(large.skb);
  irq_disabled=true;
  sl_binding_retire(&s.channels[0].binding);
- assert(sl_session_submit(&scope,atomic_submit,&s)==-ECANCELED&&submitted==1);
+ assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==-ECANCELED&&submitted==1);
  irq_disabled=false;
  struct sl_admission closed={&s,&s.channels[0],alloc_skb(1,0),1};
- assert(sl_admit(&closed)==-ENOTCONN&&closed.skb);kfree_skb(closed.skb);
+ assert(sl_admit(&closed,fixture_security_revision)==-ENOTCONN&&closed.skb);kfree_skb(closed.skb);
  irq_disabled=true;
- scope.channel=NULL;assert(sl_session_submit(&scope,atomic_submit,&s)==0&&submitted==2);
- sl_channel_close(&s.progress);assert(sl_session_submit(&scope,atomic_submit,&s)==-ECANCELED&&submitted==2);irq_disabled=false;
+ scope.channel=NULL;assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==0&&submitted==2);
+ sl_channel_close(&s.progress);assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==-ECANCELED&&submitted==2);irq_disabled=false;
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
  batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
 	session_status_tests();
+ protected_grant_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

@@ -736,7 +736,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         let retired = if known { Some(data.reconcile(&links)) } else { None };
         let link = if known { links.iter().flatten().find(|link| link.handle == handle) } else { None };
         if let Some(link) = link {
-            let _ = data.receive(super::sle_native_data::Packet { lifetime: link.lifetime, handle, bytes }, boundary, now);
+            let _ = data.receive(super::sle_native_data::Packet { lifetime: link.lifetime, security_revision: link.security_revision, handle, bytes }, boundary, now);
         } else {
             data.dropped = data.dropped.saturating_add(1);
         }
@@ -785,6 +785,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
             receipt
         };
         super::sle_ingress::enqueue_rx(&owner,SleEvent::NativeSecurityInstallation{lifetime,security_revision,handle,event,status,enabled});
+        owner.kick_session_data(); // wake protected bindings even if ordinary event queue lost
         return 0;
     }
     if length > 260 { return PROTOCOL_ERROR; }
@@ -865,7 +866,7 @@ struct NativeTxTicket {
     handle: u16,
     length: usize,
     epoch: Option<u64>,
-    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
+    consent: Option<unsafe extern "C" fn(*mut c_void, u64, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
     scope: *mut c_void,
     attempted: Cell<bool>,
     submitted: Cell<bool>,
@@ -895,9 +896,9 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
     if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
     if !host.admits_data() { return -(kernel::bindings::EACCES as i32); }
     if ticket.epoch.is_some_and(|epoch| !host.grants.permits(epoch)) { return -(kernel::bindings::EACCES as i32); }
-    if !links.iter().flatten().any(|link| link.handle == ticket.handle && link.lifetime == ticket.lifetime) {
+    let Some(link) = links.iter().flatten().find(|link| link.handle == ticket.handle && link.lifetime == ticket.lifetime) else {
         return -(kernel::bindings::ESTALE as i32);
-    }
+    };
     if let Err(error) = data.credits.reserve(ticket.lifetime, ticket.handle, ticket.length) {
         ticket.credit_blocked.set(error == super::sle_data_credit::CreditError::WouldBlock);
         return super::sle_native_data::error(error).to_errno();
@@ -908,7 +909,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
     let result = if let Some(consent) = ticket.consent {
         // SAFETY: scope belongs to the live session worker; consent holds its
         // state lock through the same prepared atomic queue operation.
-        unsafe { consent(ticket.scope, submit.unwrap(), context) }
+        unsafe { consent(ticket.scope, link.security_revision, submit.unwrap(), context) }
     } else { unsafe { submit.unwrap()(context) } };
     if result == 0 {
         ticket.submitted.set(true); // USB queued; only genuine NOCP pays debt.
@@ -934,7 +935,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
 pub(crate) unsafe extern "C" fn sparklink_native_acb_send_deferred_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, boundary: u8,
     data: *const u8, length: usize, epoch: u64,
-    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
+    consent: Option<unsafe extern "C" fn(*mut c_void, u64, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
     scope: *mut c_void, wait: *mut u32,
 ) -> i32 {
     if consent.is_none() || scope.is_null() || wait.is_null() { return EINVAL.to_errno(); }
@@ -944,7 +945,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_deferred_rust(
 }
 unsafe fn native_acb_send(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize, boundary: u8,
-    epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void, wait: *mut u32,
+    epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, u64, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void, wait: *mut u32,
 ) -> i32 {
     // SAFETY: optional internal output lives throughout this synchronous call.
     // Early transport/identity visibility EAGAIN is a finite retry, never credit.
@@ -1000,9 +1001,9 @@ unsafe fn native_acb_send(
 #[no_mangle]
 pub(crate) unsafe extern "C" fn sparklink_native_acb_take_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16,
-    data: *mut u8, capacity: usize, length: *mut usize,
+    data: *mut u8, capacity: usize, length: *mut usize, security_revision: *mut u64,
 ) -> i32 {
-    if data.is_null() || length.is_null() { return EINVAL.to_errno(); }
+    if data.is_null() || length.is_null() || security_revision.is_null() { return EINVAL.to_errno(); }
     let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     let host = owner.host.lock();
     let (_, known, links) = host.link_snapshot();
@@ -1022,6 +1023,6 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_take_rust(
     // SAFETY: caller provides writable, disjoint kernel data/length buffers.
     // Capacity was checked without consuming on EMSGSIZE; packet owns bytes.
     unsafe { core::ptr::copy_nonoverlapping(packet.bytes.as_ptr(), data, packet.bytes.len());
-        *length = packet.bytes.len(); }
+        *length = packet.bytes.len(); *security_revision = packet.security_revision; }
     0
 }

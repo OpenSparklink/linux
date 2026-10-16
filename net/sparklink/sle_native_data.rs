@@ -10,6 +10,7 @@ pub(crate) const MAXIMUM: usize = 2047;
 
 pub(crate) struct Packet {
     pub(crate) lifetime: u64,
+    pub(crate) security_revision: u64,
     pub(crate) handle: u16,
     pub(crate) bytes: KVec<u8>,
 }
@@ -61,6 +62,11 @@ impl NativeData {
         let Some(index) = existing else {
             self.dropped = self.dropped.saturating_add(1); return Err(EINVAL);
         };
+        if self.partial[index].as_ref().unwrap().0.security_revision != packet.security_revision {
+            self.partial[index] = None;
+            self.dropped = self.dropped.saturating_add(1);
+            return Err(EINVAL);
+        }
         let current = self.partial[index].as_mut().unwrap();
         if current.0.bytes.len() + packet.bytes.len() > MAXIMUM {
             self.partial[index] = None;

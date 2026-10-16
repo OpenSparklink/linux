@@ -1239,9 +1239,11 @@ struct sle_link_snapshot {
  * lifetime-bound0011 initial encryption-on, NOT Agent/identity/trusted Grant.
  * mode4 additionally requires the original author's explicit comparison-code
  * confirmation before DH proof. state11 reports this installed mechanism;
- * daemon identity/Agent integration, protected Grant and Bond remain absent.
- * Full security facade remains EOPNOTSUPP. Client explicitly disconnects after
- * this limited exchange. Revoke/Down invalidates it and never refunds debt.
+ * userspace Agent policy is separate from this historical result. Current
+ * facts come from CONNECTION_SECURITY; fixed socket Grants freeze/check their
+ * security epoch. Neither operation result nor Grant establishes Bond.
+ * Legacy global security facade remains EOPNOTSUPP. Same-life re-pairing has
+ * no qualified barrier and is rejected. Revoke/Down never refunds debt.
  */
 #define SLE_SECURITY_CAPABILITY_ONLY 1U
 /* Experimental no-entry/no-MITM/no-Bond candidate key agreement. state8 means
@@ -1253,7 +1255,8 @@ struct sle_link_snapshot {
  * installation. state9 is observed UNAUTHENTICATED encryption, never Agent
  * approval, authenticated peer identity, trusted Grant or Bond. */
 #define SLE_SECURITY_UNAUTHENTICATED_ENCRYPTION 3U
-/* Explicit privileged numeric-comparison mechanism, no daemon UI/Grant/Bond.
+/* Explicit privileged numeric-comparison mechanism; Agent UI/policy belongs
+ * to userspace, no Bond or arbitrary trusted flag.
  * flags8 marks a live comparison prompt; flags16 local confirmation,32 real
  * peer proof,64 installed numeric mechanism. state11 requires all actual
  * protocol/confirmation/installation stages, never an arbitrary trust flag. */

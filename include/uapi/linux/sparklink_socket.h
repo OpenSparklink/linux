@@ -12,7 +12,14 @@
  * actual USB submission; accepted physical obligations are retained.
  * directions is TX, RX, or TX|RX. Forbidden send/recv returns EACCES;
  * poll advertises only granted readiness. CMTC belongs to Session.
- * Current basic mode only accepts security=NONE; protected requests reject.
+ * Fixed channels accept NONE, ENCRYPTED or AUTHENTICATED below. Kernel
+ * mints a frozen per-lifetime security epoch from the current physical Session,
+ * not a caller supplied or cached grade. ENCRYPTED needs level1 or2;
+ * AUTHENTICATED needs the explicitly confirmed numeric level2 mechanism.
+ * These requirements do not assert a named identity, policy authorization or
+ * Bond. Off/rekey/revocation permanently invalidates an old protected fd;
+ * each software admission, actual USB commit and RX dequeue checks authority.
+ * ACB receipt epochs also reject old RX and cross-epoch PB reassembly.
  * Fixed basic channels: CUTC local/remote TCID31 with USER_PI, or SLE SMTC
  * local/remote TCID10 with PI0. Each has one independent binding per physical
  * connection lifetime. Final close retires only that channel; same-lifetime
@@ -48,7 +55,7 @@ struct sockaddr_sparklink_dynamic {
 #define SPARKLINK_SOCKET_SECURITY_NONE 0
 #define SPARKLINK_SOCKET_SECURITY_ENCRYPTED 1
 #define SPARKLINK_SOCKET_SECURITY_AUTHENTICATED 2
-/* Protected security requirements are defined but currently unsupported. */
+/* Dynamic protected modes remain unsupported; no implicit downgrade. */
 #define SPARKLINK_SOCKET_USER_PI 241
 /* Read-only delegated socket snapshot. No lease token or trusted security
  * projection. Success requires current Runtime authorization and completed

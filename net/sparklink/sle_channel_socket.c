@@ -129,6 +129,26 @@ static int sl_permits(struct sl_connection_session *s, struct sl_basic_channel *
 		(direction == SL_GRANT_RX && c->peer_closed)) &&
 	       sl_grant_permits(&sl_sk(c->sk)->grant, scope, direction);
 }
+/* Caller holds Runtime Host/data/gate then Session. Owner reads never take
+ * Host or the Session table mutex. Management/physical retirement closes the
+ * outer authority before stopping Owner, so no check-to-submit window opens. */
+static int sl_grant_current(struct sl_connection_session *s,
+			    const struct sl_channel_grant *grant, u64 revision)
+{
+	int level;
+	if (!grant->security)
+		return 0;
+	level = sl_security_owner_level_rust(s->security, revision);
+	return level >= 0 && sl_grant_security_permits(grant, revision, level) ?
+		       0 :
+		       -EACCES;
+}
+static int sl_security_check(struct sl_connection_session *s,
+			     struct sl_basic_channel *c, u64 revision)
+{
+	return c->sk ? sl_grant_current(s, &sl_sk(c->sk)->grant, revision) :
+		       -ENOTCONN;
+}
 /* Pending setup has no grant yet. Closing/terminal channels never regain data
  * permission even while their protocol cleanup remains Session-owned. */
 static int sl_dynamic_status(struct sl_basic_channel *c)
@@ -304,7 +324,8 @@ static void sl_progress_event(struct sl_connection_session *s, unsigned int even
 /* Invoked inside actual Runtime Host/data/gate commit. Order is those locks
  * then session lock. No caller holds session lock over any Runtime API/wait.
  * Last-fd detach and actual USB queueing therefore have one linearization. */
-static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
+static int sl_session_submit(void *scope, u64 security_revision,
+			     int (*submit)(void *), void *context)
 {
 	struct sl_submit_scope *permission = scope;
 	struct sl_connection_session *s = permission->session;
@@ -322,7 +343,9 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 		struct sl_fragment_cursor *cursor = (void *)permission->operation->cb;
 		if (s->tx_inflight != permission->operation || s->fragment_slot != c - s->channels)
 			ret = -ECANCELED;
-		else if (!sl_grant_permits(&s->tx_grant, observed, SL_GRANT_TX))
+		else if (!sl_grant_permits(&s->tx_grant, observed,
+					   SL_GRANT_TX) ||
+			 sl_grant_current(s, &s->tx_grant, security_revision))
 			ret = -EACCES;
 		else if (time_after_eq(jiffies, cursor->deadline))
 			ret = -ETIMEDOUT;
@@ -335,7 +358,8 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 		}
 	} else if (c && !sl_binding_live(c->binding))
 		ret = -ECANCELED;
-	else if (c && !sl_permits(s, c, SL_GRANT_TX))
+	else if (c && (!sl_permits(s, c, SL_GRANT_TX) ||
+		       sl_security_check(s, c, security_revision)))
 		ret = -EACCES;
 	else
 		ret = submit(context); /* atomic queue only; no wait or protocol reentry */
@@ -421,8 +445,9 @@ struct sl_dynamic_received {
 	struct sl_channel_signal message;
 	bool changed;
 };
-static int sl_dynamic_receive(void *context)
+static int sl_dynamic_receive(void *context, u64 security_revision)
 {
+	(void)security_revision; /* Dynamic protected modes remain unsupported. */
 	struct sl_dynamic_received *r = context;
 	struct sl_connection_session *s = r->session;
 	struct sl_channel_signal *m = &r->message;
@@ -570,9 +595,10 @@ struct sl_dynamic_submit {
 	enum sl_dynamic_phase phase;
 	size_t pdu_bytes;
 };
-static int sl_dynamic_consent(void *context, int (*submit)(void *),
-			      void *argument)
+static int sl_dynamic_consent(void *context, u64 security_revision,
+			      int (*submit)(void *), void *argument)
 {
+	(void)security_revision; /* Dynamic control is not a protected data Grant. */
 	struct sl_dynamic_submit *a = context;
 	struct sl_connection_session *s = a->session;
 	struct sl_basic_channel *c = a->channel;
@@ -606,7 +632,7 @@ static int sl_dynamic_consent(void *context, int (*submit)(void *),
 /* Exactly one session worker consumes the connection's ACB queue. Decode once,
  * route CMTC to session state, then route DTAP by local TCID/PI to channel RX. */
 static void sl_route(struct sl_connection_session *s, const u8 *bytes,
-		     size_t length)
+		     size_t length, u64 security_revision)
 {
 	unsigned long flags;
 	struct sl_channel_frame frame;
@@ -680,6 +706,8 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes,
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) &&
 	    sl_permits(s, c, SL_GRANT_RX) &&
+	    (!sl_sk(c->sk)->grant.security ||
+	     sl_sk(c->sk)->grant.security_epoch == security_revision) &&
 	    (!c->dynamic || c->negotiation.phase == SL_DYN_OPEN) &&
 	    frame.tcid == c->local_tcid && frame.pi == c->pi &&
 	    frame.length <= c->mtu && length <= c->mps) {
@@ -723,6 +751,23 @@ static void sl_fail_channel(struct sl_connection_session *s, struct sl_basic_cha
 		sl_socket_fault(sk, error);
 		sock_put(sk);
 	}
+}
+struct sl_security_probe {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+};
+static int sl_security_probe(void *context, u64 security_revision)
+{
+	struct sl_security_probe *p = context;
+	unsigned long flags;
+	int ret;
+	spin_lock_irqsave(&p->session->lock, flags);
+	ret = p->channel->sk && sl_binding_live(p->channel->binding) ?
+		      sl_security_check(p->session, p->channel,
+					security_revision) :
+		      0;
+	spin_unlock_irqrestore(&p->session->lock, flags);
+	return ret;
 }
 /* Serialized worker or stop-after-join only. Physical credit lives in Runtime
  * and is never returned by dropping an operation or closing its author fd. */
@@ -1136,7 +1181,7 @@ static void sl_work(struct work_struct *work)
 	unsigned int i;
 	struct sl_session_schedule plan = { 0 };
 	struct sl_tx_budget budget = { 0 };
-	u64 began = ktime_get_ns();
+	u64 began = ktime_get_ns(), security_revision;
 	unsigned long state_flags;
 
 	spin_lock_irqsave(&s->lock, state_flags);
@@ -1162,7 +1207,27 @@ static void sl_work(struct work_struct *work)
 		goto again;
 	}
 	s->unknown_deadline = 0;
-	if (ret) { sl_fault(s, ret); goto put; }
+	if (ret) {
+		sl_fault(s, ret);
+		goto put;
+	}
+	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
+		struct sl_security_probe p = { s, &s->channels[i] };
+		bool protected;
+		spin_lock_irqsave(&s->lock, state_flags);
+		protected = p.channel->sk &&
+			    sl_binding_live(p.channel->binding) &&
+			    sl_sk(p.channel->sk)->grant.security;
+		spin_unlock_irqrestore(&s->lock, state_flags);
+		if (!protected)
+			continue;
+		ret = sparklink_native_session_admit(s->controller,
+						     s->generation, s->lifetime,
+						     s->handle, s->epoch,
+						     sl_security_probe, &p);
+		if (ret == -EACCES)
+			sl_fail_channel(s, p.channel, ret);
+	}
 	sl_progress_event(s, 0, 0, 0);
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
@@ -1178,12 +1243,15 @@ static void sl_work(struct work_struct *work)
 		sl_progress_event(s, 1, 0, 0);
 	}
 	for (i = 0; i < 16 && sl_channel_active(sl_snapshot(s)); i++) {
-		ret = sparklink_native_acb_take(s->controller, s->generation, s->lifetime,
-			s->handle, s->rx_buffer, sizeof(s->rx_buffer), &size);
+		ret = sparklink_native_acb_take(s->controller, s->generation,
+						s->lifetime, s->handle,
+						s->rx_buffer,
+						sizeof(s->rx_buffer), &size,
+						&security_revision);
 		if (ret == -EAGAIN)
 			break;
 		if (ret) { sl_fault(s, ret); break; }
-		sl_route(s, s->rx_buffer, size);
+		sl_route(s, s->rx_buffer, size, security_revision);
 	}
 	s->rx_budget_exhausted = i == 16;
 	if (!sl_channel_active(sl_snapshot(s)))
@@ -1301,7 +1369,7 @@ struct sl_bind_admission {
 };
 /* Final publication takes Host/data/gate -> Binding -> Session. No sleeping
  * allocation/lookup spans any of these locks. Revoked first cannot mint. */
-static int sl_publish_binding(void *context)
+static int sl_publish_binding(void *context, u64 security_revision)
 {
 	struct sl_bind_admission *admission = context;
 	struct socket *sock = admission->sock;
@@ -1310,6 +1378,16 @@ static int sl_publish_binding(void *context)
 	struct sl_basic_channel *c = &s->channels[admission->channel_slot];
 	unsigned long flags, binding_flags;
 	int ret = 0;
+	int level = admission->grant.security ?
+			    sl_security_owner_level_rust(s->security,
+							 security_revision) :
+			    0;
+	if (level < 0 ||
+	    !sl_grant_init_security(&admission->grant, admission->grant.scope,
+				    admission->grant.directions,
+				    admission->grant.security,
+				    security_revision, level))
+		return -EACCES;
 	spin_lock_irqsave(&binding->lock, binding_flags);
 	spin_lock_irqsave(&s->lock, flags);
 	if (binding->session)
@@ -1344,8 +1422,9 @@ struct sl_dynamic_admission {
 	const struct sockaddr_sparklink_dynamic *address;
 	bool active;
 };
-static int sl_dynamic_publish(void *context)
+static int sl_dynamic_publish(void *context, u64 security_revision)
 {
+	(void)security_revision; /* Dynamic protected modes remain unsupported. */
 	struct sl_dynamic_admission *a = context;
 	struct sl_connection_session *s = a->session;
 	struct sl_socket_binding *b = sl_sk(a->sock->sk);
@@ -1489,7 +1568,7 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 		return -EINVAL;
 	if (!input->directions || input->directions & ~(SPARKLINK_SOCKET_TX | SPARKLINK_SOCKET_RX))
 		return -EINVAL;
-	if (input->security)
+	if (input->security > SPARKLINK_SOCKET_SECURITY_AUTHENTICATED)
 		return -EOPNOTSUPP;
 	slot = sl_channel_key_slot(input->local_tcid, input->remote_tcid, input->pi);
 	if (slot < 0)
@@ -1498,8 +1577,11 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 		.generation = input->generation, .lifetime = input->lifetime, .epoch = input->lease,
 		.handle = input->handle, .local_tcid = input->local_tcid,
 		.remote_tcid = input->remote_tcid, .pi = input->pi };
-	if (!sl_grant_init(&grant, scope, input->directions, input->security))
+	if (!sl_grant_scope_valid(scope))
 		return -EINVAL;
+	grant = (struct sl_channel_grant){ .scope = scope,
+					   .directions = input->directions,
+					   .security = input->security };
 	s = sparklink_native_session_get(input->controller, input->generation, input->lifetime, input->handle, input->lease, &ret);
 	if (!s)
 		return ret;
@@ -1531,7 +1613,7 @@ static int sl_can_write(struct sl_connection_session *s,
 	return ready;
 }
 struct sl_admission { struct sl_connection_session *session; struct sl_basic_channel *channel; struct sk_buff *skb; size_t length; };
-static int sl_admit(void *context)
+static int sl_admit(void *context, u64 security_revision)
 {
 	struct sl_admission *admission = context;
 	struct sl_connection_session *s = admission->session;
@@ -1544,7 +1626,9 @@ static int sl_admit(void *context)
 	spin_lock_irqsave(&s->lock, flags);
 	if (sl_binding_live(c->binding) && sl_dynamic_status(c))
 		ret = sl_dynamic_status(c);
-	else if (sl_binding_live(c->binding) && !sl_permits(s, c, SL_GRANT_TX))
+	else if (sl_binding_live(c->binding) &&
+		 (!sl_permits(s, c, SL_GRANT_TX) ||
+		  sl_security_check(s, c, security_revision)))
 		ret = -EACCES;
 	else if (s->progress.phase != SL_CH_OPEN ||
 		 !sl_binding_live(c->binding))
@@ -1578,7 +1662,7 @@ static int sl_admit(void *context)
 }
 /* Early permission check prevents a receive-only fd from allocating/copying
  * sender memory or waiting for negotiation. Final queue admission rechecks. */
-static int sl_tx_access(void *context)
+static int sl_tx_access(void *context, u64 security_revision)
 {
 	struct sl_admission *admission = context;
 	struct sl_connection_session *s = admission->session;
@@ -1586,10 +1670,12 @@ static int sl_tx_access(void *context)
 	unsigned long flags;
 	int ret;
 	spin_lock_irqsave(&s->lock, flags);
-	ret = !sl_binding_live(c->binding)   ? -ENOTCONN :
-	      sl_dynamic_status(c)	     ? sl_dynamic_status(c) :
-	      !sl_permits(s, c, SL_GRANT_TX) ? -EACCES :
-					       0;
+	ret = !sl_binding_live(c->binding) ? -ENOTCONN :
+	      sl_dynamic_status(c)	   ? sl_dynamic_status(c) :
+	      (!sl_permits(s, c, SL_GRANT_TX) ||
+	       sl_security_check(s, c, security_revision)) ?
+				     -EACCES :
+				     0;
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
 }
@@ -1654,7 +1740,7 @@ struct sl_receive {
  * unlink under Session/RX locks. No allocation, wait or user copy here. PEEK
  * holds a reference, including zero-sized datagrams; SO_PEEK_OFF is unsupported.
  * Revocation after this point does not revoke an already admitted user copy. */
-static int sl_take(void *context)
+static int sl_take(void *context, u64 security_revision)
 {
 	struct sl_receive *receive = context;
 	struct sl_connection_session *s = receive->session;
@@ -1675,7 +1761,8 @@ static int sl_take(void *context)
 		ret = sl_dynamic_status(c);
 		goto unlock;
 	}
-	if (!sl_permits(s, c, SL_GRANT_RX)) {
+	if (!sl_permits(s, c, SL_GRANT_RX) ||
+	    sl_security_check(s, c, security_revision)) {
 		ret = -EACCES;
 		goto unlock;
 	}
@@ -1746,25 +1833,24 @@ put:
 	sl_connection_session_put(s);
 	return copied;
 }
-static __poll_t sl_poll(struct file *file, struct socket *sock,
-			poll_table *wait)
+struct sl_poll_read {
+	struct socket *sock;
+	struct sl_connection_session *session;
+	__poll_t mask;
+};
+static int sl_poll_admit(void *context, u64 security_revision)
 {
+	struct sl_poll_read *read = context;
+	struct socket *sock = read->sock;
+	struct sl_connection_session *s = read->session;
+	struct sl_basic_channel *c = sl_bound_channel(sock->sk, s);
 	unsigned long flags;
-	struct sl_connection_session *s;
-	struct sl_basic_channel *c;
 	__poll_t mask = 0;
-
-	sock_poll_wait(file, sock, wait);
-	s = sl_binding_session(sock->sk);
-	if (!s)
-		return EPOLLERR | EPOLLHUP;
-	c = sl_bound_channel(sock->sk, s);
-	if (sparklink_native_session_status(s->controller, s->generation,
-					    s->lifetime, s->handle, s->epoch)) {
-		sl_connection_session_put(s);
-		return EPOLLERR | EPOLLHUP;
-	}
 	spin_lock_irqsave(&s->lock, flags);
+	if (sl_security_check(s, c, security_revision)) {
+		mask = EPOLLERR | EPOLLHUP;
+		goto unlock;
+	}
 	if (sl_channel_active(s->progress) && sl_binding_live(c->binding) &&
 	    c->peer_closed) {
 		mask = EPOLLHUP;
@@ -1787,10 +1873,29 @@ static __poll_t sl_poll(struct file *file, struct socket *sock,
 				     SL_CHANNEL_TX))
 			mask |= EPOLLOUT | EPOLLWRNORM;
 	}
+unlock:
 	spin_unlock_irqrestore(&s->lock, flags);
-	sl_connection_session_put(s);
-	return mask;
+	read->mask = mask;
+	return 0;
 }
+static __poll_t sl_poll(struct file *file, struct socket *sock,
+			poll_table *wait)
+{
+	struct sl_connection_session *s;
+	struct sl_poll_read read;
+	int ret;
+	sock_poll_wait(file, sock, wait);
+	s = sl_binding_session(sock->sk);
+	if (!s)
+		return EPOLLERR | EPOLLHUP;
+	read = (struct sl_poll_read){ .sock = sock, .session = s };
+	ret = sparklink_native_session_admit(s->controller, s->generation,
+					     s->lifetime, s->handle, s->epoch,
+					     sl_poll_admit, &read);
+	sl_connection_session_put(s);
+	return ret ? EPOLLERR | EPOLLHUP : read.mask;
+}
+
 struct sl_info_read {
 	struct sl_connection_session *session;
 	struct sl_basic_channel *channel;
@@ -1801,18 +1906,21 @@ struct sl_info_read {
  * capability snapshot. No user memory, wait, credit mutation or RX consumption.
  */
 static int sl_view_access(struct sl_connection_session *s,
-			  struct sl_basic_channel *c, struct sock *sk)
+			  struct sl_basic_channel *c, struct sock *sk,
+			  u64 security_revision)
 {
 	if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) ||
 	    c->sk != sk)
 		return -ENOTCONN;
 	if (sl_dynamic_status(c))
 		return sl_dynamic_status(c);
-	if (!sl_permits(s, c, SL_GRANT_TX) && !sl_permits(s, c, SL_GRANT_RX))
+	if ((!sl_permits(s, c, SL_GRANT_TX) &&
+	     !sl_permits(s, c, SL_GRANT_RX)) ||
+	    sl_security_check(s, c, security_revision))
 		return -EACCES;
 	return s->progress.phase == SL_CH_OPEN ? 0 : -EAGAIN;
 }
-static int sl_read_info(void *context)
+static int sl_read_info(void *context, u64 security_revision)
 {
 	struct sl_info_read *read = context;
 	struct sl_connection_session *s = read->session;
@@ -1821,7 +1929,7 @@ static int sl_read_info(void *context)
 	int ret = 0;
 
 	spin_lock_irqsave(&s->lock, flags);
-	ret = sl_view_access(s,c,read->sk);
+	ret = sl_view_access(s, c, read->sk, security_revision);
 	if (!ret)
 		read->value = (struct sparklink_channel_info) {
 			.version = SPARKLINK_CHANNEL_INFO_VERSION, .size = sizeof(read->value),
@@ -1843,7 +1951,8 @@ struct sl_tx_status_read {
 };
 /* Runtime holds Host/data/gate and this callback adds Session lock. No pointer
  * escapes; copy_to_user happens after all locks, withdrawal may follow it. */
-static int sl_read_tx_status(const struct sparklink_credit_snapshot *credit, void *context)
+static int sl_read_tx_status(const struct sparklink_credit_snapshot *credit,
+			     u64 security_revision, void *context)
 {
     struct sl_tx_status_read *read=context;
     struct sl_connection_session *s=read->session;
@@ -1851,7 +1960,7 @@ static int sl_read_tx_status(const struct sparklink_credit_snapshot *credit, voi
     unsigned long flags;
     int ret;
     spin_lock_irqsave(&s->lock,flags);
-    ret=sl_view_access(s,c,read->sk);
+    ret = sl_view_access(s, c, read->sk, security_revision);
     if (!ret) {
         read->value=(struct sparklink_channel_tx_status){
             .version=SPARKLINK_CHANNEL_TX_STATUS_VERSION,.size=sizeof(read->value),
@@ -1885,8 +1994,9 @@ struct sl_session_status_read {
  * published by service_running under this lock; never read it while running.
  * Concurrent purge can only reduce the conservatively summed queue count.
  */
-static int sl_read_session_status(const struct sparklink_credit_snapshot *credit,
-				  void *context)
+static int
+sl_read_session_status(const struct sparklink_credit_snapshot *credit,
+		       u64 security_revision, void *context)
 {
 	struct sl_session_status_read *read = context;
 	struct sl_connection_session *s = read->session;
@@ -1896,7 +2006,7 @@ static int sl_read_session_status(const struct sparklink_credit_snapshot *credit
 	int ret;
 
 	spin_lock_irqsave(&s->lock, flags);
-	ret = sl_view_access(s, read->channel, read->sk);
+	ret = sl_view_access(s, read->channel, read->sk, security_revision);
 	if (ret)
 		goto out;
 	*v = (struct sparklink_session_tx_status){
