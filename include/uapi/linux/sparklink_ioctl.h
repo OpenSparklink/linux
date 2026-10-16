@@ -1227,7 +1227,7 @@ struct sle_link_snapshot {
 
 /* Experimental manager-approved security mechanism; NOT authenticated Pair.
  * Both operations require the same active Managed File and CAP_NET_ADMIN.
- * flags selects exactly one mode1/2/3 below; no raw TX/RX/keys.
+ * flags selects exactly one mode1/2/3/4 below; no raw TX/RX/keys.
  * action1 arms T response; action2 starts G request. Other roles unsupported.
  * Once per physical lifetime; no same-life retry, no restart after expiry.
  * Entire original timeout1..5000ms includes policy admission/queue/replies.
@@ -1237,6 +1237,9 @@ struct sle_link_snapshot {
  * all own relay Completes must drain. It does not grant trusted identity.
  * state3 is pending install; state9 requires real own command acceptance and
  * lifetime-bound0011 initial encryption-on, NOT Agent/identity/trusted Grant.
+ * mode4 additionally requires the original author's explicit comparison-code
+ * confirmation before DH proof. state11 reports this installed mechanism;
+ * daemon identity/Agent integration, protected Grant and Bond remain absent.
  * Full security facade remains EOPNOTSUPP. Client explicitly disconnects after
  * this limited exchange. Revoke/Down invalidates it and never refunds debt.
  */
@@ -1250,6 +1253,11 @@ struct sle_link_snapshot {
  * installation. state9 is observed UNAUTHENTICATED encryption, never Agent
  * approval, authenticated peer identity, trusted Grant or Bond. */
 #define SLE_SECURITY_UNAUTHENTICATED_ENCRYPTION 3U
+/* Explicit privileged numeric-comparison mechanism, no daemon UI/Grant/Bond.
+ * flags8 marks a live comparison prompt; flags16 local confirmation,32 real
+ * peer proof,64 installed numeric mechanism. state11 requires all actual
+ * protocol/confirmation/installation stages, never an arbitrary trust flag. */
+#define SLE_SECURITY_NUMERIC_COMPARISON 4U
 struct sle_security_negotiation_submit {
     /* version2; absolute CLOCK_MONOTONIC ns, set before policy/Agent waiting.
      * timeout_ms bounds the remaining budget (1..5000), never resets it.
@@ -1276,8 +1284,19 @@ struct sle_security_negotiation_result {
     __u32 flags;
     __u16 handle;
     __u8 role, status;
-    __u8 local_caps[10], peer_caps[10], reserved[4];
+    __u8 local_caps[10], peer_caps[10];
+    __u32 comparison_code; /* valid only while flags8; may be zero (000000) */
 };
+/* Same original Managed File/request/physical identity; no raw proof or keys.
+ * accept0 is local rejection, not a fabricated remote failure/physical rollback.
+ * Reserved bytes zero; original deadline cannot be replaced or extended. */
+struct sle_security_numeric_confirm {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version, comparison_code;
+    __u16 handle;
+    __u8 accept, reserved[5];
+};
+#define SL_IOCTL_SECURITY_NUMERIC_CONFIRM _IOW(SL_MAGIC, 0xd5, struct sle_security_numeric_confirm)
 #define SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT _IOW(SL_MAGIC, 0xd2, struct sle_security_negotiation_submit)
 #define SL_IOCTL_SECURITY_NEGOTIATION_RESULT _IOWR(SL_MAGIC, 0xd3, struct sle_security_negotiation_result)
 #define SL_IOCTL_SECURITY_NEGOTIATION_CANCEL _IOW(SL_MAGIC, 0xd4, struct sle_security_negotiation_cancel)

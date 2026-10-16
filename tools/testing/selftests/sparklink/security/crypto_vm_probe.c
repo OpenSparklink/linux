@@ -18,7 +18,7 @@ static int pair_material_vectors(void)
 	static const u8 link[16]={0x6b,0xd8,0x4d,0x76,0xc3,0xc2,0xad,0x8d,0x88,0x7f,0x15,0x42,0x98,0xfe,0x6b,0xdc};
 	static const u8 gp[16]={0xa9,0x9f,0x50,0x22,0xc3,0x52,0x85,0x8e,0x06,0x8d,0x61,0x4c,0x23,0x7a,0x31,0x78};
 	static const u8 tp[16]={0xe7,0x8f,0x1a,0x29,0xbe,0x12,0x90,0x05,0xee,0x74,0xd7,0x0b,0x6a,0x6f,0x97,0xde};
-	struct sl_pair_material m={.role=0,.peer_valid=true};
+	struct sl_pair_material m={.role=0,.method=1,.peer_valid=true};
 	u8 nonce[16], out[16], bad[16];unsigned int i;int result=-EILSEQ;
 	for(i=0;i<32;i++)m.shared[i]=i;
 	for(i=0;i<16;i++){m.nonce[i]=16+i;nonce[i]=32+i;}
@@ -39,20 +39,37 @@ out:
 	memzero_explicit(&m,sizeof(m));memzero_explicit(nonce,sizeof(nonce));memzero_explicit(out,sizeof(out));memzero_explicit(bad,sizeof(bad));return result;
 }
 
-static int pair_material_fresh(void)
+static int numeric_public_vector(void)
+{
+    struct sl_pair_material m={.role=0,.method=0,.derived=true};
+    u32 number=1000001;unsigned int i;int error;
+    for(i=0;i<64;i++){m.public[i]=1+i;m.peer[i]=129+i;}
+    for(i=0;i<16;i++){m.nonce[i]=16+i;m.peer_nonce[i]=32+i;}
+    error=sl_pair_material_numeric(&m,&number);
+    if(error || number!=759201)return -EILSEQ;
+    m.method=1;number=1000001;
+    if(sl_pair_material_numeric(&m,&number)!=-EINVAL || number!=1000001)return -EILSEQ;
+    m.method=0;m.derived=false;
+    if(sl_pair_material_numeric(&m,&number)!=-EINVAL || number!=1000001)return -EILSEQ;
+    memzero_explicit(&m,sizeof(m));return 0;
+}
+
+static int pair_material_fresh(u8 method)
 {
 	static const u8 ga[6]={1,2,3,4,5,6},ta[6]={11,12,13,14,15,16};
 	struct sl_pair_material *g=NULL,*t=NULL,*other=NULL;
-	u8 gpub[64],tpub[64],again[64],invalid[64]={0},gn[16],tn[16],cfm[16],gp[16],tp[16],out[16];int result;
-	result=sl_pair_material_create(0,ga,ta,&g);if(result)goto out;
-	result=sl_pair_material_create(1,ta,ga,&t);if(result)goto out;
-	result=sl_pair_material_create(0,ga,ta,&other);if(result)goto out;
+	u8 gpub[64],tpub[64],again[64],invalid[64]={0},gn[16],tn[16],cfm[16],gp[16],tp[16],out[16];u32 gc=1000001,tc=1000001;int result;
+	result=sl_pair_material_create(0,method,ga,ta,&g);if(result)goto out;
+	result=sl_pair_material_create(1,method,ta,ga,&t);if(result)goto out;
+	result=sl_pair_material_create(0,method,ga,ta,&other);if(result)goto out;
 	result=-EILSEQ;
 	if(sl_pair_material_public(g,gpub)||sl_pair_material_public(t,tpub)||sl_pair_material_public(other,again)||!memcmp(gpub,tpub,64)||!memcmp(gpub,again,64))goto out;
 	if(sl_pair_material_peer(g,invalid)>=0 || g->peer_valid)goto out;
 	if(sl_pair_material_peer(g,tpub)||sl_pair_material_peer(t,gpub)||sl_pair_material_peer(g,tpub)!=-EALREADY)goto out;
 	if(sl_pair_material_nonce(g,gn)||sl_pair_material_nonce(t,tn)||!memcmp(gn,tn,16)||sl_pair_material_confirm(t,cfm))goto out;
 	if(sl_pair_material_derive(g,tn,cfm,gp)||sl_pair_material_derive(t,gn,NULL,tp)||memcmp(g->candidate_link_key,t->candidate_link_key,16))goto out;
+    if(!method && (sl_pair_material_numeric(g,&gc)||sl_pair_material_numeric(t,&tc)||gc!=tc||gc>=1000000))goto out;
+    if(method && (sl_pair_material_numeric(g,&gc)!=-EINVAL||gc!=1000001))goto out;
 	memset(out,0xa5,16);invalid[0]=gp[0]^1;memcpy(invalid+1,gp+1,15);
 	if(sl_pair_material_verify(t,invalid,out)!=-EKEYREJECTED||memchr_inv(out,0xa5,16))goto out;
 	if(sl_pair_material_verify(t,gp,out)||memcmp(out,tp,16)||sl_pair_material_verify(g,tp,out)||memcmp(out,gp,16))goto out;
@@ -96,7 +113,9 @@ static int __init security_crypto_probe_init(void)
         if(result>=0 || memcmp(a_secret,before,32)){result=-EILSEQ;goto out;}
     }
     result=pair_material_vectors();if(result)goto out;
-    for(iteration=0;iteration<8;iteration++){result=pair_material_fresh();if(result)goto out;}
+    for(iteration=0;iteration<8;iteration++){result=numeric_public_vector();if(result)goto out;
+    result=pair_material_fresh(0);if(result)goto out;
+    result=pair_material_fresh(1);if(result)goto out;}
     result=0;
 out:
     memzero_explicit(digest,sizeof(digest));memzero_explicit(before,sizeof(before));

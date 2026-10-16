@@ -1000,3 +1000,95 @@ fn author_cancel_does_not_rewrite_completed_controller_encryption_or_expired_res
     assert_eq!(expired.cancel(id, 100), Ok(false));
     assert_eq!(expired.capability_observation(101).unwrap().state, 7);
 }
+
+// Protocol/crypto-dependency fixtures only. Numeric bytes below are synthetic
+// receipts, not cryptographic vectors or authentication/real-device proof.
+fn numeric_receipt(kind: CryptoKind) -> CryptoReceipt {
+    match kind {
+        CryptoKind::NumericPublicAndConfirm => CryptoReceipt {output:[3;16],nonce:[4;16],comparison:None},
+        CryptoKind::NumericGDerive => CryptoReceipt {output:[5;16],nonce:[6;16],comparison:Some(424242)},
+        CryptoKind::NumericTDerive => CryptoReceipt {output:[7;16],nonce:[4;16],comparison:Some(424242)},
+        CryptoKind::GProofAndRespond => CryptoReceipt {output:[7;16],nonce:[0;16],comparison:None},
+        _ => CryptoReceipt {output:[0;16],nonce:[0;16],comparison:None},
+    }
+}
+fn numeric_prompts() -> ([Session;2],[Identity;2]) { numeric_prompts_with_code(424242) }
+fn numeric_prompts_with_code(code:u32) -> ([Session;2],[Identity;2]) {
+    let g=identity();let t=Identity {controller:2,generation:3,..g};let ids=[g,t];
+    let mut sides=[session(),Session::new(t,10,100).unwrap()];
+    let first=sides[0].approve_numeric(g,11,0,true,[1;64]).unwrap().unwrap();
+    assert!(sides[1].approve_numeric(t,11,1,false,[2;64]).unwrap().is_none());
+    for n in 0..2 {sides[n].enable_installation(ids[n],11,n as u8).unwrap();}
+    let mut pending=std::collections::VecDeque::from([(0,first)]);let mut indices=Vec::new();
+    while let Some((source,packet))=pending.pop_front() {
+        let target=1-source;indices.push(packet.index);
+        assert!(!matches!(packet.index,0x141|0x142|0x1c03|0x1c05));
+        sides[source].commit(packet.ticket,ids[source],12,||Ok(())).unwrap();
+        if let Some(job)=sides[target].pairing_input(ids[target],13,packet.index,packet.payload()).unwrap() {
+            let mut receipt=numeric_receipt(job.kind);
+            if receipt.comparison.is_some(){receipt.comparison=Some(code);}
+            sides[target].material_output(ids[target],14,job,Ok(receipt)).unwrap();
+        }
+        assert!(sides[source].reply(packet.ticket,15,true,0).is_some());
+        for n in 0..2 {if let Some(p)=sides[n].prepare(ids[n],16).unwrap(){pending.push_back((n,p));}}
+    }
+    assert_eq!(indices,vec![0x134,0x135,0x136,0x137,0x13c,0x139]);
+    for s in &mut sides {let o=s.capability_observation(17).unwrap();assert_eq!((o.state,o.flags,o.comparison_code),(3,15,code));assert_eq!(s.phase(),Phase::Open);assert_eq!(s.queued(),0);}
+    (sides,ids)
+}
+#[test]
+fn numeric_requires_same_original_confirmation_and_real_peer_proof_before_install() {
+    let (mut s,ids)=numeric_prompts();
+    assert!(s[0].confirm_numeric(ids[0],18,42,true).is_err());assert_eq!(s[0].queued(),0);
+    assert!(s[0].confirm_numeric(Identity {lifetime:99,..ids[0]},18,424242,true).is_err());
+    assert!(s[0].confirm_numeric(ids[0],18,424242,true).unwrap().is_none());
+    assert!(s[0].confirm_numeric(ids[0],18,424242,true).is_err());
+    let packet=s[0].prepare(ids[0],19).unwrap().unwrap();assert_eq!(packet.index,0x141);
+    s[0].commit(packet.ticket,ids[0],20,||Ok(())).unwrap();
+    assert!(s[1].pairing_input(ids[1],21,0x141,packet.payload()).unwrap().is_none());
+    assert!(s[1].pairing_input(ids[1],21,0x141,packet.payload()).is_err());
+    s[0].reply(packet.ticket,22,true,0).unwrap();
+    assert_eq!(s[1].queued(),0);
+    let job=s[1].confirm_numeric(ids[1],23,424242,true).unwrap().unwrap();
+    assert_eq!(job.kind,CryptoKind::GProofAndRespond);
+    s[1].material_output(ids[1],24,job,Ok(numeric_receipt(job.kind))).unwrap();
+    let packet=s[1].prepare(ids[1],25).unwrap().unwrap();assert_eq!(packet.index,0x142);
+    s[1].commit(packet.ticket,ids[1],26,||Ok(())).unwrap();
+    let job=s[0].pairing_input(ids[0],27,0x142,packet.payload()).unwrap().unwrap();
+    s[0].material_output(ids[0],28,job,Ok(numeric_receipt(job.kind))).unwrap();
+    s[1].reply(packet.ticket,29,true,0).unwrap();
+    for n in 0..2 {let o=s[n].capability_observation(30).unwrap();assert_eq!(o.state,3);assert_eq!(o.flags&56,48);assert_eq!(o.comparison_code,0);}
+    s[0].progress_installation(ids[0],31).unwrap();let packet=s[0].prepare(ids[0],31).unwrap().unwrap();assert_eq!(packet.index,0x1c03);
+    s[0].commit(packet.ticket,ids[0],32,||Ok(())).unwrap();s[0].reply(packet.ticket,33,false,0).unwrap();
+    assert_ne!(s[0].capability_observation(33).unwrap().state,11);
+    s[0].installation_event(ids[0],34,0x11,0,1).unwrap();assert_eq!(s[0].capability_observation(35).unwrap().state,11);
+}
+#[test]
+fn numeric_reject_cancel_expire_and_late_jobs_never_continue_proof_or_install() {
+    for mode in 0..3 {
+        let (mut s,ids)=numeric_prompts();
+        if mode==0 {assert!(s[0].confirm_numeric(ids[0],18,424242,false).unwrap().is_none());}
+        if mode==1 {assert!(s[0].cancel(ids[0],18).unwrap());}
+        if mode==2 {s[0].expire(100);}
+        assert!(s[0].confirm_numeric(ids[0],if mode==2 {100} else {19},424242,true).is_err());
+        let o=s[0].capability_observation(101).unwrap();assert_eq!(o.flags&8,0);assert_eq!(o.comparison_code,0);assert_eq!(s[0].queued(),0);
+    }
+    let (mut s,ids)=numeric_prompts();s[0].confirm_numeric(ids[0],18,424242,true).unwrap();
+    let packet=s[0].prepare(ids[0],19).unwrap().unwrap();s[0].commit(packet.ticket,ids[0],20,||Ok(())).unwrap();
+    s[1].pairing_input(ids[1],21,0x141,packet.payload()).unwrap();let job=s[1].confirm_numeric(ids[1],22,424242,true).unwrap().unwrap();
+    s[1].cancel(ids[1],23).unwrap();assert!(s[1].material_output(ids[1],24,job,Ok(numeric_receipt(job.kind))).is_err());assert_eq!(s[1].queued(),0);
+}
+
+#[test]
+fn numeric_zero_is_a_live_code_and_local_confirmation_is_not_peer_proof() {
+    let (mut s,ids)=numeric_prompts_with_code(0);
+    for n in 0..2 {
+        assert!(s[n].confirm_numeric(ids[n],18,0,true).unwrap().is_none());
+        let o=s[n].capability_observation(19).unwrap();
+        assert_eq!((o.state,o.flags,o.comparison_code),(3,23,0));
+        s[n].progress_installation(ids[n],20).unwrap();
+        assert!(!s[n].installation_pending());
+    }
+    assert_eq!(s[0].prepare(ids[0],21).unwrap().unwrap().index,0x141);
+    assert!(s[1].prepare(ids[1],21).unwrap().is_none());
+}

@@ -2321,7 +2321,7 @@ pub(crate) struct SleSecurityNegotiationSubmit {
 pub(crate) struct SleSecurityNegotiationResult {
     pub generation:u64,pub lifetime:u64,pub request_id:u64,
     pub version:u32,pub profile:u32,pub state:u32,pub error:i32,pub flags:u32,
-    pub handle:u16,pub role:u8,pub status:u8,pub local_caps:[u8;10],pub peer_caps:[u8;10],pub reserved:[u8;4],
+    pub handle:u16,pub role:u8,pub status:u8,pub local_caps:[u8;10],pub peer_caps:[u8;10],pub comparison_code:u32,
 }
 /// Local author withdrawal, independent of physical Session/controller ownership.
 #[repr(C, align(8))]
@@ -2337,7 +2337,7 @@ const _: () = assert!(core::mem::size_of::<SleSecurityNegotiationCancel>() == 32
 pub(crate) const SL_IOCTL_SECURITY_NEGOTIATION_CANCEL: u32 =
     _IOW::<SleSecurityNegotiationCancel>(SL_MAGIC, 0xd4);
 impl_check_reserved!(SleSecurityNegotiationSubmit, [reserved]);
-impl_check_reserved!(SleSecurityNegotiationResult, [reserved]);
+impl_check_reserved!(SleSecurityNegotiationResult);
 // SAFETY: both layouts are padding-free integers/byte arrays, all bit patterns valid.
 unsafe impl FromBytes for SleSecurityNegotiationSubmit {}
 // SAFETY: padding-free integer/byte layout, initialized output only.
@@ -2346,3 +2346,15 @@ const _: ()=assert!(core::mem::size_of::<SleSecurityNegotiationSubmit>()==64);
 const _: ()=assert!(core::mem::size_of::<SleSecurityNegotiationResult>()==72);
 pub(crate) const SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT:u32=_IOW::<SleSecurityNegotiationSubmit>(SL_MAGIC,0xd2);
 pub(crate) const SL_IOCTL_SECURITY_NEGOTIATION_RESULT:u32=_IOWR::<SleSecurityNegotiationResult>(SL_MAGIC,0xd3);
+
+#[repr(C, align(8))]
+#[derive(Copy, Clone)]
+pub(crate) struct SleSecurityNumericConfirm {
+    pub generation:u64, pub lifetime:u64, pub request_id:u64,
+    pub version:u32, pub comparison_code:u32, pub handle:u16, pub accept:u8, pub reserved:[u8;5],
+}
+impl_check_reserved!(SleSecurityNumericConfirm,[reserved]);
+// SAFETY: padding-free integer/byte layout, all bit patterns valid, reserved checked.
+unsafe impl FromBytes for SleSecurityNumericConfirm {}
+const _: ()=assert!(core::mem::size_of::<SleSecurityNumericConfirm>()==40);
+pub(crate) const SL_IOCTL_SECURITY_NUMERIC_CONFIRM:u32=_IOW::<SleSecurityNumericConfirm>(SL_MAGIC,0xd5);

@@ -20,7 +20,8 @@ struct sl_pair_material {
 	u8 private[32], public[64], peer[64], shared[32], nonce[16];
 	u8 g_address[6], t_address[6], own_proof[16], peer_proof[16];
 	u8 candidate_link_key[16];
-	u8 role;
+	u8 role, method;
+	u8 peer_nonce[16];
 	bool peer_valid, derived, verified;
 };
 
@@ -59,13 +60,13 @@ static int dialect_mac(const u8 key[16], const u8 *message, u32 length, u8 *out)
 	return error;
 }
 
-int sl_pair_material_create(u8 role, const u8 *local, const u8 *remote,
+int sl_pair_material_create(u8 role, u8 method, const u8 *local, const u8 *remote,
 			    struct sl_pair_material **out)
 {
 	struct sl_pair_material *m;
 	int error;
 
-	if (role > 1 || !local || !remote || !out)
+	if (role > 1 || method > 1 || !local || !remote || !out)
 		return -EINVAL;
 	if (!rng_is_initialized())
 		return -EAGAIN;
@@ -73,6 +74,7 @@ int sl_pair_material_create(u8 role, const u8 *local, const u8 *remote,
 	if (!m)
 		return -ENOMEM;
 	m->role = role;
+	m->method = method;
 	memcpy(m->g_address, role ? remote : local, 6);
 	memcpy(m->t_address, role ? local : remote, 6);
 	error = sle_ecdh_generate(m->private, m->public);
@@ -148,7 +150,8 @@ int sl_pair_material_nonce(struct sl_pair_material *m, u8 *out)
 	return 0;
 }
 
-/* Method1 is explicitly no-entry/no-MITM, no Bond: its protocol salt is zero.
+/* Method1 is no-entry/no-MITM; method0 is numeric comparison, no Bond.
+ * Both have a zero protocol salt, bound to their actual IO/method in proof.
  * This is not a zero random nonce or a fallback credential. All nonces/private
  * scalars are fresh. IO/OOB/algorithm inputs must match the sole known offer.
  */
@@ -159,7 +162,9 @@ static int proof_for(struct sl_pair_material *m, const u8 key[16],
 	int error;
 
 	memcpy(message, nonce, 16);
-	message[32] = 3; message[33] = 3; message[34] = 1;
+	message[32] = m->method ? 3 : 1;
+	message[33] = message[32];
+	message[34] = m->method;
 	memset(message + 35, 2, 4);
 	memcpy(message + 41, m->g_address, 6);
 	memcpy(message + 47, m->t_address, 6);
@@ -211,6 +216,7 @@ int sl_pair_material_derive(struct sl_pair_material *m, const u8 *nonce,
 		memcpy(m->candidate_link_key, link, 16);
 		memcpy(m->own_proof, own, 16);
 		memcpy(m->peer_proof, peer, 16);
+		memcpy(m->peer_nonce, nonce, 16);
 		m->derived = true;
 		memcpy(out, own, 16);
 	}
@@ -222,6 +228,36 @@ out:
 	memzero_explicit(own, sizeof(own));
 	memzero_explicit(peer, sizeof(peer));
 	memzero_explicit(expected, sizeof(expected));
+	return error;
+}
+
+/* Standard 9.3.4.6 with the existing SDK111 whole-message/CMAC byte-order
+ * adapter. Public X is LE32; decimal reduction interprets the LE128 digest.
+ * This is only a display value: it confers no confirmation or security grade.
+ */
+int sl_pair_material_numeric(struct sl_pair_material *m, u32 *out)
+{
+	const u8 *g, *t;
+	u8 message[112], digest[16];
+	u32 number = 0;
+	int i, error;
+
+	if (!m || !out || m->method != 0 || !m->derived || m->verified)
+		return -EINVAL;
+	g = m->role ? m->peer : m->public;
+	t = m->role ? m->public : m->peer;
+	memcpy(message, g + 16, 16);
+	memcpy(message + 16, t, 64);
+	memcpy(message + 80, m->role ? m->peer_nonce : m->nonce, 16);
+	memcpy(message + 96, m->role ? m->nonce : m->peer_nonce, 16);
+	error = dialect_mac(g, message, sizeof(message), digest);
+	if (!error) {
+		for (i = 15; i >= 0; i--)
+			number = (number * 256 + digest[i]) % 1000000;
+		*out = number;
+	}
+	memzero_explicit(message, sizeof(message));
+	memzero_explicit(digest, sizeof(digest));
 	return error;
 }
 
@@ -237,6 +273,7 @@ int sl_pair_material_verify(struct sl_pair_material *m, const u8 *proof, u8 *out
 	memzero_explicit(m->private, sizeof(m->private));
 	memzero_explicit(m->shared, sizeof(m->shared));
 	memzero_explicit(m->nonce, sizeof(m->nonce));
+	memzero_explicit(m->peer_nonce, sizeof(m->peer_nonce));
 	memzero_explicit(m->own_proof, sizeof(m->own_proof));
 	memzero_explicit(m->peer_proof, sizeof(m->peer_proof));
 	m->verified = true;

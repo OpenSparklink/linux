@@ -1249,12 +1249,20 @@ fn ioctl_security_negotiation(
         owner.schedule_rx(0);
         return Ok(0);
     }
+    if cmd == SL_IOCTL_SECURITY_NUMERIC_CONFIRM {
+        let input:SleSecurityNumericConfirm=read_user_struct(arg)?;
+        if input.version!=1 {return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));}
+        if input.generation==0 || input.lifetime==0 || input.request_id==0 || input.handle>0x0fff || input.accept>1 || input.comparison_code>=1000000 {return Err(EINVAL);}
+        if input.generation!=owner.identity.generation {return Err(ENODEV);}
+        owner.confirm_security_numeric(me.file_id,&input)?;
+        owner.kick_commands();owner.schedule_rx(0);return Ok(0);
+    }
     if cmd == SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT {
         let request: SleSecurityNegotiationSubmit = read_user_struct(arg)?;
         if request.version != 2 || request.profile != owner.protocol_profile {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
-        if !matches!(request.flags,1|2|3)
+        if !matches!(request.flags,1|2|3|4)
             || request.generation == 0
             || request.lifetime == 0
             || request.request_id == 0
@@ -1293,6 +1301,7 @@ fn ioctl_security_negotiation(
         || input.status != 0
         || input.local_caps != [0; 10]
         || input.peer_caps != [0; 10]
+        || input.comparison_code != 0
     {
         return Err(EINVAL);
     }
@@ -1319,6 +1328,7 @@ fn ioctl_security_negotiation(
     output.status = observation.status;
     output.local_caps = observation.local;
     output.peer_caps = observation.peer;
+    output.comparison_code = observation.comparison_code;
     output.error = if observation.error!=0 {observation.error}else{match observation.state {
         5 => {
             if observation.status == 0 {
@@ -1754,7 +1764,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
         SL_IOCTL_DIAGNOSTIC_RESULT => ioctl_diagnostic_result(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
-        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL => ioctl_security_negotiation(context,me,cmd,arg),
+        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL | SL_IOCTL_SECURITY_NUMERIC_CONFIRM => ioctl_security_negotiation(context,me,cmd,arg),
         SL_IOCTL_CONNECTION_SUBMIT => ioctl_connection_submit(context, me, arg),
         SL_IOCTL_CONNECTION_RESULT => ioctl_connection_result(context, me, arg),
         SL_IOCTL_LINK_SNAPSHOT => ioctl_link_snapshot(context, me, arg),
@@ -2135,6 +2145,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT
             | SL_IOCTL_SECURITY_NEGOTIATION_RESULT
             | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL
+            | SL_IOCTL_SECURITY_NUMERIC_CONFIRM
             | SL_IOCTL_CONNECTION_SUBMIT
             | SL_IOCTL_CONNECTION_RESULT
             | SL_IOCTL_LINK_SNAPSHOT

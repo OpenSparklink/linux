@@ -29,10 +29,21 @@ pub(crate) enum Error {
 
 /// Unreleased ABI carries the caller's original CLOCK_MONOTONIC deadline,
 /// including policy/Agent waiting. Never grant a fresh relative budget here.
-pub(crate) fn original_deadline(now_ns: u64, deadline_ns: u64, maximum_ms: u32) -> Result<u64, Error> {
-    if !(1..=5000).contains(&maximum_ms) { return Err(Error::Invalid); }
-    let remaining = deadline_ns.checked_sub(now_ns).filter(|v| *v != 0).ok_or(Error::Expired)?;
-    if remaining > u64::from(maximum_ms) * 1_000_000 { return Err(Error::Invalid); }
+pub(crate) fn original_deadline(
+    now_ns: u64,
+    deadline_ns: u64,
+    maximum_ms: u32,
+) -> Result<u64, Error> {
+    if !(1..=5000).contains(&maximum_ms) {
+        return Err(Error::Invalid);
+    }
+    let remaining = deadline_ns
+        .checked_sub(now_ns)
+        .filter(|v| *v != 0)
+        .ok_or(Error::Expired)?;
+    if remaining > u64::from(maximum_ms) * 1_000_000 {
+        return Err(Error::Invalid);
+    }
     Ok(deadline_ns)
 }
 
@@ -40,12 +51,24 @@ pub(crate) fn original_deadline(now_ns: u64, deadline_ns: u64, maximum_ms: u32) 
 /// authorization deadline. Sample jiffies AFTER monotonic time: a delayed
 /// conversion may delay cleanup but never authorizes a late USB submission.
 /// One extra tick avoids expiring the Host command before the sub-tick edge.
-pub(crate) fn host_wake_deadline(now_ns: u64, deadline_ns: u64, jiffies_after: u64, hz: u32) -> Result<u64, Error> {
+pub(crate) fn host_wake_deadline(
+    now_ns: u64,
+    deadline_ns: u64,
+    jiffies_after: u64,
+    hz: u32,
+) -> Result<u64, Error> {
     original_deadline(now_ns, deadline_ns, 5000)?;
-    if hz == 0 { return Err(Error::Invalid); }
-    let scaled = (deadline_ns - now_ns).checked_mul(u64::from(hz)).ok_or(Error::Overflow)?;
+    if hz == 0 {
+        return Err(Error::Invalid);
+    }
+    let scaled = (deadline_ns - now_ns)
+        .checked_mul(u64::from(hz))
+        .ok_or(Error::Overflow)?;
     let ticks = scaled.checked_add(999_999_999).ok_or(Error::Overflow)? / 1_000_000_000;
-    jiffies_after.checked_add(ticks).and_then(|v| v.checked_add(1)).ok_or(Error::Overflow)
+    jiffies_after
+        .checked_add(ticks)
+        .and_then(|v| v.checked_add(1))
+        .ok_or(Error::Overflow)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +279,14 @@ impl Session {
         {
             return Err(Error::Stale);
         }
+        if let Some(c) = &mut self.capability {
+            c.observation.flags &= !8;
+            c.observation.comparison_code = 0;
+        }
+        if let Some(p) = &mut self.pairing {
+            p.number = None;
+            p.pending_peer_proof = None;
+        }
         self.queue.fill(None);
         if let Some(c) = &mut self.capability {
             if c.observation.state < 4 {
@@ -310,6 +341,14 @@ impl Session {
                     }
                 } else {
                     c.observation.state = 5;
+                    if let Some(c) = &mut self.capability {
+                        c.observation.flags &= !8;
+                        c.observation.comparison_code = 0;
+                    }
+                    if let Some(p) = &mut self.pairing {
+                        p.number = None;
+                        p.pending_peer_proof = None;
+                    }
                     self.queue.fill(None);
                     self.phase = Phase::Closed;
                 }
@@ -327,9 +366,13 @@ impl Session {
     /// is not reported as disabled); pending physical debt is never refunded.
     /// The caller checks the original File/request and serializes authorization.
     pub(crate) fn cancel(&mut self, identity: Identity, now: u64) -> Result<bool, Error> {
-        if identity != self.identity { return Err(Error::Stale); }
+        if identity != self.identity {
+            return Err(Error::Stale);
+        }
         let observation = self.capability_observation(now).ok_or(Error::Unsupported)?;
-        if observation.state >= 4 { return Ok(false); }
+        if observation.state >= 4 {
+            return Ok(false);
+        }
         self.withdraw();
         Ok(true)
     }
@@ -341,6 +384,14 @@ impl Session {
             if c.observation.state < 4 {
                 c.observation.state = 6;
             }
+        }
+        if let Some(c) = &mut self.capability {
+            c.observation.flags &= !8;
+            c.observation.comparison_code = 0;
+        }
+        if let Some(p) = &mut self.pairing {
+            p.number = None;
+            p.pending_peer_proof = None;
         }
         self.queue.fill(None);
         if self.phase == Phase::Uncertain {
@@ -362,6 +413,14 @@ impl Session {
                 c.observation.state = 7;
             }
         }
+        if let Some(c) = &mut self.capability {
+            c.observation.flags &= !8;
+            c.observation.comparison_code = 0;
+        }
+        if let Some(p) = &mut self.pairing {
+            p.number = None;
+            p.pending_peer_proof = None;
+        }
         self.queue.fill(None);
         if self.outstanding() || self.installation_pending() {
             self.phase = Phase::Uncertain;
@@ -375,6 +434,14 @@ impl Session {
     /// Controller reset/reinit belongs to Runtime; no fake callback is emitted.
     #[cfg(any(test, kani))]
     pub(crate) fn retired_after_barrier(&mut self) {
+        if let Some(c) = &mut self.capability {
+            c.observation.flags &= !8;
+            c.observation.comparison_code = 0;
+        }
+        if let Some(p) = &mut self.pairing {
+            p.number = None;
+            p.pending_peer_proof = None;
+        }
         self.queue.fill(None);
         self.active = None;
         if let Some(i) = &mut self.installation {
@@ -399,6 +466,7 @@ pub(crate) struct CapabilityObservation {
     pub(crate) status: u8,
     pub(crate) local: [u8; 10],
     pub(crate) peer: [u8; 10],
+    pub(crate) comparison_code: u32,
     pub(crate) error: i32,
 }
 
@@ -412,6 +480,7 @@ struct CapabilityExchange {
 // PSK/OOB/MITM or trusted result. Higher authentication/install stages remain
 // unsupported; entering this exchange requires explicit manager approval.
 const CAPABILITY_OFFER: [u8; 10] = [3, 0, 0, 16, 0, 2, 2, 2, 2, 0];
+const NUMERIC_OFFER: [u8; 10] = [1, 0, 4, 16, 0, 2, 2, 2, 2, 0];
 
 impl Session {
     pub(crate) fn deadline(&self) -> u64 {
@@ -430,6 +499,21 @@ impl Session {
         role: u8,
         initiate: bool,
     ) -> Result<Option<Packet>, Error> {
+        self.approve_exchange(current, now, role, initiate, false)
+    }
+    fn approve_exchange(
+        &mut self,
+        current: Identity,
+        now: u64,
+        role: u8,
+        initiate: bool,
+        numeric: bool,
+    ) -> Result<Option<Packet>, Error> {
+        let offer = if numeric {
+            NUMERIC_OFFER
+        } else {
+            CAPABILITY_OFFER
+        };
         self.admission(current, now)?;
         if self.capability.is_some()
             || self.active.is_some()
@@ -447,13 +531,14 @@ impl Session {
                 state: if initiate { 2 } else { 1 },
                 flags: 0,
                 status: 0,
-                local: CAPABILITY_OFFER,
+                local: offer,
+                comparison_code: 0,
                 peer: [0; 10],
                 error: 0,
             },
         });
         if initiate {
-            self.enqueue(current, now, 0x134, &CAPABILITY_OFFER)?;
+            self.enqueue(current, now, 0x134, &offer)?;
             self.prepare(current, now)
         } else {
             Ok(None)
@@ -501,6 +586,12 @@ impl Session {
 
     pub(crate) fn capability_observation(&mut self, now: u64) -> Option<CapabilityObservation> {
         self.expire(now);
+        if self.phase != Phase::Open {
+            if let Some(c) = &mut self.capability {
+                c.observation.flags &= !8;
+                c.observation.comparison_code = 0;
+            }
+        }
         self.capability.map(|c| c.observation)
     }
 }
@@ -516,7 +607,17 @@ pub(crate) enum CryptoKind {
     GDerive,
     GProofAndRespond,
     TProof,
+    NumericPublicAndConfirm,
+    NumericGDerive,
+    NumericTDerive,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct CryptoReceipt {
+    pub(crate) output: [u8; 16],
+    pub(crate) nonce: [u8; 16],
+    pub(crate) comparison: Option<u32>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CryptoJob {
     pub(crate) ticket: Ticket,
@@ -532,6 +633,11 @@ struct Pairing {
     confirm: [u8; 16],
     job: Option<(Ticket, CryptoKind)>,
     proof_verified: bool,
+    numeric: bool,
+    number: Option<u32>,
+    user_confirmed: bool,
+    own_proof: [u8; 16],
+    pending_peer_proof: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Copy)]
@@ -560,7 +666,28 @@ impl Session {
         initiate: bool,
         public: [u8; 64],
     ) -> Result<Option<Packet>, Error> {
-        let packet = self.approve_capabilities(current, now, role, initiate)?;
+        self.approve_pairing(current, now, role, initiate, public, false)
+    }
+    pub(crate) fn approve_numeric(
+        &mut self,
+        current: Identity,
+        now: u64,
+        role: u8,
+        initiate: bool,
+        public: [u8; 64],
+    ) -> Result<Option<Packet>, Error> {
+        self.approve_pairing(current, now, role, initiate, public, true)
+    }
+    fn approve_pairing(
+        &mut self,
+        current: Identity,
+        now: u64,
+        role: u8,
+        initiate: bool,
+        public: [u8; 64],
+        numeric: bool,
+    ) -> Result<Option<Packet>, Error> {
+        let packet = self.approve_exchange(current, now, role, initiate, numeric)?;
         self.pairing = Some(Pairing {
             expected: if initiate { 0x135 } else { 0x134 },
             last_submitted: 0,
@@ -568,6 +695,11 @@ impl Session {
             confirm: [0; 16],
             job: None,
             proof_verified: false,
+            numeric,
+            number: None,
+            user_confirmed: false,
+            own_proof: [0; 16],
+            pending_peer_proof: None,
         });
         Ok(packet)
     }
@@ -585,16 +717,20 @@ impl Session {
         if self.phase != Phase::Open
             || self.active.is_some()
             || self.queued() != 0
-            || !self
-                .pairing
-                .is_some_and(|p| p.proof_verified && p.job.is_none())
+            || !self.pairing.is_some_and(|p| {
+                p.proof_verified && p.job.is_none() && (!p.numeric || p.user_confirmed)
+            })
         {
             return;
         }
         if let Some(install) = self.installation {
             if install.accepted && install.encrypted {
                 if let Some(c) = &mut self.capability {
-                    c.observation.state = 9;
+                    let numeric = self.pairing.is_some_and(|p| p.numeric && p.user_confirmed);
+                    c.observation.state = if numeric { 11 } else { 9 };
+                    if numeric {
+                        c.observation.flags |= 64;
+                    }
                 }
                 self.phase = Phase::Closed;
             }
@@ -649,9 +785,9 @@ impl Session {
         if i.queued
             || self.active.is_some()
             || self.queued() != 0
-            || !self
-                .pairing
-                .is_some_and(|p| p.proof_verified && p.job.is_none())
+            || !self.pairing.is_some_and(|p| {
+                p.proof_verified && p.job.is_none() && (!p.numeric || p.user_confirmed)
+            })
             || (i.role == 1 && !i.requested)
         {
             return Ok(());
@@ -749,11 +885,14 @@ impl Session {
         if event == 0x0011
             && self.phase == Phase::Closed
             && self.installation.is_some()
-            && self.capability.is_some_and(|c| c.observation.state == 9)
+            && self
+                .capability
+                .is_some_and(|c| matches!(c.observation.state, 9 | 11))
             && (status != 0 || enabled != 1)
         {
             if let Some(c) = &mut self.capability {
                 c.observation.state = 5;
+                c.observation.flags &= !64;
                 c.observation.status = status;
                 c.observation.error = if status != 0 { -5 } else { -71 };
             }
@@ -787,7 +926,7 @@ impl Session {
         Ok(())
     }
 
-    /// G-initiated no-entry/no-MITM/no-Bond only. Every receive requires the
+    /// G-initiated no-entry or explicit numeric comparison, no Bond. Every receive requires the
     /// prerequisite local packet to have ACTUALLY submitted, not just queued.
     /// No crypto is performed here or under the caller's IRQ lock.
     pub(crate) fn pairing_input(
@@ -811,19 +950,47 @@ impl Session {
             0x135 => 0x134,
             0x136 => 0x135,
             0x137 | 0x138 => 0x136,
-            0x139 => 0x138,
+            0x139 => {
+                if p.numeric {
+                    0x13c
+                } else {
+                    0x138
+                }
+            }
+            0x13c if p.numeric => 0x136,
             0x13a => 0x139,
-            0x141 => 0x13a,
+            0x141 => {
+                if p.numeric {
+                    0x13c
+                } else {
+                    0x13a
+                }
+            }
             0x142 => 0x141,
             _ => return Err(Error::Unsupported),
         };
         if p.last_submitted != previous {
             return Err(Error::Stale);
         }
+        if p.numeric && index == 0x141 && !p.user_confirmed {
+            if bytes.len() != 16 || p.pending_peer_proof.is_some() {
+                return Err(Error::Stale);
+            }
+            let mut proof = [0; 16];
+            proof.copy_from_slice(bytes);
+            p.pending_peer_proof = Some(proof);
+            self.pairing = Some(p);
+            return Ok(None);
+        }
         let mut data = [0; 64];
+        let offer = if p.numeric {
+            NUMERIC_OFFER
+        } else {
+            CAPABILITY_OFFER
+        };
         let kind = match index {
             0x134 | 0x135 => {
-                if bytes != CAPABILITY_OFFER {
+                if bytes != offer {
                     self.fail_pairing(-95);
                     return Err(Error::Unsupported);
                 }
@@ -833,11 +1000,11 @@ impl Session {
                     c.observation.state = 2;
                 }
                 if index == 0x134 {
-                    self.enqueue(current, now, 0x135, &CAPABILITY_OFFER)?;
+                    self.enqueue(current, now, 0x135, &offer)?;
                     p.expected = 0x136;
                 } else {
                     let mut message = [0; 70];
-                    message[..6].copy_from_slice(&[16, 1, 2, 2, 2, 2]);
+                    message[..6].copy_from_slice(&[16, if p.numeric { 0 } else { 1 }, 2, 2, 2, 2]);
                     message[6..].copy_from_slice(&p.public);
                     self.enqueue(current, now, 0x136, &message)?;
                     p.expected = 0x137;
@@ -846,12 +1013,18 @@ impl Session {
                 return Ok(None);
             }
             0x136 => {
-                if bytes.len() != 70 || bytes[..6] != [16, 1, 2, 2, 2, 2] {
+                if bytes.len() != 70
+                    || bytes[..6] != [16, if p.numeric { 0 } else { 1 }, 2, 2, 2, 2]
+                {
                     self.fail_pairing(-95);
                     return Err(Error::Unsupported);
                 }
                 data.copy_from_slice(&bytes[6..]);
-                CryptoKind::GPublicAndConfirm
+                if p.numeric {
+                    CryptoKind::NumericPublicAndConfirm
+                } else {
+                    CryptoKind::GPublicAndConfirm
+                }
             }
             0x137 => {
                 if bytes.len() != 64 {
@@ -860,6 +1033,15 @@ impl Session {
                 }
                 data.copy_from_slice(bytes);
                 CryptoKind::TPublic
+            }
+            0x13c if p.numeric => {
+                if bytes.len() != 32 {
+                    self.fail_pairing(-22);
+                    return Err(Error::Invalid);
+                }
+                p.confirm.copy_from_slice(&bytes[..16]);
+                data[..16].copy_from_slice(&bytes[16..]);
+                CryptoKind::NumericGDerive
             }
             0x138 | 0x139 | 0x13a | 0x141 | 0x142 => {
                 if bytes.len() != 16 {
@@ -872,7 +1054,13 @@ impl Session {
                         p.confirm.copy_from_slice(bytes);
                         CryptoKind::GNonce
                     }
-                    0x139 => CryptoKind::TDerive,
+                    0x139 => {
+                        if p.numeric {
+                            CryptoKind::NumericTDerive
+                        } else {
+                            CryptoKind::TDerive
+                        }
+                    }
                     0x13a => CryptoKind::GDerive,
                     0x141 => CryptoKind::GProofAndRespond,
                     _ => CryptoKind::TProof,
@@ -899,12 +1087,31 @@ impl Session {
     /// The real crypto caller supplies this receipt, then Runtime still checks
     /// the real Host/gate at enqueue AND the final driver submission. A late
     /// job can never revive a cancelled/expired/foreign Session.
+    #[cfg(any(test, kani))]
     pub(crate) fn pairing_output(
         &mut self,
         current: Identity,
         now: u64,
         job: CryptoJob,
         result: Result<[u8; 16], i32>,
+    ) -> Result<(), Error> {
+        self.material_output(
+            current,
+            now,
+            job,
+            result.map(|output| CryptoReceipt {
+                output,
+                nonce: [0; 16],
+                comparison: None,
+            }),
+        )
+    }
+    pub(crate) fn material_output(
+        &mut self,
+        current: Identity,
+        now: u64,
+        job: CryptoJob,
+        result: Result<CryptoReceipt, i32>,
     ) -> Result<(), Error> {
         self.admission(current, now)?;
         let mut p = self.pairing.ok_or(Error::Unsupported)?;
@@ -919,14 +1126,47 @@ impl Session {
                 return Err(Error::Closed);
             }
         };
+        let receipt = output;
+        let output = receipt.output;
         match job.kind {
+            CryptoKind::NumericPublicAndConfirm => {
+                self.enqueue(current, now, 0x137, &p.public)?;
+                let mut message = [0; 32];
+                message[..16].copy_from_slice(&output);
+                message[16..].copy_from_slice(&receipt.nonce);
+                self.enqueue(current, now, 0x13c, &message)?;
+                p.expected = 0x139;
+            }
+            CryptoKind::NumericGDerive | CryptoKind::NumericTDerive => {
+                let Some(number) = receipt.comparison.filter(|v| *v < 1_000_000) else {
+                    self.fail_pairing(-22);
+                    return Err(Error::Invalid);
+                };
+                if !p.numeric || p.number.is_some() {
+                    self.fail_pairing(-22);
+                    return Err(Error::Invalid);
+                }
+                p.number = Some(number);
+                p.own_proof = output;
+                if job.kind == CryptoKind::NumericGDerive {
+                    self.enqueue(current, now, 0x139, &receipt.nonce)?;
+                    p.expected = 0x142;
+                } else {
+                    p.expected = 0x141;
+                }
+                if let Some(c) = &mut self.capability {
+                    c.observation.state = 3;
+                    c.observation.flags |= 8;
+                    c.observation.comparison_code = number;
+                }
+            }
             CryptoKind::GPublicAndConfirm => {
                 self.enqueue(current, now, 0x137, &p.public)?;
                 self.enqueue(current, now, 0x138, &output)?;
                 p.expected = 0x139;
             }
             CryptoKind::TPublic => {
-                p.expected = 0x138;
+                p.expected = if p.numeric { 0x13c } else { 0x138 };
             }
             CryptoKind::GNonce => {
                 self.enqueue(current, now, 0x139, &output)?;
@@ -941,17 +1181,79 @@ impl Session {
                 p.expected = 0x142;
             }
             CryptoKind::GProofAndRespond => {
+                if p.numeric && !p.user_confirmed {
+                    return Err(Error::Invalid);
+                }
                 self.enqueue(current, now, 0x142, &output)?;
                 p.expected = 0;
                 p.proof_verified = true;
             }
             CryptoKind::TProof => {
+                if p.numeric && !p.user_confirmed {
+                    return Err(Error::Invalid);
+                }
                 p.expected = 0;
                 p.proof_verified = true;
+            }
+        }
+        if p.numeric && p.proof_verified {
+            if let Some(c) = &mut self.capability {
+                c.observation.flags |= 32;
             }
         }
         self.pairing = Some(p);
         self.finish_pairing_if_drained();
         Ok(())
+    }
+}
+
+impl Session {
+    pub(crate) fn confirm_numeric(
+        &mut self,
+        current: Identity,
+        now: u64,
+        code: u32,
+        accept: bool,
+    ) -> Result<Option<CryptoJob>, Error> {
+        self.admission(current, now)?;
+        let mut p = self.pairing.ok_or(Error::Unsupported)?;
+        if !p.numeric || p.user_confirmed || p.number != Some(code) || p.job.is_some() {
+            return Err(Error::Stale);
+        }
+        if !accept {
+            self.fail_pairing(-13);
+            return Ok(None);
+        }
+        let role = self.capability.ok_or(Error::Unsupported)?.role;
+        let job = if role == 0 {
+            self.enqueue(current, now, 0x141, &p.own_proof)?;
+            None
+        } else if let Some(proof) = p.pending_peer_proof.take() {
+            let cookie = self.next_cookie;
+            self.next_cookie = cookie.checked_add(1).ok_or(Error::Overflow)?;
+            let ticket = Ticket {
+                identity: current,
+                cookie,
+            };
+            p.job = Some((ticket, CryptoKind::GProofAndRespond));
+            let mut data = [0; 64];
+            data[..16].copy_from_slice(&proof);
+            Some(CryptoJob {
+                ticket,
+                kind: CryptoKind::GProofAndRespond,
+                data,
+                confirm: p.confirm,
+            })
+        } else {
+            None
+        };
+        p.user_confirmed = true;
+        p.number = None;
+        if let Some(c) = &mut self.capability {
+            c.observation.flags = (c.observation.flags & !8) | 16;
+            c.observation.comparison_code = 0;
+        }
+        self.pairing = Some(p);
+        Ok(job)
     }
 }

@@ -194,7 +194,11 @@ impl Command {
         let mut result = EINVAL.to_errno();
         match session.commit(self.ticket, owner.identity, now(), || {
             result = submit();
-            if result == 0 { Ok(()) } else { Err(()) }
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
         }) {
             Ok(()) => 0,
             Err(relay::Error::NeverSubmitted) => result,
@@ -338,9 +342,7 @@ impl super::ControllerRuntime {
             handle,
             grant_epoch: epoch,
         };
-        let deadline = now()
-            .checked_add(5_000_000_000)
-            .ok_or(EOVERFLOW);
+        let deadline = now().checked_add(5_000_000_000).ok_or(EOVERFLOW);
         let deadline = match deadline {
             Ok(d) => d,
             Err(e) => {
@@ -367,6 +369,7 @@ impl Command {
         mut material: Option<super::sle_pair_material::Material>,
         public: [u8; 64],
         install: bool,
+        numeric: bool,
     ) -> Result<Option<(Self, relay::Packet)>> {
         let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
         let mut state = owner.state.lock();
@@ -378,7 +381,9 @@ impl Command {
                 return Err(EBUSY);
             }
             let mut session = relay::Session::new(identity, now(), deadline).map_err(error)?;
-            let packet = if material.is_some() {
+            let packet = if numeric {
+                session.approve_numeric(identity, now(), role, initiate, public)
+            } else if material.is_some() {
                 session.approve_key_agreement(identity, now(), role, initiate, public)
             } else {
                 session.approve_capabilities(identity, now(), role, initiate)
@@ -414,6 +419,62 @@ impl Command {
         }
     }
 
+    unsafe fn execute_crypto(
+        pointer: *mut c_void,
+        identity: Identity,
+        job: relay::CryptoJob,
+        runtime: &super::ControllerRuntime,
+    ) -> Result {
+        let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+        let mut state = owner.state.lock();
+        if state.stopped || owner.identity != identity {
+            return Err(ENODEV);
+        }
+        let material = state.material.take();
+        drop(state);
+        let result = if let Some(mut material) = material {
+            // Actual P256/CMAC may sleep. No Owner/Host/gate guard
+            // or unretained C pointer crosses this operation.
+            let receipt = material.execute(&job);
+            let host = runtime.host.lock();
+            let gate = runtime.schedule_gate.lock();
+            let (_, known, links) = host.link_snapshot();
+            let live = !*gate
+                && host.admits_data()
+                && host.grants.permits(identity.grant_epoch)
+                && known
+                && links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.lifetime == identity.lifetime && l.handle == identity.handle);
+            let mut state = owner.state.lock();
+            let result = if !live || state.stopped {
+                Err(EACCES)
+            } else {
+                state.session.as_mut().ok_or(ENODEV).and_then(|s| {
+                    s.material_output(identity, now(), job, receipt)
+                        .map_err(error)
+                })
+            };
+            if result.is_ok() {
+                state.material = Some(material);
+            } else if let Some(s) = &mut state.session {
+                s.withdraw();
+            }
+            drop(state);
+            drop(gate);
+            drop(host);
+            result
+        } else {
+            let mut state = owner.state.lock();
+            if let Some(s) = &mut state.session {
+                s.crypto_failed(EIO.to_errno());
+            }
+            Err(EIO)
+        };
+        result
+    }
+
     /// Returns handled=true for an approved lifetime even on failure. Such a
     /// packet must not fall through and manufacture another denial procedure.
     unsafe fn receive(
@@ -436,48 +497,8 @@ impl Command {
             };
             let result = match job {
                 Ok(Some(job)) => {
-                    let material = state.material.take();
                     drop(state);
-                    let result = if let Some(mut material) = material {
-                        // Actual P256/CMAC may sleep. No Owner/Host/gate guard
-                        // or unretained C pointer crosses this operation.
-                        let receipt = material.execute(&job);
-                        let host = runtime.host.lock();
-                        let gate = runtime.schedule_gate.lock();
-                        let (_, known, links) = host.link_snapshot();
-                        let live = !*gate
-                            && host.admits_data()
-                            && host.grants.permits(identity.grant_epoch)
-                            && known
-                            && links.iter().flatten().any(|l| {
-                                l.lifetime == identity.lifetime && l.handle == identity.handle
-                            });
-                        let mut state = owner.state.lock();
-                        let result = if !live || state.stopped {
-                            Err(EACCES)
-                        } else {
-                            state.session.as_mut().ok_or(ENODEV).and_then(|s| {
-                                s.pairing_output(identity, now(), job, receipt)
-                                    .map_err(error)
-                            })
-                        };
-                        if result.is_ok() {
-                            state.material = Some(material);
-                        } else if let Some(s) = &mut state.session {
-                            s.withdraw();
-                        }
-                        drop(state);
-                        drop(gate);
-                        drop(host);
-                        result
-                    } else {
-                        let mut state = owner.state.lock();
-                        if let Some(s) = &mut state.session {
-                            s.crypto_failed(EIO.to_errno());
-                        }
-                        Err(EIO)
-                    };
-                    result
+                    unsafe { Self::execute_crypto(pointer, identity, job, runtime) }
                 }
                 Ok(None) => {
                     drop(state);
@@ -572,10 +593,14 @@ impl super::ControllerRuntime {
         let jiffies_after = unsafe { kernel::bindings::jiffies_64 };
         // Use the actual kernel timer rate, not bindgen's userspace HZ macro.
         let hz = kernel::time::msecs_to_jiffies(1000) as u32;
-        let deadline = match relay::host_wake_deadline(sampled_ns, command.deadline, jiffies_after, hz) {
-            Ok(value) => value,
-            Err(e) => { retained.withdraw(); return Err(error(e)); }
-        };
+        let deadline =
+            match relay::host_wake_deadline(sampled_ns, command.deadline, jiffies_after, hz) {
+                Ok(value) => value,
+                Err(e) => {
+                    retained.withdraw();
+                    return Err(error(e));
+                }
+            };
         let mut host = self.host.lock();
         let gate = self.schedule_gate.lock();
         let result = if *gate {
@@ -600,9 +625,11 @@ impl super::ControllerRuntime {
         // The immutable caller deadline also covers policy/Agent/queue/crypto.
         // Session's every prepare/commit/input/query uses this same ns domain;
         // no conversion to Host timer ticks can extend authorization.
-        let deadline = relay::original_deadline(now(), request.deadline_monotonic_ns, request.timeout_ms).map_err(error)?;
+        let deadline =
+            relay::original_deadline(now(), request.deadline_monotonic_ns, request.timeout_ms)
+                .map_err(error)?;
         let identity = self.relay_identity(request.lifetime, request.handle)?;
-        let (material, public) = if matches!(request.flags, 2 | 3) {
+        let (material, public) = if matches!(request.flags, 2 | 3 | 4) {
             let mut snapshot: super::sle_uapi::SleControllerSnapshot =
                 unsafe { core::mem::zeroed() };
             runtime.controller.provider().fill_snapshot(&mut snapshot);
@@ -610,6 +637,7 @@ impl super::ControllerRuntime {
                 request.role,
                 &snapshot.address,
                 &request.address,
+                request.flags == 4,
             )?;
             let public = material.public()?;
             (Some(material), public)
@@ -653,7 +681,8 @@ impl super::ControllerRuntime {
                     deadline,
                     material,
                     public,
-                    request.flags == 3,
+                    matches!(request.flags, 3 | 4),
+                    request.flags == 4,
                 )
             }
         })();
@@ -669,35 +698,128 @@ impl super::ControllerRuntime {
     }
 
     pub(crate) fn cancel_security_author(
-        &self, author: u64, lifetime: u64, handle: u16, request: u64,
+        &self,
+        author: u64,
+        lifetime: u64,
+        handle: u16,
+        request: u64,
     ) -> Result {
         let identity = self.relay_identity(lifetime, handle)?;
-        let (pointer, epoch) = self.existing_session_for_event(lifetime, handle).ok_or(ENOENT)?;
+        let (pointer, epoch) = self
+            .existing_session_for_event(lifetime, handle)
+            .ok_or(ENOENT)?;
         // Keep the event lookup's cloned kref through validation and material
         // destruction; cancellation must never allocate a replacement Session.
         let (result, material) = (|| {
             let host = self.host.lock();
             let (_, known, links) = host.link_snapshot();
             let gate = self.schedule_gate.lock();
-            if *gate { return (Err(ENODEV), None); }
+            if *gate {
+                return (Err(ENODEV), None);
+            }
             if epoch != identity.grant_epoch || !host.admits_data() || !host.grants.permits(epoch) {
                 return (Err(EACCES), None);
             }
-            if !known || !links.iter().flatten().any(|l| l.lifetime == lifetime && l.handle == handle) {
-                return (Err(Error::from_errno(-(kernel::bindings::ESTALE as i32))), None);
+            if !known
+                || !links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.lifetime == lifetime && l.handle == handle)
+            {
+                return (
+                    Err(Error::from_errno(-(kernel::bindings::ESTALE as i32))),
+                    None,
+                );
             }
             // SAFETY: lookup retains the C object and immutable security owner.
             let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
             let mut state = owner.state.lock();
-            if owner.identity != identity || state.stopped { return (Err(ENODEV), None); }
-            if state.author != author || state.request != request { return (Err(ENOENT), None); }
-            let result = state.session.as_mut().ok_or(ENOENT)
-                .and_then(|session| session.cancel(identity, now()).map_err(error)).map(|_| ());
-            let material = if result.is_ok() { state.material.take() } else { None };
+            if owner.identity != identity || state.stopped {
+                return (Err(ENODEV), None);
+            }
+            if state.author != author || state.request != request {
+                return (Err(ENOENT), None);
+            }
+            let result = state
+                .session
+                .as_mut()
+                .ok_or(ENOENT)
+                .and_then(|session| session.cancel(identity, now()).map_err(error))
+                .map(|_| ());
+            let material = if result.is_ok() {
+                state.material.take()
+            } else {
+                None
+            };
             (result, material)
         })();
         drop(material); // wipe secrets outside Host/gate/Owner locks
-        // SAFETY: release exactly the existing-lookup caller ref, never table ref.
+                        // SAFETY: release exactly the existing-lookup caller ref, never table ref.
+        unsafe { sl_connection_session_put(pointer) };
+        result
+    }
+
+    pub(crate) fn confirm_security_numeric(
+        &self,
+        author: u64,
+        request: &super::sle_uapi::SleSecurityNumericConfirm,
+    ) -> Result {
+        let identity = self.relay_identity(request.lifetime, request.handle)?;
+        let (pointer, epoch) = self
+            .existing_session_for_event(request.lifetime, request.handle)
+            .ok_or(ENOENT)?;
+        let mut rejected_material = None;
+        let result = (|| {
+            let host = self.host.lock();
+            let (_, known, links) = host.link_snapshot();
+            let gate = self.schedule_gate.lock();
+            if *gate
+                || epoch != identity.grant_epoch
+                || !host.admits_data()
+                || !host.grants.permits(epoch)
+            {
+                return Err(EACCES);
+            }
+            if !known
+                || !links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.lifetime == request.lifetime && l.handle == request.handle)
+            {
+                return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+            }
+            let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+            let mut state = owner.state.lock();
+            if state.stopped || owner.identity != identity {
+                return Err(ENODEV);
+            }
+            if state.author != author || state.request != request.request_id {
+                return Err(ENOENT);
+            }
+            let result = state
+                .session
+                .as_mut()
+                .ok_or(ENOENT)?
+                .confirm_numeric(
+                    identity,
+                    now(),
+                    request.comparison_code,
+                    request.accept == 1,
+                )
+                .map_err(error);
+            if result.is_ok() && request.accept == 0 {
+                rejected_material = state.material.take();
+            }
+            result
+        })()
+        .and_then(|job| {
+            if let Some(job) = job {
+                unsafe { Command::execute_crypto(pointer, identity, job, self) }
+            } else {
+                Ok(())
+            }
+        });
+        drop(rejected_material);
         unsafe { sl_connection_session_put(pointer) };
         result
     }

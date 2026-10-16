@@ -3,7 +3,7 @@
 #define _SPARKLINK_PAIR_MATERIAL_H
 #include <linux/types.h>
 struct sl_pair_material;
-int sl_pair_material_create(u8 role, const u8 *local, const u8 *remote,
+int sl_pair_material_create(u8 role, u8 method, const u8 *local, const u8 *remote,
 			    struct sl_pair_material **out);
 void sl_pair_material_destroy(struct sl_pair_material *material);
 int sl_pair_material_public(struct sl_pair_material *material, u8 *out);
@@ -12,6 +12,7 @@ int sl_pair_material_confirm(struct sl_pair_material *material, u8 *out);
 int sl_pair_material_nonce(struct sl_pair_material *material, u8 *out);
 int sl_pair_material_derive(struct sl_pair_material *material, const u8 *nonce,
 			    const u8 *confirm, u8 *out);
+int sl_pair_material_numeric(struct sl_pair_material *material, u32 *out);
 int sl_pair_material_verify(struct sl_pair_material *material, const u8 *proof,
 			    u8 *out);
 int sl_pair_material_install(struct sl_pair_material *material, u8 role, u8 *out);
