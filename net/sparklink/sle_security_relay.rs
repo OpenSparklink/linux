@@ -894,6 +894,46 @@ impl super::ControllerRuntime {
         }
     }
 
+    /// Snapshot only: never creates a Session, starts an exchange or grants
+    /// access. Physical identity/lease and the ingress barrier share the Host
+    /// lock with event attribution; owner state is copied under its IRQ lock.
+    pub(crate) fn connection_security_observation(
+        &self, lifetime: u64, handle: u16,
+    ) -> Result<relay::SecurityObservation> {
+        let retained = self.existing_session_for_event(lifetime, handle);
+        let result = (|| {
+            let host = self.host.lock();
+            let (_, known, links) = host.link_snapshot();
+            let gate = self.schedule_gate.lock();
+            if *gate { return Err(ENODEV); }
+            if let Some(fault) = host.controller_status().2 { return Err(fault); }
+            if !known { return Err(EAGAIN); }
+            let link = links.iter().flatten().find(|l| l.lifetime == lifetime && l.handle == handle)
+                .ok_or(Error::from_errno(-(kernel::bindings::ESTALE as i32)))?;
+            let epoch = host.grants.current_epoch().ok_or(EACCES)?;
+            if !host.admits_data() { return Err(EACCES); }
+            if link.security_revision == 0 { return Err(EOVERFLOW); }
+            let Some((pointer, retained_epoch)) = retained else {
+                return Ok(relay::SecurityObservation {
+                    epoch: link.security_revision, level: 0, flags: 0, method: 0, key_size: 0,
+                });
+            };
+            if epoch != retained_epoch { return Err(EACCES); }
+            // SAFETY: distinct table reference retained until after all locks.
+            let owner = unsafe { &*sl_connection_session_security(pointer).cast::<Owner>() };
+            let state = owner.state.lock();
+            if state.stopped { return Err(EACCES); }
+            match &state.session {
+                Some(session) => session.security_observation(owner.identity, link.security_revision).map_err(error),
+                None => Ok(relay::SecurityObservation {
+                    epoch: link.security_revision, level: 0, flags: 0, method: 0, key_size: 0,
+                }),
+            }
+        })();
+        if let Some((pointer, _)) = retained { unsafe { sl_connection_session_put(pointer) }; }
+        result
+    }
+
     pub(crate) fn receive_security_installation(
         &self,
         lifetime: u64,
@@ -901,6 +941,7 @@ impl super::ControllerRuntime {
         event: u16,
         status: u8,
         enabled: u8,
+        security_revision: u64,
     ) -> Result {
         // This lookup never creates a Session and grants no new authorization.
         let (pointer, epoch) = self
@@ -942,7 +983,7 @@ impl super::ControllerRuntime {
             // Old physical receipt may pay old obligation; cannot recreate keys,
             // authorize the successor epoch or publish a new successful result.
             session
-                .installation_event(identity, now(), event, status, enabled)
+                .installation_event_at(identity, now(), event, status, enabled, security_revision)
                 .map_err(error)
         })();
         unsafe { sl_connection_session_put(pointer) };

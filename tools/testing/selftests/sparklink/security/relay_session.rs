@@ -681,30 +681,31 @@ fn same_session_installation_requires_proof_role_request_actual_submit_accept_an
                     Err(Error::Stale)
                 );
                 if event_first {
-                    s.installation_event(id, 23, 0x11, 0, 1).unwrap();
+                    s.installation_event_at(id, 23, 0x11, 0, 1, 2).unwrap();
                 }
                 assert_eq!(s.capability_observation(24).unwrap().state, 3);
                 s.reply(p.ticket, 25, complete, 0).unwrap();
                 if !event_first {
                     assert_eq!(s.capability_observation(26).unwrap().state, 3);
-                    s.installation_event(id, 27, 0x11, 0, 1).unwrap();
+                    s.installation_event_at(id, 27, 0x11, 0, 1, 2).unwrap();
                 }
                 assert_eq!(s.capability_observation(28).unwrap().state, 9);
                 assert_eq!(s.phase(), Phase::Closed);
                 assert!(!s.outstanding());
                 assert_eq!(s.installation_event(id, 29, 0x11, 0, 1), Err(Error::Closed));
-                // An actual later off event also invalidates the observation
-                // beyond the old operation deadline; a late on cannot revive it.
-                assert_eq!(
-                    s.installation_event(id, 101, 0x11, 0, 0),
-                    Err(Error::Closed)
-                );
-                assert_eq!(s.capability_observation(102).unwrap().state, 5);
-                assert_eq!(
-                    s.installation_event(id, 103, 0x11, 0, 1),
-                    Err(Error::Expired)
-                );
-                assert_ne!(s.capability_observation(104).unwrap().state, 9);
+                // Operation success remains historical; live epoch2 is invalid
+                // as soon as newer receipt3 exists, before its worker runs.
+                let live = s.security_observation(id, 2).unwrap();
+                assert_eq!((live.level,live.flags,live.method,live.key_size),(1,13,3,16));
+                assert_eq!(s.security_observation(id,3).unwrap().level,0);
+                assert_eq!(s.security_observation(Identity {lifetime:99,..id},2),Err(Error::Stale));
+                assert_eq!(s.security_observation(id,0),Err(Error::Overflow));
+                assert_eq!(s.installation_event_at(id,101,0x11,0,0,3),Err(Error::Closed));
+                assert_eq!(s.capability_observation(102).unwrap().state,9);
+                assert_eq!(s.security_observation(id,3).unwrap().level,0);
+                assert_eq!(s.installation_event_at(id,103,0x11,0,1,4),Err(Error::Expired));
+                assert_eq!(s.capability_observation(104).unwrap().state,9);
+                assert_eq!(s.security_observation(id,4).unwrap().level,0);
             }
         }
     }
@@ -1061,7 +1062,10 @@ fn numeric_requires_same_original_confirmation_and_real_peer_proof_before_instal
     s[0].progress_installation(ids[0],31).unwrap();let packet=s[0].prepare(ids[0],31).unwrap().unwrap();assert_eq!(packet.index,0x1c03);
     s[0].commit(packet.ticket,ids[0],32,||Ok(())).unwrap();s[0].reply(packet.ticket,33,false,0).unwrap();
     assert_ne!(s[0].capability_observation(33).unwrap().state,11);
-    s[0].installation_event(ids[0],34,0x11,0,1).unwrap();assert_eq!(s[0].capability_observation(35).unwrap().state,11);
+    s[0].installation_event_at(ids[0],34,0x11,0,1,2).unwrap();assert_eq!(s[0].capability_observation(35).unwrap().state,11);
+    assert_eq!(s[0].security_observation(ids[0],2).unwrap(),SecurityObservation {epoch:2,level:2,flags:15,method:4,key_size:16});
+    s[0].withdraw();assert_eq!(s[0].security_observation(ids[0],2).unwrap().level,0);
+    assert_eq!(s[0].capability_observation(101).unwrap().state,11);
 }
 #[test]
 fn numeric_reject_cancel_expire_and_late_jobs_never_continue_proof_or_install() {

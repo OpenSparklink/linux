@@ -214,8 +214,8 @@ impl WorkItem<0> for ControllerRuntime {
                             pr_debug!("sparklink: relay admission refused {}\n",error.to_errno());
                         }
                     }
-                    if let Some(sle_dli::SleEvent::NativeSecurityInstallation {lifetime,handle,event,status,enabled})=&event {
-                        if let Err(error)=this.receive_security_installation(*lifetime,*handle,*event,*status,*enabled) {
+                    if let Some(sle_dli::SleEvent::NativeSecurityInstallation {lifetime,security_revision,handle,event,status,enabled})=&event {
+                        if let Err(error)=this.receive_security_installation(*lifetime,*handle,*event,*status,*enabled,*security_revision) {
                             pr_debug!("sparklink: security installation event refused {}\n",error.to_errno());
                         }
                     }

@@ -298,6 +298,10 @@ impl CommandHost {
         // facts. Do not expose its observed absence as a known empty table.
         (revision, known && self.fault.is_none() && self.connections.fault_reason().is_none(), links)
     }
+    pub(crate) fn security_receipt(&mut self, handle: u16) -> Option<(u64, u64)> {
+        if !self.link_snapshot().1 { return None; }
+        self.links.security_receipt(handle)
+    }
     pub(crate) fn cancel_connection(&mut self, file: u64, request: u64) -> Result {
         let selected = self.connections.query(file, request).map(|operation| operation.cookie);
         let cookie = self.connections.cancel(file, request).map_err(|_| ENOENT)?;

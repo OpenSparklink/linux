@@ -1301,4 +1301,27 @@ struct sle_security_numeric_confirm {
 #define SL_IOCTL_SECURITY_NEGOTIATION_RESULT _IOWR(SL_MAGIC, 0xd3, struct sle_security_negotiation_result)
 #define SL_IOCTL_SECURITY_NEGOTIATION_CANCEL _IOW(SL_MAGIC, 0xd4, struct sle_security_negotiation_cancel)
 
+/* Current physical Session mechanism snapshot; not an author-operation result.
+ * Managed + CAP_NET_ADMIN, exact nonzero generation/lifetime, version1; all
+ * output fields zero on input. No allocation, exchange, raw keys or trust bit.
+ * security_epoch is per physical lifetime and advances at receipt ingress,
+ * BEFORE ordinary event queueing. A lost/pending receipt cannot preserve an
+ * older positive snapshot. Epoch0 is poisoned overflow and returns EOVERFLOW.
+ * level0 none; level1 no-MITM encryption; level2 explicitly confirmed numeric
+ * mechanism. These are NOT named peer identity, local app authorization, Bond
+ * or a protected Grant. flags: cipher1, numeric confirmation2, proof4, accept8.
+ * Query revalidates active lease, controller and physical lifetime under locks.
+ * Off/failure/rekey/withdraw/Down/retire cannot revive with a late on event.
+ * A snapshot is informational, not authorization for a later USB submission.
+ * Firmware handle-only receipt attribution still needs a proven reuse barrier.
+ */
+struct sle_connection_security {
+    __aligned_u64 generation, lifetime, security_epoch;
+    __u32 version, profile, level, flags;
+    __u16 handle;
+    __u8 method, key_size;
+    __s32 error;
+};
+#define SL_IOCTL_CONNECTION_SECURITY _IOWR(SL_MAGIC, 0xd6, struct sle_connection_security)
+
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

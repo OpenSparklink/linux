@@ -42,6 +42,7 @@ impl<T> Lock<T>{fn new(v:T)->Self{Self(RefCell::new(v))}fn lock(&self)->RefMut<'
 struct Host{grants:sle_grant::LeaseAuthority,links:LinkObservation,data_revoked:bool,fault:Option<Error>}
 impl Host{fn controller_status(&self)->(u32,bool,Option<Error>){(0,true,self.fault)}
 // @@ADMITTED@@
+fn security_receipt(&mut self,handle:u16)->Option<(u64,u64)>{self.links.security_receipt(handle)}
 fn link_snapshot(&self)->(u64,bool,[Option<sle_link_observation::Link>;16]){self.links.snapshot()}}
 struct Poll;impl Poll{fn notify_all(&self){}}
 struct Dummy{transport:*mut c_void}
@@ -521,8 +522,9 @@ fn security_event(event:u16,body:&[u8])->Vec<u8>{let mut v=vec![0xa2,event as u8
  link(&a,0,2);link(&a,0,1);
  assert_eq!(receive(0,7,&security_event(0x11,&[1,0,0,255])),0); // status/value stay opaque here
  let events=a.commands.borrow();assert_eq!(events.len(),3);assert!(b.commands.borrow().is_empty());
- for (n,e) in events.iter().enumerate(){match e{SleEvent::NativeSecurityInstallation{lifetime,handle,event,status,enabled}=>{
+ for (n,e) in events.iter().enumerate(){match e{SleEvent::NativeSecurityInstallation{lifetime,security_revision,handle,event,status,enabled}=>{
   assert_eq!((*lifetime,*handle),(if n==2{3}else{1},0));
+  assert_eq!(*security_revision,if n==1 {3}else{2});
   assert_eq!((*event,*status,*enabled),if n==0{(0xe,0,0)}else if n==1{(0x11,0,1)}else{(0x11,1,255)});
  },_=>panic!("wrong metadata variant")}}
 }
@@ -677,4 +679,16 @@ fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u6
  assert_eq!(call(&mut wait,&mut scope),-11);assert_eq!(wait,2);
  assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
  assert_eq!(call(&mut wait,&mut scope),-5); // uncertain debt never refunded
+}
+
+#[test] fn security_barrier_is_visible_before_queued_receipt_processing_or_loss() {
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ let before=a.host.lock().link_snapshot().2[0].unwrap().security_revision;
+ assert_eq!(before,1);
+ assert_eq!(receive(0,7,&security_event(0x11,&[0,0,0,0])),0);
+ // Fixture deliberately discards the ordinary queued event. The actual
+ // production IRQ ingress has already invalidated the previous revision.
+ a.commands.borrow_mut().clear();
+ assert_eq!(a.host.lock().link_snapshot().2[0].unwrap().security_revision,2);
+ assert_eq!(b.host.lock().link_snapshot().2[0].unwrap().security_revision,1);
 }

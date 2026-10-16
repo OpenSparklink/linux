@@ -23,6 +23,10 @@ pub(crate) const CAPACITY: usize = 16;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Link {
     pub(crate) lifetime: u64,
+    /// IRQ-safe ingress barrier, separate from the connection table revision.
+    /// A queued/dropped security receipt must already invalidate an older
+    /// security snapshot. Zero is permanently poisoned after counter overflow.
+    pub(crate) security_revision: u64,
     pub(crate) handle: u16,
     pub(crate) role: u8,
     pub(crate) address_type: u8,
@@ -60,6 +64,15 @@ impl LinkObservation {
     pub(crate) fn snapshot(&self) -> (u64, bool, [Option<Link>; CAPACITY]) {
         (self.revision, self.known(), self.links)
     }
+    /// Host lock serializes this with query/admission and ingress attribution.
+    /// This records a receipt, never enables encryption or creates a Session.
+    pub(crate) fn security_receipt(&mut self, handle: u16) -> Option<(u64, u64)> {
+        if !self.known() { return None; }
+        let link = self.links.iter_mut().flatten().find(|l| l.handle == handle)?;
+        link.security_revision = if link.security_revision == 0 { 0 }
+            else { link.security_revision.checked_add(1).unwrap_or(0) };
+        Some((link.lifetime, link.security_revision))
+    }
     fn advance(&mut self) -> Option<u64> {
         let Some(next) = self.revision.checked_add(1) else {
             self.uncertain = true;
@@ -94,7 +107,7 @@ impl LinkObservation {
             self.uncertain = true;
             return;
         }
-        let link = Link { lifetime: 0, handle, role: evidence.role as u8,
+        let link = Link { lifetime: 0, security_revision: 1, handle, role: evidence.role as u8,
             address_type: evidence.address_type as u8, address: evidence.address };
         if let Some(existing) = self.links.iter().flatten().find(|entry| entry.handle == handle) {
             if existing.role != link.role || existing.address_type != link.address_type
@@ -116,6 +129,36 @@ mod tests {
     }
     fn disconnected(handle: u16) -> LinkEvidence {
         LinkEvidence {kind:2,status:0,handle:handle as u32,role:0,address_type:0,address:[0;6],reserved:[0;2]}
+    }
+    #[test]
+    fn security_receipt_is_per_link_non_authorizing_and_survives_queue_loss() {
+        let mut state=LinkObservation::new();
+        assert_eq!(state.security_receipt(7),None);
+        state.observe(&connected(7,[1;6]));state.observe(&connected(8,[2;6]));
+        let before=state.snapshot();
+        assert_eq!(state.security_receipt(7),Some((1,2)));
+        assert_eq!(state.security_receipt(7),Some((1,3)));
+        let after=state.snapshot();
+        assert_eq!((before.0,before.1),(after.0,after.1));
+        assert!(before.2[1]==after.2[1]);
+        assert_eq!(after.2[0].unwrap().security_revision,3);
+        // No RX ring/worker is needed to publish this barrier. Duplicate link
+        // reports cannot reset it; actual Down/new lifetime starts separately.
+        state.observe(&connected(7,[1;6]));
+        assert_eq!(state.snapshot().2[0].unwrap().security_revision,3);
+        state.observe(&disconnected(7));state.observe(&connected(7,[1;6]));
+        let link=state.snapshot().2[0].unwrap();
+        assert_ne!(link.lifetime,1);assert_eq!(link.security_revision,1);
+    }
+    #[test]
+    fn security_revision_overflow_poison_never_revives_or_invalidates_peer() {
+        let mut state=LinkObservation::new();
+        state.observe(&connected(7,[1;6]));state.observe(&connected(8,[2;6]));
+        state.links[0].as_mut().unwrap().security_revision=u64::MAX;
+        assert_eq!(state.security_receipt(7),Some((1,0)));
+        assert_eq!(state.security_receipt(7),Some((1,0)));
+        assert!(state.known());assert_eq!(state.links[1].unwrap().security_revision,1);
+        state.uncertain=true;assert_eq!(state.security_receipt(8),None);
     }
     #[test]
     fn snapshot_lifetime_survives_duplicates_and_detects_handle_reuse() {

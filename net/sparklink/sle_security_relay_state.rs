@@ -126,6 +126,8 @@ pub(crate) struct Session {
     capability: Option<CapabilityExchange>,
     pairing: Option<Pairing>,
     installation: Option<Installation>,
+    security_revision: u64,
+    security_revoked: bool,
 }
 
 impl Session {
@@ -154,6 +156,8 @@ impl Session {
             capability: None,
             pairing: None,
             installation: None,
+            security_revision: 0,
+            security_revoked: false,
         })
     }
     pub(crate) fn phase(&self) -> Phase {
@@ -279,6 +283,7 @@ impl Session {
         {
             return Err(Error::Stale);
         }
+        self.security_revoked = true;
         if let Some(c) = &mut self.capability {
             c.observation.flags &= !8;
             c.observation.comparison_code = 0;
@@ -380,6 +385,7 @@ impl Session {
     /// Revoking a policy author removes only unexecuted work. Submitted
     /// commands retain their real reply reservation, even after final fd close.
     pub(crate) fn withdraw(&mut self) {
+        self.security_revoked = true;
         if let Some(c) = &mut self.capability {
             if c.observation.state < 4 {
                 c.observation.state = 6;
@@ -434,6 +440,7 @@ impl Session {
     /// Controller reset/reinit belongs to Runtime; no fake callback is emitted.
     #[cfg(any(test, kani))]
     pub(crate) fn retired_after_barrier(&mut self) {
+        self.security_revoked = true;
         if let Some(c) = &mut self.capability {
             c.observation.flags &= !8;
             c.observation.comparison_code = 0;
@@ -650,12 +657,73 @@ struct Installation {
     pending: bool,
 }
 
+/// Current mechanism facts, not an author-operation result, application
+/// authorization, durable identity or Bond. Runtime supplies the latest
+/// per-link ingress revision while holding Host -> gate -> owner locks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SecurityObservation {
+    pub(crate) epoch: u64,
+    pub(crate) level: u32, // 0 none, 1 no-MITM encryption, 2 confirmed numeric
+    pub(crate) flags: u32, // cipher=1, numeric confirmation=2, proof=4, acceptance=8
+    pub(crate) method: u8, // 0 none, 3 no-MITM, 4 numeric; not an identity grade
+    pub(crate) key_size: u8,
+}
+
 impl Session {
     pub(crate) fn key_agreement(&self) -> bool {
         self.pairing.is_some()
     }
     pub(crate) fn crypto_failed(&mut self, error: i32) {
         self.fail_pairing(error);
+    }
+
+    pub(crate) fn security_observation(
+        &self,
+        current: Identity,
+        ingress_revision: u64,
+    ) -> Result<SecurityObservation, Error> {
+        if current != self.identity { return Err(Error::Stale); }
+        if ingress_revision == 0 { return Err(Error::Overflow); }
+        let mut out = SecurityObservation {
+            epoch: ingress_revision, level: 0, flags: 0, method: 0, key_size: 0,
+        };
+        if !self.security_revoked && self.security_revision == ingress_revision
+            && self.phase == Phase::Closed
+            && self.installation.is_some_and(|i| i.accepted && i.encrypted)
+            && self.pairing.is_some_and(|p| p.proof_verified && p.job.is_none())
+        {
+            match self.capability.map(|c| c.observation.state) {
+                Some(9) => { out.level = 1; out.flags = 13; out.method = 3; out.key_size = 16; }
+                Some(11) if self.pairing.is_some_and(|p| p.numeric && p.user_confirmed) => {
+                    out.level = 2; out.flags = 15; out.method = 4; out.key_size = 16;
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Production ingress stamped this receipt before it could be queued or
+    /// dropped. A newer receipt immediately makes the previous snapshot stale,
+    /// even before this worker runs. A late on cannot revive a revoked result.
+    pub(crate) fn installation_event_at(
+        &mut self, current: Identity, now: u64, event: u16, status: u8,
+        enabled: u8, revision: u64,
+    ) -> Result<(), Error> {
+        if current != self.identity { return Err(Error::Stale); }
+        if revision == 0 || (event == 0x0011 && (status != 0 || enabled != 1))
+            || (event == 0x000e && self.security_revision != 0)
+        {
+            self.security_revoked = true;
+        }
+        let pending = self.phase == Phase::Open;
+        let result = self.installation_event(current, now, event, status, enabled);
+        if result.is_ok() && pending && event == 0x0011 && status == 0 && enabled == 1
+            && !self.security_revoked
+        {
+            self.security_revision = revision;
+        }
+        result
     }
 
     pub(crate) fn approve_key_agreement(
@@ -835,9 +903,8 @@ impl Session {
         status: u8,
         enabled: u8,
     ) -> Result<(), Error> {
-        // Terminal success is a historical operation result, never permission
-        // to keep reporting encryption after an actual off/failure/rekey event.
-        // Revocation/physical lifetime are separately rechecked by Runtime.
+        // Terminal success is historical. Current security is independently
+        // invalidated by installation_event_at and Runtime's ingress barrier.
         if current != self.identity {
             return Err(Error::Stale);
         }
@@ -890,12 +957,6 @@ impl Session {
                 .is_some_and(|c| matches!(c.observation.state, 9 | 11))
             && (status != 0 || enabled != 1)
         {
-            if let Some(c) = &mut self.capability {
-                c.observation.state = 5;
-                c.observation.flags &= !64;
-                c.observation.status = status;
-                c.observation.error = if status != 0 { -5 } else { -71 };
-            }
             return Err(Error::Closed);
         }
         self.admission(current, now)?;

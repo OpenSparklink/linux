@@ -1237,6 +1237,21 @@ fn ioctl_security_negotiation(
     arg: usize,
 ) -> Result<isize> {
     let owner = discovery_owner(context, me)?;
+    if cmd == SL_IOCTL_CONNECTION_SECURITY {
+        let input:SleConnectionSecurity=read_user_struct(arg)?;
+        if input.version!=1 {return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));}
+        if input.generation==0 || input.lifetime==0 || input.handle>0x0fff
+            || input.security_epoch!=0 || input.profile!=0 || input.level!=0 || input.flags!=0
+            || input.method!=0 || input.key_size!=0 || input.error!=0 {return Err(EINVAL);}
+        if input.generation!=owner.identity.generation {return Err(ENODEV);}
+        let snapshot=owner.connection_security_observation(input.lifetime,input.handle)?;
+        let output=SleConnectionSecurity {generation:input.generation,lifetime:input.lifetime,
+            security_epoch:snapshot.epoch,version:1,profile:owner.protocol_profile,
+            level:snapshot.level,flags:snapshot.flags,handle:input.handle,
+            method:snapshot.method,key_size:snapshot.key_size,error:0};
+        write_user_struct(arg,&output)?;
+        return Ok(0);
+    }
     if cmd == SL_IOCTL_SECURITY_NEGOTIATION_CANCEL {
         let input: SleSecurityNegotiationCancel = read_user_struct(arg)?;
         if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
@@ -1764,7 +1779,7 @@ fn ioctl_dispatch_infra(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u
         SL_IOCTL_SNOOP_GET => ioctl_snoop_get(context, me, arg),
         SL_IOCTL_DIAGNOSTIC_RESULT => ioctl_diagnostic_result(context, me, arg),
         SL_IOCTL_CONTROLLER_SNAPSHOT => ioctl_controller_snapshot(context, me, arg),
-        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL | SL_IOCTL_SECURITY_NUMERIC_CONFIRM => ioctl_security_negotiation(context,me,cmd,arg),
+        SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT | SL_IOCTL_SECURITY_NEGOTIATION_RESULT | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL | SL_IOCTL_SECURITY_NUMERIC_CONFIRM | SL_IOCTL_CONNECTION_SECURITY => ioctl_security_negotiation(context,me,cmd,arg),
         SL_IOCTL_CONNECTION_SUBMIT => ioctl_connection_submit(context, me, arg),
         SL_IOCTL_CONNECTION_RESULT => ioctl_connection_result(context, me, arg),
         SL_IOCTL_LINK_SNAPSHOT => ioctl_link_snapshot(context, me, arg),
@@ -2146,6 +2161,7 @@ impl MiscDevice for SparkLinkCtl {
             | SL_IOCTL_SECURITY_NEGOTIATION_RESULT
             | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL
             | SL_IOCTL_SECURITY_NUMERIC_CONFIRM
+            | SL_IOCTL_CONNECTION_SECURITY
             | SL_IOCTL_CONNECTION_SUBMIT
             | SL_IOCTL_CONNECTION_RESULT
             | SL_IOCTL_LINK_SNAPSHOT

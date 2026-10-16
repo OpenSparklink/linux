@@ -201,19 +201,22 @@ pub mod relay {
             let enabled: u8 = kani::any();
             let command_status: u8 = kani::any();
             if event_first {
-                let _ = s.installation_event(key(), 25, 0x11, status, enabled);
+                let _ = s.installation_event_at(key(), 25, 0x11, status, enabled, 2);
             }
             s.reply(packet.ticket, 26, false, command_status).unwrap();
             if !event_first {
-                let _ = s.installation_event(key(), 27, 0x11, status, enabled);
+                let _ = s.installation_event_at(key(), 27, 0x11, status, enabled, 2);
             }
             assert!(!s.outstanding());
             let good = status == 0 && enabled == 1 && command_status == 0;
             assert_eq!(s.capability_observation(28).unwrap().state == 9, good);
             if good {
-                assert!(s.installation_event(key(), 101, 0x11, 0, 0).is_err());
-                assert!(s.installation_event(key(), 102, 0x11, 0, 1).is_err());
-                assert_ne!(s.capability_observation(103).unwrap().state, 9);
+                assert_eq!(s.security_observation(key(),2).unwrap().level,1);
+                assert_eq!(s.security_observation(key(),3).unwrap().level,0);
+                assert!(s.installation_event_at(key(),101,0x11,0,0,3).is_err());
+                assert!(s.installation_event_at(key(),102,0x11,0,1,4).is_err());
+                assert_eq!(s.capability_observation(103).unwrap().state,9);
+                assert_eq!(s.security_observation(key(),4).unwrap().level,0);
             }
         }
 

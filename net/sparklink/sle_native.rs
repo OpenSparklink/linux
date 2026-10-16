@@ -776,13 +776,15 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         // Installation receipts may settle an existing physical obligation
         // after grant withdrawal. The worker only targets the original Session;
         // this metadata path neither creates one nor admits application data.
-        let lifetime={
-            let host=owner.host.lock();let (_,known,links)=host.link_snapshot();let gate=owner.schedule_gate.lock();
+        let (lifetime,security_revision)={
+            let mut host=owner.host.lock();let gate=owner.schedule_gate.lock();
             if *gate {return ENODEV.to_errno();}
-            let Some(link)=links.iter().flatten().find(|l|known&&l.handle==handle) else {return -(kernel::bindings::ESTALE as i32);};
-            link.lifetime
+            // Publish the per-link barrier before the ordinary RX ring. Even
+            // ring loss or a waiting worker cannot leave old security current.
+            let Some(receipt)=host.security_receipt(handle) else {return -(kernel::bindings::ESTALE as i32);};
+            receipt
         };
-        super::sle_ingress::enqueue_rx(&owner,SleEvent::NativeSecurityInstallation{lifetime,handle,event,status,enabled});
+        super::sle_ingress::enqueue_rx(&owner,SleEvent::NativeSecurityInstallation{lifetime,security_revision,handle,event,status,enabled});
         return 0;
     }
     if length > 260 { return PROTOCOL_ERROR; }

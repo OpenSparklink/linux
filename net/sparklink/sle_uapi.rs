@@ -2358,3 +2358,16 @@ impl_check_reserved!(SleSecurityNumericConfirm,[reserved]);
 unsafe impl FromBytes for SleSecurityNumericConfirm {}
 const _: ()=assert!(core::mem::size_of::<SleSecurityNumericConfirm>()==40);
 pub(crate) const SL_IOCTL_SECURITY_NUMERIC_CONFIRM:u32=_IOW::<SleSecurityNumericConfirm>(SL_MAGIC,0xd5);
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct SleConnectionSecurity {
+    pub(crate) generation:u64, pub(crate) lifetime:u64, pub(crate) security_epoch:u64,
+    pub(crate) version:u32, pub(crate) profile:u32, pub(crate) level:u32, pub(crate) flags:u32,
+    pub(crate) handle:u16, pub(crate) method:u8, pub(crate) key_size:u8, pub(crate) error:i32,
+}
+impl_check_reserved!(SleConnectionSecurity);
+// SAFETY: initialized integer-only ABI, every bit pattern valid.
+unsafe impl FromBytes for SleConnectionSecurity {}
+const _: ()=assert!(core::mem::size_of::<SleConnectionSecurity>()==48);
+pub(crate) const SL_IOCTL_CONNECTION_SECURITY:u32=_IOWR::<SleConnectionSecurity>(SL_MAGIC,0xd6);
