@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Runtime-owned connection session, bounded fixed channels, fd bindings. Dynamic
- * TCIDs/reliable modes and same-lifetime rebinding require protocol support. */
+/* Runtime-owned connection session, bounded fixed/dynamic basic channels and
+ * fd bindings. Reliable modes and TCID reuse still require verified barriers. */
 #include <linux/capability.h>
 #include <linux/compat.h>
 #include <linux/uaccess.h>
@@ -22,10 +22,15 @@
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sle_dynamic_state.h"
 #include "sle_fragment_cursor.h"
 #include "sle_security_relay.h"
 
-_Static_assert(SL_SESSION_CHANNELS == 2 && SL_CHANNEL_USER_SLOT == 0 && SL_CHANNEL_SMTC_SLOT == 1, "fixed channel table bounds");
+_Static_assert(sizeof(struct sockaddr_sparklink_dynamic) == 64,
+	       "dynamic address layout");
+_Static_assert(SL_FIXED_CHANNELS == 2 && SL_CHANNEL_USER_SLOT == 0 &&
+		       SL_CHANNEL_SMTC_SLOT == 1,
+	       "fixed channel table bounds");
 _Static_assert(SL_GRANT_TX == SPARKLINK_SOCKET_TX && SL_GRANT_RX == SPARKLINK_SOCKET_RX, "grant direction UAPI mismatch");
 
 #define SL_CHANNEL_TX 8
@@ -35,6 +40,13 @@ struct sl_basic_channel {
 	u8 local_tcid, remote_tcid, pi;
 	unsigned int mtu, mps;
 	struct sl_binding_progress binding;
+	bool dynamic;
+	struct sl_dynamic_progress negotiation;
+	unsigned long dynamic_deadline;
+	unsigned int pending_directions, source_port, destination_port, aid,
+		slqi;
+	int dynamic_error;
+	bool dynamic_notified, close_id_assigned, peer_closed;
 	struct sock *sk; /* held reference; session lock protects detach/delivery */
 	struct sk_buff_head tx, rx;
 	u64 rx_dropped;
@@ -50,6 +62,10 @@ struct sl_connection_session {
 	unsigned long unknown_deadline; /* worker-only bounded snapshot uncertainty */
 	struct delayed_work work;
 	struct sl_basic_channel channels[SL_SESSION_CHANNELS];
+	unsigned int next_signal_id, next_tcid; /* Session lock, never reused */
+	struct sl_channel_signal
+		rejection[4]; /* worker-only bounded unsupported requests */
+	unsigned int rejection_count;
 	unsigned int tx_next; /* serialized worker-only round-robin start */
 	u16 acb_maximum; /* controller packet size, distinct from DTAP MTU */
 	int fragment_slot; /* sole operation slot; Session lock protects ownership */
@@ -85,7 +101,26 @@ static int sl_permits(struct sl_connection_session *s, struct sl_basic_channel *
 		.handle = s->handle, .local_tcid = c->local_tcid,
 		.remote_tcid = c->remote_tcid, .pi = c->pi };
 
-	return c->sk && sl_grant_permits(&sl_sk(c->sk)->grant, scope, direction);
+	return c->sk &&
+	       (!c->dynamic || c->negotiation.phase == SL_DYN_OPEN ||
+		(direction == SL_GRANT_RX && c->peer_closed)) &&
+	       sl_grant_permits(&sl_sk(c->sk)->grant, scope, direction);
+}
+/* Pending setup has no grant yet. Closing/terminal channels never regain data
+ * permission even while their protocol cleanup remains Session-owned. */
+static int sl_dynamic_status(struct sl_basic_channel *c)
+{
+	if (!c->dynamic || c->negotiation.phase == SL_DYN_OPEN)
+		return 0;
+	switch (c->negotiation.phase) {
+	case SL_DYN_LISTEN:
+	case SL_DYN_CONNECT:
+	case SL_DYN_CONNECT_SENT:
+	case SL_DYN_RESPONSE:
+		return -EAGAIN;
+	default:
+		return -ENOTCONN;
+	}
 }
 static void sl_session_destroy(struct kref *refs)
 {
@@ -211,7 +246,7 @@ static void sl_progress_event(struct sl_connection_session *s, unsigned int even
 	}
 	after = s->progress.phase;
 	if (after == SL_CH_OPEN) {
-		for (i = 0; i < SL_SESSION_CHANNELS; i++) {
+		for (i = 0; i < SL_FIXED_CHANNELS; i++) {
 			s->channels[i].mtu = sl_channel_payload_limit(s->progress, s->channels[i].remote_tcid);
 			s->channels[i].mps = s->progress.mps;
 		}
@@ -272,9 +307,237 @@ static int sl_send(struct sl_connection_session *s, struct sl_basic_channel *c, 
 		s->handle, data, length, s->epoch, sl_session_submit, &permission);
 }
 
+/* Session lock protects all channel transitions and the immutable final grant.
+ * Called only inside Runtime Host/data/gate admission or actual submit consent.
+ */
+static int sl_dynamic_grant(struct sl_connection_session *s,
+			    struct sl_basic_channel *c,
+			    struct sl_channel_grant *grant)
+{
+	struct sl_grant_scope scope = { .controller = s->controller,
+					.generation = s->generation,
+					.lifetime = s->lifetime,
+					.epoch = s->epoch,
+					.handle = s->handle,
+					.local_tcid = c->local_tcid,
+					.remote_tcid = c->remote_tcid,
+					.pi = c->pi };
+	return c->sk && sl_binding_live(c->binding) &&
+	       sl_grant_init(grant, scope, c->pending_directions, 0);
+}
+static void sl_dynamic_open(struct sl_basic_channel *c,
+			    struct sl_channel_grant grant)
+{
+	/* No application grant exists before this one publication. c->sk remains
+	 * attached under Session lock until release removes it before orphaning. */
+	sl_sk(c->sk)->grant = grant;
+	WRITE_ONCE(c->sk->sk_state, TCP_ESTABLISHED);
+	if (c->sk->sk_socket)
+		WRITE_ONCE(c->sk->sk_socket->state, SS_CONNECTED);
+}
+static void sl_dynamic_closing(struct sl_connection_session *s,
+			       struct sl_basic_channel *c)
+{
+	if (c->negotiation.phase != SL_DYN_CLOSE || c->close_id_assigned)
+		return;
+	if (s->next_signal_id > 255) {
+		c->negotiation.phase = SL_DYN_FAILED;
+		c->dynamic_error = -ENOSPC;
+		return;
+	}
+	c->negotiation.identifier = s->next_signal_id++;
+	c->close_id_assigned = true;
+	c->dynamic_deadline = jiffies + msecs_to_jiffies(5000);
+}
+struct sl_dynamic_received {
+	struct sl_connection_session *session;
+	struct sl_channel_signal message;
+	bool changed;
+};
+static int sl_dynamic_receive(void *context)
+{
+	struct sl_dynamic_received *r = context;
+	struct sl_connection_session *s = r->session;
+	struct sl_channel_signal *m = &r->message;
+	struct sl_basic_channel *c = NULL;
+	struct sl_channel_grant grant;
+	unsigned int i, result = 1;
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->progress.phase != SL_CH_OPEN)
+		goto unlock;
+	r->changed = true;
+	if (m->code == SL_CMTC_CONNECT_REQ) {
+		for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++) {
+			struct sl_basic_channel *entry = &s->channels[i];
+			if (entry->remote_tcid == m->source) {
+				result = 4;
+				goto reject;
+			} /* bounded tombstones */
+			if (entry->dynamic &&
+			    entry->negotiation.phase == SL_DYN_LISTEN &&
+			    sl_binding_live(entry->binding) &&
+			    entry->source_port == m->destination_port &&
+			    entry->destination_port == m->source_port &&
+			    entry->aid == m->aid)
+				c = entry;
+		}
+		if (!c || !m->ports || !m->exclusive || m->measurement ||
+		    m->slqi_count != 1 || m->slqi[0] != c->slqi)
+			goto reject;
+		if (time_after_eq(jiffies, c->dynamic_deadline)) {
+			c->negotiation.phase = SL_DYN_FAILED;
+			c->dynamic_error = -ETIMEDOUT;
+			goto reject;
+		}
+		if (m->mtu > c->mtu || m->mtu > s->progress.mtu) {
+			result = 2;
+			goto reject;
+		}
+		if (m->mps > c->mps || m->mps > s->progress.mps ||
+		    m->mps < m->mtu + 5U) {
+			result = 3;
+			goto reject;
+		}
+		c->remote_tcid = m->source;
+		c->mtu = m->mtu;
+		c->mps = m->mps;
+		c->negotiation.peer_identifier = m->identifier;
+		c->negotiation.phase = SL_DYN_RESPONSE;
+	} else if (m->code == SL_CMTC_CONNECT_RSP) {
+		for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++)
+			if (s->channels[i].local_tcid == m->source)
+				c = &s->channels[i];
+		if (!c || m->identifier != c->negotiation.identifier ||
+		    (c->negotiation.phase != SL_DYN_CONNECT_SENT &&
+		     c->negotiation.phase != SL_DYN_ABANDONED))
+			goto unlock;
+		if (time_after_eq(jiffies, c->dynamic_deadline)) {
+			c->negotiation.phase = SL_DYN_FAILED;
+			c->dynamic_error = -ETIMEDOUT;
+			goto unlock;
+		}
+		if (m->result) {
+			sl_dynamic_connected(&c->negotiation, m->identifier,
+					     m->result);
+			c->dynamic_error = -ECONNREFUSED;
+			goto unlock;
+		}
+		for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++)
+			if (&s->channels[i] != c &&
+			    s->channels[i].remote_tcid == m->destination) {
+				c->negotiation.phase = SL_DYN_FAILED;
+				c->dynamic_error = -EPROTO;
+				goto unlock;
+			}
+		c->remote_tcid = m->destination;
+		if (c->negotiation.phase == SL_DYN_CONNECT_SENT) {
+			if (!sl_dynamic_grant(s, c, &grant)) {
+				c->negotiation.phase = SL_DYN_ABANDONED;
+			} else
+				sl_dynamic_open(c, grant);
+		}
+		sl_dynamic_connected(&c->negotiation, m->identifier, 0);
+		sl_dynamic_closing(s, c);
+	} else {
+		for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++) {
+			struct sl_basic_channel *entry = &s->channels[i];
+			/* A peer close can overtake its create response. It may
+			 * cancel our already-submitted setup, never mint a Grant. */
+			if (m->code == SL_CMTC_CLOSE_REQ && entry->dynamic &&
+			    entry->local_tcid == m->destination &&
+			    !entry->remote_tcid &&
+			    (entry->negotiation.phase == SL_DYN_CONNECT_SENT ||
+			     entry->negotiation.phase == SL_DYN_ABANDONED)) {
+				entry->remote_tcid = m->source;
+				c = entry;
+			}
+			if (entry->dynamic &&
+			    (m->code == SL_CMTC_CLOSE_REQ ?
+				     entry->local_tcid == m->destination &&
+					     entry->remote_tcid == m->source :
+				     entry->local_tcid == m->source &&
+					     entry->remote_tcid ==
+						     m->destination))
+				c = entry;
+		}
+		if (!c)
+			goto unlock;
+		if (m->code == SL_CMTC_CLOSE_REQ &&
+		    (c->negotiation.phase == SL_DYN_OPEN ||
+		     c->negotiation.phase == SL_DYN_RESPONSE ||
+		     c->negotiation.phase == SL_DYN_CONNECT_SENT ||
+		     c->negotiation.phase == SL_DYN_ABANDONED ||
+		     c->negotiation.phase == SL_DYN_CLOSE ||
+		     c->negotiation.phase == SL_DYN_CLOSE_SENT)) {
+			c->negotiation.peer_identifier = m->identifier;
+			if (c->negotiation.phase == SL_DYN_OPEN)
+				c->dynamic_deadline =
+					jiffies + msecs_to_jiffies(5000);
+			c->negotiation.phase = SL_DYN_CLOSE_RESPONSE;
+			c->peer_closed = true;
+		} else if (m->code == SL_CMTC_CLOSE_RSP &&
+			   c->negotiation.phase == SL_DYN_CLOSE_SENT &&
+			   m->identifier == c->negotiation.identifier)
+			c->negotiation.phase = SL_DYN_RETIRED;
+	}
+	goto unlock;
+reject:
+	if (s->rejection_count < ARRAY_SIZE(s->rejection))
+		s->rejection[s->rejection_count++] =
+			(struct sl_channel_signal){ .code = SL_CMTC_CONNECT_RSP,
+						    .identifier = m->identifier,
+						    .source = m->source,
+						    .result = result };
+unlock:
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
+struct sl_dynamic_submit {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+	enum sl_dynamic_phase phase;
+	size_t pdu_bytes;
+};
+static int sl_dynamic_consent(void *context, int (*submit)(void *),
+			      void *argument)
+{
+	struct sl_dynamic_submit *a = context;
+	struct sl_connection_session *s = a->session;
+	struct sl_basic_channel *c = a->channel;
+	struct sl_channel_grant grant = { 0 };
+	enum sl_dynamic_phase phase = a->phase;
+	int ret;
+	spin_lock(&s->lock); /* Runtime Host/data/gate has IRQs disabled */
+	if (s->progress.phase != SL_CH_OPEN || s->fragment_slot >= 0 ||
+	    c->negotiation.phase != phase)
+		ret = -ECANCELED;
+	else if (!a->pdu_bytes || a->pdu_bytes > s->progress.mps)
+		ret = -EMSGSIZE;
+	else if (time_after_eq(jiffies, c->dynamic_deadline))
+		ret = -ETIMEDOUT;
+	else if ((phase == SL_DYN_CONNECT || phase == SL_DYN_RESPONSE) &&
+		 !sl_binding_live(c->binding))
+		ret = -ECANCELED;
+	else if (phase == SL_DYN_RESPONSE && !sl_dynamic_grant(s, c, &grant))
+		ret = -ECANCELED;
+	else {
+		ret = submit(argument);
+		if (!ret) {
+			if (phase == SL_DYN_RESPONSE)
+				sl_dynamic_open(c, grant);
+			sl_dynamic_submitted(&c->negotiation);
+		}
+	}
+	spin_unlock(&s->lock);
+	return ret;
+}
 /* Exactly one session worker consumes the connection's ACB queue. Decode once,
  * route CMTC to session state, then route DTAP by local TCID/PI to channel RX. */
-static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t length)
+static void sl_route(struct sl_connection_session *s, const u8 *bytes,
+		     size_t length)
 {
 	unsigned long flags;
 	struct sl_channel_frame frame;
@@ -290,22 +553,52 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 	if (ret)
 		return;
 	if (frame.tcid == SL_CHANNEL_CMTC) {
-		if (sl_channel_cap_decode(frame.data, frame.length, &code, &identifier, &mask, &cap))
+		if (frame.length && frame.data[0] >= SL_CMTC_CONNECT_REQ &&
+		    frame.data[0] <= SL_CMTC_CLOSE_RSP) {
+			struct sl_dynamic_received r = { .session = s };
+			if (length > sl_snapshot(s).mps)
+				return;
+			if (!sl_channel_signal_decode(frame.data, frame.length,
+						      &r.message) &&
+			    !sparklink_native_session_admit(
+				    s->controller, s->generation, s->lifetime,
+				    s->handle, s->epoch, sl_dynamic_receive,
+				    &r) &&
+			    r.changed)
+				sl_wake(s);
+			return;
+		}
+		if (sl_channel_cap_decode(frame.data, frame.length, &code,
+					  &identifier, &mask, &cap))
 			return;
 		if (code == 1) {
-			if (s->response_pending && s->response_id != identifier) {
+			if (s->response_pending &&
+			    s->response_id != identifier) {
 				sl_fault(s, -EPROTO);
 				return;
 			}
 			s->response_pending = true;
 			s->response_id = identifier;
 			s->response_mask = mask;
-		} else if (identifier == SL_CHANNEL_CAP_IDENTIFIER && sl_snapshot(s).request_submitted) {
+		} else if (identifier == SL_CHANNEL_CAP_IDENTIFIER &&
+			   sl_snapshot(s).request_submitted) {
 			sl_progress_event(s, 2, cap.mtu, cap.mps);
 		}
 		return;
 	}
 	slot = sl_channel_rx_slot(frame.tcid, frame.pi);
+	if (slot < 0) {
+		unsigned int i;
+		spin_lock_irqsave(&s->lock, flags);
+		for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++)
+			if (s->channels[i].dynamic &&
+			    s->channels[i].local_tcid == frame.tcid &&
+			    s->channels[i].pi == frame.pi) {
+				slot = i;
+				break;
+			}
+		spin_unlock_irqrestore(&s->lock, flags);
+	}
 	if (slot < 0)
 		return;
 	c = &s->channels[slot];
@@ -315,13 +608,16 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 	memcpy(skb_put(skb, frame.length), frame.data, frame.length);
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) &&
-	    sl_permits(s, c, SL_GRANT_RX) && frame.tcid == c->local_tcid && frame.pi == c->pi &&
+	    sl_permits(s, c, SL_GRANT_RX) &&
+	    (!c->dynamic || c->negotiation.phase == SL_DYN_OPEN) &&
+	    frame.tcid == c->local_tcid && frame.pi == c->pi &&
 	    frame.length <= c->mtu && length <= c->mps) {
 		spin_lock(&c->rx.lock);
 		if (c->rx.qlen < SL_CHANNEL_RX &&
-            atomic_read(&c->sk->sk_rmem_alloc) < READ_ONCE(c->sk->sk_rcvbuf) &&
-            sk_rmem_schedule(c->sk, skb, skb->truesize)) {
-            skb_set_owner_r(skb, c->sk);
+		    atomic_read(&c->sk->sk_rmem_alloc) <
+			    READ_ONCE(c->sk->sk_rcvbuf) &&
+		    sk_rmem_schedule(c->sk, skb, skb->truesize)) {
+			skb_set_owner_r(skb, c->sk);
 			__skb_queue_tail(&c->rx, skb);
 			skb = NULL;
 			sk = c->sk;
@@ -447,10 +743,155 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	sl_wake(s);
 	return ret == -EAGAIN ? 0 : ret;
 }
+static void sl_dynamic_work(struct sl_connection_session *s)
+{
+	unsigned int i;
+	unsigned long flags;
+	u8 signal[32], wire[36];
+	int n, ret;
+	bool wake = false;
+
+	for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++) {
+		struct sl_basic_channel *c = &s->channels[i];
+		struct sl_channel_signal m = { 0 };
+		struct sl_dynamic_submit consent = { .session = s,
+						     .channel = c };
+		bool notify = false;
+		int error = 0;
+		spin_lock_irqsave(&s->lock, flags);
+		if (!c->dynamic) {
+			spin_unlock_irqrestore(&s->lock, flags);
+			continue;
+		}
+		sl_dynamic_tick(&c->negotiation,
+				time_after_eq(jiffies, c->dynamic_deadline));
+		if ((c->negotiation.phase == SL_DYN_FAILED ||
+		     c->negotiation.phase == SL_DYN_RETIRED ||
+		     c->negotiation.phase == SL_DYN_CLOSE_RESPONSE) &&
+		    !c->dynamic_notified) {
+			c->dynamic_notified = true;
+			notify = true;
+			error = c->dynamic_error ? c->dynamic_error :
+						   -ETIMEDOUT;
+		}
+		consent.phase = c->negotiation.phase;
+		if (s->progress.phase == SL_CH_OPEN && s->fragment_slot < 0) {
+			m.source = c->local_tcid;
+			m.destination = c->remote_tcid;
+			m.identifier = c->negotiation.identifier;
+			switch (consent.phase) {
+			case SL_DYN_CONNECT:
+				if (c->mtu > s->progress.mtu ||
+				    c->mps > s->progress.mps ||
+				    s->progress.mps < 26) {
+					c->negotiation.phase = SL_DYN_FAILED;
+					c->dynamic_error = -EMSGSIZE;
+					break;
+				}
+				m.code = SL_CMTC_CONNECT_REQ;
+				m.mtu = c->mtu;
+				m.mps = c->mps;
+				m.exclusive = 1;
+				m.ports = 1;
+				m.source_port = c->source_port;
+				m.destination_port = c->destination_port;
+				m.aid = c->aid;
+				m.slqi_count = 1;
+				m.slqi[0] = c->slqi;
+				break;
+			case SL_DYN_RESPONSE:
+			case SL_DYN_REJECT:
+				m.code = SL_CMTC_CONNECT_RSP;
+				m.identifier = c->negotiation.peer_identifier;
+				m.source = c->remote_tcid;
+				m.destination = c->local_tcid;
+				m.result = consent.phase == SL_DYN_REJECT ? 1 :
+									    0;
+				break;
+			case SL_DYN_CLOSE:
+				m.code = SL_CMTC_CLOSE_REQ;
+				break;
+			case SL_DYN_CLOSE_RESPONSE:
+				m.code = SL_CMTC_CLOSE_RSP;
+				m.identifier = c->negotiation.peer_identifier;
+				m.source = c->remote_tcid;
+				m.destination = c->local_tcid;
+				break;
+			default:
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&s->lock, flags);
+		if (notify) {
+			if (c->peer_closed) {
+				struct sock *sk;
+				bool granted;
+				spin_lock_irqsave(&s->lock, flags);
+				sk = c->sk;
+				granted = sk && sl_sk(sk)->grant.scope.lifetime;
+				if (sk)
+					sock_hold(sk);
+				spin_unlock_irqrestore(&s->lock, flags);
+				skb_queue_purge(
+					&c->tx); /* already-begun PDU is Session-owned */
+				if (sk) {
+					if (!granted)
+						sl_socket_fault(sk,
+								-ECONNRESET);
+					WRITE_ONCE(sk->sk_state, TCP_CLOSE);
+					sk->sk_data_ready(sk);
+					sk->sk_state_change(sk);
+					sock_put(sk);
+				}
+			} else
+				sl_fail_channel(s, c, error);
+			wake = true;
+		}
+		if (!m.code)
+			continue;
+		n = sl_channel_signal_encode(signal, sizeof(signal), &m);
+		if (n >= 0)
+			n = sl_channel_frame_encode(wire, sizeof(wire),
+						    SL_CHANNEL_CMTC, 0, signal,
+						    n);
+		consent.pdu_bytes = n > 0 ? n : 0;
+		ret = n < 0 ? n :
+			      sparklink_native_acb_send_guarded(
+				      s->controller, s->generation, s->lifetime,
+				      s->handle, wire, n, s->epoch,
+				      sl_dynamic_consent, &consent);
+		if (!ret)
+			wake = true;
+		if (ret && ret != -EAGAIN && ret != -ECANCELED) {
+			spin_lock_irqsave(&s->lock, flags);
+			c->negotiation.phase = SL_DYN_FAILED;
+			c->dynamic_error = ret;
+			spin_unlock_irqrestore(&s->lock, flags);
+		}
+	}
+	/* Explicit failure only, bounded FIFO; no fabricated success for unknown endpoints. */
+	if (s->rejection_count && s->fragment_slot < 0 &&
+	    sl_snapshot(s).phase == SL_CH_OPEN) {
+		n = sl_channel_signal_encode(signal, sizeof(signal),
+					     &s->rejection[0]);
+		if (n >= 0)
+			n = sl_channel_frame_encode(wire, sizeof(wire),
+						    SL_CHANNEL_CMTC, 0, signal,
+						    n);
+		ret = n < 0 ? n : sl_send(s, NULL, wire, n);
+		if (!ret) {
+			s->rejection_count--;
+			memmove(s->rejection, s->rejection + 1,
+				s->rejection_count * sizeof(s->rejection[0]));
+		}
+	}
+	if (wake)
+		sl_wake(s);
+}
 static void sl_work(struct work_struct *work)
 {
 	struct sl_connection_session *s = container_of(to_delayed_work(work), struct sl_connection_session, work);
-	u8 signal[16], wire[24];
+	u8 signal[32], wire[36];
 	size_t size;
 	int ret, n;
 	unsigned int i;
@@ -505,6 +946,7 @@ static void sl_work(struct work_struct *work)
 		s->response_pending = false;
 		sl_progress_event(s, 3, 0, 0);
 	}
+	sl_dynamic_work(s);
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		unsigned int slot = (s->tx_next + i) % SL_SESSION_CHANNELS;
 		ret = sl_transmit_channel(s, &s->channels[slot]);
@@ -537,7 +979,9 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 		struct sl_basic_channel *c = &s->channels[i];
 		skb_queue_head_init(&c->tx);
 		skb_queue_head_init(&c->rx);
-		c->local_tcid = i == SL_CHANNEL_USER_SLOT ? SL_CHANNEL_CUTC : SL_CHANNEL_SMTC;
+		c->local_tcid = i >= SL_FIXED_CHANNELS	  ? 0 :
+				i == SL_CHANNEL_USER_SLOT ? SL_CHANNEL_CUTC :
+							    SL_CHANNEL_SMTC;
 		c->remote_tcid = c->local_tcid;
 		c->pi = i == SL_CHANNEL_USER_SLOT ? SPARKLINK_SOCKET_USER_PI : 0;
 	}
@@ -547,6 +991,8 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 	 */
 	s->acb_maximum = maximum;
 	s->fragment_slot = -1;
+	s->next_signal_id = 1;
+	s->next_tcid = 0x80;
 	s->progress.maximum = SL_FRAGMENT_PDU_MAX - 5;
 	s->progress.maximum_mps = SL_FRAGMENT_PDU_MAX;
 	return s;
@@ -627,6 +1073,139 @@ static int sl_publish_binding(void *context)
 	spin_unlock_irqrestore(&binding->lock, binding_flags);
 	return ret;
 }
+struct sl_dynamic_admission {
+	struct socket *sock;
+	struct sl_connection_session *session;
+	const struct sockaddr_sparklink_dynamic *address;
+	bool active;
+};
+static int sl_dynamic_publish(void *context)
+{
+	struct sl_dynamic_admission *a = context;
+	struct sl_connection_session *s = a->session;
+	struct sl_socket_binding *b = sl_sk(a->sock->sk);
+	const struct sockaddr_sparklink_dynamic *in = a->address;
+	struct sl_basic_channel *c = NULL;
+	unsigned long flags, binding_flags;
+	unsigned int i, slot = 0;
+	int ret = 0;
+
+	spin_lock_irqsave(&b->lock, binding_flags);
+	spin_lock_irqsave(&s->lock, flags);
+	if (b->session) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (s->progress.phase != SL_CH_UNBOUND &&
+	    !sl_channel_active(s->progress)) {
+		ret = -ENOTCONN;
+		goto unlock;
+	}
+	if (a->active && s->acb_maximum < 26) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+	for (i = SL_FIXED_CHANNELS; i < SL_SESSION_CHANNELS; i++) {
+		struct sl_basic_channel *entry = &s->channels[i];
+		if (entry->dynamic && sl_binding_live(entry->binding) &&
+		    entry->source_port == in->source_port &&
+		    entry->destination_port == in->destination_port &&
+		    entry->aid == in->aid) {
+			ret = -EADDRINUSE;
+			goto unlock;
+		}
+		if (!c && entry->negotiation.phase == SL_DYN_UNUSED) {
+			c = entry;
+			slot = i;
+		}
+	}
+	if (!c || s->next_tcid > 0xdf ||
+	    (a->active && s->next_signal_id > 255)) {
+		ret = -ENOSPC;
+		goto unlock;
+	}
+	if (s->progress.phase == SL_CH_UNBOUND) {
+		sl_channel_start(&s->progress, s->progress.maximum,
+				 s->progress.maximum_mps);
+		s->deadline = jiffies + msecs_to_jiffies(5000);
+	}
+	c->dynamic = true;
+	c->local_tcid = s->next_tcid++;
+	c->pi = in->base.pi;
+	c->mtu = in->mtu;
+	c->mps = in->mps;
+	c->source_port = in->source_port;
+	c->destination_port = in->destination_port;
+	c->aid = in->aid;
+	c->slqi = in->slqi;
+	c->pending_directions = in->base.directions;
+	c->negotiation.phase = a->active ? SL_DYN_CONNECT : SL_DYN_LISTEN;
+	c->negotiation.identifier = a->active ? s->next_signal_id++ : 0;
+	c->dynamic_deadline = jiffies + msecs_to_jiffies(5000);
+	sl_binding_attach(&c->binding);
+	c->sk = a->sock->sk;
+	sock_hold(c->sk);
+	b->channel_slot = slot;
+	b->session =
+		s; /* transfer caller's reference; grant is not minted yet */
+	a->sock->state = a->active ? SS_CONNECTING : SS_UNCONNECTED;
+	WRITE_ONCE(c->sk->sk_state, TCP_SYN_SENT);
+unlock:
+	spin_unlock_irqrestore(&s->lock, flags);
+	spin_unlock_irqrestore(&b->lock, binding_flags);
+	return ret;
+}
+static int sl_dynamic_attach(struct socket *sock,
+			     struct sockaddr_unsized *address, int length,
+			     bool active)
+{
+	const struct sockaddr_sparklink_dynamic *in = (void *)address;
+	struct sl_connection_session *s;
+	int ret;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+	if (length != sizeof(*in) || in->base.family != AF_SPARKLINK ||
+	    in->base.version != SPARKLINK_SOCKET_DYNAMIC_VERSION ||
+	    in->base.flags ||
+	    memchr_inv(in->base.reserved, 0, sizeof(in->base.reserved)) ||
+	    in->reserved || in->base.local_tcid || in->base.remote_tcid ||
+	    !in->base.directions ||
+	    in->base.directions &
+		    ~(SPARKLINK_SOCKET_TX | SPARKLINK_SOCKET_RX) ||
+	    in->base.pi < 241 || in->base.pi > 250 || !in->source_port ||
+	    !in->destination_port || !in->aid || !in->mtu || in->mtu > 2042 ||
+	    in->mps > 2047 || in->mps < in->mtu + 5U)
+		return -EINVAL;
+	if (in->mode || in->base.security)
+		return -EOPNOTSUPP;
+	s = sparklink_native_session_get(in->base.controller,
+					 in->base.generation, in->base.lifetime,
+					 in->base.handle, in->base.lease, &ret);
+	if (!s)
+		return ret;
+	{
+		struct sl_dynamic_admission a = { sock, s, in, active };
+		ret = sparklink_native_session_admit(s->controller,
+						     s->generation, s->lifetime,
+						     s->handle, s->epoch,
+						     sl_dynamic_publish, &a);
+	}
+	if (ret)
+		sl_connection_session_put(s);
+	else
+		sl_schedule(s);
+	return ret;
+}
+static int sl_connect(struct socket *sock, struct sockaddr_unsized *address,
+		      int length, int flags)
+{
+	int ret;
+	if (!(flags & O_NONBLOCK))
+		return -EOPNOTSUPP;
+	ret = sl_dynamic_attach(sock, address, length, true);
+	return ret ? ret : -EINPROGRESS;
+}
 static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int length)
 {
 	struct sl_socket_binding *binding = sl_sk(sock->sk);
@@ -636,6 +1215,8 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 	struct sl_grant_scope scope;
 	int ret = 0, slot;
 
+	if (length == sizeof(struct sockaddr_sparklink_dynamic))
+		return sl_dynamic_attach(sock, address, length, false);
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 	if (length != sizeof(*input) || input->family != AF_SPARKLINK || input->version != SPARKLINK_SOCKET_VERSION ||
@@ -668,40 +1249,54 @@ static int sl_bind(struct socket *sock, struct sockaddr_unsized *address, int le
 		sl_schedule(s);
 	return ret;
 }
-static int sl_can_write(struct sl_connection_session *s, struct sl_basic_channel *c)
+static int sl_can_write(struct sl_connection_session *s,
+			struct sl_basic_channel *c)
 {
 	unsigned long flags;
 	int ready;
 	spin_lock_irqsave(&s->lock, flags);
-	ready = !sl_channel_active(s->progress) || !sl_binding_live(c->binding) || !sl_permits(s, c, SL_GRANT_TX) ||
-		(s->progress.phase == SL_CH_OPEN && sl_binding_space(c->binding, skb_queue_len(&c->tx), SL_CHANNEL_TX));
+	ready = !sl_channel_active(s->progress) ||
+		!sl_binding_live(c->binding) ||
+		sl_dynamic_status(c) == -ENOTCONN ||
+		(!sl_dynamic_status(c) && !sl_permits(s, c, SL_GRANT_TX)) ||
+		(s->progress.phase == SL_CH_OPEN && !sl_dynamic_status(c) &&
+		 sl_binding_space(c->binding, skb_queue_len(&c->tx),
+				  SL_CHANNEL_TX));
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ready;
 }
 struct sl_admission { struct sl_connection_session *session; struct sl_basic_channel *channel; struct sk_buff *skb; size_t length; };
 static int sl_admit(void *context)
 {
-    struct sl_admission *admission = context;
-    struct sl_connection_session *s = admission->session;
-    struct sl_basic_channel *c = admission->channel;
-    struct sk_buff *skb = admission->skb;
-    size_t length = admission->length;
-    unsigned long flags;
-    int ret;
+	struct sl_admission *admission = context;
+	struct sl_connection_session *s = admission->session;
+	struct sl_basic_channel *c = admission->channel;
+	struct sk_buff *skb = admission->skb;
+	size_t length = admission->length;
+	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&s->lock, flags);
-	if (sl_binding_live(c->binding) && !sl_permits(s, c, SL_GRANT_TX))
+	if (sl_binding_live(c->binding) && sl_dynamic_status(c))
+		ret = sl_dynamic_status(c);
+	else if (sl_binding_live(c->binding) && !sl_permits(s, c, SL_GRANT_TX))
 		ret = -EACCES;
-	else if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(c->binding))
-		ret = sl_channel_active(s->progress) && sl_binding_live(c->binding) ? -EAGAIN : -ENOTCONN;
-	else if (length > c->mtu || length > sl_channel_payload_limit(s->progress, c->remote_tcid))
+	else if (s->progress.phase != SL_CH_OPEN ||
+		 !sl_binding_live(c->binding))
+		ret = sl_channel_active(s->progress) &&
+				      sl_binding_live(c->binding) ?
+			      -EAGAIN :
+			      -ENOTCONN;
+	else if (length > c->mtu ||
+		 length > sl_channel_payload_limit(s->progress, c->remote_tcid))
 		ret = -EMSGSIZE;
 	else {
 		spin_lock(&c->tx.lock);
 		if (!sl_binding_space(c->binding, c->tx.qlen, SL_CHANNEL_TX))
 			ret = -EAGAIN;
 		else {
-			((struct sl_fragment_cursor *)skb->cb)->deadline = jiffies + msecs_to_jiffies(5000);
+			((struct sl_fragment_cursor *)skb->cb)->deadline =
+				jiffies + msecs_to_jiffies(5000);
 			__skb_queue_tail(&c->tx, skb);
 			admission->skb = NULL;
 			ret = 0;
@@ -709,7 +1304,7 @@ static int sl_admit(void *context)
 		spin_unlock(&c->tx.lock);
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
-    return ret;
+	return ret;
 }
 /* Early permission check prevents a receive-only fd from allocating/copying
  * sender memory or waiting for negotiation. Final queue admission rechecks. */
@@ -721,8 +1316,10 @@ static int sl_tx_access(void *context)
 	unsigned long flags;
 	int ret;
 	spin_lock_irqsave(&s->lock, flags);
-	ret = !sl_binding_live(c->binding) ? -ENOTCONN :
-		!sl_permits(s, c, SL_GRANT_TX) ? -EACCES : 0;
+	ret = !sl_binding_live(c->binding)   ? -ENOTCONN :
+	      sl_dynamic_status(c)	     ? sl_dynamic_status(c) :
+	      !sl_permits(s, c, SL_GRANT_TX) ? -EACCES :
+					       0;
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
 }
@@ -802,6 +1399,10 @@ static int sl_take(void *context)
 		ret = -ENOTCONN;
 		goto unlock;
 	}
+	if (sl_dynamic_status(c) && !c->peer_closed) {
+		ret = sl_dynamic_status(c);
+		goto unlock;
+	}
 	if (!sl_permits(s, c, SL_GRANT_RX)) {
 		ret = -EACCES;
 		goto unlock;
@@ -810,7 +1411,7 @@ static int sl_take(void *context)
 	receive->last = c->rx.prev;
 	receive->skb = skb_peek(&c->rx);
 	if (!receive->skb) {
-		ret = -EAGAIN;
+		ret = c->peer_closed ? -ENOTCONN : -EAGAIN;
 	} else {
 		if (receive->flags & MSG_PEEK)
 			skb_get(receive->skb);
@@ -873,7 +1474,8 @@ put:
 	sl_connection_session_put(s);
 	return copied;
 }
-static __poll_t sl_poll(struct file *file, struct socket *sock, poll_table *wait)
+static __poll_t sl_poll(struct file *file, struct socket *sock,
+			poll_table *wait)
 {
 	unsigned long flags;
 	struct sl_connection_session *s;
@@ -885,18 +1487,32 @@ static __poll_t sl_poll(struct file *file, struct socket *sock, poll_table *wait
 	if (!s)
 		return EPOLLERR | EPOLLHUP;
 	c = sl_bound_channel(sock->sk, s);
-	if (sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch)) {
+	if (sparklink_native_session_status(s->controller, s->generation,
+					    s->lifetime, s->handle, s->epoch)) {
 		sl_connection_session_put(s);
 		return EPOLLERR | EPOLLHUP;
 	}
 	spin_lock_irqsave(&s->lock, flags);
-	if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) ||
-	    (!sl_permits(s, c, SL_GRANT_TX) && !sl_permits(s, c, SL_GRANT_RX)))
+	if (sl_channel_active(s->progress) && sl_binding_live(c->binding) &&
+	    c->peer_closed) {
+		mask = EPOLLHUP;
+		if (READ_ONCE(sock->sk->sk_err))
+			mask |= EPOLLERR;
+		if (sl_permits(s, c, SL_GRANT_RX) && !skb_queue_empty(&c->rx))
+			mask |= EPOLLIN | EPOLLRDNORM;
+	} else if (!sl_channel_active(s->progress) ||
+		   !sl_binding_live(c->binding) ||
+		   sl_dynamic_status(c) == -ENOTCONN ||
+		   (!sl_dynamic_status(c) && !sl_permits(s, c, SL_GRANT_TX) &&
+		    !sl_permits(s, c, SL_GRANT_RX)))
 		mask = EPOLLERR | EPOLLHUP;
 	else {
 		if (sl_permits(s, c, SL_GRANT_RX) && !skb_queue_empty(&c->rx))
 			mask |= EPOLLIN | EPOLLRDNORM;
-		if (sl_permits(s, c, SL_GRANT_TX) && s->progress.phase == SL_CH_OPEN && sl_binding_space(c->binding, skb_queue_len(&c->tx), SL_CHANNEL_TX))
+		if (sl_permits(s, c, SL_GRANT_TX) &&
+		    s->progress.phase == SL_CH_OPEN &&
+		    sl_binding_space(c->binding, skb_queue_len(&c->tx),
+				     SL_CHANNEL_TX))
 			mask |= EPOLLOUT | EPOLLWRNORM;
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
@@ -912,13 +1528,17 @@ struct sl_info_read {
 /* Runtime Host/data/gate -> Session: validate the fd's exact grant and copy one
  * capability snapshot. No user memory, wait, credit mutation or RX consumption.
  */
-static int sl_view_access(struct sl_connection_session *s, struct sl_basic_channel *c, struct sock *sk)
+static int sl_view_access(struct sl_connection_session *s,
+			  struct sl_basic_channel *c, struct sock *sk)
 {
-    if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) || c->sk != sk)
-        return -ENOTCONN;
-    if (!sl_permits(s,c,SL_GRANT_TX) && !sl_permits(s,c,SL_GRANT_RX))
-        return -EACCES;
-    return s->progress.phase == SL_CH_OPEN ? 0 : -EAGAIN;
+	if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding) ||
+	    c->sk != sk)
+		return -ENOTCONN;
+	if (sl_dynamic_status(c))
+		return sl_dynamic_status(c);
+	if (!sl_permits(s, c, SL_GRANT_TX) && !sl_permits(s, c, SL_GRANT_RX))
+		return -EACCES;
+	return s->progress.phase == SL_CH_OPEN ? 0 : -EAGAIN;
 }
 static int sl_read_info(void *context)
 {
@@ -1045,6 +1665,10 @@ static int sl_release(struct socket *sock)
 			held = c->sk;
 			c->sk = NULL;
 			sl_binding_retire(&c->binding);
+			if (c->dynamic) {
+				sl_dynamic_detach(&c->negotiation);
+				sl_dynamic_closing(s, c);
+			}
 		}
 		spin_unlock_irqrestore(&s->lock, flags);
 	}
@@ -1063,14 +1687,24 @@ static int sl_release(struct socket *sock)
 	return 0;
 }
 static const struct proto_ops sl_channel_ops = {
-	.family = PF_SPARKLINK, .owner = THIS_MODULE, .release = sl_release,
-	.bind = sl_bind, .connect = sock_no_connect, .socketpair = sock_no_socketpair,
-	.accept = sock_no_accept, .getname = sock_no_getname, .poll = sl_poll,
-	.ioctl = sl_ioctl, .listen = sock_no_listen, .shutdown = sock_no_shutdown,
+	.family = PF_SPARKLINK,
+	.owner = THIS_MODULE,
+	.release = sl_release,
+	.bind = sl_bind,
+	.connect = sl_connect,
+	.socketpair = sock_no_socketpair,
+	.accept = sock_no_accept,
+	.getname = sock_no_getname,
+	.poll = sl_poll,
+	.ioctl = sl_ioctl,
+	.listen = sock_no_listen,
+	.shutdown = sock_no_shutdown,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = sl_compat_ioctl,
 #endif
-	.sendmsg = sl_sendmsg, .recvmsg = sl_recvmsg, .mmap = sock_no_mmap,
+	.sendmsg = sl_sendmsg,
+	.recvmsg = sl_recvmsg,
+	.mmap = sock_no_mmap,
 };
 static struct proto sl_channel_proto = {
 	.name = "SPARKLINK", .owner = THIS_MODULE, .obj_size = sizeof(struct sl_socket_binding),

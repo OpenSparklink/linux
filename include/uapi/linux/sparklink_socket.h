@@ -27,6 +27,21 @@ struct sockaddr_sparklink {
 	__u8 local_tcid, remote_tcid, pi, reserved[3];
 	__u32 directions, security;
 };
+/* Unpublished version3 extension. bind() stages one passive per-connection
+ * endpoint; nonblocking connect() stages one active CMTC request and returns
+ * EINPROGRESS. CHANNEL_INFO EAGAIN and no POLLOUT until real negotiation.
+ * Only CAP_NET_ADMIN can stage; a delegated staged fd has no data Grant yet.
+ * Local/remote TCID inputs must be zero: kernel assigns and negotiates them.
+ * Ports/AID match an explicitly authorized peer endpoint. Basic only, no QoS
+ * guarantee from a preferred SLQI. No security projection or reliable mode.
+ */
+struct sockaddr_sparklink_dynamic {
+	struct sockaddr_sparklink base;
+	__u16 source_port, destination_port, aid, mtu, mps;
+	__u8 slqi, mode;
+	__u32 reserved;
+};
+#define SPARKLINK_SOCKET_DYNAMIC_VERSION 3
 #define SPARKLINK_SOCKET_VERSION 2
 #define SPARKLINK_SOCKET_TX 1
 #define SPARKLINK_SOCKET_RX 2

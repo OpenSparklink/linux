@@ -18,6 +18,7 @@ static unsigned long jiffies = 42;
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sle_dynamic_state.h"
 #include "sle_fragment_cursor.h"
 #include "sparklink_socket.h"
 #define __user
@@ -38,7 +39,8 @@ static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 struct sock;
 struct sk_buff {struct sock *owner;struct sk_buff *next;unsigned int len,truesize,users;unsigned long cb[6];u8 data[2047];};
 struct sk_buff_head {spinlock_t lock;unsigned int qlen;struct sk_buff *head,*tail,*prev;};
-struct sock {unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state,sk_shutdown;void (*sk_data_ready)(struct sock *);void (*sk_error_report)(struct sock *);void (*sk_state_change)(struct sock *);};
+struct socket;
+struct sock {struct socket *sk_socket;unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state,sk_shutdown;void (*sk_data_ready)(struct sock *);void (*sk_error_report)(struct sock *);void (*sk_state_change)(struct sock *);};
 struct kref {unsigned int refs;};
 struct delayed_work {int unused;};
 static unsigned int allocations,submitted;
@@ -60,6 +62,10 @@ static void sl_fault(struct sl_connection_session *s,int error){assert(error<0);
 
 struct socket {struct sock *sk;int state;};
 #define SS_CONNECTED 1
+#define SS_CONNECTING 2
+#define SS_UNCONNECTED 0
+#define TCP_SYN_SENT 2
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define TCP_ESTABLISHED 1
 #define TCP_CLOSE 7
 #define SHUTDOWN_MASK 3
@@ -162,6 +168,31 @@ static int sparklink_native_acb_fragment_guarded(u16 id,u64 generation,u64 lifet
    sl_binding_retire(&permission->channel->binding);permission->channel->sk=NULL;spin_unlock_irqrestore(&permission->session->lock,flags);}
  }
  return result;
+}
+/* Deliberately replace only Runtime/USB; actual worker/consent/codec remain.
+ * A finite configurable transport budget and explicit failure are visible.
+ * This does not prove the separate production credit ledger or real locks. */
+static unsigned int control_budget, control_count;
+static int control_failure;
+static u8 control_bytes[16][36];
+static size_t control_lengths[16];
+struct control_submission {const u8 *bytes;size_t length;};
+static int control_submit(void *context){
+ struct control_submission *p=context;assert(host_locked&&irq_disabled&&current_session->lock.held);
+ if(control_failure)return control_failure;
+ if(!control_budget)return -EAGAIN;
+ assert(control_count<16&&p->length<=36);control_budget--;
+ memcpy(control_bytes[control_count],p->bytes,p->length);control_lengths[control_count++]=p->length;
+ return 0;
+}
+static int sparklink_native_acb_send_guarded(u16 id,u64 generation,u64 lifetime,u16 handle,
+ const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope){
+ int result=sparklink_native_session_status(id,generation,lifetime,handle,epoch);
+ if(result)return result;
+ struct control_submission submission={bytes,length};
+ assert(!host_locked&&!irq_disabled);host_locked=true;irq_disabled=true;
+ result=consent(scope,control_submit,&submission);
+ assert(!current_session->lock.held);host_locked=false;irq_disabled=false;return result;
 }
 /* @@FUNCTIONS@@ */
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
@@ -434,6 +465,127 @@ static void negotiated_limit_tests(void){
  sl_route(&s,wire,254);assert(s.channels[0].rx.qlen==1);skb_queue_purge(&s.channels[0].rx);
  assert(allocations==0&&b.sk.sk_rmem_alloc==0);
 }
+static void dynamic_publication_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding fixed={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
+ struct sl_socket_binding b={.sk={.refs=1}};struct socket sock={.sk=&b.sk};
+ init_receive(&s,&fixed.sk);s.acb_maximum=254;s.next_tcid=0x80;s.next_signal_id=1;
+ struct sockaddr_sparklink_dynamic input={.base={.pi=241,.directions=3},.source_port=10,.destination_port=20,.aid=30,.mtu=249,.mps=254,.slqi=1};
+ struct sl_dynamic_admission admission={.sock=&sock,.session=&s,.address=&input,.active=true};
+ authority=false;assert(sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission)==-EACCES);
+ assert(s.next_tcid==0x80&&s.next_signal_id==1&&!b.session&&b.sk.refs==1);
+ authority=true;assert(!sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission));
+ assert(b.session==&s&&b.channel_slot==2&&b.sk.refs==2&&s.next_tcid==0x81&&s.next_signal_id==2);
+ assert(s.channels[2].negotiation.phase==SL_DYN_CONNECT&&!b.grant.scope.lifetime&&sock.state==SS_CONNECTING);
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission)==-EINVAL);
+ struct sl_socket_binding duplicate={.sk={.refs=1}};struct socket other={.sk=&duplicate.sk};admission.sock=&other;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission)==-EADDRINUSE);
+ assert(!duplicate.session&&duplicate.sk.refs==1&&s.next_tcid==0x81);
+ s.next_signal_id=256;input.source_port=11;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission)==-ENOSPC);
+ assert(!duplicate.session&&s.next_tcid==0x81);
+}
+static int credit_blocked_submit(void *context){(void)context;return -EAGAIN;}
+static void route_signal(struct sl_connection_session *s,struct sl_channel_signal m){
+ u8 bytes[32],frame[36];int n=sl_channel_signal_encode(bytes,sizeof(bytes),&m);assert(n>0);
+ n=sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,bytes,n);assert(n>0);sl_route(s,frame,n);
+}
+static void dynamic_protocol_tests(void){
+ struct sl_connection_session s;
+ struct sl_socket_binding fixed={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
+ struct sl_socket_binding app={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready},.channel_slot=2};
+ struct socket sock={.sk=&app.sk};app.sk.sk_socket=&sock;
+ init_receive(&s,&fixed.sk);s.fragment_slot=-1;s.next_signal_id=6;
+ struct sl_basic_channel *c=&s.channels[2];c->dynamic=true;c->local_tcid=0x83;c->pi=241;
+ c->mtu=249;c->mps=254;c->source_port=0x1111;c->destination_port=0x2222;c->aid=0x3333;c->slqi=1;c->pending_directions=3;
+ c->negotiation.phase=SL_DYN_LISTEN;c->dynamic_deadline=jiffies+100;c->sk=&app.sk;c->rx.prev=(void *)&c->rx;assert(sl_binding_attach(&c->binding));
+ struct sl_channel_signal request={.code=SL_CMTC_CONNECT_REQ,.identifier=0,.source=0x95,.mtu=249,.mps=254,.exclusive=1,.ports=1,.source_port=0x2222,.destination_port=0x1111,.aid=0x3333,.slqi_count=1,.slqi={1}};
+ assert(sl_poll(NULL,&sock,NULL)==0&&sl_dynamic_status(c)==-EAGAIN);
+ authority=false;route_signal(&s,request);assert(c->negotiation.phase==SL_DYN_LISTEN&&!app.grant.scope.lifetime);
+ authority=true;route_signal(&s,request);assert(c->negotiation.phase==SL_DYN_RESPONSE&&c->remote_tcid==0x95&&!app.grant.scope.lifetime);
+ assert(sl_poll(NULL,&sock,NULL)==0&&!sl_permits(&s,c,SL_GRANT_TX));
+ struct sl_dynamic_submit consent={.session=&s,.channel=c,.phase=SL_DYN_RESPONSE,.pdu_bytes=12};unsigned int before=submitted;
+ irq_disabled=true;assert(sl_dynamic_consent(&consent,credit_blocked_submit,&s)==-EAGAIN);irq_disabled=false;
+ assert(submitted==before&&c->negotiation.phase==SL_DYN_RESPONSE&&!app.grant.scope.lifetime);
+ irq_disabled=true;assert(sl_dynamic_consent(&consent,atomic_submit,&s)==0);irq_disabled=false;
+ assert(c->negotiation.phase==SL_DYN_OPEN&&app.grant.scope.local_tcid==0x83&&app.grant.scope.remote_tcid==0x95&&app.grant.scope.epoch==1);
+ assert(sock.state==SS_CONNECTED&&sl_poll(NULL,&sock,NULL)==(EPOLLOUT|EPOLLWRNORM));
+ route(&s,0x95,241,"remote TCID is not local");route(&s,0x83,242,"wrong PI");assert(!c->rx.qlen);
+ route(&s,0x83,241,"dynamic peer");route(&s,31,241,"fixed peer");assert(c->rx.qlen==1&&s.channels[0].rx.qlen==1);
+ struct sl_channel_signal close={.code=SL_CMTC_CLOSE_REQ,.identifier=7,.source=0x95,.destination=0x83};
+ route_signal(&s,close);assert(c->negotiation.phase==SL_DYN_CLOSE_RESPONSE&&sl_poll(NULL,&sock,NULL)==(EPOLLIN|EPOLLRDNORM|EPOLLHUP));
+ route(&s,0x83,241,"late after logical close");assert(c->rx.qlen==1);
+ struct msghdr message={0};assert(sl_recvmsg(&sock,&message,100,MSG_DONTWAIT)==12&&!memcmp(message.bytes,"dynamic peer",12));
+ assert(sl_recvmsg(&sock,&message,100,MSG_DONTWAIT)==-ENOTCONN&&sl_poll(NULL,&sock,NULL)==EPOLLHUP);
+ consent.phase=SL_DYN_CLOSE_RESPONSE;irq_disabled=true;assert(!sl_dynamic_consent(&consent,atomic_submit,&s));irq_disabled=false;
+ assert(c->negotiation.phase==SL_DYN_RETIRED&&sl_permits(&s,&s.channels[0],SL_GRANT_RX));
+ skb_queue_purge(&c->rx);skb_queue_purge(&s.channels[0].rx);assert(!allocations);
+ /* Reusing a peer TCID cannot bind a new authorized endpoint in this lifetime. */
+ route_signal(&s,request);assert(s.rejection_count==1&&s.rejection[0].result==4);
+
+ memset(&app.grant,0,sizeof(app.grant));c->remote_tcid=0;c->binding=(struct sl_binding_progress){.bound=1};
+ c->negotiation=(struct sl_dynamic_progress){.phase=SL_DYN_RESPONSE};consent.phase=SL_DYN_RESPONSE;
+ sl_dynamic_detach(&c->negotiation);sl_binding_retire(&c->binding);before=submitted;
+ irq_disabled=true;assert(sl_dynamic_consent(&consent,atomic_submit,&s)==-ECANCELED);irq_disabled=false;
+ assert(submitted==before&&!app.grant.scope.lifetime&&c->negotiation.phase==SL_DYN_REJECT);
+ /* An already submitted request remains a physical obligation after detach.
+  * Its late valid reply queues a real close, never a new application grant. */
+ c->negotiation=(struct sl_dynamic_progress){.phase=SL_DYN_CONNECT_SENT,.identifier=5};
+ sl_dynamic_detach(&c->negotiation);assert(c->negotiation.phase==SL_DYN_ABANDONED);
+ struct sl_channel_signal response={.code=SL_CMTC_CONNECT_RSP,.identifier=5,.source=0x83,.destination=0x95};
+ route_signal(&s,response);assert(c->negotiation.phase==SL_DYN_CLOSE&&c->negotiation.identifier==6&&!app.grant.scope.lifetime);
+ consent.phase=SL_DYN_CLOSE;irq_disabled=true;assert(!sl_dynamic_consent(&consent,atomic_submit,&s));irq_disabled=false;
+ response.code=SL_CMTC_CLOSE_RSP;response.identifier=6;route_signal(&s,response);
+ assert(c->negotiation.phase==SL_DYN_RETIRED&&!app.grant.scope.lifetime);
+ assert(sl_permits(&s,&s.channels[0],SL_GRANT_TX));
+}
+static void dynamic_worker_tests(void){
+ struct sl_connection_session s;
+ struct sl_socket_binding fixed={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
+ struct sl_socket_binding app={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready,.sk_error_report=data_ready,.sk_state_change=data_ready}};
+ struct socket sock={.sk=&app.sk};app.sk.sk_socket=&sock;
+ struct sockaddr_sparklink_dynamic input={.base={.pi=241,.directions=3},.source_port=10,.destination_port=20,.aid=30,.mtu=249,.mps=254,.slqi=1};
+ struct sl_dynamic_admission admission={.sock=&sock,.session=&s,.address=&input,.active=true};
+ init_receive(&s,&fixed.sk);s.fragment_slot=-1;s.acb_maximum=254;s.next_tcid=0x80;s.next_signal_id=1;
+ control_budget=0;control_failure=0;control_count=0;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission));
+ struct sl_basic_channel *c=&s.channels[2];
+ sl_dynamic_work(&s);assert(!control_count&&c->negotiation.phase==SL_DYN_CONNECT&&!app.grant.scope.lifetime);
+ control_budget=1;sl_dynamic_work(&s);assert(control_count==1&&control_lengths[0]==26&&c->negotiation.phase==SL_DYN_CONNECT_SENT&&!app.grant.scope.lifetime);
+ struct sl_channel_frame frame;struct sl_channel_signal m;
+ assert(!sl_channel_frame_decode(control_bytes[0],control_lengths[0],&frame));
+ assert(frame.tcid==SL_CHANNEL_CMTC&&!sl_channel_signal_decode(frame.data,frame.length,&m));
+ assert(m.code==SL_CMTC_CONNECT_REQ&&m.source==0x80&&m.identifier==1&&m.destination_port==20&&m.source_port==10);
+ sl_dynamic_work(&s);assert(control_count==1); /* no duplicate setup submission */
+ /* Peer close overtakes its response: cleanup has real echo, no Grant; a
+  * later valid success must not reopen it or affect the fixed sibling. */
+ struct sl_channel_signal close={.code=SL_CMTC_CLOSE_REQ,.identifier=0,.source=0x91,.destination=0x80};
+ route_signal(&s,close);assert(c->negotiation.phase==SL_DYN_CLOSE_RESPONSE&&!app.grant.scope.lifetime);
+ control_budget=1;sl_dynamic_work(&s);assert(control_count==2&&control_lengths[1]==11&&c->negotiation.phase==SL_DYN_RETIRED);
+ assert(!sl_channel_frame_decode(control_bytes[1],control_lengths[1],&frame));
+ assert(!sl_channel_signal_decode(frame.data,frame.length,&m)&&m.code==SL_CMTC_CLOSE_RSP&&m.identifier==0&&m.source==0x91&&m.destination==0x80);
+ assert(sl_poll(NULL,&sock,NULL)==(EPOLLERR|EPOLLHUP));
+ struct sl_channel_signal response={.code=SL_CMTC_CONNECT_RSP,.identifier=1,.source=0x80,.destination=0x91};
+ route_signal(&s,response);assert(c->negotiation.phase==SL_DYN_RETIRED&&!app.grant.scope.lifetime&&sl_permits(&s,&s.channels[0],SL_GRANT_TX));
+ /* Independent physical fixture, not a same-lifetime slot reset/reuse. */
+ init_receive(&s,&fixed.sk);s.fragment_slot=-1;s.acb_maximum=254;s.next_tcid=0x80;s.next_signal_id=1;
+ memset(&app.grant,0,sizeof(app.grant));app.session=NULL;app.sk.sk_err=0;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission));
+ c=&s.channels[2];control_budget=0;control_count=0;unsigned long old=jiffies;
+ jiffies=c->dynamic_deadline;sl_dynamic_work(&s);
+ assert(!control_count&&c->negotiation.phase==SL_DYN_FAILED&&!app.grant.scope.lifetime&&app.sk.sk_err==ETIMEDOUT);
+ assert(sl_permits(&s,&s.channels[0],SL_GRANT_TX));jiffies=old;
+ /* Different physical fixture: pending response obtains no Grant until the
+  * actual worker's guarded atomic submission succeeds. */
+ init_receive(&s,&fixed.sk);s.fragment_slot=-1;s.acb_maximum=254;s.next_tcid=0x80;s.next_signal_id=1;
+ memset(&app.grant,0,sizeof(app.grant));app.session=NULL;app.sk.sk_err=0;admission.active=false;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission));
+ c=&s.channels[2];m=(struct sl_channel_signal){.code=SL_CMTC_CONNECT_REQ,.identifier=255,.source=0xa3,.mtu=249,.mps=254,.ports=1,.exclusive=1,.source_port=20,.destination_port=10,.aid=30,.slqi_count=1,.slqi={1}};
+ route_signal(&s,m);sl_dynamic_work(&s);assert(c->negotiation.phase==SL_DYN_RESPONSE&&!app.grant.scope.lifetime&&!control_count);
+ control_budget=1;sl_dynamic_work(&s);assert(c->negotiation.phase==SL_DYN_OPEN&&app.grant.scope.remote_tcid==0xa3&&control_count==1&&control_lengths[0]==12);
+ assert(!sl_channel_frame_decode(control_bytes[0],control_lengths[0],&frame)&&!sl_channel_signal_decode(frame.data,frame.length,&m));
+ assert(m.code==SL_CMTC_CONNECT_RSP&&m.identifier==255&&m.source==0xa3&&m.destination==0x80&&!m.result);
+ assert(!allocations);
+}
 int main(void){
  identifier_zero_request_tests();negotiated_limit_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
@@ -469,6 +621,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();
+ receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

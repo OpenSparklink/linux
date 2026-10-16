@@ -43,6 +43,27 @@ fragment size and controller packet credit are independent of both budgets.
 Source tests and bounded checks do not establish firmware or peer acceptance;
 consult the qualification entry for the exact image and remaining gates.
 
+Dynamic basic channel setup is an unpublished version3 socket address extension
+(64 bytes). CAP_NET_ADMIN plus the current Managed epoch is required to stage
+it: bind registers a passive, port/AID-scoped per-connection endpoint;
+nonblocking connect returns EINPROGRESS for an active request. Neither action
+publishes a final data Grant. CHANNEL_INFO remains EAGAIN and POLLOUT remains
+clear until the real CMTC exchange and Runtime identity revalidation complete.
+Local and remote TCIDs are assigned separately in 0x80..0xdf. PI is restricted
+to the user-defined range 241..250. Port/AID matching is not authentication.
+
+There are four dynamic slots per physical connection lifetime. Slots, TCIDs and
+outbound signaling identifiers are not reused within that lifetime; terminal
+entries remain bounded tombstones. This is a resource limit, not a proof of
+safe arbitrary TCID reuse. Basic mode is the only supported mode; a preferred
+SLQI does not promise a programmed QoS policy. Final fd release cancels an
+unsubmitted setup, retains an already-submitted physical obligation and drives
+actual CMTC cleanup. A peer logical close forbids new TX/RX, while complete RX
+queued before that close may drain under the original Runtime authorization.
+Managed revocation and physical disconnect retain their existing failure
+semantics and cannot renew an old fd. Reliable/security-protected modes and
+blocking channel setup are explicitly unsupported.
+
 UAPI has not been published: callers, Rust/C/Python bindings and tests may be
 migrated together without an old ABI compatibility period. Match actual headers
 and source revisions; reserved-field checks and errors vary by request and must
