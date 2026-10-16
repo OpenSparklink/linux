@@ -39,8 +39,7 @@ def run(output):
                          ('RECEIVE', 'sparklink_native_receive_rust'),
                          ('SEND', 'sparklink_native_acb_send_rust'),
                          ('SEND_COMMON', 'native_acb_send'),
-                         ('GUARDED_SEND', 'sparklink_native_acb_send_guarded_rust'),
-                         ('FRAGMENT_SEND', 'sparklink_native_acb_fragment_guarded_rust'),
+                         ('DEFERRED_SEND', 'sparklink_native_acb_send_deferred_rust'),
                          ('COMMIT', 'sparklink_native_tx_commit_rust'),
                          ('TAKE', 'sparklink_native_acb_take_rust')]:
         fixture = fixture.replace('// @@' + marker + '@@', function(source, name))

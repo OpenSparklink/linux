@@ -6,6 +6,7 @@
 #include <linux/uaccess.h>
 #include <linux/errno.h>
 #include <linux/kref.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/net.h>
 #include <linux/poll.h>
@@ -25,6 +26,7 @@
 #include "sle_dynamic_state.h"
 #include "sle_fragment_cursor.h"
 #include "sle_security_relay.h"
+#include "sle_session_schedule.h"
 
 _Static_assert(sizeof(struct sockaddr_sparklink_dynamic) == 64,
 	       "dynamic address layout");
@@ -66,6 +68,10 @@ struct sl_connection_session {
 	struct sl_channel_signal
 		rejection[4]; /* worker-only bounded unsupported requests */
 	unsigned int rejection_count;
+	unsigned long rejection_deadline[4];
+	unsigned long response_deadline;
+	bool work_progress, work_retry; /* serialized worker-only send results */
+	bool rx_budget_exhausted;
 	unsigned int tx_next; /* serialized worker-only round-robin start */
 	u16 acb_maximum; /* controller packet size, distinct from DTAP MTU */
 	int fragment_slot; /* sole operation slot; Session lock protects ownership */
@@ -180,13 +186,13 @@ static struct sl_channel_progress sl_snapshot(struct sl_connection_session *s)
 	spin_unlock_irqrestore(&s->lock, flags);
 	return view;
 }
-static void sl_schedule(struct sl_connection_session *s)
+static void sl_schedule(struct sl_connection_session *s, unsigned long delay)
 {
 	unsigned long flags;
 	spin_lock_irqsave(&s->lock, flags);
 	if (sl_channel_active(s->progress)) {
 		sl_connection_session_get(s);
-		if (!queue_delayed_work(system_unbound_wq, &s->work, msecs_to_jiffies(10)))
+		if (!queue_delayed_work(system_unbound_wq, &s->work, delay))
 			sl_connection_session_put(s);
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
@@ -195,7 +201,8 @@ static void sl_schedule(struct sl_connection_session *s)
  * The Session lock serializes queue admission with stop's close-before-join.
  * A fresh queue owns one kref, including a requeue while the callback runs;
  * modifying an already pending item keeps its original queue reference.
- * Unlike the temporary deadline fallback, an event never waits for 10 ms.
+ * Event readiness and original deadlines share one work item; events only
+ * advance it. Closed admission is serialized before cancel/join.
  */
 void sl_connection_session_kick(void *opaque)
 {
@@ -318,12 +325,23 @@ static int sl_session_submit(void *scope, int (*submit)(void *), void *context)
 	spin_unlock(&s->lock);
 	return ret;
 }
+/* Scheduling evidence only. The actual Runtime/Ticket consent still decides
+ * authority, identity, deadline, reservation and USB acceptance. */
+static void sl_send_result(struct sl_connection_session *s, int ret, u32 wait)
+{
+	if (!ret)
+		s->work_progress = true;
+	else if (ret == -EAGAIN && wait != SPARKLINK_ACB_WAIT_CREDIT)
+		s->work_retry = true;
+}
 static int sl_send(struct sl_connection_session *s, struct sl_basic_channel *c, const u8 *data, size_t length)
 {
 	struct sl_submit_scope permission = { .session = s, .channel = c };
-
-	return sparklink_native_acb_send_guarded(s->controller, s->generation, s->lifetime,
-		s->handle, data, length, s->epoch, sl_session_submit, &permission);
+	u32 wait = SPARKLINK_ACB_WAIT_RETRY;
+	int ret = sparklink_native_acb_send_deferred(s->controller, s->generation, s->lifetime,
+		s->handle, 0, data, length, s->epoch, sl_session_submit, &permission, &wait);
+	sl_send_result(s, ret, wait);
+	return ret;
 }
 
 /* Session lock protects all channel transitions and the immutable final grant.
@@ -504,12 +522,14 @@ static int sl_dynamic_receive(void *context)
 	}
 	goto unlock;
 reject:
-	if (s->rejection_count < ARRAY_SIZE(s->rejection))
+	if (s->rejection_count < ARRAY_SIZE(s->rejection)) {
+		s->rejection_deadline[s->rejection_count] = jiffies + msecs_to_jiffies(5000);
 		s->rejection[s->rejection_count++] =
 			(struct sl_channel_signal){ .code = SL_CMTC_CONNECT_RSP,
 						    .identifier = m->identifier,
 						    .source = m->source,
 						    .result = result };
+	}
 unlock:
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
@@ -596,6 +616,8 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes,
 				sl_fault(s, -EPROTO);
 				return;
 			}
+			if (!s->response_pending)
+				s->response_deadline = jiffies + msecs_to_jiffies(5000);
 			s->response_pending = true;
 			s->response_id = identifier;
 			s->response_mask = mask;
@@ -698,7 +720,21 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	unsigned int length, boundary;
 	int slot = c - s->channels, ret = 0;
 	bool started, local_timeout;
+	u32 wait = SPARKLINK_ACB_WAIT_RETRY;
 
+	/* A queued channel's original deadline cannot be hidden behind another
+	 * channel's begun PB sequence. Expire only its unsubmitted local queue. */
+	spin_lock_irqsave(&s->lock, flags);
+	spin_lock(&c->tx.lock);
+	skb = skb_peek(&c->tx);
+	local_timeout = skb && time_after_eq(jiffies,
+		((struct sl_fragment_cursor *)skb->cb)->deadline);
+	spin_unlock(&c->tx.lock);
+	spin_unlock_irqrestore(&s->lock, flags);
+	if (local_timeout) {
+		sl_fail_channel(s, c, -ETIMEDOUT);
+		s->work_progress = true;
+	}
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->tx_inflight && s->fragment_slot != slot) {
 		spin_unlock_irqrestore(&s->lock, flags);
@@ -725,10 +761,11 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	else if (!sl_fragment_next(skb->len, cursor->offset, s->acb_maximum, &length, &boundary))
 		ret = -EPROTO;
 	else {
-		ret = sparklink_native_acb_fragment_guarded(s->controller, s->generation,
+		ret = sparklink_native_acb_send_deferred(s->controller, s->generation,
 			s->lifetime, s->handle, boundary, skb->data + cursor->offset, length,
-			s->epoch, sl_session_submit, &permission);
+			s->epoch, sl_session_submit, &permission, &wait);
 	}
+	sl_send_result(s, ret, wait);
 	spin_lock_irqsave(&s->lock, flags);
 	if (!ret && !sl_fragment_advance(cursor, skb->len, length))
 		ret = -EPROTO;
@@ -753,14 +790,25 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 		ret = 0; /* author closed before first submit: no physical obligation */
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
-	if (skb)
+	if (skb) {
 		sl_retire_tx(s);
+		s->work_progress = true; /* bounded retirement exposes the next queued item */
+	}
 	if (local_timeout) {
 		sl_fail_channel(s, c, ret);
 		ret = 0;
 	}
 	sl_wake(s);
 	return ret == -EAGAIN ? 0 : ret;
+}
+static void sl_shift_rejection(struct sl_connection_session *s)
+{
+	s->rejection_count--;
+	memmove(s->rejection, s->rejection + 1,
+		s->rejection_count * sizeof(s->rejection[0]));
+	memmove(s->rejection_deadline, s->rejection_deadline + 1,
+		s->rejection_count * sizeof(s->rejection_deadline[0]));
+	s->work_progress = true;
 }
 static void sl_dynamic_work(struct sl_connection_session *s)
 {
@@ -777,6 +825,7 @@ static void sl_dynamic_work(struct sl_connection_session *s)
 						     .channel = c };
 		bool notify = false;
 		int error = 0;
+		u32 wait = SPARKLINK_ACB_WAIT_RETRY;
 		spin_lock_irqsave(&s->lock, flags);
 		if (!c->dynamic) {
 			spin_unlock_irqrestore(&s->lock, flags);
@@ -805,6 +854,7 @@ static void sl_dynamic_work(struct sl_connection_session *s)
 				    s->progress.mps < 26) {
 					c->negotiation.phase = SL_DYN_FAILED;
 					c->dynamic_error = -EMSGSIZE;
+				s->work_progress = true;
 					break;
 				}
 				m.code = SL_CMTC_CONNECT_REQ;
@@ -875,19 +925,25 @@ static void sl_dynamic_work(struct sl_connection_session *s)
 						    n);
 		consent.pdu_bytes = n > 0 ? n : 0;
 		ret = n < 0 ? n :
-			      sparklink_native_acb_send_guarded(
+			      sparklink_native_acb_send_deferred(
 				      s->controller, s->generation, s->lifetime,
-				      s->handle, wire, n, s->epoch,
-				      sl_dynamic_consent, &consent);
+				      s->handle, 0, wire, n, s->epoch,
+				      sl_dynamic_consent, &consent, &wait);
+		sl_send_result(s, ret, wait);
 		if (!ret)
 			wake = true;
 		if (ret && ret != -EAGAIN && ret != -ECANCELED) {
 			spin_lock_irqsave(&s->lock, flags);
 			c->negotiation.phase = SL_DYN_FAILED;
 			c->dynamic_error = ret;
+			s->work_progress = true;
 			spin_unlock_irqrestore(&s->lock, flags);
 		}
 	}
+	/* Drop expired unsent negative responses even behind another PDU. Their
+	 * original deadline must not turn into immediate reschedule spinning. */
+	while (s->rejection_count && time_after_eq(jiffies, s->rejection_deadline[0]))
+		sl_shift_rejection(s);
 	/* Explicit failure only, bounded FIFO; no fabricated success for unknown endpoints. */
 	if (s->rejection_count && s->fragment_slot < 0 &&
 	    sl_snapshot(s).phase == SL_CH_OPEN) {
@@ -898,14 +954,78 @@ static void sl_dynamic_work(struct sl_connection_session *s)
 						    SL_CHANNEL_CMTC, 0, signal,
 						    n);
 		ret = n < 0 ? n : sl_send(s, NULL, wire, n);
-		if (!ret) {
-			s->rejection_count--;
-			memmove(s->rejection, s->rejection + 1,
-				s->rejection_count * sizeof(s->rejection[0]));
-		}
+		if (!ret)
+			sl_shift_rejection(s);
 	}
 	if (wake)
 		sl_wake(s);
+}
+/* One bounded pass, then sleep until an event, earliest original deadline,
+ * or explicit non-credit EAGAIN retry. Caller is the sole Session worker.
+ * Queue peeks take TX lock beneath Session lock: detach purges outside it. */
+static struct sl_session_schedule sl_next_schedule(struct sl_connection_session *s)
+{
+	struct sl_session_schedule plan = { 0 };
+	unsigned long flags, now = jiffies;
+	bool runnable = false;
+	unsigned int i;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (!sl_channel_active(s->progress))
+		goto unlock;
+	if (s->progress.phase == SL_CH_NEGOTIATING) {
+		sl_session_schedule_deadline(&plan, now, s->deadline);
+		runnable = !s->progress.request_submitted;
+	}
+	if (s->unknown_deadline)
+		sl_session_schedule_deadline(&plan, now, s->unknown_deadline);
+	if (s->response_pending) {
+		sl_session_schedule_deadline(&plan, now, s->response_deadline);
+		runnable |= s->fragment_slot < 0;
+	}
+	if (s->rejection_count) {
+		sl_session_schedule_deadline(&plan, now, s->rejection_deadline[0]);
+		runnable |= s->fragment_slot < 0;
+	}
+	if (s->tx_inflight) {
+		struct sl_fragment_cursor *cursor = (void *)s->tx_inflight->cb;
+		sl_session_schedule_deadline(&plan, now, cursor->deadline);
+		runnable = true;
+	}
+	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
+		struct sl_basic_channel *c = &s->channels[i];
+		struct sk_buff *skb;
+		if (c->dynamic && sl_dynamic_pending(c->negotiation)) {
+			sl_session_schedule_deadline(&plan, now, c->dynamic_deadline);
+			if (s->progress.phase == SL_CH_OPEN && s->fragment_slot < 0 &&
+			    (c->negotiation.phase == SL_DYN_CONNECT ||
+			     c->negotiation.phase == SL_DYN_RESPONSE ||
+			     c->negotiation.phase == SL_DYN_REJECT ||
+			     c->negotiation.phase == SL_DYN_CLOSE ||
+			     c->negotiation.phase == SL_DYN_CLOSE_RESPONSE))
+				runnable = true;
+		}
+		if (c->dynamic && !c->dynamic_notified &&
+		    (c->negotiation.phase == SL_DYN_FAILED || c->negotiation.phase == SL_DYN_RETIRED))
+			sl_session_schedule_delay(&plan, 0);
+		if (!sl_binding_live(c->binding))
+			continue;
+		spin_lock(&c->tx.lock);
+		skb = skb_peek(&c->tx);
+		if (skb) {
+			struct sl_fragment_cursor *cursor = (void *)skb->cb;
+			sl_session_schedule_deadline(&plan, now, cursor->deadline);
+			runnable = true;
+		}
+		spin_unlock(&c->tx.lock);
+	}
+	if (s->rx_budget_exhausted || (runnable && s->work_progress))
+		sl_session_schedule_delay(&plan, 0);
+	else if ((runnable || s->unknown_deadline) && s->work_retry)
+		sl_session_schedule_delay(&plan, msecs_to_jiffies(10));
+unlock:
+	spin_unlock_irqrestore(&s->lock, flags);
+	return plan;
 }
 static void sl_work(struct work_struct *work)
 {
@@ -914,11 +1034,14 @@ static void sl_work(struct work_struct *work)
 	size_t size;
 	int ret, n;
 	unsigned int i;
+	struct sl_session_schedule plan;
 
+	s->work_progress = s->work_retry = s->rx_budget_exhausted = false;
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
 	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
 	if (ret == -EAGAIN) {
+		s->work_retry = true;
 		/* Unknown physical state is bounded independently of CMTC deadline. */
 		sl_progress_event(s, 0, 0, 0);
 		if (!s->unknown_deadline)
@@ -951,8 +1074,13 @@ static void sl_work(struct work_struct *work)
 		if (ret) { sl_fault(s, ret); break; }
 		sl_route(s, s->rx_buffer, size);
 	}
+	s->rx_budget_exhausted = i == 16;
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
+	if (s->response_pending && time_after_eq(jiffies, s->response_deadline)) {
+		sl_fault(s, -ETIMEDOUT);
+		goto put;
+	}
 	if (s->response_pending && s->fragment_slot < 0) {
 		n = sl_channel_cap_response(signal, sizeof(signal), s->response_id, s->response_mask, sl_snapshot(s).maximum, sl_snapshot(s).maximum_mps);
 		if (n >= 0)
@@ -974,8 +1102,9 @@ static void sl_work(struct work_struct *work)
 	s->tx_next = (s->tx_next + 1) % SL_SESSION_CHANNELS;
 again:
 	sl_progress_event(s, 0, 0, 0);
-	if (sl_channel_active(sl_snapshot(s)))
-		sl_schedule(s);
+	plan = sl_next_schedule(s);
+	if (plan.pending)
+		sl_schedule(s, plan.delay);
 put:
 	if (!sl_channel_active(sl_snapshot(s)))
 		sl_retire_tx(s);

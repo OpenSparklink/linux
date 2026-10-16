@@ -71,19 +71,19 @@ int main(void)
 	owner = &s;
 	sl_connection_session_kick(&s); assert(s.refs == 1 && !s.work.pending);
 	sl_channel_start(&s.progress, 2042, 2047);
-	sl_schedule(&s); assert(s.refs == 2 && s.work.delay == 10);
+	sl_schedule(&s, 10); assert(s.refs == 2 && s.work.delay == 10);
 	sl_connection_session_kick(&s); assert(s.refs == 2 && s.work.delay == 0);
 	for (unsigned int i = 0; i < 32; i++) sl_connection_session_kick(&s);
 	assert(s.refs == 2 && s.work.pending);
-	sl_schedule(&s); assert(s.refs == 2 && s.work.delay == 0); /* no postponed event */
+	sl_schedule(&s, 10); assert(s.refs == 2 && s.work.delay == 0); /* no postponed event */
 	begin(&s);
 	sl_connection_session_kick(&s); assert(s.refs == 3 && s.work.pending);
-	sl_schedule(&s); assert(s.refs == 3 && s.work.delay == 0);
+	sl_schedule(&s, 10); assert(s.refs == 3 && s.work.delay == 0);
 	finish(&s); begin(&s); finish(&s); assert(s.refs == 1);
 	sl_connection_session_kick(&s); begin(&s);
 	sl_connection_session_kick(&s); assert(s.refs == 3);
 	stop(&s); assert(s.refs == 2 && !s.work.pending);
-	sl_connection_session_kick(&s); sl_schedule(&s); assert(s.refs == 2 && !s.work.pending);
+	sl_connection_session_kick(&s); sl_schedule(&s, 10); assert(s.refs == 2 && !s.work.pending);
 	finish(&s); assert(s.refs == 1 && !irq_disabled && !s.lock.held);
 	puts("ACTUAL_SESSION_WAKE_SEQUENTIAL_DEPENDENCIES_PASS");
 	return 0;

@@ -867,6 +867,7 @@ struct NativeTxTicket {
     scope: *mut c_void,
     attempted: Cell<bool>,
     submitted: Cell<bool>,
+    credit_blocked: Cell<bool>, // exact reserve result, not an errno heuristic
 }
 
 /// Driver has prepared an immutable transfer. Exactly one callback may attempt
@@ -896,6 +897,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
         return -(kernel::bindings::ESTALE as i32);
     }
     if let Err(error) = data.credits.reserve(ticket.lifetime, ticket.handle, ticket.length) {
+        ticket.credit_blocked.set(error == super::sle_data_credit::CreditError::WouldBlock);
         return super::sle_native_data::error(error).to_errno();
     }
     // SAFETY: registered Backend contract permits only an already prepared
@@ -921,31 +923,30 @@ pub(crate) unsafe extern "C" fn sparklink_native_acb_send_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize,
 ) -> i32 {
     // SAFETY: preserves internal caller buffer lifetime until driver joins.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, 0, None, None, core::ptr::null_mut()) }
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, 0, None, None, core::ptr::null_mut(), core::ptr::null_mut()) }
 }
+/// Same retained Ticket/commit path, with a typed internal EAGAIN reason.
+/// A credit wait can sleep until a real NOCP/event or its original deadline;
+/// transport/visibility EAGAIN must retain a finite retry source. Not UAPI.
 #[no_mangle]
-pub(crate) unsafe extern "C" fn sparklink_native_acb_send_guarded_rust(
-    id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize, epoch: u64,
-    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
-) -> i32 {
-    if consent.is_none() || scope.is_null() { return EINVAL.to_errno(); }
-    // SAFETY: session worker holds its reference and scope until this returns.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, 0, Some(epoch), consent, scope) }
-}
-#[no_mangle]
-pub(crate) unsafe extern "C" fn sparklink_native_acb_fragment_guarded_rust(
+pub(crate) unsafe extern "C" fn sparklink_native_acb_send_deferred_rust(
     id: u16, generation: u64, lifetime: u64, handle: u16, boundary: u8,
     data: *const u8, length: usize, epoch: u64,
-    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
+    consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>,
+    scope: *mut c_void, wait: *mut u32,
 ) -> i32 {
-    if consent.is_none() || scope.is_null() { return EINVAL.to_errno(); }
-    // SAFETY: identical synchronous ticket/buffer lifetime to guarded full ACB.
-    unsafe { native_acb_send(id, generation, lifetime, handle, data, length, boundary, Some(epoch), consent, scope) }
+    if consent.is_none() || scope.is_null() || wait.is_null() { return EINVAL.to_errno(); }
+    // SAFETY: C worker owns the writable reason and synchronous scope/buffer.
+    unsafe { native_acb_send(id, generation, lifetime, handle, data, length,
+        boundary, Some(epoch), consent, scope, wait) }
 }
 unsafe fn native_acb_send(
     id: u16, generation: u64, lifetime: u64, handle: u16, data: *const u8, length: usize, boundary: u8,
-    epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void,
+    epoch: Option<u64>, consent: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32>, scope: *mut c_void, wait: *mut u32,
 ) -> i32 {
+    // SAFETY: optional internal output lives throughout this synchronous call.
+    // Early transport/identity visibility EAGAIN is a finite retry, never credit.
+    if !wait.is_null() { unsafe { *wait = 2 }; }
     if boundary > 3 || data.is_null() || length == 0 || length > super::sle_native_data::MAXIMUM { return EINVAL.to_errno(); }
     let Some(owner) = super::sle_ingress::ingress_owner(DeviceIdentity { id, generation }) else { return ENODEV.to_errno(); };
     let _lifecycle = owner.native_lifecycle.lock();
@@ -976,13 +977,19 @@ unsafe fn native_acb_send(
         }
     }
     let mut ticket = NativeTxTicket { owner: owner.clone(), lifetime, handle, length, epoch,
-        consent, scope, attempted: Cell::new(false), submitted: Cell::new(false) };
+        consent, scope, attempted: Cell::new(false), submitted: Cell::new(false), credit_blocked: Cell::new(false) };
     // SAFETY: caller owns immutable bytes, the ticket and retained Backend
     // remain live until the blocking driver callback joins its completion.
     let result = unsafe { sparklink_native_transport_acb(transport.transport,
         (&mut ticket as *mut NativeTxTicket).cast(), handle, boundary, data, length) };
     let result = if result == 0 && !ticket.submitted.get() { PROTOCOL_ERROR } else { result };
     if result != 0 && ticket.submitted.get() { owner.data.lock().credits.transport_failed(); }
+    if !wait.is_null() {
+        // Only an actual failed reserve marks CREDIT. A generic driver EAGAIN
+        // or accepted-but-uncertain failure can never masquerade as that wait.
+        unsafe { *wait = if result != EAGAIN.to_errno() { 0 }
+            else if ticket.credit_blocked.get() { 1 } else { 2 } };
+    }
     owner.data_poll.notify_all();
     result
 }

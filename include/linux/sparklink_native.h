@@ -187,10 +187,10 @@ void sparklink_native_snoop_tx(u16 id, u64 generation, u16 opcode,
 
 /* Session/channel consent is held through the actual atomic queue call.
  * Scope and immutable bytes remain live until the blocking callback joins. */
-int sparklink_native_acb_send_guarded(u16 id, u64 generation, u64 lifetime, u16 handle,
-    const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
-int sparklink_native_acb_fragment_guarded(u16 id, u64 generation, u64 lifetime, u16 handle, u8 boundary,
-    const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
+/* Internal scheduling result only; does not grant permission or return credit. */
+enum sparklink_acb_wait { SPARKLINK_ACB_WAIT_NONE = 0, SPARKLINK_ACB_WAIT_CREDIT = 1,
+                         SPARKLINK_ACB_WAIT_RETRY = 2 };
+int sparklink_native_acb_send_deferred(u16 id, u64 generation, u64 lifetime,
+    u16 handle, u8 boundary, const u8 *data, size_t length, u64 epoch,
+    int (*consent)(void *, int (*)(void *), void *), void *scope, u32 *wait);
 #endif

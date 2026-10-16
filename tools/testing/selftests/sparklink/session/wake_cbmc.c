@@ -17,7 +17,13 @@ void verify_wake_sequences(void) {
   unsigned int op = nondet_uint(); __CPROVER_assume(op < 6);
   switch (op) {
    case 0: sl_connection_session_kick(&s); break;
-   case 1: sl_schedule(&s); break;
+   case 1: {
+    unsigned int delay=nondet_uint();__CPROVER_assume(delay<=5000);
+    bool event_pending=s.work.pending&&s.work.delay==0;
+    sl_schedule(&s,delay);
+    __CPROVER_assert(!event_pending||s.work.delay==0,"pending event never postponed by timer");
+    break;
+   }
    case 2: if (s.work.pending && !s.work.running) begin(&s); break;
    case 3: if (s.work.running) finish(&s); break;
    case 4: stop(&s); break;
@@ -25,7 +31,7 @@ void verify_wake_sequences(void) {
   }
   __CPROVER_assert(s.refs == 1U+(unsigned)s.work.pending+(unsigned)s.work.running,"one reference per queued/running invocation");
   __CPROVER_assert(sl_channel_active(s.progress) || !s.work.pending,"closed rejects new queue");
-  __CPROVER_assert(!s.work.pending || s.work.delay<=10,"event never postponed beyond fallback");
+  __CPROVER_assert(!s.work.pending || s.work.delay<=5000,"bounded original timer or immediate event");
  }
  stop(&s); if (s.work.running) finish(&s);
  __CPROVER_assert(s.refs==1&&!s.work.pending&&!s.work.running,"close/cancel/finish settle queue refs");

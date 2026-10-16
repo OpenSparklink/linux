@@ -131,7 +131,8 @@ static unsigned long copy_to_user(void *out,const void *in,unsigned long size){
  assert(!host_locked&&!irq_disabled&&!current_session->lock.held);
  unsigned long copied=copy_limit<size?copy_limit:size;memcpy(out,in,copied);return size-copied;
 }
-static int time_after_eq(unsigned long a,unsigned long b){return a>=b;}
+static int time_after_eq(unsigned long a,unsigned long b){return (long)(a-b)>=0;}
+#include "sle_session_schedule.h"
 static void sl_wake(struct sl_connection_session *s){(void)s;}
 static struct sk_buff *skb_dequeue(struct sk_buff_head *q){
  unsigned long flags;struct sk_buff *skb;
@@ -151,7 +152,7 @@ static int fragment_submit(void *context){
  if(fragment_failure)return fragment_failure;
  packet_budget--;return 0;
 }
-static int sparklink_native_acb_fragment_guarded(u16 id,u64 generation,u64 lifetime,u16 handle,u8 boundary,
+static int fixture_fragment_send(u16 id,u64 generation,u64 lifetime,u16 handle,u8 boundary,
  const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope){
  struct sl_submit_scope *permission=scope;int result;unsigned long flags;
  assert(id==permission->session->controller&&generation==permission->session->generation);
@@ -185,7 +186,7 @@ static int control_submit(void *context){
  memcpy(control_bytes[control_count],p->bytes,p->length);control_lengths[control_count++]=p->length;
  return 0;
 }
-static int sparklink_native_acb_send_guarded(u16 id,u64 generation,u64 lifetime,u16 handle,
+static int fixture_control_send(u16 id,u64 generation,u64 lifetime,u16 handle,
  const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope){
  int result=sparklink_native_session_status(id,generation,lifetime,handle,epoch);
  if(result)return result;
@@ -193,6 +194,16 @@ static int sparklink_native_acb_send_guarded(u16 id,u64 generation,u64 lifetime,
  assert(!host_locked&&!irq_disabled);host_locked=true;irq_disabled=true;
  result=consent(scope,control_submit,&submission);
  assert(!current_session->lock.held);host_locked=false;irq_disabled=false;return result;
+}
+static int sparklink_native_acb_send_deferred(u16 id,u64 generation,u64 lifetime,u16 handle,u8 boundary,
+ const u8 *bytes,size_t length,u64 epoch,int (*consent)(void *,int (*)(void *),void *),void *scope,u32 *wait){
+ /* Configurable Runtime/USB dependency. Classification is tested on actual
+  * Rust reserve/commit separately, not proven by this C fixture. */
+ bool control=!boundary&&length>1&&bytes[0]==2&&bytes[1]==0;
+ int result=control?fixture_control_send(id,generation,lifetime,handle,bytes,length,epoch,consent,scope):
+  fixture_fragment_send(id,generation,lifetime,handle,boundary,bytes,length,epoch,consent,scope);
+ *wait=result==-EAGAIN&&!(control?control_budget:packet_budget)?SPARKLINK_ACB_WAIT_CREDIT:SPARKLINK_ACB_WAIT_RETRY;
+ return result;
 }
 /* @@FUNCTIONS@@ */
 static int atomic_submit(void *context){struct sl_connection_session *s=context;assert(irq_disabled&&s->lock.held);submitted++;return 0;}
@@ -586,6 +597,65 @@ static void dynamic_worker_tests(void){
  assert(m.code==SL_CMTC_CONNECT_RSP&&m.identifier==255&&m.source==0xa3&&m.destination==0x80&&!m.result);
  assert(!allocations);
 }
+static void scheduling_tests(void) {
+ struct sl_connection_session s={0};struct sl_socket_binding app={0};
+ init_receive(&s,&app.sk);current_session=&s;jiffies=42;s.fragment_slot=-1;s.acb_maximum=254;
+ struct sl_session_schedule p=sl_next_schedule(&s);assert(!p.pending); /* idle is not a timer */
+ s.progress=(struct sl_channel_progress){0};sl_channel_start(&s.progress,2042,2047);s.deadline=5042;
+ p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000);
+ s.work_retry=true;p=sl_next_schedule(&s);assert(p.delay==10);
+ s.work_retry=false;s.work_progress=true;p=sl_next_schedule(&s);assert(p.delay==0);
+ s.work_progress=false;s.progress.phase=SL_CH_OPEN;
+ enqueue_fragment_test(&s.channels[0],255);
+ p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000);
+ packet_budget=0;s.work_retry=false;s.work_progress=false;
+ assert(!sl_transmit_channel(&s,&s.channels[0]));assert(!s.work_progress&&!s.work_retry);
+ p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000); /* full pool: no10ms timer */
+ packet_budget=2;assert(!sl_transmit_channel(&s,&s.channels[0]));
+ p=sl_next_schedule(&s);assert(p.pending&&p.delay==0); /* bounded next fragment */
+ s.work_progress=false;s.work_retry=false;
+ p=sl_next_schedule(&s);assert(p.pending&&p.delay==5000);
+ s.rx_budget_exhausted=true;p=sl_next_schedule(&s);assert(p.delay==0);
+ s.rx_budget_exhausted=false;jiffies=5042;p=sl_next_schedule(&s);assert(p.delay==0);
+ sl_retire_tx(&s);assert(!allocations);s.work_progress=false;
+ p=sl_next_schedule(&s);assert(!p.pending);
+ s.response_pending=true;s.response_deadline=5100;p=sl_next_schedule(&s);assert(p.pending&&p.delay==58);
+ s.response_pending=false;s.channels[2].dynamic=true;s.channels[2].negotiation.phase=SL_DYN_LISTEN;s.channels[2].dynamic_deadline=5070;
+ p=sl_next_schedule(&s);assert(p.pending&&p.delay==28);
+ sl_channel_close(&s.progress);p=sl_next_schedule(&s);assert(!p.pending);
+ sl_channel_start(&s.progress,2042,2047); /* closed cannot restart */
+ assert(!sl_next_schedule(&s).pending);jiffies=42;
+}
+static void blocked_original_deadlines_tests(void) {
+ struct sl_connection_session s;
+ struct sl_socket_binding app[2]={0};
+ for(unsigned int i=0;i<2;i++){
+  app[i].sk.refs=1;app[i].sk.sk_data_ready=data_ready;
+  app[i].sk.sk_error_report=data_ready;app[i].sk.sk_state_change=data_ready;
+ }
+ init_receive(&s,&app[0].sk);s.fragment_slot=-1;s.acb_maximum=254;
+ s.progress.maximum=s.progress.mtu=2042;s.progress.maximum_mps=s.progress.mps=2047;
+ s.channels[0].mtu=2042;s.channels[0].mps=2047;
+ struct sl_basic_channel *other=&s.channels[1];
+ other->local_tcid=other->remote_tcid=10;other->sk=&app[1].sk;
+ other->mtu=2042;other->mps=2047;app[1].channel_slot=1;
+ assert(sl_binding_attach(&other->binding));init_grant(&s,&app[1].sk,3);
+ fragment_count=fragment_bytes_count=0;packet_budget=1;fragment_failure=0;
+ enqueue_fragment_test(&s.channels[0],255);
+ ((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline=6000;
+ assert(!sl_transmit_channel(&s,&s.channels[0]));assert(s.tx_inflight&&s.tx_started);
+ struct sk_buff *physical=s.tx_inflight;unsigned int count=fragment_count;
+ enqueue_fragment_test(other,64);((struct sl_fragment_cursor *)other->tx.head->cb)->deadline=100;
+ jiffies=100;s.work_progress=s.work_retry=false;
+ assert(!sl_transmit_channel(&s,other));assert(!other->tx.qlen&&!sl_binding_live(other->binding));
+ assert(s.tx_inflight==physical&&s.tx_started&&fragment_count==count&&allocations==1);
+ s.work_progress=false;struct sl_session_schedule p=sl_next_schedule(&s);
+ assert(p.pending&&p.delay==5900); /* expired queued channel cannot spin */
+ s.rejection_count=1;s.rejection_deadline[0]=99;
+ sl_dynamic_work(&s);assert(!s.rejection_count&&s.tx_inflight==physical);
+ s.work_progress=false;p=sl_next_schedule(&s);assert(p.delay==5900);
+ sl_retire_tx(&s);assert(!allocations);jiffies=42;
+}
 int main(void){
  identifier_zero_request_tests();negotiated_limit_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
@@ -621,6 +691,6 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
+ scheduling_tests();blocked_original_deadlines_tests();receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

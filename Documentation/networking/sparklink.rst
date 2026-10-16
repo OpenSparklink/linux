@@ -81,12 +81,25 @@ an already pending queue keeps its existing reference. Closed Sessions reject
 further enqueue. Actual submit still revalidates Grant, generation, lifetime
 and Ticket. The atomic hint is not a replacement for these locked states.
 
-This is an incremental wakeup stage: the original 10 ms maintenance fallback
-still runs. Separating original-deadline timers and removing periodic polling,
-bounded continuous TX, no-lost-wakeup/drain interleaving validation and same
-configuration real-device comparisons remain required. No latency improvement
-or complete event-driven/performance qualification is claimed from source or
-sequential dependency fixtures alone.
+The unique worker now selects the earliest original negotiation, dynamic
+channel, queued/begun PDU or pending control-response deadline. An idle open
+Session does not queue maintenance work. A pass drains at most 16 RX PDUs and
+advances each of the six channel slots at most once; residual progress requests
+another immediate pass, preserving a begun physical PB sequence. Queue admission
+and real RX/NOCP notifications remain the only normal readiness sources.
+
+Only an actual data-credit reserve failure marks the internal CREDIT wait.
+Other EAGAIN results retain a finite 10 ms retry bounded by the operation's
+original deadline. USB success does not return credit, and an uncertain USB
+failure cannot be classified as an empty pool or refund debt. Runtime's separate
+command/lifecycle scheduling is unchanged. Expired unsubmitted queues and
+negative responses cannot hide behind another begun PDU and create a zero-delay
+loop. Dropping them does not settle the begun PDU's physical obligations.
+
+Source, sequential dependency fixtures and bounded helper checks do not grant
+new real-device, concurrency or performance qualification. Actual callback/
+queue/drain interleavings, starvation/load and same-configuration device
+comparisons still require the separately recorded gates.
 
 UAPI has not been published: callers, Rust/C/Python bindings and tests may be
 migrated together without an old ABI compatibility period. Match actual headers

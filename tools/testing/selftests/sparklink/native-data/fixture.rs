@@ -136,8 +136,7 @@ mod under_test{use super::*;
 // @@RECEIVE@@
 // @@SEND@@
 // @@SEND_COMMON@@
-// @@GUARDED_SEND@@
-// @@FRAGMENT_SEND@@
+// @@DEFERRED_SEND@@
 // @@TAKE@@
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
@@ -266,6 +265,14 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
  assert_eq!(send(0,7,1,0,b"credit exhausted"),-11);
 }
 
+// Test argument adapter only: no alternative send/credit/transition logic.
+unsafe fn test_guarded(id:u16,generation:u64,lifetime:u64,handle:u16,boundary:u8,
+ data:*const u8,length:usize,epoch:u64,
+ consent:Option<unsafe extern "C" fn(*mut c_void,unsafe extern "C" fn(*mut c_void)->i32,*mut c_void)->i32>,scope:*mut c_void)->i32 {
+ let mut wait=0;
+ unsafe{under_test::sparklink_native_acb_send_deferred_rust(id,generation,lifetime,handle,boundary,
+  data,length,epoch,consent,scope,&mut wait)}
+}
 struct ConsentScope { live: bool }
 unsafe extern "C" fn consent_scope(scope:*mut c_void,submit:unsafe extern "C" fn(*mut c_void)->i32,context:*mut c_void)->i32 {
  let scope=unsafe{&*scope.cast::<ConsentScope>()};
@@ -275,8 +282,8 @@ unsafe extern "C" fn consent_scope(scope:*mut c_void,submit:unsafe extern "C" fn
  let(a,_)=setup();link(&a,0,1);
  let mut scope=ConsentScope{live:true};
  let bytes=b"guarded";
- let send_guarded=|scope:&mut ConsentScope|unsafe{under_test::sparklink_native_acb_send_guarded_rust(
-  0,7,1,0,bytes.as_ptr(),bytes.len(),1,Some(consent_scope),(scope as *mut ConsentScope).cast())};
+ let send_guarded=|scope:&mut ConsentScope|unsafe{test_guarded(
+  0,7,1,0,0,bytes.as_ptr(),bytes.len(),1,Some(consent_scope),(scope as *mut ConsentScope).cast())};
  assert_eq!(send_guarded(&mut scope),0);
  scope.live=false;
  for _ in 0..32 {assert_eq!(send_guarded(&mut scope),-125);}
@@ -384,7 +391,7 @@ fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut
 #[test] fn actual_successor_epoch_rejects_old_ticket_without_refunding_old_debt() {
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
  let mut scope=ConsentScope{live:true};let bytes=b"epoch";
- let guarded=|epoch|unsafe{under_test::sparklink_native_acb_send_guarded_rust(0,7,1,0,bytes.as_ptr(),bytes.len(),epoch,Some(consent_scope),(&mut scope as *mut ConsentScope).cast())};
+ let guarded=|epoch|unsafe{test_guarded(0,7,1,0,0,bytes.as_ptr(),bytes.len(),epoch,Some(consent_scope),(&mut scope as *mut ConsentScope).cast())};
  let mut guarded=guarded;
  assert_eq!(guarded(1),0);
  BEFORE_COMMIT.with(|v|*v.borrow_mut()=7);
@@ -475,7 +482,7 @@ fn actual_fragment_entry_uses_individual_credit_and_rejects_invalid_pb() {
  let mut scope=ConsentScope{live:true};
  let bytes=[0x5a;254];
  let call=|pb, scope:&mut ConsentScope|unsafe{
-  under_test::sparklink_native_acb_fragment_guarded_rust(0,7,1,0,pb,
+  test_guarded(0,7,1,0,pb,
     bytes.as_ptr(),bytes.len(),1,Some(consent_scope),(scope as *mut ConsentScope).cast())
  };
  assert_eq!(call(4,&mut scope),-22);
@@ -571,7 +578,7 @@ fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u6
   generation==owner.identity.generation && known && host.admits_data() && host.grants.permits(epoch)
    && links.iter().flatten().any(|link|link.handle==0 && link.lifetime==lifetime)
    && !*owner.schedule_gate.lock() && owner.transport_open.load(Ordering::Acquire) && scope.live};
- let result=unsafe{under_test::sparklink_native_acb_send_guarded_rust(owner.identity.id,generation,lifetime,0,
+ let result=unsafe{test_guarded(owner.identity.id,generation,lifetime,0,0,
    bytes.as_ptr(),bytes.len(),epoch,Some(consent_scope),(scope as *mut ConsentScope).cast())};
  let after=TX.with(|v|v.borrow().len());
  assert!(after==before || after==before+1);
@@ -639,4 +646,35 @@ fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u6
  }
  assert!(counts.iter().all(|count|*count>1000));assert!(accepted>0 && refused>0 && uncertain>0 && atomic_rejections>0);
  println!("ACTUAL_NATIVE_SEQUENCE_FUZZ seed={SEED} cases=1024 events=32768 primed=1024 accepted={accepted} refused={refused} failure_attempts={failure_attempts} atomic_rejections={atomic_rejections} uncertain={uncertain}");
+}
+
+#[test] fn actual_deferred_reason_distinguishes_full_pool_from_transport_retry() {
+ let(a,_)=setup();link(&a,0,1);let mut scope=ConsentScope{live:true};let mut wait=99;
+ let bytes=b"classified";
+ let call=|wait:&mut u32,scope:&mut ConsentScope|unsafe{
+  under_test::sparklink_native_acb_send_deferred_rust(0,7,1,0,0,bytes.as_ptr(),bytes.len(),1,
+   Some(consent_scope),(scope as *mut ConsentScope).cast(),wait)};
+ SUBMIT_RESULT.with(|r|*r.borrow_mut()=-11);
+ assert_eq!(call(&mut wait,&mut scope),-11);assert_eq!(wait,2);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,0);
+ SUBMIT_RESULT.with(|r|*r.borrow_mut()=0);
+ for _ in 0..5 {assert_eq!(call(&mut wait,&mut scope),0);assert_eq!(wait,0);}
+ assert_eq!(call(&mut wait,&mut scope),-11);assert_eq!(wait,1);
+ // Only the real production NOCP transition makes progress possible here.
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,1]),0);
+ assert_eq!(call(&mut wait,&mut scope),0);assert_eq!(wait,0);
+}
+#[test] fn actual_deferred_reason_does_not_hide_uncertain_or_precheck_failure() {
+ let(a,_)=setup();link(&a,0,1);let mut scope=ConsentScope{live:true};let mut wait=99;
+ let bytes=b"uncertain";
+ let call=|wait:&mut u32,scope:&mut ConsentScope|unsafe{
+  under_test::sparklink_native_acb_send_deferred_rust(0,7,1,0,0,bytes.as_ptr(),bytes.len(),1,
+   Some(consent_scope),(scope as *mut ConsentScope).cast(),wait)};
+ a.transport_open.store(false,Ordering::Release);
+ assert_eq!(call(&mut wait,&mut scope),-11);assert_eq!(wait,2);
+ a.transport_open.store(true,Ordering::Release);
+ TX_RESULT.with(|r|*r.borrow_mut()=-11);
+ assert_eq!(call(&mut wait,&mut scope),-11);assert_eq!(wait,2);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
+ assert_eq!(call(&mut wait,&mut scope),-5); // uncertain debt never refunded
 }

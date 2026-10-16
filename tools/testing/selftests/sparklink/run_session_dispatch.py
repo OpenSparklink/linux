@@ -22,7 +22,7 @@ def function(source, name):
 
 def run(output):
     here=Path(__file__).resolve().parent;root=here.parents[3];net=root/'net/sparklink'
-    paths=[net/'sle_channel_socket.c',net/'sle_channel_state.h',net/'sle_channel_grant.h',net/'sle_channel_wire.c',net/'sle_channel_wire.h',root/'include/linux/sparklink_channel.h',net/'sle_channel_table.h',net/'sle_dynamic_state.h',net/'sle_fragment_cursor.h',root/'include/uapi/linux/sparklink_socket.h',here/'session/dispatch_fixture.c']
+    paths=[net/'sle_channel_socket.c',net/'sle_channel_state.h',net/'sle_channel_grant.h',net/'sle_channel_wire.c',net/'sle_channel_wire.h',root/'include/linux/sparklink_channel.h',net/'sle_channel_table.h',net/'sle_dynamic_state.h',net/'sle_fragment_cursor.h',root/'include/uapi/linux/sparklink_socket.h',net/'sle_session_schedule.h',root/'include/linux/sparklink_native.h',here/'session/dispatch_fixture.c']
     inputs={p:p.read_bytes() for p in paths};source=inputs[paths[0]].decode()
     structs=source[source.index('struct sl_basic_channel {'):source.index('static struct proto sl_channel_proto;')]
     # Include actual SocketBinding/grant layout; allocation/mapping remain dependencies.
@@ -36,7 +36,8 @@ def run(output):
     structs+=re.search(r'struct sl_receive \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sl_admission \{[^}]+\};',source)[0]
     defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX','SL_CHANNEL_TX'])
-    bodies='\n'.join(function(source,n) for n in ['sl_dynamic_publish','sl_dynamic_status','sl_dynamic_grant','sl_dynamic_open','sl_dynamic_closing','sl_dynamic_receive','sl_dynamic_consent','sl_progress_event','sl_bound_channel','sl_permits','sl_session_submit','sl_send','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll','sl_tx_access','sl_publish_binding','sl_view_access','sl_read_info','sl_read_tx_status','sl_ioctl','sl_socket_fault','sl_fail_channel','sl_retire_tx','sl_transmit_channel','sl_dynamic_work'])
+    defines+='\n'+re.search(r'enum sparklink_acb_wait \{[^}]+\};',(root/'include/linux/sparklink_native.h').read_text())[0]
+    bodies='\n'.join(function(source,n) for n in ['sl_dynamic_publish','sl_dynamic_status','sl_dynamic_grant','sl_dynamic_open','sl_dynamic_closing','sl_dynamic_receive','sl_dynamic_consent','sl_progress_event','sl_bound_channel','sl_permits','sl_session_submit','sl_send_result','sl_send','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll','sl_tx_access','sl_publish_binding','sl_view_access','sl_read_info','sl_read_tx_status','sl_ioctl','sl_socket_fault','sl_fail_channel','sl_retire_tx','sl_transmit_channel','sl_shift_rejection','sl_dynamic_work','sl_next_schedule'])
     fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
     with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
         tmp=Path(directory);(tmp/'test.c').write_text(fixture)

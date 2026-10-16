@@ -409,16 +409,6 @@ int sparklink_native_session_status(u16 id, u64 generation, u64 lifetime, u16 ha
     return sparklink_native_session_status_rust(id, generation, lifetime, handle, epoch);
 }
 
-extern int sparklink_native_acb_send_guarded_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
-    const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope);
-int sparklink_native_acb_send_guarded(u16 id, u64 generation, u64 lifetime, u16 handle,
-    const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *scope, int (*submit)(void *context), void *context), void *scope)
-{
-    return sparklink_native_acb_send_guarded_rust(id, generation, lifetime, handle, data, length, epoch, consent, scope);
-}
-
 extern int sparklink_native_session_admit_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
     u64 epoch, int (*admit)(void *), void *context);
 int sparklink_native_session_admit(u16 id, u64 generation, u64 lifetime, u16 handle,
@@ -437,20 +427,21 @@ void sparklink_backend_standard_receive(u32 id, u64 generation, const u8 *data,
 }
 EXPORT_SYMBOL_GPL(sparklink_backend_standard_receive);
 
-extern int sparklink_native_acb_fragment_guarded_rust(u16 id, u64 generation, u64 lifetime, u16 handle, u8 boundary,
-    const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *, int (*)(void *), void *), void *scope);
-int sparklink_native_acb_fragment_guarded(u16 id, u64 generation, u64 lifetime, u16 handle, u8 boundary,
-    const u8 *data, size_t length, u64 epoch,
-    int (*consent)(void *, int (*)(void *), void *), void *scope)
-{
-    return sparklink_native_acb_fragment_guarded_rust(id, generation, lifetime, handle, boundary, data, length, epoch, consent, scope);
-}
-
 extern int sparklink_native_session_inspect_rust(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,
     int (*inspect)(const struct sparklink_credit_snapshot *,void *),void *context);
 int sparklink_native_session_inspect(u16 id,u64 generation,u64 lifetime,u16 handle,u64 epoch,
     int (*inspect)(const struct sparklink_credit_snapshot *,void *),void *context)
 {
     return sparklink_native_session_inspect_rust(id,generation,lifetime,handle,epoch,inspect,context);
+}
+
+extern int sparklink_native_acb_send_deferred_rust(u16 id, u64 generation, u64 lifetime,
+    u16 handle, u8 boundary, const u8 *data, size_t length, u64 epoch,
+    int (*consent)(void *, int (*)(void *), void *), void *scope, u32 *wait);
+int sparklink_native_acb_send_deferred(u16 id, u64 generation, u64 lifetime,
+    u16 handle, u8 boundary, const u8 *data, size_t length, u64 epoch,
+    int (*consent)(void *, int (*)(void *), void *), void *scope, u32 *wait)
+{
+    return sparklink_native_acb_send_deferred_rust(id, generation, lifetime,
+        handle, boundary, data, length, epoch, consent, scope, wait);
 }

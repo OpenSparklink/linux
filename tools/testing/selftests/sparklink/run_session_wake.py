@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Actual Session immediate/fallback enqueue functions with visible API fixtures."""
+"""Actual Session event/deadline enqueue functions with visible API fixtures."""
 import argparse
 import hashlib
 import json
@@ -41,7 +41,7 @@ def check_cbmc(directory, fixture, bodies, harness, net):
             terminal = [item['cProverStatus'] for item in raw if 'cProverStatus' in item]
             diagnostics = [item for item in raw if item.get('messageType') in ('WARNING', 'ERROR')]
             expected = {'one reference per queued/running invocation', 'closed rejects new queue',
-                        'event never postponed beyond fallback', 'close/cancel/finish settle queue refs'}
+                        'pending event never postponed by timer', 'close/cancel/finish settle queue refs'}
             assert expected <= {p.get('description') for p in properties}
             row = dict(kind=kind, exit=process.returncode, property_count=len(properties),
                        statuses=sorted(statuses), terminal=terminal, diagnostics=diagnostics,
@@ -113,7 +113,7 @@ def run(output, cbmc_output=None):
                   production_bodies_sha256=hashlib.sha256(bodies.encode()).hexdigest(),
                   sources={str(p.relative_to(root)): hashlib.sha256(b).hexdigest() for p, b in originals.items()},
                   compiler=subprocess.check_output([os.environ.get('CC', 'clang'), '--version'], text=True).splitlines()[0],
-                  remaining=['Separate original-deadline scheduling and remove periodic fallback.',
+                  remaining=['Original deadline selection, classified waits and actual no-idle-poll behavior need separate production/VM evidence.',
                              'Runtime event/Session notification interleavings,actual VM drain/close/credit recovery.',
                              'Production-mapped LKMM/TLC and unchanged-config real WS73 comparison.'])
     if formal:
