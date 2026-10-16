@@ -43,6 +43,12 @@ struct socket;
 struct sock {struct socket *sk_socket;unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state,sk_shutdown;void (*sk_data_ready)(struct sock *);void (*sk_error_report)(struct sock *);void (*sk_state_change)(struct sock *);};
 struct kref {unsigned int refs;};
 struct delayed_work {int unused;};
+static bool fixture_work_pending;
+static bool delayed_work_pending(struct delayed_work *w)
+{
+	(void)w;
+	return fixture_work_pending;
+}
 static unsigned int allocations,submitted;
 static u64 fixture_now_ns, fragment_cost_ns;
 static u64 ktime_get_ns(void){return fixture_now_ns;}
@@ -451,6 +457,90 @@ static void fragment_worker_tests(void){
  assert(bindings[0].sk.sk_err==ETIMEDOUT&&bindings[0].sk.sk_shutdown==SHUTDOWN_MASK);
  assert(sl_binding_live(s.channels[1].binding)&&s.progress.phase==SL_CH_OPEN&&!allocations);
 }
+
+static void session_status_tests(void)
+{
+	struct sl_connection_session s;
+	struct sl_socket_binding binding = { .sk = { .refs = 1,
+						     .sk_rcvbuf = 100000,
+						     .sk_data_ready =
+							     data_ready } };
+	struct socket sock = { .sk = &binding.sk };
+	struct sparklink_session_tx_status value;
+	struct sk_buff *queued;
+	unsigned long f;
+	unsigned int submitted_before;
+
+	_Static_assert(sizeof(value) == 64,
+		       "session status fixed native/compat layout");
+
+	init_receive(&s, &binding.sk);
+	copy_limit = 64;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	assert(value.version == 1 && value.size == 64 && value.capacity == 5 &&
+	       value.outstanding == 3 && value.connection_debt == 2);
+	assert(!value.queued && !value.active_pdus &&
+	       !value.dynamic_allocated && !value.flags && !value.reserved[0] &&
+	       !value.reserved[1]);
+	s.channels[2].dynamic = true;
+	s.channels[2].negotiation.phase = SL_DYN_CLOSE_SENT;
+	s.channels[3].dynamic = true;
+	s.channels[3].negotiation.phase = SL_DYN_FAILED;
+	s.channels[4].dynamic = true;
+	s.channels[4].negotiation.phase = SL_DYN_RETIRED;
+	s.channels[5].dynamic = true;
+	s.channels[5].negotiation.phase = SL_DYN_OPEN;
+	s.service_running = true;
+	fixture_work_pending = true;
+	s.response_pending = true;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	assert(value.dynamic_allocated == 4 && value.dynamic_pending == 1 &&
+	       value.dynamic_failed == 1 && value.dynamic_retired == 1 &&
+	       value.dynamic_open == 1);
+	assert(value.flags == (SPARKLINK_SESSION_WORK_RUNNING |
+			       SPARKLINK_SESSION_WORK_QUEUED));
+	s.service_running = false;
+	fixture_work_pending = false;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	assert(value.flags == SPARKLINK_SESSION_BASE_PENDING);
+	s.channels[5].negotiation.phase = SL_DYN_UNUSED;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	assert(value.flags & SPARKLINK_SESSION_STATE_UNKNOWN);
+	queued = alloc_skb(10, 0);
+	skb_put(queued, 10);
+	spin_lock_irqsave(&s.lock, f);
+	spin_lock(&s.channels[2].tx.lock);
+	__skb_queue_tail(&s.channels[2].tx, queued);
+	spin_unlock(&s.channels[2].tx.lock);
+	spin_unlock_irqrestore(&s.lock, f);
+	submitted_before = submitted;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	assert(value.queued == 1 &&
+	       submitted_before == submitted); /* read-only, another channel */
+	skb_queue_purge(&s.channels[2].tx);
+	assert(!allocations);
+
+	copy_limit = 17;
+	assert(sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			(unsigned long)&value) == -EFAULT);
+	copy_limit = 64;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	authority = false;
+	memset(&value, 0x5a, sizeof(value));
+	assert(sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			(unsigned long)&value) == -EACCES);
+	for (unsigned int i = 0; i < sizeof(value); i++)
+		assert(((u8 *)&value)[i] == 0x5a);
+	authority = true;
+	copy_limit = 40;
+}
+
 static void tx_status_tests(void){
  struct sl_connection_session s;struct sl_socket_binding binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
  struct socket sock={.sk=&binding.sk};struct sparklink_channel_tx_status value;
@@ -822,5 +912,6 @@ int main(void){
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
  batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
+	session_status_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
 }

@@ -76,6 +76,7 @@ struct sl_connection_session {
 	unsigned int rejection_count;
 	unsigned long rejection_deadline[4];
 	unsigned long response_deadline;
+	bool service_running; /* Session lock publishes worker-only fields to inspection */
 	bool work_progress, work_retry; /* serialized worker-only send results */
 	bool rx_budget_exhausted, tx_budget_exhausted;
 	bool tx_blocked; /* last data attempt could not progress; worker-only */
@@ -1136,6 +1137,11 @@ static void sl_work(struct work_struct *work)
 	struct sl_session_schedule plan = { 0 };
 	struct sl_tx_budget budget = { 0 };
 	u64 began = ktime_get_ns();
+	unsigned long state_flags;
+
+	spin_lock_irqsave(&s->lock, state_flags);
+	s->service_running = true;
+	spin_unlock_irqrestore(&s->lock, state_flags);
 
 	s->service_sequence++;
 	trace_sparklink_session_work(s->controller, s->generation, s->lifetime,
@@ -1213,6 +1219,12 @@ put:
 	trace_sparklink_session_work(s->controller, s->generation, s->lifetime,
 		s->epoch, s->service_sequence, 1, budget.packets, budget.bytes,
 		budget.stop, ktime_get_ns() - began, plan.pending ? plan.delay : ~0UL, ret);
+	/* Inspection holds the same lock; when false it may read worker-private
+	 * pending-control fields. This does not mean the final work ref drained.
+	 */
+	spin_lock_irqsave(&s->lock, state_flags);
+	s->service_running = false;
+	spin_unlock_irqrestore(&s->lock, state_flags);
 	sl_connection_session_put(s);
 }
 void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime, u16 handle, u64 epoch, u16 maximum)
@@ -1860,30 +1872,143 @@ static int sl_read_tx_status(const struct sparklink_credit_snapshot *credit, voi
     spin_unlock_irqrestore(&s->lock,flags);
     return ret;
 }
+
+struct sl_session_status_read {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+	struct sock *sk;
+	struct sparklink_session_tx_status value;
+};
+
+/*
+ * Host/data/gate -> Session -> one TX queue at a time. Worker-only state is
+ * published by service_running under this lock; never read it while running.
+ * Concurrent purge can only reduce the conservatively summed queue count.
+ */
+static int sl_read_session_status(const struct sparklink_credit_snapshot *credit,
+				  void *context)
+{
+	struct sl_session_status_read *read = context;
+	struct sl_connection_session *s = read->session;
+	struct sparklink_session_tx_status *v = &read->value;
+	unsigned long flags;
+	unsigned int i;
+	int ret;
+
+	spin_lock_irqsave(&s->lock, flags);
+	ret = sl_view_access(s, read->channel, read->sk);
+	if (ret)
+		goto out;
+	*v = (struct sparklink_session_tx_status){
+		.version = SPARKLINK_SESSION_TX_STATUS_VERSION,
+		.size = sizeof(*v),
+		.controller = s->controller,
+		.handle = s->handle,
+		.generation = s->generation,
+		.lifetime = s->lifetime,
+		.capacity = credit->capacity,
+		.outstanding = credit->outstanding,
+		.connection_debt = credit->connection_debt,
+		.active_pdus = !!s->tx_inflight,
+	};
+	if (s->service_running)
+		v->flags |= SPARKLINK_SESSION_WORK_RUNNING;
+	else if (s->response_pending || s->rejection_count)
+		v->flags |= SPARKLINK_SESSION_BASE_PENDING;
+	if (delayed_work_pending(&s->work))
+		v->flags |= SPARKLINK_SESSION_WORK_QUEUED;
+	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
+		struct sl_basic_channel *c = &s->channels[i];
+
+		spin_lock(&c->tx.lock);
+		v->queued += skb_queue_len(&c->tx);
+		spin_unlock(&c->tx.lock);
+		if (!c->dynamic)
+			continue;
+		v->dynamic_allocated++;
+		switch (c->negotiation.phase) {
+		case SL_DYN_OPEN:
+			v->dynamic_open++;
+			break;
+		case SL_DYN_RETIRED:
+			v->dynamic_retired++;
+			break;
+		case SL_DYN_FAILED:
+			v->dynamic_failed++;
+			break;
+		case SL_DYN_LISTEN:
+		case SL_DYN_CONNECT:
+		case SL_DYN_CONNECT_SENT:
+		case SL_DYN_ABANDONED:
+		case SL_DYN_RESPONSE:
+		case SL_DYN_REJECT:
+		case SL_DYN_CLOSE:
+		case SL_DYN_CLOSE_SENT:
+		case SL_DYN_CLOSE_RESPONSE:
+			v->dynamic_pending++;
+			break;
+		default:
+			v->dynamic_pending++;
+			v->flags |= SPARKLINK_SESSION_STATE_UNKNOWN;
+		}
+	}
+out:
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
 static int sl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
 	struct sl_connection_session *s;
 	struct sl_info_read read;
 	struct sl_tx_status_read tx_read;
+	struct sl_session_status_read session_read;
 	int ret;
 
-	if (cmd != SPARKLINK_CHANNEL_INFO && cmd != SPARKLINK_CHANNEL_TX_STATUS)
+	if (cmd != SPARKLINK_CHANNEL_INFO &&
+	    cmd != SPARKLINK_CHANNEL_TX_STATUS &&
+	    cmd != SPARKLINK_SESSION_TX_STATUS)
 		return -ENOIOCTLCMD;
 	s = sl_binding_session(sock->sk);
 	if (!s)
 		return -ENOTCONN;
-    if (cmd == SPARKLINK_CHANNEL_INFO) {
-        read = (struct sl_info_read) { .session = s, .channel = sl_bound_channel(sock->sk, s), .sk = sock->sk };
-        ret = sparklink_native_session_admit(s->controller, s->generation,
-            s->lifetime, s->handle, s->epoch, sl_read_info, &read);
-        if (!ret && copy_to_user((void __user *)arg, &read.value, sizeof(read.value)))
-            ret = -EFAULT;
-    } else {
-        tx_read=(struct sl_tx_status_read){.session=s,.channel=sl_bound_channel(sock->sk,s),.sk=sock->sk};
-        ret=sparklink_native_session_inspect(s->controller,s->generation,s->lifetime,s->handle,s->epoch,sl_read_tx_status,&tx_read);
-        if (!ret && copy_to_user((void __user *)arg,&tx_read.value,sizeof(tx_read.value)))
-            ret=-EFAULT;
-    }
+	if (cmd == SPARKLINK_CHANNEL_INFO) {
+		read = (struct sl_info_read){ .session = s,
+					      .channel = sl_bound_channel(
+						      sock->sk, s),
+					      .sk = sock->sk };
+		ret = sparklink_native_session_admit(s->controller,
+						     s->generation, s->lifetime,
+						     s->handle, s->epoch,
+						     sl_read_info, &read);
+		if (!ret && copy_to_user((void __user *)arg, &read.value,
+					 sizeof(read.value)))
+			ret = -EFAULT;
+	} else if (cmd == SPARKLINK_CHANNEL_TX_STATUS) {
+		tx_read = (struct sl_tx_status_read){
+			.session = s,
+			.channel = sl_bound_channel(sock->sk, s),
+			.sk = sock->sk
+		};
+		ret = sparklink_native_session_inspect(
+			s->controller, s->generation, s->lifetime, s->handle,
+			s->epoch, sl_read_tx_status, &tx_read);
+		if (!ret && copy_to_user((void __user *)arg, &tx_read.value,
+					 sizeof(tx_read.value)))
+			ret = -EFAULT;
+	} else {
+		session_read = (struct sl_session_status_read){
+			.session = s,
+			.channel = sl_bound_channel(sock->sk, s),
+			.sk = sock->sk
+		};
+		ret = sparklink_native_session_inspect(
+			s->controller, s->generation, s->lifetime, s->handle,
+			s->epoch, sl_read_session_status, &session_read);
+		if (!ret &&
+		    copy_to_user((void __user *)arg, &session_read.value,
+				 sizeof(session_read.value)))
+			ret = -EFAULT;
+	}
 	sl_connection_session_put(s);
 	return ret;
 }

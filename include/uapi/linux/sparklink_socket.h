@@ -85,4 +85,27 @@ struct sparklink_channel_tx_status {
 #define SPARKLINK_CHANNEL_TX_ACTIVE 1U
 #define SPARKLINK_CHANNEL_TX_BEGUN 2U
 #define SPARKLINK_CHANNEL_TX_STATUS _IOR('S', 0xe1, struct sparklink_channel_tx_status)
+/* Read-only per-connection mechanism view through an existing authorized fd.
+ * No lease, payload, reset, credit refund or new binding. 64 bytes for native
+ * and compat. Success observes this identity, never promises future idleness,
+ * callback/reference drain, firmware truth or safe TCID/handle reuse.
+ * queues are counted under each queue lock (conservative during concurrent
+ * purge); zero is meaningful while Session lock excludes new admissions.
+ * Dynamic FAILED entries remain visible tombstones, not successful closes.
+ */
+struct sparklink_session_tx_status {
+	__u16 version, size, controller, handle;
+	__aligned_u64 generation, lifetime;
+	__u16 capacity, outstanding, connection_debt, queued, active_pdus;
+	__u16 dynamic_open, dynamic_pending, dynamic_retired, dynamic_failed, dynamic_allocated;
+	__u32 flags;
+	__aligned_u64 reserved[2];
+};
+
+#define SPARKLINK_SESSION_TX_STATUS_VERSION 1
+#define SPARKLINK_SESSION_WORK_RUNNING 1U
+#define SPARKLINK_SESSION_WORK_QUEUED 2U
+#define SPARKLINK_SESSION_BASE_PENDING 4U
+#define SPARKLINK_SESSION_STATE_UNKNOWN 8U
+#define SPARKLINK_SESSION_TX_STATUS _IOR('S', 0xe2, struct sparklink_session_tx_status)
 #endif

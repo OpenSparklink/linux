@@ -300,3 +300,28 @@ unwind must be rejected. This does not prove real concurrency, reference drain,
 scheduling fairness, protocol credit, firmware behavior or end-to-end latency.
 The physical VM gates and accurate source identities remain separate; see the
 user repository's sole current-capabilities and implementation-plan entries.
+
+
+Session mechanism observation (unpublished v1)
+---------------------------------------------
+
+``SPARKLINK_SESSION_TX_STATUS`` (socket ioctl 0xe2, 64 bytes, identical native
+and compat layout) is read-only through an existing live authorized binding.
+It exposes controller/generation/lifetime/handle, reservation counts, aggregate
+software TX queue/active PDU and bounded dynamic channel phase counts. It does
+not expose a lease, send a controller command, refund credit or create a channel.
+Authorization and identity use the existing Host/data/gate -> Session contract;
+user copy follows lock release and failure never fills a successful snapshot.
+
+The Session lock publishes ``service_running`` at worker entry and exit. An
+inspector never reads worker-private pending-control fields while it is true;
+the false publication carries prior writes through the same lock. The queue
+counts take each queue lock under Session, which excludes new admissions;
+concurrent purge can make a nonzero aggregate conservative. A work-queued bit
+is observational: zero is not a work-reference or callback drain barrier.
+
+FAILED entries are visible tombstones, distinct from successfully RETIRED
+CMTC entries. A caller must know which failures it expects; neither zero debt
+nor fd release makes a failed close successful. A snapshot cannot promise future
+idleness, NOCP accuracy, firmware state clearing or safe TCID/handle reuse.
+Independent captured close/NOCP evidence remains necessary for the VM gate.
