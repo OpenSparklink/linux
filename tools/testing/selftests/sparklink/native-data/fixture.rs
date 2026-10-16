@@ -73,6 +73,7 @@ thread_local!{
  static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(Vec::new())};
  static TX:RefCell<Vec<(usize,u16,Vec<u8>)>>=const{RefCell::new(Vec::new())};
  static BEFORE_COMMIT:RefCell<u8>=const{RefCell::new(0)};
+ static SUBMIT_CALLS:Cell<usize>=const{Cell::new(0)};
  static SUBMIT_RESULT:RefCell<i32>=const{RefCell::new(0)};
  static TX_RESULT:RefCell<i32>=const{RefCell::new(0)};
  static EARLY_COMPLETE:RefCell<bool>=const{RefCell::new(false)};
@@ -90,6 +91,7 @@ unsafe extern "C" fn atomic_submit(context:*mut c_void)->i32{
  assert!(owner.host.0.try_borrow_mut().is_err());
  assert!(owner.data.0.try_borrow_mut().is_err());
  assert!(owner.schedule_gate.0.try_borrow_mut().is_err());
+ SUBMIT_CALLS.with(|v|v.set(v.get()+1));
  let result=SUBMIT_RESULT.with(|r|*r.borrow());
  if result==0 {TX.with(|t|t.borrow_mut().push((x.p as usize,x.handle,
      unsafe{std::slice::from_raw_parts(x.data,x.n)}.to_vec())));}
@@ -134,6 +136,7 @@ mod under_test{use super::*;
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
  OWNERS.with(|o|*o.borrow_mut()=vec![a.clone(),b.clone()]);TX.with(|t|t.borrow_mut().clear());
+ SUBMIT_CALLS.with(|v|v.set(0));
  BEFORE_COMMIT.with(|b|*b.borrow_mut()=0);SUBMIT_RESULT.with(|r|*r.borrow_mut()=0);
  TX_RESULT.with(|r|*r.borrow_mut()=0);EARLY_COMPLETE.with(|e|*e.borrow_mut()=false);NOW.with(|n|*n.borrow_mut()=1);(a,b)}
 fn link(owner:&Owner,handle:u16,kind:u32){owner.host.lock().links.observe(&LinkEvidence{kind,status:0,handle:handle as u32,role:1,address_type:0,address:[1;6],reserved:[0;2]});}
@@ -505,4 +508,92 @@ fn security_event(event:u16,body:&[u8])->Vec<u8>{let mut v=vec![0xa2,event as u8
  let(peer_after,_)=b.existing_session_for_event(1,0).unwrap();assert_eq!(peer,peer_after);
  unsafe{assert!(!(*peer.cast::<FakeSession>()).stopped);sl_connection_session_put(peer);sl_connection_session_put(peer_after);}
  b.stop_sessions(-19);
+}
+
+// Seeded stateful exploration through the actual production ingress/commit,
+// authority and ledger. Dependency fixtures above remain explicit: this is
+// neither exhaustive proof nor a claim about NOCP hardware attribution.
+fn sequence_credit(owner:&Owner)->(u16,u16,u16,u64) {
+ let data=owner.data.lock();let snapshot=data.credits.snapshot(1,0);
+ let sum:u16=(1..=65).map(|lifetime|data.credits.snapshot(lifetime,0).connection_debt).sum();
+ assert_eq!(sum,snapshot.outstanding,"retained old debt must still account for outstanding");
+ assert!(snapshot.outstanding<=snapshot.capacity && snapshot.peak_reserved<=snapshot.capacity);
+ assert!(snapshot.outstanding<=snapshot.peak_reserved);
+ (snapshot.outstanding,sum,snapshot.peak_reserved,snapshot.pool_exhaustions)
+}
+fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u64,epoch:u64)->i32 {
+ let bytes=b"sequence";
+ let before=TX.with(|v|v.borrow().len());
+ let eligible={let host=owner.host.lock();let(_,known,links)=host.link_snapshot();
+  generation==owner.identity.generation && known && host.admits_data() && host.grants.permits(epoch)
+   && links.iter().flatten().any(|link|link.handle==0 && link.lifetime==lifetime)
+   && !*owner.schedule_gate.lock() && owner.transport_open.load(Ordering::Acquire) && scope.live};
+ let result=unsafe{under_test::sparklink_native_acb_send_guarded_rust(owner.identity.id,generation,lifetime,0,
+   bytes.as_ptr(),bytes.len(),epoch,Some(consent_scope),(scope as *mut ConsentScope).cast())};
+ let after=TX.with(|v|v.borrow().len());
+ assert!(after==before || after==before+1);
+ if after!=before {assert!(eligible,"no new physical submit from revoked/stale/cancelled admission");}
+ result
+}
+#[test] fn actual_seeded_submission_revocation_completion_sequences() {
+ const SEED:u64=0x730111;
+ let mut counts=[0usize;16];let mut accepted=0usize;let mut refused=0usize;
+ let mut failure_attempts=0usize;let mut atomic_rejections=0usize;let mut uncertain=0usize;
+ for case in 0..1024u64 {
+  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+  let mut scope=ConsentScope{live:true};let mut peer=ConsentScope{live:true};
+  assert_eq!(sequence_send(&a,&mut scope,7,1,1),0); // valid physical obligation first
+  let mut random=SEED^case.wrapping_mul(0x9e3779b97f4a7c15);let mut trace=Vec::new();
+  for _ in 0..32 {
+   random^=random<<13;random^=random>>7;random^=random<<17;
+   let operation=(random&15) as usize;counts[operation]+=1;trace.push(operation);
+   let checked=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+   let old=sequence_credit(&a);let peer_before=sequence_credit(&b);
+   match operation {
+    0=>{if sequence_send(&a,&mut scope,7,1,1)==0{accepted+=1;}else{refused+=1;}},
+    1=>a.host.lock().grants.revoke(),
+    2=>{a.host.lock().grants.activate(2,true);},
+    3=>link(&a,0,2),
+    4=>link(&a,0,1),
+    5=>{receive(0,7,&[0xa2,9,0,3,0,0,0,1]);},
+    6=>{let calls=SUBMIT_CALLS.with(Cell::get);SUBMIT_RESULT.with(|v|*v.borrow_mut()=-12);
+      sequence_send(&a,&mut scope,7,1,1);SUBMIT_RESULT.with(|v|*v.borrow_mut()=0);
+      assert_eq!(sequence_credit(&a).0,old.0,"never-queued failure cannot pay old debt: {trace:?}");
+      failure_attempts+=1;atomic_rejections+=SUBMIT_CALLS.with(Cell::get)-calls;},
+    7=>{TX_RESULT.with(|v|*v.borrow_mut()=-110);
+      let submitted=TX.with(|v|v.borrow().len());sequence_send(&a,&mut scope,7,1,1);
+      TX_RESULT.with(|v|*v.borrow_mut()=0);
+      if TX.with(|v|v.borrow().len())!=submitted {
+       assert_eq!(sequence_credit(&a).0,old.0+1,"uncertain failure retains physical debt: {trace:?}");
+       assert_eq!(a.data.lock().credits.maximum(),Err(sle_data_credit::CreditError::Fault));uncertain+=1;
+      }},
+    8=>scope.live=false, // author withdrawal is one-way for this binding
+    9=>{assert_eq!(sequence_send(&a,&mut scope,6,1,1),-19);},
+    10=>a.transport_open.store(false,Ordering::Release),
+    11=>*a.schedule_gate.lock()=true,
+    12=>{let mut mode=((random>>8)%5) as u8;
+      mode=[1,2,3,4,7][mode as usize];
+      if mode==7 && !a.host.lock().grants.accepts(2){mode=2;}
+      BEFORE_COMMIT.with(|v|*v.borrow_mut()=mode);
+      sequence_send(&a,&mut scope,7,1,1);BEFORE_COMMIT.with(|v|*v.borrow_mut()=0);},
+    13=>{let(epoch,lifetime)={let host=a.host.lock();let(_,_,links)=host.link_snapshot();
+      (host.grants.current_epoch().unwrap_or(0),links.iter().flatten().next().map_or(0,|link|link.lifetime))};
+      if sequence_send(&a,&mut scope,7,lifetime,epoch)==0{accepted+=1;}else{refused+=1;}},
+    14=>{sequence_send(&b,&mut peer,8,1,1);},
+    15=>{receive(0,7,&[0xa2,2,0,3,0,0,0,4]);
+      assert_eq!(sequence_credit(&a),old,"command credit cannot refill data: {trace:?}");},
+    _=>unreachable!(),
+   }
+   let after=sequence_credit(&a);assert!(after.2>=old.2 && after.3>=old.3,"generation counters monotonic: {trace:?}");
+   if ![0,5,6,7,12,13].contains(&operation){assert_eq!(after.0,old.0,"non-data transition erased debt: {trace:?}");}
+   if operation!=14{assert_eq!(sequence_credit(&b),peer_before,"cross-controller mutation: {trace:?}");}
+   }));
+   if let Err(error)=checked {
+    let message=error.downcast_ref::<String>().map(String::as_str).or_else(||error.downcast_ref::<&str>().copied()).unwrap_or("non-string panic");
+    panic!("sequence failure seed={SEED} case={case} operations={trace:?}: {message}");
+   }
+  }
+ }
+ assert!(counts.iter().all(|count|*count>1000));assert!(accepted>0 && refused>0 && uncertain>0 && atomic_rejections>0);
+ println!("ACTUAL_NATIVE_SEQUENCE_FUZZ seed={SEED} cases=1024 events=32768 primed=1024 accepted={accepted} refused={refused} failure_attempts={failure_attempts} atomic_rejections={atomic_rejections} uncertain={uncertain}");
 }

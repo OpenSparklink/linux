@@ -13,6 +13,10 @@ from run_connection_tx import function
 
 
 def run(output):
+    if output and any(p.exists() for p in [output, output.with_suffix('.bin'), output.with_suffix('.fixture.rs')]):
+        raise ValueError('refuse to overwrite existing source-bound evidence')
+    runner = Path(__file__).resolve()
+    runner_bytes = runner.read_bytes()
     here = Path(__file__).resolve().parent
     root = here.parents[3]
     net = root / 'net/sparklink'
@@ -47,9 +51,23 @@ def run(output):
             (tmp / p.name).write_bytes(originals[p])
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
-        process = subprocess.run([str(tmp / 'test'), '--test-threads=1'], text=True,capture_output=True)
+        binary = (tmp / 'test').read_bytes()
+        if output:
+            with output.with_suffix('.bin').open('xb') as destination:
+                destination.write(binary)
+            with output.with_suffix('.fixture.rs').open('xb') as destination:
+                destination.write(fixture.encode())
+        process = subprocess.run([str(tmp / 'test'), '--test-threads=1', '--show-output'], text=True,capture_output=True)
         result=process.stdout
-        print(result);print(process.stderr);process.check_returncode()
+        print(result);print(process.stderr)
+        if process.returncode and output:
+            output.write_text(json.dumps({'status': 'FAIL', 'exit': process.returncode,
+                'runner_sha256': hashlib.sha256(runner_bytes).hexdigest(),
+                'generated_fixture_sha256': hashlib.sha256(fixture.encode()).hexdigest(),
+                'test_binary_sha256': hashlib.sha256(binary).hexdigest(),
+                'scope': 'Failed dependency-fixture test, not hardware qualification'}, indent=2)+'\n')
+        process.check_returncode()
+    assert runner.read_bytes() == runner_bytes
     assert all(p.read_bytes() == data for p, data in originals.items())
     count = re.search(r'test result: ok\. (\d+) passed; 0 failed;', result)
     assert count
@@ -57,6 +75,19 @@ def run(output):
               'scope': 'actual ingress/send/take and credit/queue modules; allocation, locks, owner registry and USB dependencies are fixtures',
               'real_data_acceptance': False, 'socket_acceptance': False,
               'sources': {str(p.relative_to(root)): hashlib.sha256(b).hexdigest() for p, b in originals.items()}}
+    record.update(runner_sha256=hashlib.sha256(runner_bytes).hexdigest(),
+                  generated_fixture_sha256=hashlib.sha256(fixture.encode()).hexdigest(),
+                  test_binary_sha256=hashlib.sha256(binary).hexdigest(),
+                  rustc=subprocess.check_output([os.environ.get('RUSTC', 'rustc'), '--version'], text=True).strip())
+    sequence = re.search(r'ACTUAL_NATIVE_SEQUENCE_FUZZ seed=(\d+) cases=(\d+) events=(\d+) primed=(\d+) accepted=(\d+) refused=(\d+) failure_attempts=(\d+) atomic_rejections=(\d+) uncertain=(\d+)', result)
+    assert sequence, 'missing required stateful sequence exploration'
+    record['stateful_sequences'] = dict(zip(
+        ['seed', 'cases', 'events', 'primed', 'accepted', 'refused', 'failure_attempts', 'atomic_rejections', 'uncertain'],
+        map(int, sequence.groups())))
+    record['sequence_scope'] = ('Actual production NativeTX/credit/authority/ingress transitions after a valid '
+        'initial submit, 1024 seeded 32-event sequences; explicit USB/locks/clock/owner/consent fixtures. '
+        'Conservation, no stale submit, definite/uncertain failure and controller isolation only. '
+        'Not exhaustive/formal, original-deadline/worker/VFS concurrency or NOCP accuracy/reuse proof.')
     if output:
         output.write_text(json.dumps(record, indent=2) + '\n')
     print(json.dumps(record, indent=2))
