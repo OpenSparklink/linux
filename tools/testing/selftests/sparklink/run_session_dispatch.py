@@ -33,7 +33,7 @@ def run(output):
     structs+=re.search(r'struct sl_receive \{[^}]+\};',source)[0]
     structs+=re.search(r'struct sl_admission \{[^}]+\};',source)[0]
     defines='\n'.join(re.search(r'^#define '+n+r' .*$',source,re.M)[0] for n in ['SL_CHANNEL_RX','SL_CHANNEL_TX'])
-    bodies='\n'.join(function(source,n) for n in ['sl_bound_channel','sl_permits','sl_session_submit','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll','sl_tx_access','sl_publish_binding','sl_view_access','sl_read_info','sl_read_tx_status','sl_ioctl','sl_socket_fault','sl_fail_channel','sl_retire_tx','sl_transmit_channel'])
+    bodies='\n'.join(function(source,n) for n in ['sl_progress_event','sl_bound_channel','sl_permits','sl_session_submit','sl_route','sl_admit','sl_take','sl_recvmsg','sl_poll','sl_tx_access','sl_publish_binding','sl_view_access','sl_read_info','sl_read_tx_status','sl_ioctl','sl_socket_fault','sl_fail_channel','sl_retire_tx','sl_transmit_channel'])
     fixture=inputs[paths[-1]].decode().replace('/* @@STRUCTS@@ */',structs).replace('/* @@LIMITS@@ */',defines).replace('/* @@FUNCTIONS@@ */',bodies)
     with tempfile.TemporaryDirectory(prefix='sparklink-session-dispatch-') as directory:
         tmp=Path(directory);(tmp/'test.c').write_text(fixture)

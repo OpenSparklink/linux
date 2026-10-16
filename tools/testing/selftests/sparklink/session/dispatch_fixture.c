@@ -56,7 +56,6 @@ static int atomic_read(int *value){return *value;}
 static int sk_rmem_schedule(struct sock *sk,struct sk_buff *skb,unsigned int size){(void)sk;(void)skb;(void)size;return 1;}
 static void skb_set_owner_r(struct sk_buff *skb,struct sock *sk){skb->owner=sk;sk->sk_rmem_alloc+=skb->truesize;}
 static struct sl_channel_progress sl_snapshot(struct sl_connection_session *s){return s->progress;}
-static void sl_progress_event(struct sl_connection_session *s,unsigned int event,unsigned int mtu){(void)s;(void)event;(void)mtu;assert(!"capability-reply integration covered separately");}
 static void sl_fault(struct sl_connection_session *s,int error){assert(error<0);sl_channel_fail(&s->progress);}
 
 struct socket {struct sock *sk;int state;};
@@ -174,8 +173,8 @@ static void init_grant(struct sl_connection_session *s,struct sock *sk,unsigned 
 }
 static void init_receive(struct sl_connection_session *s,struct sock *sk){
  memset(s,0,sizeof(*s));s->controller=1;s->generation=7;s->lifetime=11;s->handle=3;s->epoch=1;s->refs.refs=1;
- sl_channel_start(&s->progress,249);sl_channel_request_submitted(&s->progress,0);sl_channel_peer_capability(&s->progress,249,0);sl_channel_response_submitted(&s->progress,0);
- s->channels[0].local_tcid=31;s->channels[0].remote_tcid=31;s->channels[0].pi=241;s->channels[0].mtu=249;s->channels[0].sk=sk;assert(sl_binding_attach(&s->channels[0].binding));
+ sl_channel_start(&s->progress, 249, 254);sl_channel_request_submitted(&s->progress,0);sl_channel_peer_capability(&s->progress, 249, 254, 0);sl_channel_response_submitted(&s->progress,0);
+ s->channels[0].local_tcid=31;s->channels[0].remote_tcid=31;s->channels[0].pi=241;s->channels[0].mtu=249;s->channels[0].mps=254;s->channels[0].sk=sk;assert(sl_binding_attach(&s->channels[0].binding));
  init_grant(s,sk,SL_GRANT_TX|SL_GRANT_RX);
  s->channels[0].rx.prev=(struct sk_buff *)&s->channels[0].rx;current_session=s;authority=true;copy_fault=false;receive_timeout=5;wait_calls=0;status_error=0;
 }
@@ -231,7 +230,7 @@ static void direction_tests(void){
 static void publication_tests(void){
  struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct socket sock={.sk=&b.sk};
  init_receive(&s,&b.sk);s.channels[0].sk=NULL;s.channels[0].binding=(struct sl_binding_progress){0};
- s.progress=(struct sl_channel_progress){.phase=SL_CH_UNBOUND,.maximum=249};s.deadline=0;jiffies=10000;
+ s.progress=(struct sl_channel_progress){.phase=SL_CH_UNBOUND,.maximum=249,.maximum_mps=254};s.deadline=0;jiffies=10000;
  struct sl_bind_admission admission={.sock=&sock,.binding=&b,.session=&s,.grant=b.grant};
  struct sl_channel_grant before=b.grant;authority=false;
  assert(sparklink_native_session_admit(1,7,11,3,1,sl_publish_binding,&admission)==-EACCES);
@@ -254,7 +253,7 @@ static void two_channel_tests(void)
  struct socket us={.sk=&user.sk},ss={.sk=&service.sk};struct msghdr msg={0};
  init_receive(&s,&user.sk);
  s.channels[1].local_tcid=s.channels[1].remote_tcid=10;s.channels[1].pi=0;
- s.channels[1].mtu=249;s.channels[1].sk=&service.sk;s.channels[1].rx.prev=(void *)&s.channels[1].rx;
+ s.channels[1].mtu=249;s.channels[1].mps=254;s.channels[1].sk=&service.sk;s.channels[1].rx.prev=(void *)&s.channels[1].rx;
  assert(sl_binding_attach(&s.channels[1].binding));init_grant(&s,&service.sk,3);
  u8 bytes[]={2,3,254,0,1,2},wire[10];
  assert(sl_channel_frame_encode(wire,sizeof(wire),10,0,bytes,sizeof(bytes))==10);
@@ -287,12 +286,12 @@ static void two_channel_tests(void)
 static void capability_tests(void)
 {
  struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
- struct socket sock={.sk=&b.sk};init_receive(&s,&b.sk);s.channels[0].mps=249;
+ struct socket sock={.sk=&b.sk};init_receive(&s,&b.sk);s.channels[0].mps=254;
  struct sparklink_channel_info out,good;memset(&out,0xa5,sizeof(out));
  assert(sizeof(out)==40&&_Alignof(struct sparklink_channel_info)==8);
  assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_INFO,(unsigned long)&out)==0);
  assert(out.version==1&&out.size==40&&out.controller==1&&out.handle==3&&out.generation==7&&out.lifetime==11);
- assert(out.mtu==249&&out.mps==249&&out.local_tcid==31&&out.remote_tcid==31&&out.pi==241&&out.mode==0&&out.directions==3&&out.reserved==0);
+ assert(out.mtu==249&&out.mps==254&&out.local_tcid==31&&out.remote_tcid==31&&out.pi==241&&out.mode==0&&out.directions==3&&out.reserved==0);
  good=out;struct sl_channel_progress before=s.progress;unsigned int refs=s.refs.refs;
  route(&s,31,241,"not consumed");
  copy_limit=20;memset(&out,0xa5,sizeof(out));
@@ -406,7 +405,7 @@ static void tx_status_tests(void){
 }
 static void identifier_zero_request_tests(void){
  struct sl_connection_session s={0};u8 request[8],frame[12];
- sl_channel_start(&s.progress,249);
+ sl_channel_start(&s.progress, 249, 254);
  assert(sl_channel_cap_request(request,sizeof(request),0)==8);
  assert(sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,request,8)==12);
  sl_route(&s,frame,sizeof(frame));assert(s.response_pending&&s.response_id==0&&s.progress.phase==SL_CH_NEGOTIATING);
@@ -414,11 +413,32 @@ static void identifier_zero_request_tests(void){
  request[1]=7;assert(sl_channel_frame_encode(frame,sizeof(frame),SL_CHANNEL_CMTC,0,request,8)==12);
  sl_route(&s,frame,sizeof(frame));assert(s.progress.phase==SL_CH_FAILED); /* existing bounded single-query contract */
 }
+static void negotiated_limit_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
+ init_receive(&s,&b.sk);s.channels[1].remote_tcid=10;
+ s.progress=(struct sl_channel_progress){0};sl_channel_start(&s.progress,2042,2047);s.deadline=jiffies+100;
+ sl_progress_event(&s,1,0,0);sl_progress_event(&s,3,0,0);
+ u8 signal[16],wire[255],payload[250]={0};
+ assert(sl_channel_cap_response(signal,sizeof(signal),SL_CHANNEL_CAP_IDENTIFIER,SL_CHANNEL_CAP_QUERY,2042,254)==16);
+ assert(sl_channel_frame_encode(wire,sizeof(wire),SL_CHANNEL_CMTC,0,signal,16)==20);
+ sl_route(&s,wire,20); /* Actual route -> locked publication -> per-channel limit. */
+ assert(s.progress.phase==SL_CH_OPEN&&s.progress.mtu==2042&&s.progress.mps==254);
+ assert(s.channels[0].mtu==249&&s.channels[0].mps==254&&s.channels[1].mtu==250&&s.channels[1].mps==254);
+ struct sl_admission too_large={&s,&s.channels[0],alloc_skb(255,0),250};
+ assert(sl_admit(&too_large)==-EMSGSIZE&&too_large.skb&&s.channels[0].tx.qlen==0);kfree_skb(too_large.skb);
+ struct sl_admission boundary={&s,&s.channels[0],alloc_skb(254,0),249};
+ assert(sl_admit(&boundary)==0&&!boundary.skb&&s.channels[0].tx.qlen==1);skb_queue_purge(&s.channels[0].tx);
+ assert(sl_channel_frame_encode(wire,sizeof(wire),31,241,payload,250)==255);
+ sl_route(&s,wire,255);assert(s.channels[0].rx.qlen==0&&s.channels[0].rx_dropped==1);
+ assert(sl_channel_frame_encode(wire,sizeof(wire),31,241,payload,249)==254);
+ sl_route(&s,wire,254);assert(s.channels[0].rx.qlen==1);skb_queue_purge(&s.channels[0].rx);
+ assert(allocations==0&&b.sk.sk_rmem_alloc==0);
+}
 int main(void){
- identifier_zero_request_tests();
+ identifier_zero_request_tests();negotiated_limit_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
- sl_channel_start(&s.progress,249);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress,249,0);sl_channel_response_submitted(&s.progress,0);
- s.channels[0].local_tcid=SL_CHANNEL_CUTC;s.channels[0].remote_tcid=SL_CHANNEL_CUTC;s.channels[0].pi=241;s.channels[0].mtu=249;s.channels[0].sk=sk;
+ sl_channel_start(&s.progress, 249, 254);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress, 249, 254, 0);sl_channel_response_submitted(&s.progress,0);
+ s.channels[0].local_tcid=SL_CHANNEL_CUTC;s.channels[0].remote_tcid=SL_CHANNEL_CUTC;s.channels[0].pi=241;s.channels[0].mtu=249;s.channels[0].mps=254;s.channels[0].sk=sk;
  assert(sl_binding_attach(&s.channels[0].binding));
  init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);
  route(&s,SL_CHANNEL_CUTC,241,"real codec");assert(s.channels[0].rx.qlen==1&sk->wakes==1&sk->refs==1);

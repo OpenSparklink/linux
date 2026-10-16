@@ -42,23 +42,23 @@ enum sl_channel_phase { SL_CH_UNBOUND, SL_CH_NEGOTIATING, SL_CH_OPEN,
 	SL_CH_FAILED, SL_CH_CLOSED };
 struct sl_channel_progress {
 	enum sl_channel_phase phase;
-	unsigned int maximum, mtu;
+	unsigned int maximum, maximum_mps, mtu, mps;
 	unsigned int request_submitted, peer_capability, response_submitted;
 };
 static inline int sl_channel_active(struct sl_channel_progress s)
 {
 	return s.phase == SL_CH_NEGOTIATING || s.phase == SL_CH_OPEN;
 }
-static inline void sl_channel_start(struct sl_channel_progress *s, unsigned int maximum)
+static inline void sl_channel_start(struct sl_channel_progress *s, unsigned int maximum, unsigned int maximum_mps)
 {
 	if (s->phase != SL_CH_UNBOUND)
 		return;
-	if (!maximum || maximum > 2042) {
+	if (!maximum || maximum > 2042 || maximum_mps < 20 || maximum_mps > 2047) {
 		s->phase = SL_CH_FAILED;
 		return;
 	}
 	*s = (struct sl_channel_progress){ .phase = SL_CH_NEGOTIATING,
-		.maximum = maximum, .mtu = maximum };
+		.maximum = maximum, .maximum_mps = maximum_mps, .mtu = maximum, .mps = maximum_mps };
 }
 static inline void sl_channel_fail(struct sl_channel_progress *s)
 {
@@ -87,12 +87,14 @@ static inline void sl_channel_request_submitted(struct sl_channel_progress *s, i
 		s->request_submitted = 1;
 }
 static inline void sl_channel_peer_capability(struct sl_channel_progress *s,
-	unsigned int mtu, int expired)
+	unsigned int mtu, unsigned int mps, int expired)
 {
 	sl_channel_tick(s, expired);
-	if (s->phase == SL_CH_NEGOTIATING && s->request_submitted &&
-	    !s->peer_capability && mtu && mtu <= s->maximum) {
-		s->mtu = mtu;
+	if (s->phase == SL_CH_NEGOTIATING && s->request_submitted && !s->peer_capability) {
+		/* The selected native capability response itself is a 20-byte PDU. */
+		if (!mtu || mps < 20) { sl_channel_fail(s); return; }
+		s->mtu = mtu < s->maximum ? mtu : s->maximum;
+		s->mps = mps < s->maximum_mps ? mps : s->maximum_mps;
 		s->peer_capability = 1;
 		sl_channel_try_open(s);
 	}
@@ -104,5 +106,13 @@ static inline void sl_channel_response_submitted(struct sl_channel_progress *s, 
 		s->response_submitted = 1;
 		sl_channel_try_open(s);
 	}
+}
+/* SDU admission reserves the complete basic header inside the peer PDU limit.
+ * Local/remote unicast dynamic TCIDs both use the five-byte basic header. */
+static inline unsigned int sl_channel_payload_limit(struct sl_channel_progress s, unsigned int tcid)
+{
+	unsigned int header = tcid <= 0x1d ? 4 : 5;
+	if (!tcid || tcid > 255 || s.mps <= header) return 0;
+	return s.mtu < s.mps - header ? s.mtu : s.mps - header;
 }
 #endif

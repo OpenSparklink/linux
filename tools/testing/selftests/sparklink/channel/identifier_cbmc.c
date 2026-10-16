@@ -15,11 +15,11 @@ int main(void)
     if(n!=8)return 0; /* counterexample must not call decode with an invalid length */
     assert(!sl_channel_cap_decode(bytes,n,&code,&id,&mask,&cap));
     assert(code==1 && id==identifier && mask==SL_CHANNEL_CAP_QUERY);
-    n=sl_channel_cap_response(bytes,sizeof(bytes),identifier,mask,2042);
+    n=sl_channel_cap_response(bytes,sizeof(bytes),identifier,mask,2042,2047);
     assert(n==16);
     if(n!=16)return 0;
     assert(!sl_channel_cap_decode(bytes,n,&code,&id,&mask,&cap));
-    assert(code==2 && id==identifier && cap.mtu==2042 && cap.mps==2042 && cap.modes==0);
+    assert(code==2 && id==identifier && cap.mtu==2042 && cap.mps==2047 && cap.modes==0);
     for(unsigned int i=0;i<sizeof(bytes);i++)bytes[i]=nondet_byte();
     code=77;id=88;mask=99;cap=(struct sl_channel_cap){11,22,33,44};
     unsigned int length=nondet_uint()%17;

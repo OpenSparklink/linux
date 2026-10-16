@@ -17,10 +17,10 @@ int main(void)
 	CHECK(n == 8 && !memcmp(signal, (unsigned char[]){1,7,4,0,0xe2,0,0,0}, 8));
 	CHECK(sl_channel_cap_decode(signal, n, &code, &identifier, &mask, &cap) == 0);
 	CHECK(code == 1 && identifier == 7 && mask == 0xe2);
-	n = sl_channel_cap_response(signal, sizeof(signal), 7, mask, 249);
-	CHECK(n == 16 && !memcmp(signal, (unsigned char[]){2,7,12,0,0xe2,0,0,0,0,0,249,0,249,0,1,1}, 16));
+	n = sl_channel_cap_response(signal,sizeof(signal),7,mask,249,254);
+	CHECK(n == 16 && !memcmp(signal, (unsigned char[]){2,7,12,0,0xe2,0,0,0,0,0,249,0,254,0,1,1}, 16));
 	CHECK(sl_channel_cap_decode(signal, n, &code, &identifier, &mask, &cap) == 0);
-	CHECK(cap.mtu == 249 && cap.mps == 249 && cap.version == 0x0101 && cap.modes == 0);
+	CHECK(cap.mtu == 249 && cap.mps == 254 && cap.version == 0x0101 && cap.modes == 0);
 	CHECK(sl_channel_frame_encode(frame, sizeof(frame), 2, 0, signal, n) == 20);
 	CHECK(sl_channel_frame_decode(frame, 20, &parsed) == 0 && parsed.tcid == 2 && parsed.pi == 0 && parsed.length == 16);
 	CHECK(sl_channel_frame_encode(frame, sizeof(frame), 31, 241, (unsigned char *)"abc", 3) == 8);
@@ -39,11 +39,14 @@ int main(void)
 	for (unsigned int id = 0; id < 256; id++) {
 		n = sl_channel_cap_request(signal, sizeof(signal), id);
 		CHECK(n == 8 && sl_channel_cap_decode(signal, n, &code, &identifier, &mask, &cap) == 0 && identifier == id);
-		n = sl_channel_cap_response(signal, sizeof(signal), id, mask, 2042);
+		n = sl_channel_cap_response(signal,sizeof(signal),id,mask,2042,2047);
 		CHECK(n == 16 && sl_channel_cap_decode(signal, n, &code, &identifier, &mask, &cap) == 0 && identifier == id);
 	}
 	CHECK(sl_channel_cap_request(signal, sizeof(signal), 256) == -EINVAL);
-	CHECK(sl_channel_cap_response(signal, sizeof(signal), 256, mask, 2042) == -EINVAL);
+	CHECK(sl_channel_cap_response(signal,sizeof(signal),256,mask,2042,2047) == -EINVAL);
+	CHECK(sl_channel_cap_response(signal,sizeof(signal),0,SL_CHANNEL_CAP_QUERY,249,19) == -EINVAL);
+	CHECK(sl_channel_cap_response(signal,sizeof(signal),0,SL_CHANNEL_CAP_QUERY,249,2048) == -EINVAL);
+	CHECK(sl_channel_cap_response(signal,sizeof(signal),0,SL_CHANNEL_CAP_QUERY,249,20) == 16);
 	puts("basic DTAP/CMTC production codec PASS (offline only)");
 	return 0;
 }

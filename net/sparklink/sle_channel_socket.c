@@ -193,7 +193,7 @@ static void sl_notify(struct sl_connection_session *s, int error)
 }
 static void sl_wake(struct sl_connection_session *s) { sl_notify(s, 0); }
 static void sl_fault(struct sl_connection_session *s, int error) { sl_notify(s, error); }
-static void sl_progress_event(struct sl_connection_session *s, unsigned int event, unsigned int mtu)
+static void sl_progress_event(struct sl_connection_session *s, unsigned int event, unsigned int mtu, unsigned int mps)
 {
 	unsigned long flags;
 	enum sl_channel_phase before, after;
@@ -205,20 +205,20 @@ static void sl_progress_event(struct sl_connection_session *s, unsigned int even
 	expired = time_after_eq(jiffies, s->deadline);
 	switch (event) {
 	case 1: sl_channel_request_submitted(&s->progress, expired); break;
-	case 2: sl_channel_peer_capability(&s->progress, mtu, expired); break;
+	case 2: sl_channel_peer_capability(&s->progress, mtu, mps, expired); break;
 	case 3: sl_channel_response_submitted(&s->progress, expired); break;
 	default: sl_channel_tick(&s->progress, expired); break;
 	}
 	after = s->progress.phase;
 	if (after == SL_CH_OPEN) {
 		for (i = 0; i < SL_SESSION_CHANNELS; i++) {
-			s->channels[i].mtu = s->progress.mtu;
-			s->channels[i].mps = s->progress.mtu;
+			s->channels[i].mtu = sl_channel_payload_limit(s->progress, s->channels[i].remote_tcid);
+			s->channels[i].mps = s->progress.mps;
 		}
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
 	if (before == SL_CH_NEGOTIATING && after == SL_CH_FAILED)
-		sl_fault(s, -ETIMEDOUT);
+		sl_fault(s, expired ? -ETIMEDOUT : -EPROTO);
 	else if (before != SL_CH_OPEN && after == SL_CH_OPEN)
 		sl_wake(s);
 }
@@ -301,8 +301,7 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 			s->response_id = identifier;
 			s->response_mask = mask;
 		} else if (identifier == SL_CHANNEL_CAP_IDENTIFIER && sl_snapshot(s).request_submitted) {
-			struct sl_channel_progress view = sl_snapshot(s);
-			sl_progress_event(s, 2, min_t(unsigned int, view.maximum, min(cap.mtu, cap.mps)));
+			sl_progress_event(s, 2, cap.mtu, cap.mps);
 		}
 		return;
 	}
@@ -317,7 +316,7 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes, size_t le
 	spin_lock_irqsave(&s->lock, flags);
 	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) &&
 	    sl_permits(s, c, SL_GRANT_RX) && frame.tcid == c->local_tcid && frame.pi == c->pi &&
-	    frame.length <= c->mtu) {
+	    frame.length <= c->mtu && length <= c->mps) {
 		spin_lock(&c->rx.lock);
 		if (c->rx.qlen < SL_CHANNEL_RX &&
             atomic_read(&c->sk->sk_rmem_alloc) < READ_ONCE(c->sk->sk_rcvbuf) &&
@@ -461,7 +460,7 @@ static void sl_work(struct work_struct *work)
 	ret = sparklink_native_session_status(s->controller, s->generation, s->lifetime, s->handle, s->epoch);
 	if (ret == -EAGAIN) {
 		/* Unknown physical state is bounded independently of CMTC deadline. */
-		sl_progress_event(s, 0, 0);
+		sl_progress_event(s, 0, 0, 0);
 		if (!s->unknown_deadline)
 			s->unknown_deadline = jiffies + msecs_to_jiffies(5000);
 		if (time_after_eq(jiffies, s->unknown_deadline))
@@ -470,7 +469,7 @@ static void sl_work(struct work_struct *work)
 	}
 	s->unknown_deadline = 0;
 	if (ret) { sl_fault(s, ret); goto put; }
-	sl_progress_event(s, 0, 0);
+	sl_progress_event(s, 0, 0, 0);
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
 	if (!sl_snapshot(s).request_submitted) {
@@ -482,7 +481,7 @@ static void sl_work(struct work_struct *work)
 		if (ret == -EAGAIN)
 			goto again;
 		if (ret) { sl_fault(s, ret); goto put; }
-		sl_progress_event(s, 1, 0);
+		sl_progress_event(s, 1, 0, 0);
 	}
 	for (i = 0; i < 16 && sl_channel_active(sl_snapshot(s)); i++) {
 		ret = sparklink_native_acb_take(s->controller, s->generation, s->lifetime,
@@ -495,7 +494,7 @@ static void sl_work(struct work_struct *work)
 	if (!sl_channel_active(sl_snapshot(s)))
 		goto put;
 	if (s->response_pending && s->fragment_slot < 0) {
-		n = sl_channel_cap_response(signal, sizeof(signal), s->response_id, s->response_mask, sl_snapshot(s).maximum);
+		n = sl_channel_cap_response(signal, sizeof(signal), s->response_id, s->response_mask, sl_snapshot(s).maximum, sl_snapshot(s).maximum_mps);
 		if (n >= 0)
 			n = sl_channel_frame_encode(wire, sizeof(wire), SL_CHANNEL_CMTC, 0, signal, n);
 		if (n < 0) { sl_fault(s, n); goto put; }
@@ -504,7 +503,7 @@ static void sl_work(struct work_struct *work)
 			goto again;
 		if (ret) { sl_fault(s, ret); goto put; }
 		s->response_pending = false;
-		sl_progress_event(s, 3, 0);
+		sl_progress_event(s, 3, 0, 0);
 	}
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		unsigned int slot = (s->tx_next + i) % SL_SESSION_CHANNELS;
@@ -513,7 +512,7 @@ static void sl_work(struct work_struct *work)
 	}
 	s->tx_next = (s->tx_next + 1) % SL_SESSION_CHANNELS;
 again:
-	sl_progress_event(s, 0, 0);
+	sl_progress_event(s, 0, 0, 0);
 	if (sl_channel_active(sl_snapshot(s)))
 		sl_schedule(s);
 put:
@@ -549,6 +548,7 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 	s->acb_maximum = maximum;
 	s->fragment_slot = -1;
 	s->progress.maximum = SL_FRAGMENT_PDU_MAX - 5;
+	s->progress.maximum_mps = SL_FRAGMENT_PDU_MAX;
 	return s;
 }
 void sl_connection_session_stop(void *opaque, int error)
@@ -611,7 +611,7 @@ static int sl_publish_binding(void *context)
 		ret = -EADDRINUSE;
 	else {
 		if (s->progress.phase == SL_CH_UNBOUND) {
-			sl_channel_start(&s->progress, s->progress.maximum);
+			sl_channel_start(&s->progress, s->progress.maximum, s->progress.maximum_mps);
 			s->deadline = jiffies + msecs_to_jiffies(5000);
 		}
 		binding->grant = admission->grant;
@@ -694,7 +694,7 @@ static int sl_admit(void *context)
 		ret = -EACCES;
 	else if (s->progress.phase != SL_CH_OPEN || !sl_binding_live(c->binding))
 		ret = sl_channel_active(s->progress) && sl_binding_live(c->binding) ? -EAGAIN : -ENOTCONN;
-	else if (length > c->mtu)
+	else if (length > c->mtu || length > sl_channel_payload_limit(s->progress, c->remote_tcid))
 		ret = -EMSGSIZE;
 	else {
 		spin_lock(&c->tx.lock);
@@ -743,7 +743,7 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 	if (ret)
 		goto put;
 	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
-	if (length > sl_snapshot(s).mtu) { ret = -EMSGSIZE; goto put; }
+	if (length > sl_channel_payload_limit(sl_snapshot(s), c->remote_tcid)) { ret = -EMSGSIZE; goto put; }
 	while (!sl_can_write(s, c)) {
 		if (!timeout) { ret = -EAGAIN; goto put; }
 		timeout = wait_event_interruptible_timeout(*sk_sleep(sock->sk), sl_can_write(s, c), timeout);

@@ -69,17 +69,17 @@ int sl_channel_cap_request(unsigned char *out, size_t capacity, unsigned int ide
 }
 
 int sl_channel_cap_response(unsigned char *out, size_t capacity, unsigned int identifier,
-			    unsigned int requested, unsigned int maximum)
+			    unsigned int requested, unsigned int maximum, unsigned int maximum_mps)
 {
 	unsigned int accepted = requested & SL_CHANNEL_CAP_QUERY;
 	size_t n = 8;
 
-	if (!out || identifier > 255 || !maximum || maximum > 2042 || capacity < 16)
+	if (!out || identifier > 255 || !maximum || maximum > 2042 || maximum_mps < 20 || maximum_mps > 2047 || capacity < 16)
 		return -EINVAL;
 	out[0] = 2; out[1] = identifier; put32(out + 4, accepted);
 	if (accepted & 2) { put16(out + n, 0); n += 2; } /* no optional modes */
 	if (accepted & 0x20) { put16(out + n, maximum); n += 2; }
-	if (accepted & 0x40) { put16(out + n, maximum); n += 2; }
+	if (accepted & 0x40) { put16(out + n, maximum_mps); n += 2; }
 	if (accepted & 0x80) { put16(out + n, 0x0101); n += 2; }
 	put16(out + 2, n - 4);
 	return n;

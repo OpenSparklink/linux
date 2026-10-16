@@ -32,6 +32,17 @@ data path. Snoop is an independent privileged observation path. Legacy read(2)
 event delivery, EVENT_COUNT/EVENT_STATS and raw DLI polling were removed.
 Do not infer support from remaining legacy ioctl or Generic Netlink declarations.
 
+The basic channel capability exchange keeps the SDU MTU and the complete DTAP
+PDU MPS separate. The current Native implementation advertises MTU 2042 and
+MPS 2047; these are local implementation limits, not universal protocol maxima.
+The selected capability-response PDU needs MPS at least 20. A smaller peer MPS
+reduces socket admission by the complete basic header: five bytes for CUTC,
+four for SMTC. CHANNEL_INFO reports the resulting SDU budget and PDU budget
+separately. Oversize sends fail with EMSGSIZE; oversize RX is dropped. ACB
+fragment size and controller packet credit are independent of both budgets.
+Source tests and bounded checks do not establish firmware or peer acceptance;
+consult the qualification entry for the exact image and remaining gates.
+
 UAPI has not been published: callers, Rust/C/Python bindings and tests may be
 migrated together without an old ABI compatibility period. Match actual headers
 and source revisions; reserved-field checks and errors vary by request and must

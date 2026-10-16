@@ -26,7 +26,7 @@ int sl_channel_frame_encode(unsigned char *out, size_t capacity,
 			    const unsigned char *data, size_t length);
 int sl_channel_cap_request(unsigned char *out, size_t capacity, unsigned int identifier);
 int sl_channel_cap_response(unsigned char *out, size_t capacity, unsigned int identifier,
-			    unsigned int requested, unsigned int maximum);
+			    unsigned int requested, unsigned int maximum, unsigned int maximum_mps);
 int sl_channel_cap_decode(const unsigned char *data, size_t length,
 			  unsigned int *code, unsigned int *identifier,
 			  unsigned int *requested, struct sl_channel_cap *cap);
