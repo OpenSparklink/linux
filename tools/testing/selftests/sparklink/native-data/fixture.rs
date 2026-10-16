@@ -56,6 +56,7 @@ struct Owner{
  sessions:Lock<[Option<sle_sessions::Session>;16]>,schedule_gate:Lock<bool>,native_lifecycle:Lock<()>,state:Lock<Option<State>>,transport_open:AtomicBool,
  commands:RefCell<Vec<SleEvent>>,
  session_data_pending:AtomicBool,
+ rx_schedules:Cell<usize>,
 }
 impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  identity:DeviceIdentity{id,generation},host:Lock::new(Host{grants:{let mut g=sle_grant::LeaseAuthority::new();assert!(g.activate(1,true));g},links:LinkObservation::new(),data_revoked:false,fault:None}),
@@ -63,8 +64,9 @@ impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Native(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
  session_data_pending:AtomicBool::new(false),
+ rx_schedules:Cell::new(0),
 })}}
-impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
+impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0);self.rx_schedules.set(self.rx_schedules.get()+1);}}
 #[derive(Debug)] enum SleEvent{
  CommandCredits{credits:u8},
  NativeCommandReply{opcode:u16,command_credits:u8,status:u8,complete:bool,data:KVec<u8>},
@@ -74,6 +76,7 @@ impl Owner{fn schedule_rx(&self,delay:u64){assert_eq!(delay,0)}}
 }
 thread_local!{
  static OWNERS:RefCell<Vec<Rc<Owner>>>=const{RefCell::new(Vec::new())};
+ static PUBLISH_DURING_HINT:Cell<bool>=const{Cell::new(false)};
  static TX:RefCell<Vec<(usize,u16,Vec<u8>)>>=const{RefCell::new(Vec::new())};
  static BEFORE_COMMIT:RefCell<u8>=const{RefCell::new(0)};
  static SUBMIT_CALLS:Cell<usize>=const{Cell::new(0)};
@@ -138,6 +141,7 @@ mod under_test{use super::*;
 // @@TAKE@@
 }
 fn setup()->(Rc<Owner>,Rc<Owner>){let a=Owner::new(0,7);let b=Owner::new(1,8);
+ PUBLISH_DURING_HINT.with(|v|v.set(false));
  OWNERS.with(|o|*o.borrow_mut()=vec![a.clone(),b.clone()]);TX.with(|t|t.borrow_mut().clear());
  SUBMIT_CALLS.with(|v|v.set(0));
  BEFORE_COMMIT.with(|b|*b.borrow_mut()=0);SUBMIT_RESULT.with(|r|*r.borrow_mut()=0);
@@ -311,6 +315,11 @@ fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut
  assert!(owner.data.0.try_borrow_mut().is_ok());
  assert!(owner.schedule_gate.0.try_borrow_mut().is_ok());
  s.kicks+=1;
+ // Controlled model counterexample boundary: new producer after the actual
+ // AtomicBool swap/target snapshot, before the notification callback returns.
+ if PUBLISH_DURING_HINT.with(|v|v.replace(false)) {
+  assert_eq!(receive(owner.identity.id,owner.identity.generation,&acb(s.handle,&[2])),0);
+ }
 }}
 #[test] fn actual_runtime_data_hint_coalesces_after_unlock_without_peer_or_stale_grants(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);let(p,_)=session(0,7,1,0);let(q,_)=session(1,8,1,0);
@@ -319,12 +328,17 @@ fn session(id:u16,generation:u64,life:u64,handle:u16)->(*mut c_void,i32){let mut
  assert_eq!(receive(0,7,&acb(0,&[1])),0);
  assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,0]),0);
  assert!(a.session_data_pending.load(Ordering::Acquire));
- a.notify_session_data();assert!(!a.session_data_pending.load(Ordering::Acquire));
+ PUBLISH_DURING_HINT.with(|v|v.set(true));
+ a.notify_session_data();assert!(a.session_data_pending.load(Ordering::Acquire));
  unsafe{assert_eq!((*p.cast::<FakeSession>()).kicks,1);assert_eq!((*p.cast::<FakeSession>()).refs,2);assert_eq!((*q.cast::<FakeSession>()).kicks,0);}
+ assert_eq!(a.rx_schedules.get(),3); // actual RX/NOCP/injected-RX all request Runtime work
+ a.notify_session_data();assert!(!a.session_data_pending.load(Ordering::Acquire));
+ unsafe{assert_eq!((*p.cast::<FakeSession>()).kicks,2);assert_eq!((*p.cast::<FakeSession>()).refs,2);}
  assert_eq!(take(0,7,1,0,1),(0,vec![1])); // hint did not steal RX
+ assert_eq!(take(0,7,1,0,1),(0,vec![2]));
  {a.host.lock().grants.revoke();}a.reconcile_sessions();
  a.kick_session_data();a.notify_session_data();
- unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert_eq!((*p.cast::<FakeSession>()).kicks,1);}
+ unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert_eq!((*p.cast::<FakeSession>()).kicks,2);}
  a.stop_sessions(-19);b.stop_sessions(-19);unsafe{sl_connection_session_put(p);sl_connection_session_put(q);}
 }
 #[test] fn actual_runtime_session_get_shares_one_owner_and_preserves_lifetime(){
