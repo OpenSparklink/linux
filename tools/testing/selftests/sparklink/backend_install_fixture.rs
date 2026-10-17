@@ -10,7 +10,6 @@ const EIO:i32=-5;
 type KBox<T>=Box<T>;
 macro_rules! pr_info{($($arg:tt)*)=>{let _=format_args!($($arg)*);}}
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]pub enum SleBus{#[default]None=0,Usb=4,Test=6}
-#[derive(Default)]struct SleDevStats;
 mod sle_dli{pub use super::SleBus;
  // @@INFO@@
  impl Default for SleControllerInfo{// @@INFO_DEFAULT@@
@@ -91,7 +90,7 @@ fn setup()->DeviceIdentity{
  let old={let mut s=SUBSYSTEM.lock();let old=s.take();*s=Some(Shared::new());old};drop(old);
  CONSTRUCTIONS.store(0,Ordering::Relaxed);DROPS.store(0,Ordering::Relaxed);HOOK.with(|h|h.set(0));
  let info=SleControllerInfo::default();
- assert_eq!(info.name,[0;32]);
+ assert_eq!(info.name,[0;32]);assert_eq!((info.features,info.max_connections),(0,0));
  assert_eq!((info.features_ext,info.max_pdu_payload,info.max_mtu,info.max_mps,info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0,0,0,0,0));
  reserve_backend_identity(&info).unwrap()
 }
@@ -102,7 +101,7 @@ fn failed(r:Result<Arc<ControllerRuntime>>,e:i32){assert!(matches!(r,Err(n) if n
 #[test]fn candidate_allocation_and_drop_outside_registry(){let id=setup();failed(install(id,1),ENOMEM);assert_eq!(DROPS.load(Ordering::Relaxed),1);let s=SUBSYSTEM.lock();assert!(s.as_ref().unwrap().runtime(id.id).is_none());}
 #[test]fn successful_candidate_publishes_exact_identity_queried_metadata(){
  let id=setup();let o=install(id,0).unwrap();assert_eq!(o.identity,id);assert_eq!(o.registration.addr,[9;6]);assert_eq!(o.registration.bus,SleBus::None);assert!(o.registration.name.starts_with(b"sle0\0"));
- let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_eq!((d.addr,d.fw_version),([9;6],77));assert_eq!((d.features,d.max_connections),(0,0));assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);let _=&d.stats;
+ let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_eq!((d.addr,d.fw_version),([9;6],77));assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);
 }
 #[test]fn successful_native_candidate_keeps_peer_owner(){
  let id=setup();let peer=reserve_backend_identity(&SleControllerInfo{bus:SleBus::Test,addr:[3;6],..Default::default()}).unwrap();let p=install_backend_runtime(peer,Box::new(ControllerState),1,None).unwrap();let o=install(id,0).unwrap();assert_eq!(o.identity,id);assert_eq!(p.registration.bus,SleBus::Test);assert_eq!(p.registration.addr,[3;6]);
@@ -119,7 +118,7 @@ fn failed(r:Result<Arc<ControllerRuntime>>,e:i32){assert!(matches!(r,Err(n) if n
  let _=setup();let id=reserve_backend_identity_profile(&SleControllerInfo{bus:SleBus::Usb,..Default::default()},1).unwrap();
  assert_eq!(query_backend_pending(id),Ok((SleBus::Usb,1,0,0)));assert_eq!(validate_backend_reservation(id,SleBus::Usb,1),Ok(()));
  assert_eq!(validate_backend_reservation(id,SleBus::Test,1),Err(EINVAL));assert_eq!(validate_backend_reservation(id,SleBus::Usb,0),Err(EINVAL));
- let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_eq!((d.addr,d.fw_version,d.features,d.max_connections),([0;6],0,0,0));assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);
+ let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(id.id).unwrap();assert_eq!((d.addr,d.fw_version),([0;6],0));assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);
 }
 #[test]fn pending_fault_is_core_owned_and_positive_errors_rejected(){
  let id=setup();assert_eq!(update_backend_pending(id,10,-110),Ok(()));assert_eq!(query_backend_pending(id),Ok((SleBus::None,0,10,-110)));

@@ -7,7 +7,6 @@ type Result<T=()>=std::result::Result<T,i32>;
 const ENOSPC:i32=-28;const ENODEV:i32=-19;
 macro_rules! pr_info{($($arg:tt)*)=>{let _=format_args!($($arg)*);}}
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)] pub enum SleBus{#[default]None,Usb}
-#[derive(Default)]struct SleDevStats;
 mod sle_dli {pub use super::SleBus;
  // @@INFO@@
  impl Default for SleControllerInfo{// @@INFO_DEFAULT@@
@@ -54,8 +53,8 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
 }}
 
 #[test]fn constructor_has_only_setup_and_preserves_explicit_metadata(){
- let info=SleControllerInfo{addr:[3;6],fw_version:7,features:11,max_connections:2,bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);assert_eq!((info.features_ext,info.max_pdu_payload,info.max_mtu,info.max_mps,info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0,0,0,0,0));
- assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.pending_profile,d.pending_phase,d.pending_error),(0,0,0));assert_eq!((d.id,d.generation,d.addr,d.fw_version,d.features,d.max_connections,d.bus),(4,5,[3;6],7,11,2,SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");let _=&d.stats;
+ let info=SleControllerInfo{addr:[3;6],fw_version:7,features:11,max_connections:2,bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);assert_eq!((info.features,info.max_connections),(11,2));assert_eq!((info.features_ext,info.max_pdu_payload,info.max_mtu,info.max_mps,info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0,0,0,0,0));
+ assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.pending_profile,d.pending_phase,d.pending_error),(0,0,0));assert_eq!((d.id,d.generation,d.addr,d.fw_version,d.bus),(4,5,[3;6],7,SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");
 }
 #[test]fn full_registry_cannot_invent_ready_or_extra_slot(){
  let mut r=SleDevRegistry::new();for id in 0..SLE_DEV_MAX{let got=r.register_pending(&SleControllerInfo::default()).unwrap();assert_eq!(got as usize,id);assert_eq!(r.get(got).unwrap().flags.load(Ordering::Acquire),SLE_DEV_SETUP);}
@@ -68,7 +67,7 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
  let mut r=SleDevRegistry::new();r.next_generation=u64::MAX;assert_eq!(r.register_pending(&SleControllerInfo::default()),Err(ENOSPC));assert_eq!(r.allocated,0);assert!(r.slots.iter().all(Option::is_none));
 }
 #[test]fn actual_usb_reservation_is_pending_unknown_and_requires_subsystem(){
- *SUBSYSTEM.lock()=None;assert_eq!(reserve_usb_identity(),Err(ENODEV));*SUBSYSTEM.lock()=Some(Shared::new());let identity=reserve_usb_identity().unwrap();let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(identity.id).unwrap();assert_eq!(d.identity(),identity);assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.addr,d.fw_version,d.features,d.max_connections,d.bus),([0;6],0,0,0,SleBus::Usb));
+ *SUBSYSTEM.lock()=None;assert_eq!(reserve_usb_identity(),Err(ENODEV));*SUBSYSTEM.lock()=Some(Shared::new());let identity=reserve_usb_identity().unwrap();let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(identity.id).unwrap();assert_eq!(d.identity(),identity);assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.addr,d.fw_version,d.bus),([0;6],0,SleBus::Usb));
 }
 
 #[test]fn actual_detach_rejects_stale_identity_and_preserves_other_owner(){

@@ -7,10 +7,10 @@
 //! attached via a transport bus (UART, USB, SPI, or SDIO).
 //!
 //! The global `SLE_DEV_REGISTRY` tracks all registered devices and provides
-//! index-based lookup.  Device lifecycle is modelled as a set of atomic
-//! flags that gate operations like advertising, scanning, and connecting.
+//! index-based lookup. Atomic flags describe registry setup and retirement;
+//! Host Ready, discovery and connection state belong to their Runtime owners.
 
-#![allow(dead_code)]
+#![deny(dead_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::prelude::*;
@@ -21,44 +21,10 @@ use crate::sle_dli::{SleBus, SleControllerInfo};
 // Device state flags (bitfield, similar to HCI_* flags in bluetooth)
 // ---------------------------------------------------------------------------
 
-/// Device has been inserted into the global registry.
-pub(crate) const SLE_DEV_REGISTERED: u32 = 1 << 0;
-/// Device is up and ready for operations.
-pub(crate) const SLE_DEV_UP: u32 = 1 << 1;
 /// Device is performing initial setup / firmware handshake.
 pub(crate) const SLE_DEV_SETUP: u32 = 1 << 2;
 /// Device is being torn down (unregister in progress).
 pub(crate) const SLE_DEV_UNREGISTERING: u32 = 1 << 3;
-/// Device is actively advertising.
-pub(crate) const SLE_DEV_ADVERTISING: u32 = 1 << 4;
-/// Device is actively scanning.
-pub(crate) const SLE_DEV_SCANNING: u32 = 1 << 5;
-/// Device has at least one active connection.
-pub(crate) const SLE_DEV_CONNECTED: u32 = 1 << 6;
-/// Device radio is suspended (low-power state).
-pub(crate) const SLE_DEV_SUSPENDED: u32 = 1 << 7;
-
-// ---------------------------------------------------------------------------
-// Per-device statistics
-// ---------------------------------------------------------------------------
-
-/// Cumulative statistics for a single SleDev.
-#[derive(Default)]
-pub(crate) struct SleDevStats {
-    /// Total commands sent to controller.
-    pub(crate) cmd_tx: u64,
-    /// Total events received from controller.
-    pub(crate) evt_rx: u64,
-    /// Total data bytes sent.
-    pub(crate) data_tx_bytes: u64,
-    /// Total data bytes received.
-    pub(crate) data_rx_bytes: u64,
-    /// Count of hardware errors reported.
-    pub(crate) hw_errors: u32,
-    /// Count of command timeouts.
-    pub(crate) cmd_timeouts: u32,
-}
-
 // ---------------------------------------------------------------------------
 // SleDev — per-controller device object
 // ---------------------------------------------------------------------------
@@ -76,7 +42,8 @@ pub(crate) struct DeviceIdentity {
 /// Per-controller device object, analogous to Bluetooth's `hci_dev`.
 ///
 /// Tracks device identity (index, name, address, bus type), lifecycle
-/// state (atomic flags), controller capabilities, and runtime statistics.
+/// setup/retirement state (atomic flags) and observed address metadata.
+/// Capabilities/statistics remain in their actual Runtime/Backend owners.
 ///
 /// The actual protocol state (connections, advertising, security, etc.)
 /// remains in `SubsystemShared`.  `SleDev` provides the device-model
@@ -100,12 +67,6 @@ pub(crate) struct SleDev {
     flags: AtomicU32,
     /// Firmware version (packed major.minor.patch).
     fw_version: u32,
-    /// Feature bitmask from controller info.
-    features: u64,
-    /// Maximum concurrent connections.
-    max_connections: u8,
-    /// Cumulative device statistics.
-    pub(crate) stats: SleDevStats,
 }
 
 impl SleDev {
@@ -138,18 +99,10 @@ impl SleDev {
             addr: info.addr,
             flags: AtomicU32::new(SLE_DEV_SETUP),
             fw_version: info.fw_version,
-            features: info.features,
-            max_connections: info.max_connections,
-            stats: SleDevStats::default(),
         }
     }
 
     // -- Identity accessors ------------------------------------------------
-
-    /// Device index.
-    pub(crate) fn id(&self) -> u16 {
-        self.id
-    }
 
     pub(crate) fn identity(&self) -> DeviceIdentity {
         DeviceIdentity { id: self.id, generation: self.generation }
@@ -175,21 +128,6 @@ impl SleDev {
         &self.addr
     }
 
-    /// Firmware version.
-    pub(crate) fn fw_version(&self) -> u32 {
-        self.fw_version
-    }
-
-    /// Feature bitmask.
-    pub(crate) fn features(&self) -> u64 {
-        self.features
-    }
-
-    /// Maximum connections the controller supports.
-    pub(crate) fn max_connections(&self) -> u8 {
-        self.max_connections
-    }
-
     /// Update hardware info read back during probe (MAC, firmware version).
     pub(crate) fn update_hw_info(&mut self, addr: [u8; 6], fw_version: u32) {
         self.addr = addr;
@@ -203,16 +141,6 @@ impl SleDev {
         self.flags.load(Ordering::Acquire) & flag != 0
     }
 
-    /// Set a flag. Returns the previous flag state.
-    pub(crate) fn set_flag(&self, flag: u32) -> u32 {
-        self.flags.fetch_or(flag, Ordering::AcqRel)
-    }
-
-    /// Clear a flag. Returns the previous flag state.
-    pub(crate) fn clear_flag(&self, flag: u32) -> u32 {
-        self.flags.fetch_and(!flag, Ordering::AcqRel)
-    }
-
     /// Return the raw flags word.
     pub(crate) fn flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire)
@@ -220,16 +148,9 @@ impl SleDev {
 
     // -- Lifecycle transitions ---------------------------------------------
 
-    /// Check whether the device is operational (UP and not UNREGISTERING/SUSPENDED).
-    pub(crate) fn is_up(&self) -> bool {
-        let f = self.flags.load(Ordering::Acquire);
-        (f & SLE_DEV_UP != 0) && (f & (SLE_DEV_UNREGISTERING | SLE_DEV_SUSPENDED) == 0)
-    }
-
-    /// Begin teardown. Sets `UNREGISTERING`, clears `UP`.
+    /// Begin registry teardown. Host Ready is owned by the Runtime.
     pub(crate) fn begin_unregister(&self) {
         self.flags.fetch_or(SLE_DEV_UNREGISTERING, Ordering::AcqRel);
-        self.flags.fetch_and(!SLE_DEV_UP, Ordering::AcqRel);
     }
 }
 
