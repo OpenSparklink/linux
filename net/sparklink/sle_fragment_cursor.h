@@ -11,6 +11,9 @@ struct sl_fragment_cursor {
     unsigned int offset;
     unsigned long deadline;
     unsigned long long observation; /* trace-only ID; never authorization */
+    unsigned long long security_epoch; /* optional restrictive intent, never a grant */
+    unsigned int minimum_security;
+    unsigned long long intent_deadline_ns;
 };
 static inline int sl_fragment_next(unsigned int total, unsigned int offset,
     unsigned int maximum, unsigned int *length, unsigned int *boundary)

@@ -35,6 +35,7 @@
 
 _Static_assert(sizeof(struct sl_fragment_cursor) <= sizeof_field(struct sk_buff, cb),
 	       "fragment cursor fits private skb control buffer");
+_Static_assert(sizeof(struct sparklink_send_constraint) == 48, "send constraint ABI");
 _Static_assert(sizeof(struct sparklink_message_security) == 40 &&
                sizeof(struct sparklink_message_security) <= sizeof_field(struct sk_buff, cb),
                "message context layout and skb ownership");
@@ -144,6 +145,33 @@ static int sl_grant_current(struct sl_connection_session *s,
 		return 0;
 	level = sl_security_owner_level_rust(s->security, revision);
 	return level >= 0 && sl_grant_security_permits(grant, revision, level) ?
+		       0 :
+		       -EACCES;
+}
+/* Runtime Host/data/gate and Session are held. Constraint only tightens the
+ * original Grant. Even minimum0 must retain its requested receipt epoch. */
+static int sl_constraint_check(struct sl_connection_session *s,
+			       struct sl_basic_channel *c,
+			       const struct sparklink_send_constraint *m,
+			       u64 revision)
+{
+	u64 now;
+	if (!m->security_epoch)
+		return 0;
+	now = ktime_get_ns();
+	if (!sl_send_constraint_timely(m->deadline_monotonic_ns, now))
+		return -ETIMEDOUT;
+	if (m->deadline_monotonic_ns - now > 5ULL * NSEC_PER_SEC)
+		return -EINVAL;
+	return sl_send_constraint_valid(m) &&
+			       sl_send_constraint_identity(
+				       m, s->generation, s->lifetime,
+				       s->controller, s->handle, c->local_tcid,
+				       c->remote_tcid, c->pi) &&
+			       sl_send_constraint_permits(
+				       m->security_epoch, m->minimum, revision,
+				       sl_security_owner_level_rust(s->security,
+								    revision)) ?
 		       0 :
 		       -EACCES;
 }
@@ -341,19 +369,37 @@ static int sl_session_submit(void *scope, u64 security_revision,
 		ret = -ECANCELED;
 	else if (permission->operation) {
 		struct sl_grant_scope observed = { .controller = s->controller,
-			.generation = s->generation, .lifetime = s->lifetime, .epoch = s->epoch,
-			.handle = s->handle, .local_tcid = c->local_tcid,
-			.remote_tcid = c->remote_tcid, .pi = c->pi };
-		struct sl_fragment_cursor *cursor = (void *)permission->operation->cb;
-		if (s->tx_inflight != permission->operation || s->fragment_slot != c - s->channels)
+						   .generation = s->generation,
+						   .lifetime = s->lifetime,
+						   .epoch = s->epoch,
+						   .handle = s->handle,
+						   .local_tcid = c->local_tcid,
+						   .remote_tcid =
+							   c->remote_tcid,
+						   .pi = c->pi };
+		struct sl_fragment_cursor *cursor =
+			(void *)permission->operation->cb;
+		if (s->tx_inflight != permission->operation ||
+		    s->fragment_slot != c - s->channels)
 			ret = -ECANCELED;
 		else if (!sl_grant_permits(&s->tx_grant, observed,
 					   SL_GRANT_TX) ||
 			 sl_grant_current(s, &s->tx_grant, security_revision))
 			ret = -EACCES;
-		else if (time_after_eq(jiffies, cursor->deadline))
+		else if (cursor->security_epoch &&
+			 !sl_send_constraint_permits(
+				 cursor->security_epoch,
+				 cursor->minimum_security, security_revision,
+				 sl_security_owner_level_rust(
+					 s->security, security_revision)))
+			ret = -EACCES;
+		else if ((cursor->intent_deadline_ns &&
+			  !sl_send_constraint_timely(cursor->intent_deadline_ns,
+						     ktime_get_ns())) ||
+			 time_after_eq(jiffies, cursor->deadline))
 			ret = -ETIMEDOUT;
-		else if (!s->tx_started && (!sl_binding_live(c->binding) || !sl_permits(s, c, SL_GRANT_TX)))
+		else if (!s->tx_started && (!sl_binding_live(c->binding) ||
+					    !sl_permits(s, c, SL_GRANT_TX)))
 			ret = -ECANCELED;
 		else {
 			ret = submit(context);
@@ -886,7 +932,7 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	struct sl_submit_scope permission = { .session = s, .channel = c };
 	unsigned int length, boundary;
 	int slot = c - s->channels, ret = 0;
-	bool started, local_timeout;
+	bool started, local_timeout, local_constraint;
 	u32 wait = SPARKLINK_ACB_WAIT_RETRY;
 
 	*step = (struct sl_tx_step){ 0 };
@@ -915,8 +961,9 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 		return 0;
 	cursor = (void *)skb->cb;
 	permission.operation = skb;
-	if (time_after_eq(jiffies, cursor->deadline))
-		ret = -ETIMEDOUT;
+	if (time_after_eq(jiffies, cursor->deadline) ||
+        (cursor->intent_deadline_ns && !sl_send_constraint_timely(cursor->intent_deadline_ns, ktime_get_ns())))
+        ret = -ETIMEDOUT;
 	else if (!sl_fragment_next(skb->len, cursor->offset, s->acb_maximum, &length, &boundary))
 		ret = -EPROTO;
 	else {
@@ -945,6 +992,7 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 		ret = -EPROTO;
 	started = s->tx_started;
 	local_timeout = ret == -ETIMEDOUT && !started;
+    local_constraint = ret == -EACCES && !started && cursor->security_epoch;
 	if (ret == -EAGAIN && !started && sl_binding_live(c->binding)) {
 		/* Zero submitted prefix: return author-owned work for fair scheduling.
 		 * Close linearizes under this lock and may purge it after retirement. */
@@ -968,7 +1016,7 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 		sl_retire_tx(s);
 		s->work_progress = true; /* bounded retirement exposes the next queued item */
 	}
-	if (local_timeout) {
+	if (local_timeout || local_constraint) {
 		sl_fail_channel(s, c, ret);
 		ret = 0;
 	}
@@ -1679,7 +1727,7 @@ static int sl_can_write(struct sl_connection_session *s,
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ready;
 }
-struct sl_admission { struct sl_connection_session *session; struct sl_basic_channel *channel; struct sk_buff *skb; size_t length; };
+struct sl_admission { struct sl_connection_session *session; struct sl_basic_channel *channel; struct sk_buff *skb; size_t length; struct sparklink_send_constraint constraint; };
 static int sl_admit(void *context, u64 security_revision)
 {
 	struct sl_admission *admission = context;
@@ -1687,6 +1735,7 @@ static int sl_admit(void *context, u64 security_revision)
 	struct sl_basic_channel *c = admission->channel;
 	struct sk_buff *skb = admission->skb;
 	size_t length = admission->length;
+	u64 now = ktime_get_ns();
 	unsigned long flags;
 	int ret;
 
@@ -1697,8 +1746,11 @@ static int sl_admit(void *context, u64 security_revision)
 		 (!sl_permits(s, c, SL_GRANT_TX) ||
 		  sl_security_check(s, c, security_revision)))
 		ret = -EACCES;
-	else if (s->progress.phase != SL_CH_OPEN ||
-		 !sl_binding_live(c->binding))
+	else if ((ret = sl_constraint_check(s, c, &admission->constraint,
+					    security_revision))) {
+		/* Preserve explicit original-deadline and malformed bounds errors. */
+	} else if (s->progress.phase != SL_CH_OPEN ||
+		   !sl_binding_live(c->binding))
 		ret = sl_channel_active(s->progress) &&
 				      sl_binding_live(c->binding) ?
 			      -EAGAIN :
@@ -1711,14 +1763,36 @@ static int sl_admit(void *context, u64 security_revision)
 		if (!sl_binding_space(c->binding, c->tx.qlen, SL_CHANNEL_TX))
 			ret = -EAGAIN;
 		else {
+			((struct sl_fragment_cursor *)skb->cb)->security_epoch =
+				admission->constraint.security_epoch;
+			((struct sl_fragment_cursor *)skb->cb)
+				->minimum_security =
+				admission->constraint.minimum;
+			((struct sl_fragment_cursor *)skb->cb)
+				->intent_deadline_ns =
+				admission->constraint.deadline_monotonic_ns;
 			((struct sl_fragment_cursor *)skb->cb)->deadline =
-				jiffies + msecs_to_jiffies(5000);
-			((struct sl_fragment_cursor *)skb->cb)->observation = ++s->admission_sequence;
+				jiffies +
+				(admission->constraint.security_epoch ?
+					 min_t(unsigned long,
+					       msecs_to_jiffies(5000),
+					       nsecs_to_jiffies(
+						       admission->constraint
+							       .deadline_monotonic_ns -
+						       now) +
+						       1) :
+					 msecs_to_jiffies(5000));
+			((struct sl_fragment_cursor *)skb->cb)->observation =
+				++s->admission_sequence;
 			__skb_queue_tail(&c->tx, skb);
-			trace_sparklink_session_queue(s->controller, s->generation, s->lifetime,
-				s->epoch, ((struct sl_fragment_cursor *)skb->cb)->observation,
+			trace_sparklink_session_queue(
+				s->controller, s->generation, s->lifetime,
+				s->epoch,
+				((struct sl_fragment_cursor *)skb->cb)
+					->observation,
 				c - s->channels, skb->len,
-				((struct sl_fragment_cursor *)skb->cb)->deadline, 0);
+				((struct sl_fragment_cursor *)skb->cb)->deadline,
+				0);
 			admission->skb = NULL;
 			ret = 0;
 		}
@@ -1743,8 +1817,38 @@ static int sl_tx_access(void *context, u64 security_revision)
 	       sl_security_check(s, c, security_revision)) ?
 				     -EACCES :
 				     0;
+	if (!ret)
+		ret = sl_constraint_check(s, c, &admission->constraint,
+					  security_revision);
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
+}
+/* Socket core has copied/converted ancillary input into kernel memory. This
+ * parser has one exact record and no allocation or policy side effects. */
+static int sl_send_control(struct msghdr *msg,
+			   struct sparklink_send_constraint *out)
+{
+	struct sparklink_send_constraint value;
+	const struct cmsghdr *cm;
+	if (!msg->msg_controllen) {
+		memset(out, 0, sizeof(*out));
+		return 0;
+	}
+	cm = CMSG_FIRSTHDR(msg);
+	if (!cm || cm->cmsg_len < CMSG_LEN(0) ||
+	    cm->cmsg_len > msg->msg_controllen)
+		return -EINVAL;
+	if (cm->cmsg_level != SOL_SPARKLINK ||
+	    cm->cmsg_type != SPARKLINK_SCM_TX_CONSTRAINT)
+		return -EOPNOTSUPP;
+	if (msg->msg_controllen != CMSG_SPACE(sizeof(value)) ||
+	    cm->cmsg_len != CMSG_LEN(sizeof(value)))
+		return -EINVAL;
+	memcpy(&value, CMSG_DATA(cm), sizeof(value));
+	if (!sl_send_constraint_valid(&value))
+		return -EINVAL;
+	*out = value;
+	return 0;
 }
 static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 {
@@ -1759,30 +1863,71 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 
 	if (!s)
 		return -ENOTCONN;
-	ret = sparklink_native_session_admit(s->controller, s->generation, s->lifetime, s->handle, s->epoch, sl_tx_access, &access);
+	ret = sl_send_control(msg, &access.constraint);
 	if (ret)
 		goto put;
-	if (msg->msg_name || msg->msg_controllen || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
-	if (length > sl_channel_payload_limit(sl_snapshot(s), c->remote_tcid)) { ret = -EMSGSIZE; goto put; }
+	ret = sparklink_native_session_admit(s->controller, s->generation,
+					     s->lifetime, s->handle, s->epoch,
+					     sl_tx_access, &access);
+	if (ret)
+		goto put;
+	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) {
+		ret = -EOPNOTSUPP;
+		goto put;
+	}
+	if (length > sl_channel_payload_limit(sl_snapshot(s), c->remote_tcid)) {
+		ret = -EMSGSIZE;
+		goto put;
+	}
 	while (!sl_can_write(s, c)) {
-		if (!timeout) { ret = -EAGAIN; goto put; }
-		timeout = wait_event_interruptible_timeout(*sk_sleep(sock->sk), sl_can_write(s, c), timeout);
-		if (timeout < 0) { ret = timeout; goto put; }
+		long wait = timeout, left;
+		u64 now = ktime_get_ns();
+		if (access.constraint.security_epoch) {
+			if (!sl_send_constraint_timely(
+				    access.constraint.deadline_monotonic_ns,
+				    now)) {
+				ret = -ETIMEDOUT;
+				goto put;
+			}
+			wait = min_t(
+				long, timeout,
+				nsecs_to_jiffies(
+					access.constraint.deadline_monotonic_ns -
+					now) +
+					1);
+		}
+		if (!wait) {
+			ret = -EAGAIN;
+			goto put;
+		}
+		left = wait_event_interruptible_timeout(
+			*sk_sleep(sock->sk), sl_can_write(s, c), wait);
+		if (left < 0) {
+			ret = left;
+			goto put;
+		}
+		if (timeout != MAX_SCHEDULE_TIMEOUT)
+			timeout -= wait - left;
 	}
 	header = c->remote_tcid <= 0x1d ? 4 : 5;
 	skb = alloc_skb(length + header, GFP_KERNEL);
-	if (!skb) { ret = -ENOMEM; goto put; }
+	if (!skb) {
+		ret = -ENOMEM;
+		goto put;
+	}
 	memset(skb->cb, 0, sizeof(skb->cb));
 	p = skb_put(skb, length + header);
-	p[0] = c->remote_tcid; p[1] = 0;
-	p[2] = (length + header - 4) & 255; p[3] = (length + header - 4) >> 8;
+	p[0] = c->remote_tcid;
+	p[1] = 0;
+	p[2] = (length + header - 4) & 255;
+	p[3] = (length + header - 4) >> 8;
 	if (header == 5)
 		p[4] = c->pi;
 	ret = memcpy_from_msg(p + header, msg, length);
 	if (ret)
 		goto put;
     {
-        struct sl_admission admission = { s, c, skb, length };
+        struct sl_admission admission = { .session=s, .channel=c, .skb=skb, .length=length, .constraint=access.constraint };
         ret = sparklink_native_session_admit(s->controller, s->generation, s->lifetime,
             s->handle, s->epoch, sl_admit, &admission);
         skb = admission.skb;

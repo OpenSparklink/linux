@@ -15,6 +15,7 @@
 #include "sle_channel_wire.h"
 static unsigned long jiffies = 42;
 #define msecs_to_jiffies(value) (value)
+#define nsecs_to_jiffies(value) ((value)/1000000ULL)
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
@@ -35,6 +36,7 @@ static void spin_unlock(spinlock_t *l){assert(l->held);l->held=false;}
 #define min(a,b) ((a)<(b)?(a):(b))
 #define min_t(t,a,b) ((t)min(a,b))
 #define GFP_KERNEL 0
+#define NSEC_PER_SEC 1000000000ULL
 #define SPARKLINK_SOCKET_USER_PI 241
 /* @@LIMITS@@ */
 struct sock;
@@ -91,7 +93,7 @@ struct socket {struct sock *sk;int state;};
 #define TCP_CLOSE 7
 #define SHUTDOWN_MASK 3
 #define WRITE_ONCE(x,v) ((x)=(v))
-struct msghdr {int msg_flags;u8 bytes[2047];struct sparklink_message_security security;unsigned int security_records;};
+struct msghdr {size_t msg_controllen;void *msg_control;int msg_flags;u8 bytes[2047];struct sparklink_message_security security;unsigned int security_records;};
 typedef u32 __poll_t;typedef int poll_table;struct file {int unused;};
 static void sock_poll_wait(struct file *file,struct socket *sock,poll_table *wait){(void)file;(void)sock;(void)wait;}
 static int skb_queue_empty(struct sk_buff_head *q){return !q->qlen;}
@@ -196,7 +198,7 @@ static int fixture_fragment_send(u16 id,u64 generation,u64 lifetime,u16 handle,u
  if(expire_before_fragment)jiffies=((struct sl_fragment_cursor *)permission->operation->cb)->deadline;
  /* Host/data/gate and credit are dependencies here, separately tested in Rust.
   * Invoke the actual Session consent before accepting a fragment. */
- flags=irq_disabled;irq_disabled=true;result=consent(scope,fixture_security_revision,fragment_submit,NULL);irq_disabled=flags;
+ assert(!host_locked);host_locked=true;flags=irq_disabled;irq_disabled=true;result=consent(scope,fixture_security_revision,fragment_submit,NULL);irq_disabled=flags;host_locked=false;
  if(!result){assert(fragment_count<64&&fragment_bytes_count+length<=sizeof(fragment_bytes));
   fragment_pb[fragment_count]=boundary;fragment_size[fragment_count++]=length;
   memcpy(fragment_bytes+fragment_bytes_count,bytes,length);fragment_bytes_count+=length;
@@ -322,7 +324,7 @@ static void direction_tests(void){
  init_grant(&s,sk,SL_GRANT_RX);
  struct sl_admission access={.session=&s,.channel=&s.channels[0]};assert(sl_tx_access(&access,fixture_security_revision)==-EACCES);
  assert(sl_poll(NULL,&sock,NULL)==0);
- struct sl_admission admission={&s,&s.channels[0],alloc_skb(1,0),1};assert(sl_admit(&admission,fixture_security_revision)==-EACCES&&admission.skb);kfree_skb(admission.skb);
+ struct sl_admission admission={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(1,0),.length=1};assert(sl_admit(&admission,fixture_security_revision)==-EACCES&&admission.skb);kfree_skb(admission.skb);
  struct sl_submit_scope scope={.session=&s,.channel=&s.channels[0]};unsigned int before=submitted;irq_disabled=true;
  assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==-EACCES&&submitted==before);
  scope.channel=NULL;assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==0&&submitted==before+1);irq_disabled=false;
@@ -488,7 +490,7 @@ static void fragment_worker_tests(void){
  bindings[0].sk.sk_error_report=data_ready;bindings[0].sk.sk_state_change=data_ready;
  s.channels[1].sk=&bindings[1].sk;assert(sl_binding_attach(&s.channels[1].binding));
  struct sk_buff *queued=alloc_skb(4,0);skb_put(queued,4);
- struct sl_admission admission={&s,&s.channels[0],queued,4};
+ struct sl_admission admission={.session=&s,.channel=&s.channels[0],.skb=queued,.length=4};
  assert(!sl_admit(&admission,fixture_security_revision));
  assert(((struct sl_fragment_cursor *)queued->cb)->deadline==5042);
  jiffies=5042;assert(!one_transmit(&s,&s.channels[0]));
@@ -619,9 +621,9 @@ static void negotiated_limit_tests(void){
  sl_route(&s,wire,20,fixture_security_revision); /* Actual route -> locked publication -> per-channel limit. */
  assert(s.progress.phase==SL_CH_OPEN&&s.progress.mtu==2042&&s.progress.mps==254);
  assert(s.channels[0].mtu==249&&s.channels[0].mps==254&&s.channels[1].mtu==250&&s.channels[1].mps==254);
- struct sl_admission too_large={&s,&s.channels[0],alloc_skb(255,0),250};
+ struct sl_admission too_large={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(255,0),.length=250};
  assert(sl_admit(&too_large,fixture_security_revision)==-EMSGSIZE&&too_large.skb&&s.channels[0].tx.qlen==0);kfree_skb(too_large.skb);
- struct sl_admission boundary={&s,&s.channels[0],alloc_skb(254,0),249};
+ struct sl_admission boundary={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(254,0),.length=249};
  assert(sl_admit(&boundary,fixture_security_revision)==0&&!boundary.skb&&s.channels[0].tx.qlen==1);skb_queue_purge(&s.channels[0].tx);
  assert(sl_channel_frame_encode(wire,sizeof(wire),31,241,payload,250)==255);
  sl_route(&s,wire,255,fixture_security_revision);assert(s.channels[0].rx.qlen==0&&s.channels[0].rx_dropped==1);
@@ -906,7 +908,7 @@ static void batch_worker_tests(void){
  sl_retire_tx(&s);assert(!allocations);jiffies=42;
  /* Actual admission IDs are trace-only and do not replace deadline/grant checks. */
  init_batch(&s,&b[0]);unsigned int before=observed_queue[0];
- struct sl_admission a={&s,&s.channels[0],alloc_skb(4,0),4};skb_put(a.skb,4);
+ struct sl_admission a={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(4,0),.length=4};skb_put(a.skb,4);
  assert(!sl_admit(&a,fixture_security_revision)&&!a.skb&&observed_queue[0]==before+1);
  assert(((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->observation==1);
  q=sl_tx_budget_begin(fixture_now_ns);before=observed_count;assert(!sl_transmit_batch(&s,&q));
@@ -968,7 +970,72 @@ static void protected_grant_tests(void) {
  s.channels[0].sk=NULL;b.session=NULL;sock_put(&b.sk);
  fixture_security_revision=1;fixture_security_level=0;
 }
+static struct sparklink_send_constraint intent_for(struct sl_connection_session *s,
+ struct sl_basic_channel *c,unsigned int minimum,u64 epoch) {
+ return (struct sparklink_send_constraint){.version=1,.size=48,.minimum=minimum,.deadline_monotonic_ns=fixture_now_ns+5000000000ULL,
+ .generation=s->generation,.lifetime=s->lifetime,.security_epoch=epoch,
+ .controller=s->controller,.handle=s->handle,.local_tcid=c->local_tcid,.remote_tcid=c->remote_tcid,.pi=c->pi};
+}
+static void send_constraint_tests(void) {
+ struct sl_connection_session s;struct sl_socket_binding b[2]={0};
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);fixture_security_revision=2;fixture_security_level=1;
+ struct sparklink_send_constraint good=intent_for(&s,&s.channels[0],1,2),out={0};
+ unsigned long control[16]={0};struct cmsghdr *cm=(void*)control;
+ *cm=(struct cmsghdr){.cmsg_len=CMSG_LEN(48),.cmsg_level=SOL_SPARKLINK,.cmsg_type=SPARKLINK_SCM_TX_CONSTRAINT};
+ memcpy(CMSG_DATA(cm),&good,48);struct msghdr msg={.msg_control=control,.msg_controllen=CMSG_SPACE(48)};
+ assert(!sl_send_control(&msg,&out)&&!memcmp(&out,&good,48));
+ cm->cmsg_type=SPARKLINK_SCM_RX_SECURITY;assert(sl_send_control(&msg,&out)==-EOPNOTSUPP);cm->cmsg_type=SPARKLINK_SCM_TX_CONSTRAINT;
+ for(unsigned n=0;n<120;n++) {if(n==CMSG_SPACE(48))continue;msg.msg_controllen=n;if(!n)assert(!sl_send_control(&msg,&out)&&!out.security_epoch);else assert(sl_send_control(&msg,&out)==-EINVAL);}
+ msg.msg_controllen=CMSG_SPACE(48);cm->cmsg_len--;assert(sl_send_control(&msg,&out)==-EINVAL);cm->cmsg_len++;
+ struct sparklink_send_constraint malformed=good;malformed.minimum=3;memcpy(CMSG_DATA(cm),&malformed,48);assert(sl_send_control(&msg,&out)==-EINVAL);
+ struct sl_admission a={.session=&s,.channel=&s.channels[0],.constraint=good};
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a));
+ a.constraint.deadline_monotonic_ns=fixture_now_ns;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-ETIMEDOUT);
+ a.constraint.deadline_monotonic_ns=fixture_now_ns+6000000000ULL;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EINVAL);
+ a.constraint=good;
+ a.constraint.security_epoch=1;assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EACCES);
+ a.constraint=good;a.constraint.lifetime++;assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EACCES);
+ a.constraint=good;a.constraint.minimum=2;assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EACCES);
+ /* Admission stores actual original intent. Withdraw before first USB: only
+  * this channel retires; another real production channel still submits. */
+ a.constraint=good;a.skb=alloc_skb(4,0);skb_put(a.skb,4);a.length=4;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a)&&!a.skb);
+ assert(((struct sl_fragment_cursor*)s.channels[0].tx.head->cb)->security_epoch==2);
+ fixture_security_revision=3;enqueue_fragment_test(&s.channels[1],4);unsigned before=fragment_count;
+ struct sl_tx_budget q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(!s.tx_inflight&&!allocations&&s.progress.phase==SL_CH_OPEN&&!sl_binding_live(s.channels[0].binding)&&sl_binding_live(s.channels[1].binding));
+ assert(b[0].sk.sk_err==EACCES&&!b[1].sk.sk_err&&fragment_count==before+1);
+ /* An actual prefix cannot be discarded as a successful local cancellation.
+  * Existing physical ledger is a dependency; no debt is refunded here. */
+ init_batch(&s,&b[0]);fixture_security_revision=2;fixture_security_level=1;
+ a=(struct sl_admission){.session=&s,.channel=&s.channels[0],.constraint=intent_for(&s,&s.channels[0],1,2),.skb=alloc_skb(255,0),.length=250};skb_put(a.skb,255);
+ /* This helper setup uses a negotiated large channel, not a malformed SDU. */
+ s.channels[0].mtu=2042;s.channels[0].mps=2047;s.progress.mtu=2042;s.progress.mps=2047;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a));packet_budget=1;assert(!one_transmit(&s,&s.channels[0])&&s.tx_started&&s.tx_inflight);
+ fixture_security_revision=3;packet_budget=1;assert(one_transmit(&s,&s.channels[0])==-EACCES&&!s.tx_inflight&&!allocations);
+ /* Waiting for credit preserves the absolute deadline and scheduled cleanup
+  * is bounded by it. Expiry before a prefix retires only this Channel. */
+ init_batch(&s,&b[0]);fixture_security_revision=2;fixture_security_level=1;
+ a=(struct sl_admission){.session=&s,.channel=&s.channels[0],.constraint=intent_for(&s,&s.channels[0],1,2),.skb=alloc_skb(4,0),.length=4};skb_put(a.skb,4);
+ a.constraint.deadline_monotonic_ns=fixture_now_ns+100000000ULL;
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a));
+ struct sl_fragment_cursor *queued=(void*)s.channels[0].tx.head->cb;
+ unsigned long old_jiffies=queued->deadline;u64 original=queued->intent_deadline_ns;
+ assert(old_jiffies<=jiffies+101);packet_budget=0;assert(!one_transmit(&s,&s.channels[0]));
+ queued=(void*)s.channels[0].tx.head->cb;assert(queued->deadline==old_jiffies&&queued->intent_deadline_ns==original);
+ fixture_now_ns=original;assert(!one_transmit(&s,&s.channels[0])&&!allocations&&b[0].sk.sk_err==ETIMEDOUT&&s.progress.phase==SL_CH_OPEN);
+ /* minimum0 also pins epoch and cannot weaken a protected original Grant. */
+ init_batch(&s,&b[0]);fixture_security_revision=2;fixture_security_level=2;
+ assert(sl_grant_init_security(&b[0].grant,b[0].grant.scope,3,2,2,2));
+ a=(struct sl_admission){.session=&s,.channel=&s.channels[0],.constraint=intent_for(&s,&s.channels[0],0,2)};
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a));fixture_security_level=1;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EACCES);
+ fixture_security_revision=1;fixture_security_level=0;
+}
 int main(void){
+ send_constraint_tests();
  identifier_zero_request_tests();negotiated_limit_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
  sl_channel_start(&s.progress, 249, 254);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress, 249, 254, 0);sl_channel_response_submitted(&s.progress,0);
@@ -987,18 +1054,18 @@ int main(void){
 
  irq_disabled=false;
  for(unsigned i=0;i<SL_CHANNEL_TX;i++) {
-  struct sl_admission admission={&s,&s.channels[0],alloc_skb(1,0),1};
+  struct sl_admission admission={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(1,0),.length=1};
   assert(sl_admit(&admission,fixture_security_revision)==0&&admission.skb==NULL);
  }
- struct sl_admission extra={&s,&s.channels[0],alloc_skb(1,0),1};
+ struct sl_admission extra={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(1,0),.length=1};
  assert(sl_admit(&extra,fixture_security_revision)==-EAGAIN&&extra.skb);kfree_skb(extra.skb);
- struct sl_admission large={&s,&s.channels[0],alloc_skb(250,0),250};
+ struct sl_admission large={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(250,0),.length=250};
  assert(sl_admit(&large,fixture_security_revision)==-EMSGSIZE&&large.skb);kfree_skb(large.skb);
  irq_disabled=true;
  sl_binding_retire(&s.channels[0].binding);
  assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==-ECANCELED&&submitted==1);
  irq_disabled=false;
- struct sl_admission closed={&s,&s.channels[0],alloc_skb(1,0),1};
+ struct sl_admission closed={.session=&s,.channel=&s.channels[0],.skb=alloc_skb(1,0),.length=1};
  assert(sl_admit(&closed,fixture_security_revision)==-ENOTCONN&&closed.skb);kfree_skb(closed.skb);
  irq_disabled=true;
  scope.channel=NULL;assert(sl_session_submit(&scope,fixture_security_revision,atomic_submit,&s)==0&&submitted==2);

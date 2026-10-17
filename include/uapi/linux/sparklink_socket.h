@@ -64,7 +64,7 @@ struct sockaddr_sparklink_dynamic {
  * KNOWN means the sole Owner could correlate that receipt when routing it;
  * CURRENT is rechecked at authorized dequeue. A later key cannot upgrade a
  * queued message. Both flags/grade are observations, never future TX consent.
- * No TX ancillary is implemented yet: all sendmsg control input is rejected.
+ * RX records themselves are never accepted as TX ancillary.
  * 40 bytes, identical native/compat; controller/channel identity is local fd.
  */
 #define SOL_SPARKLINK 288
@@ -78,6 +78,21 @@ struct sparklink_message_security {
     __aligned_u64 generation, lifetime, security_epoch;
     __u16 controller, handle;
     __u8 local_tcid, remote_tcid, pi, flags;
+};
+/* Restriction of an existing fd grant, not authority. Exactly one complete
+ * sendmsg record; old epoch or insufficient live mechanism denies admission
+ * and every actual USB submission, including subsequent PB fragments.
+ * minimum=0 still pins the nonzero epoch. Unknown/duplicate control rejected.
+ */
+#define SPARKLINK_SCM_TX_CONSTRAINT 2
+#define SPARKLINK_SEND_CONSTRAINT_VERSION 1
+struct sparklink_send_constraint {
+    __u16 version, size;
+    __u32 minimum;
+    __aligned_u64 generation, lifetime, security_epoch;
+    __u16 controller, handle;
+    __u8 local_tcid, remote_tcid, pi, reserved;
+    __aligned_u64 deadline_monotonic_ns; /* original CLOCK_MONOTONIC, at most5s ahead */
 };
 
 /* Read-only delegated socket snapshot. No lease token or trusted security
