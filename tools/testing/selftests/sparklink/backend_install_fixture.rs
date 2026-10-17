@@ -90,8 +90,7 @@ fn setup()->DeviceIdentity{
  let old={let mut s=SUBSYSTEM.lock();let old=s.take();*s=Some(Shared::new());old};drop(old);
  CONSTRUCTIONS.store(0,Ordering::Relaxed);DROPS.store(0,Ordering::Relaxed);HOOK.with(|h|h.set(0));
  let info=SleControllerInfo::default();
- assert_eq!(info.name,[0;32]);assert_eq!((info.features,info.max_connections),(0,0));
- assert_eq!((info.features_ext,info.max_pdu_payload,info.max_mtu,info.max_mps,info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0,0,0,0,0));
+ assert_eq!((info.bus,info.addr,info.fw_version),(SleBus::None,[0;6],0));
  reserve_backend_identity(&info).unwrap()
 }
 fn install(id:DeviceIdentity,hook:u8)->Result<Arc<ControllerRuntime>>{

@@ -53,7 +53,7 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
 }}
 
 #[test]fn constructor_has_only_setup_and_preserves_explicit_metadata(){
- let info=SleControllerInfo{addr:[3;6],fw_version:7,features:11,max_connections:2,bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);assert_eq!((info.features,info.max_connections),(11,2));assert_eq!((info.features_ext,info.max_pdu_payload,info.max_mtu,info.max_mps,info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0,0,0,0,0));
+ let info=SleControllerInfo{addr:[3;6],fw_version:7,bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);
  assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.pending_profile,d.pending_phase,d.pending_error),(0,0,0));assert_eq!((d.id,d.generation,d.addr,d.fw_version,d.bus),(4,5,[3;6],7,SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");
 }
 #[test]fn full_registry_cannot_invent_ready_or_extra_slot(){

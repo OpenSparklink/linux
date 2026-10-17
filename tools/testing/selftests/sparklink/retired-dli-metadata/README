@@ -1,0 +1,10 @@
+Historical DLI metadata only
+============================
+
+The exact b35 declarations/projection and original five bus tests are retained
+for USB/UART/SPI/serdev historical regressions. They are not production
+capabilities, a second backend, or a supported wire Host. Current registration
+contains only bus/address/legacy version observation; actual capability data
+comes from the existing Native snapshot, never an inferred MTU/security field.
+The audit JSON is the creation-time scope; current qualification lives in the
+userspace canonical registry. No fixture is built by the default kernel.

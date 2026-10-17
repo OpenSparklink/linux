@@ -37,7 +37,7 @@ def run(output):
     for marker, name in [('REGISTER', 'sle_usb_dev_register'), ('UNREGISTER', 'sle_usb_dev_unregister'), ('RELEASE','sle_usb_dev_release'), ('GET','sle_usb_dev_get'), ('PUT','sle_usb_dev_put'), ('GET_VERSION','sle_usb_dev_get_fw_version')]:
         body = block(c, re.search(r'(?m)^(?:static )?(?:void|int|u8|u32) '+name+r'\([^;{]*\)\s*\{', c).start())
         fixture = fixture.replace('/* @@'+marker+'@@ */', body)
-    dli = inputs['sle_dli.rs']
+    dli = (here/'retired-dli-metadata/legacy_metadata.rs').read_text()
     rust = (here/'usb-discovery/info_fixture.rs').read_text()
     usb=(here/'retired-usb-registration/static_controller.rs').read_text()
     declarations='\n'.join('#[repr(C)]\n#[derive(Clone,Copy,Default)]\n'+block(usb,usb.index('struct '+name+' {')) for name in ('UsbCapabilities','UsbMetadata'))
@@ -80,6 +80,7 @@ def run(output):
               'physical_acceptance': False, 'generic_dialect_acceptance': False,
               'full_capability_provenance_contract': False, 'natural_fault_root_cause_closed': False,
               'sources': {n: hashlib.sha256(s.encode()).hexdigest() for n, s in inputs.items()},
+              'archived_metadata_sha256': hashlib.sha256(dli.encode()).hexdigest(),
               'archived_attach_sha256': hashlib.sha256(assembly.encode()).hexdigest(),
               'archived_serdev_info_sha256': hashlib.sha256(serdev_source.encode()).hexdigest()}
     if output:

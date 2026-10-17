@@ -8,9 +8,13 @@ const UNSUPPORTED: i32 = -95;
 // @@BUS_ENUM@@
 // @@INFO_STRUCT@@
 // @@NATIVE_INFO@@
+mod sle_uapi { // @@SNAPSHOT@@
+}
+// @@DEFAULT@@
 struct NativeController { metadata: NativeInfo, bus: SleBus }
 impl NativeController {
     // @@PROJECTION@@
+    // @@FILL_SNAPSHOT@@
 }
 // @@CONVERSION@@
 fn controller(bus: u32) -> NativeController {
@@ -19,38 +23,14 @@ fn controller(bus: u32) -> NativeController {
         command_credits: 1, acb_length: 254, acb_count: 5, icb_length: 0, icb_count: 0,
     } }
 }
-#[test]
-fn usb_retains_physical_projection() {
-    let c=controller(1); let info=c.info();
-    assert_eq!(info.bus,SleBus::Usb); assert_eq!(info.bus as u8,4);
-    assert!(info.name.starts_with(b"ws73-native\0"));
-    assert_eq!(info.addr,c.metadata.address); assert_eq!(info.max_pdu_payload,254);
+fn snapshot(c:&NativeController)->sle_uapi::SleControllerSnapshot {
+    let mut out:sle_uapi::SleControllerSnapshot=unsafe{std::mem::zeroed()};
+    c.fill_snapshot(&mut out);
+    assert_eq!((out.generation,out.version,out.profile,out.dev_index,out.bus,out.reserved_byte,out.reserved),(0,0,0,0,0,0,[0;4]),"metadata must not manufacture identity or policy state");
+    assert_eq!(c.metadata.command_credits,1,"bootstrap credit remains separate Host input");out
 }
-#[test]
-fn test_is_not_physical_or_virtual() {
-    let c=controller(2); let info=c.info();
-    assert_eq!(info.bus,SleBus::Test); assert_eq!(info.bus as u8,6);
-    assert_ne!(info.bus,SleBus::Usb); assert_ne!(info.bus,SleBus::None);
-    assert!(info.name.starts_with(b"sparklink-test\0"));
-    assert_eq!(info.addr,c.metadata.address);
-}
-#[test]
-fn unsupported_origins_do_not_fall_back_to_usb() {
-    for raw in [0,3,4,5,6,255,u32::MAX] { assert_eq!(backend_bus(raw),Err(Error(-95))); }
-}
-#[test]
-fn provenance_is_independent_of_wire_capabilities() {
-    for bus in [1,2] {
-        let c=controller(bus); let info=c.info();
-        assert_eq!(c.bus,backend_bus(bus).unwrap());
-        // Provenance projection does not replace the retained input metadata.
-        assert_eq!((c.metadata.profile,c.metadata.command_credits,c.metadata.acb_count), (1,1,5));
-        assert_eq!((c.metadata.icb_length,c.metadata.icb_count), (0,0));
-        assert_eq!(info.features,u64::from_le_bytes([0xa5;8]));
-        assert_eq!(info.features_ext,u16::from_le_bytes([0xa5;2]));
-        assert_eq!((info.max_connections,info.max_mtu,info.max_mps),(0,0,0));
-        assert_eq!((info.transport_modes,info.measurement_cap,info.security_cap),(0,0,0));
-    }
-}
-
-#[test]fn standard_profile_keeps_queried_identity_without_ws73_or_data_policy_claim(){let mut c=controller(1);c.metadata.profile=0;let i=c.info();assert!(i.name.starts_with(b"standard-dli-usb\0"));assert_eq!(i.bus,SleBus::Usb);assert_eq!(i.addr,c.metadata.address);assert_eq!(i.features_ext,0xa5a5);assert_eq!((i.max_pdu_payload,i.max_connections,i.max_mtu,i.max_mps,i.transport_modes,i.security_cap),(0,0,0,0,0,0));}
+#[test]fn usb_retains_only_registration_identity(){let c=controller(1);let i=c.info();assert_eq!((i.bus as u8,i.addr,i.fw_version),(4,[1;6],0x04030201));}
+#[test]fn test_provenance_never_becomes_usb(){let c=controller(2);assert_eq!(c.info().bus as u8,6);assert_ne!(c.info().bus,SleBus::Usb);}
+#[test]fn unsupported_origins_do_not_fall_back_to_usb(){for raw in [0,3,4,5,6,255,u32::MAX]{assert_eq!(backend_bus(raw),Err(Error(-95)));}}
+#[test]fn snapshot_retains_full_queried_wire_metadata(){for bus in [1,2]{let c=controller(bus);let i=snapshot(&c);assert_eq!(i.valid_fields,1);assert_eq!(i.version_tuple,[1,2,3,4,5]);assert_eq!(i.features,[0xa5;10]);assert_eq!(i.address,[1;6]);assert_eq!((i.acb_length,i.acb_count,i.icb_length,i.icb_count),(254,5,0,0));assert_eq!((i.flags,i.error,i.command_credits),(0,0,0),"metadata cannot manufacture Runtime status");}}
+#[test]fn standard_profile_does_not_manufacture_ws73_capability(){let mut c=controller(1);c.metadata.profile=0;c.metadata.acb_length=0;c.metadata.acb_count=0;let i=snapshot(&c);assert_eq!((c.info().bus,i.acb_length,i.acb_count),(SleBus::Usb,0,0));assert_eq!((i.version_tuple,i.features),([1,2,3,4,5],[0xa5;10]));assert_eq!(i.flags,0);}

@@ -12,9 +12,9 @@ def function(text,name):
 
 def run(output):
     here=Path(__file__).resolve().parent;net=here.parents[3]/'net/sparklink'
-    paths=[here/'retired-transport/uart_decoder.rs',net/'sle_dli.rs',here/'retired-transport/sle_uart.rs',here/'retired-transport/sle_spi.rs']
+    paths=[here/'retired-transport/uart_decoder.rs',here/'retired-dli-metadata/legacy_metadata.rs',here/'retired-transport/sle_uart.rs',here/'retired-transport/sle_spi.rs']
     contents={p:p.read_text() for p in paths}
-    dli=contents[net/'sle_dli.rs'];a=dli.index('#[repr(u8)]',dli.index('/// DLI packet type'));b=dli.index('\n}',a)+2;enum=dli[a:b]
+    dli=contents[here/'retired-dli-metadata/legacy_metadata.rs'];a=dli.index('#[repr(u8)]',dli.index('/// DLI packet type'));b=dli.index('\n}',a)+2;enum=dli[a:b]
     encoder=function(contents[here/'retired-transport/sle_uart.rs'],'encode_command')
     spi=function(contents[here/'retired-transport/sle_spi.rs'],'encode_spi_command')+'\n'+function(contents[here/'retired-transport/sle_spi.rs'],'encode_spi_data_write')
     fixture='''extern crate self as kernel;
