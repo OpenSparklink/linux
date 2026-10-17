@@ -62,8 +62,8 @@ def run(output):
             folder.mkdir()
             source = inputs[header].decode()
             if kind == 'missing-epoch-negative':
-                assert 'm->security_epoch == current' in source
-                source = source.replace('m->security_epoch == current', '1')
+                assert 'm->security_epoch == current_revision' in source
+                source = source.replace('m->security_epoch == current_revision', '1')
             if kind == 'missing-level-negative':
                 assert 'level >= 0 && level <= 2' in source
                 source = source.replace('level >= 0 && level <= 2', '1')
