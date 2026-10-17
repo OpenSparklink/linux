@@ -89,6 +89,42 @@ int ws73_wire_pm(unsigned char *out, size_t capacity, unsigned int sequence,
 	return 128;
 }
 
+int ws73_wire_chip_request(unsigned char *out, size_t capacity,
+			   unsigned int sequence)
+{
+	if (!out || capacity < 128)
+		return -EINVAL;
+	wire_package(out, 128, sequence);
+	out[64] = 0x19; /* OAM / PLAT_MSG_TRANSFER */
+	out[65] = WS73_WIRE_PLAT_QUEUE;
+	out[66] = 32;
+	out[68] = 16; /* H2D_PLAT_CFG_MSG_GET_CHIP_TYPE */
+	out[70] = 1;  /* SDK input_data = one zero byte */
+	return 128;
+}
+
+int ws73_wire_chip_reply(const unsigned char *data, size_t size,
+			 struct ws73_chip_info *info)
+{
+	/* plat_hcc_srv + plat_misc: msg_id/len, result u32, output_len u32,
+	 * then two output bytes. HCC allocation padding is not output data.
+	 * Commit only a completely validated reply; unknown is never U.
+	 */
+	if (!data || !info || size < 4)
+		return -EPROTO;
+	if (wire_u16(data) != 10) /* D2H_*_GET_CHIP_TYPE_COMPLETE */
+		return -ENOMSG;
+	if (wire_u16(data + 2) != 10 || size < 14 ||
+	    wire_u32(data + 8) != 2)
+		return -EPROTO;
+	if (wire_u32(data + 4))
+		return -EIO;
+	if (data[12] > 2 || data[13] > 2)
+		return -EOPNOTSUPP;
+	*info = (struct ws73_chip_info) { .model = data[12], .bus = data[13] };
+	return 0;
+}
+
 int ws73_wire_command(unsigned char *out, size_t capacity, unsigned int sequence,
 		      unsigned int opcode, const unsigned char *params, size_t size)
 {
@@ -257,6 +293,10 @@ int ws73_wire_receive(const unsigned char *data, size_t size,
 		     data[offset + 1] == WS73_WIRE_BSLE_QUEUE) &&
 		    (data[offset] & 0x0f))
 			return -EPROTO;
+		if (data[offset] >> 4 == WS73_WIRE_PLAT_SERVICE &&
+		    data[offset + 1] == WS73_WIRE_PLAT_QUEUE &&
+		    (data[offset] & 0x0f) != 9)
+			return -EPROTO;
 		offset += slot;
 		count++;
 	}
@@ -271,7 +311,8 @@ int ws73_wire_receive(const unsigned char *data, size_t size,
 		int ret;
 
 		if ((service == WS73_WIRE_BSLE_SERVICE && queue == WS73_WIRE_BSLE_QUEUE) ||
-		    (service == WS73_WIRE_SLE_SERVICE && queue == WS73_WIRE_SLE_QUEUE)) {
+		    (service == WS73_WIRE_SLE_SERVICE && queue == WS73_WIRE_SLE_QUEUE) ||
+		    (service == WS73_WIRE_PLAT_SERVICE && queue == WS73_WIRE_PLAT_QUEUE)) {
 			ret = consumer(context, service, queue, netbuf + 4,
 				       wire_u16(netbuf + 2));
 			if (ret)

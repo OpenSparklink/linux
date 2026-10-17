@@ -125,6 +125,7 @@ struct ws73_usb {
 	u64 warm_recovery_started_ms;
 	unsigned int command_credits;
 	struct ws73_dli_info info;
+	struct ws73_chip_info chip_info;
 	struct ws73_dli_result dli_result;
 };
 
@@ -1173,6 +1174,15 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_QUERYING);
 	ws73_pending_status(ws, WS73_QUERYING, 0);
+	ret = ws73_chip_query(&io, &ws->chip_info);
+	if (ret)
+		goto out;
+	if (ws->chip_info.bus != 0) {
+		ret = -EPROTO;
+		goto out;
+	}
+	dev_info(&ws->intf->dev, "HCC reported WS73%c bus=USB (not firmware attestation)\n",
+		 "USE"[ws->chip_info.model]);
 	ws->dli_result.status = 0x100;
 	ret = ws73_dli_query(&io, &credits, &ws->info, &ws->dli_result);
 	if (ret)
@@ -1383,6 +1393,25 @@ static ssize_t controller_information_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(controller_information);
 
+static ssize_t chip_information_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	ssize_t ret;
+
+	if (!mutex_trylock(&ws->phase_lock))
+		return -EAGAIN;
+	if (!smp_load_acquire(&ws->metadata_valid)) {
+		mutex_unlock(&ws->phase_lock);
+		return -ENODATA;
+	}
+	ret = sysfs_emit(buf, "source=HCC_GET_CHIP_TYPE model=WS73%c model_id=%u bus=USB bus_id=%u\n",
+			 "USE"[ws->chip_info.model], ws->chip_info.model, ws->chip_info.bus);
+	mutex_unlock(&ws->phase_lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(chip_information);
+
 static ssize_t native_runtime_show(struct device *dev,
                                   struct device_attribute *attr, char *buf)
 {
@@ -1417,6 +1446,7 @@ static struct attribute *ws73_attrs[] = {
 	&dev_attr_metadata_valid.attr,
 	&dev_attr_native_runtime.attr,
 	&dev_attr_controller_information.attr,
+	&dev_attr_chip_information.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ws73);

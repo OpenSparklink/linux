@@ -19,6 +19,19 @@
 #define WS73_WIRE_BSLE_QUEUE 10U
 #define WS73_WIRE_SLE_SERVICE 10U
 #define WS73_WIRE_SLE_QUEUE 8U
+#define WS73_WIRE_PLAT_SERVICE 1U
+#define WS73_WIRE_PLAT_QUEUE 9U
+
+/* Firmware-reported model, not a board/calibration or firmware attestation. */
+struct ws73_chip_info {
+	unsigned char model; /* SDK: U=0, S=1, E=2 */
+	unsigned char bus;   /* SDK: USB=0, SDIO=1, UART=2 */
+};
+
+int ws73_wire_chip_request(unsigned char *out, size_t capacity,
+			   unsigned int sequence);
+int ws73_wire_chip_reply(const unsigned char *data, size_t size,
+			 struct ws73_chip_info *info);
 
 /* Codec functions do not allocate, do I/O, or keep any global state. */
 int ws73_wire_control(unsigned char *out, size_t capacity,

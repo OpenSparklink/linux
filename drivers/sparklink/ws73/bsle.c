@@ -94,6 +94,89 @@ static int ws73_send_control(struct ws73_bsle_io *io, unsigned int descriptor,
 	return io->send(io->context, ret);
 }
 
+struct ws73_chip_query_state {
+	struct ws73_chip_info info;
+	int complete;
+};
+
+static int ws73_chip_receive(void *context, unsigned int service,
+			     unsigned int queue, const unsigned char *data, size_t size)
+{
+	struct ws73_chip_query_state *state = context;
+	struct ws73_chip_info candidate;
+	int ret;
+
+	if (service != WS73_WIRE_PLAT_SERVICE || queue != WS73_WIRE_PLAT_QUEUE)
+		return 0;
+	ret = ws73_wire_chip_reply(data, size, &candidate);
+	if (ret == -ENOMSG)
+		return 0;
+	if (ret)
+		return ret;
+	if (state->complete)
+		return -EPROTO; /* no ambiguous duplicate response */
+	state->info = candidate;
+	state->complete = 1;
+	return 0;
+}
+
+int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
+{
+	struct ws73_chip_query_state state = {};
+	unsigned long long deadline;
+	int ret;
+
+	if (!io || !info || !io->tx || !io->rx || !io->sequence ||
+	    !io->now_ms || !io->send || !io->receive || !io->notification ||
+	    io->rx_capacity < WS73_WIRE_RX_HEADER_SIZE || io->rx_capacity > WS73_WIRE_RX_MAX)
+		return -EINVAL;
+	/* Includes TX and all unrelated/empty replies. No retry renews it. */
+	deadline = io->now_ms(io->context) + 2000;
+	ret = ws73_send_control(io, 1, WS73_WIRE_PLAT_QUEUE);
+	if (!ret)
+		ret = ws73_send_control(io, 0, 0);
+	if (ret)
+		return ret;
+	ret = ws73_wire_chip_request(io->tx, io->tx_capacity, *io->sequence);
+	if (ret < 0)
+		return ret;
+	(*io->sequence)++;
+	ret = io->send(io->context, ret);
+	if (ret)
+		return ret;
+	for (;;) {
+		unsigned long long now = io->now_ms(io->context);
+		unsigned int timeout, bits = 0;
+
+		if (now >= deadline)
+			return -ETIMEDOUT;
+		timeout = deadline - now;
+		if (timeout > 100)
+			timeout = 100;
+		ret = io->receive(io->context, timeout);
+		if (ret < 0 && ret != -ETIMEDOUT)
+			return ret;
+		if (ret > 0) {
+			if ((size_t)ret > io->rx_capacity)
+				return -EOVERFLOW;
+			ret = ws73_wire_receive(io->rx, ret, ws73_chip_receive, &state);
+			if (ret)
+				return ret;
+		}
+		ret = io->notification(io->context, 1, &bits);
+		if (ret < 0 && ret != -ETIMEDOUT)
+			return ret;
+		if (!ret && (bits & WS73_BSLE_PANIC))
+			return -EIO;
+		if (io->now_ms(io->context) >= deadline)
+			return -ETIMEDOUT;
+		if (state.complete) {
+			*info = state.info;
+			return 0;
+		}
+	}
+}
+
 static int ws73_bsle_validate(struct ws73_bsle_io *io, const unsigned char *pm, size_t pm_size,
 			      const unsigned char *custom, size_t custom_size)
 {

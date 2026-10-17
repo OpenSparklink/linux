@@ -3,6 +3,7 @@
 TEST_GEN_PROGS := sparklink_test ws73_bsle_test ws73_dli_test ws73_discovery_test
 TEST_GEN_PROGS += ws73_recovery_test sparklink_backend_test
 TEST_GEN_PROGS += ws73_acb_test
+TEST_GEN_PROGS += ws73_chip_test
 TEST_GEN_PROGS += virtual_codec_test
 TEST_GEN_PROGS += sle_channel_wire_test sle_channel_signal_test
 TEST_GEN_PROGS += sle_channel_state_test sle_channel_table_test
@@ -36,6 +37,9 @@ TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
 
 include ../lib.mk
+
+$(OUTPUT)/ws73_chip_test: ws73_chip_test.c ../../../../drivers/sparklink/ws73/wire.c ../../../../drivers/sparklink/ws73/bsle.c ../../../../drivers/sparklink/ws73/wire.h ../../../../drivers/sparklink/ws73/bsle.h
+	$(CC) $(CFLAGS) $< ../../../../drivers/sparklink/ws73/wire.c ../../../../drivers/sparklink/ws73/bsle.c $(LDLIBS) -o $@
 
 $(OUTPUT)/virtual_codec_test: virtual_codec_test.c ../../../../drivers/sparklink/virtual_codec.h
 	$(CC) $(CFLAGS) -I../../../../include $< $(LDLIBS) -o $@

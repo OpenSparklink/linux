@@ -36,6 +36,11 @@ struct ws73_bsle_io {
 	void (*phase)(void *context, enum ws73_bsle_phase phase);
 };
 
+/* Exclusive pre-registration transport owner only, after BSLE open. One
+ * request, original bounded deadline, no DLI command/data credit consumed.
+ */
+int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info);
+
 /* The PM word and 140-byte customization are deployment inputs, not guesses.
  * Success only opens the vendor transport; DLI queries are still mandatory.
  */
