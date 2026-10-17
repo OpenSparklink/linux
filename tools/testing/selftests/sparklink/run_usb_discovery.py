@@ -47,7 +47,7 @@ def run(output):
     uapi=(net/'sle_uapi.rs').read_text()
     rust=rust.replace('// @@SNAPSHOT_TYPE@@','#[derive(Default)]\n'+block(uapi,uapi.index('pub(crate) struct SleControllerSnapshot {')))
 
-    rust = rust.replace('// @@INFO_STRUCT@@', block(dli, dli.index('pub(crate) struct SleControllerInfo {')))
+    rust = rust.replace('// @@INFO_STRUCT@@', block(dli, dli.index('pub struct SleControllerInfo {')))
     rust = rust.replace('// @@DEFAULT@@', function(dli[dli.index('impl Default for SleControllerInfo'):], 'default'))
     for marker, source in [('USB_INFO', 'sle_usb.rs'), ('SERDEV_INFO', 'sle_serdev.rs')]:
         rust = rust.replace('// @@'+marker+'@@', function(serdev_source if source=='sle_serdev.rs' else usb, 'info'))
