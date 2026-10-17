@@ -53,8 +53,8 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
 }}
 
 #[test]fn constructor_has_only_setup_and_preserves_explicit_metadata(){
- let info=SleControllerInfo{addr:[3;6],fw_version:7,bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);
- assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.pending_profile,d.pending_phase,d.pending_error),(0,0,0));assert_eq!((d.id,d.generation,d.addr,d.fw_version,d.bus),(4,5,[3;6],7,SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");
+ let info=SleControllerInfo{addr:[3;6],bus:SleBus::Usb,..Default::default()};let d=SleDev::new(4,5,&info);
+ assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.pending_profile,d.pending_phase,d.pending_error),(0,0,0));assert_eq!((d.id,d.generation,d.addr,d.bus),(4,5,[3;6],SleBus::Usb));assert_eq!(&d.name[..4],b"sle4");
 }
 #[test]fn full_registry_cannot_invent_ready_or_extra_slot(){
  let mut r=SleDevRegistry::new();for id in 0..SLE_DEV_MAX{let got=r.register_pending(&SleControllerInfo::default()).unwrap();assert_eq!(got as usize,id);assert_eq!(r.get(got).unwrap().flags.load(Ordering::Acquire),SLE_DEV_SETUP);}
@@ -67,7 +67,7 @@ impl Runtime{fn invalidate(&self){self.invalidations.fetch_add(1,Ordering::Relax
  let mut r=SleDevRegistry::new();r.next_generation=u64::MAX;assert_eq!(r.register_pending(&SleControllerInfo::default()),Err(ENOSPC));assert_eq!(r.allocated,0);assert!(r.slots.iter().all(Option::is_none));
 }
 #[test]fn actual_usb_reservation_is_pending_unknown_and_requires_subsystem(){
- *SUBSYSTEM.lock()=None;assert_eq!(reserve_usb_identity(),Err(ENODEV));*SUBSYSTEM.lock()=Some(Shared::new());let identity=reserve_usb_identity().unwrap();let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(identity.id).unwrap();assert_eq!(d.identity(),identity);assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.addr,d.fw_version,d.bus),([0;6],0,SleBus::Usb));
+ *SUBSYSTEM.lock()=None;assert_eq!(reserve_usb_identity(),Err(ENODEV));*SUBSYSTEM.lock()=Some(Shared::new());let identity=reserve_usb_identity().unwrap();let s=SUBSYSTEM.lock();let d=s.as_ref().unwrap().dev_registry.get(identity.id).unwrap();assert_eq!(d.identity(),identity);assert_eq!(d.flags.load(Ordering::Acquire),SLE_DEV_SETUP);assert_eq!((d.addr,d.bus),([0;6],SleBus::Usb));
 }
 
 #[test]fn actual_detach_rejects_stale_identity_and_preserves_other_owner(){

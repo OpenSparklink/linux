@@ -102,13 +102,11 @@ pub(crate) struct SleControllerInfo {
     pub bus: SleBus,
     /// Observed address, or zero before bootstrap.
     pub addr: [u8; 6],
-    /// Legacy registry observation. Not the authoritative five-byte version.
-    pub fw_version: u32,
 }
 
 impl Default for SleControllerInfo {
     fn default() -> Self {
-        Self { bus: SleBus::None, addr: [0; 6], fw_version: 0 }
+        Self { bus: SleBus::None, addr: [0; 6] }
     }
 }
 

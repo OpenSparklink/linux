@@ -65,8 +65,6 @@ pub(crate) struct SleDev {
     pub(crate) addr: [u8; 6],
     /// Lifecycle and operational state flags (see `SLE_DEV_*` constants).
     flags: AtomicU32,
-    /// Firmware version (packed major.minor.patch).
-    fw_version: u32,
 }
 
 impl SleDev {
@@ -98,7 +96,6 @@ impl SleDev {
             pending_profile: 0, pending_phase: 0, pending_error: 0,
             addr: info.addr,
             flags: AtomicU32::new(SLE_DEV_SETUP),
-            fw_version: info.fw_version,
         }
     }
 
@@ -128,10 +125,9 @@ impl SleDev {
         &self.addr
     }
 
-    /// Update hardware info read back during probe (MAC, firmware version).
-    pub(crate) fn update_hw_info(&mut self, addr: [u8; 6], fw_version: u32) {
+    /// Update the probe-observed address;does not set Host Ready or capabilities.
+    pub(crate) fn update_address(&mut self, addr: [u8; 6]) {
         self.addr = addr;
-        self.fw_version = fw_version;
     }
 
     // -- Flag operations ---------------------------------------------------
@@ -244,13 +240,11 @@ impl SleDevRegistry {
         self.slots.iter().filter_map(|s| s.as_ref())
     }
 
-    /// Update hardware-read metadata for a registered device.
-    ///
-    /// Called after a registered bus probe reads the real MAC and firmware version
-    /// from the controller, so that the registry reflects actual hardware state.
-    pub(crate) fn update_hw_info(&mut self, id: u16, addr: [u8; 6], fw_version: u32) {
+    /// Update registration address observation under the registry lock.
+    /// Queried version/features remain in their Native snapshot owner.
+    pub(crate) fn update_address(&mut self, id: u16, addr: [u8; 6]) {
         if let Some(dev) = self.get_mut(id) {
-            dev.update_hw_info(addr, fw_version);
+            dev.update_address(addr);
         }
     }
 

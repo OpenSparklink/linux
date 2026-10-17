@@ -424,8 +424,6 @@ impl SleController for NativeController {
     fn info(&self) -> SleControllerInfo {
         SleControllerInfo {
             bus: self.bus, addr: self.metadata.address,
-            // Registry observation only. fill_snapshot retains all five bytes.
-            fw_version: u32::from_le_bytes(self.metadata.version[..4].try_into().unwrap()),
         }
     }
 
@@ -515,7 +513,7 @@ pub(crate) unsafe extern "C" fn sparklink_native_register_rust(
             let state = super::ControllerState::new_boxed(
                 metadata.address, super::sle_dli::ControllerBackend::Native(controller),
             )?;
-            super::install_backend_runtime(identity, state, metadata.command_credits, Some((metadata.address, ctrl_info.fw_version)))
+            super::install_backend_runtime(identity, state, metadata.command_credits, Some(metadata.address))
         })();
         let owner = match installed {
             Ok(owner) => owner,

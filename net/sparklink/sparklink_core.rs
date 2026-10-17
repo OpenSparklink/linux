@@ -504,7 +504,7 @@ pub(crate) fn cancel_backend_reservation(identity: sle_dev::DeviceIdentity) {
 /// failed candidates drop after the registry guard, with no lock across I/O.
 pub(crate) fn install_backend_runtime(
     identity: sle_dev::DeviceIdentity, state: KBox<ControllerState>, initial_command_credits: u8,
-    queried: Option<([u8; 6], u32)>,
+    queried_address: Option<[u8; 6]>,
 ) -> Result<Arc<ControllerRuntime>> {
     let registration = {
         let registry = SUBSYSTEM.lock();
@@ -516,7 +516,7 @@ pub(crate) fn install_backend_runtime(
         let len = dev.name().len().min(name.len());
         name[..len].copy_from_slice(&dev.name()[..len]);
         RuntimeRegistration { identity, bus: dev.bus(),
-            addr: queried.map_or(*dev.addr(), |info| info.0), name }
+            addr: queried_address.unwrap_or(*dev.addr()), name }
     };
     let owner = ControllerRuntime::new(registration, state, initial_command_credits)?;
     {
@@ -527,7 +527,7 @@ pub(crate) fn install_backend_runtime(
         let slot = shared.runtimes.get_mut(identity.id as usize).ok_or(EINVAL)?;
         if slot.is_some() { return Err(EBUSY); }
         *slot = Some(owner.clone());
-        if let Some((addr, version)) = queried { shared.dev_registry.update_hw_info(identity.id, addr, version); }
+        if let Some(addr) = queried_address { shared.dev_registry.update_address(identity.id, addr); }
     }
     Ok(owner)
 }
