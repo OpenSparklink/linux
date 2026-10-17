@@ -150,7 +150,7 @@ class RadioVerdict(unittest.TestCase):
 class AuthorizationVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.denied = ['own-service', 'StartDiscovery', 'StopDiscovery', 'SubmitScanning',
+        cls.denied = ['own-service', 'StartControllerScan', 'StopControllerScan', 'SubmitScanning',
                       'SubmitStopScanning', 'SubmitStopAdvertising', 'SubmitAdvertising',
                       'unique-owner-write', 'interface-less-write', 'interface-less-read',
                       'Properties.Set', 'future-method', 'foreign-interface',
@@ -173,6 +173,10 @@ class AuthorizationVerdict(unittest.TestCase):
     def test_missing_read(self): self.assertTrue(assess(self.good.replace('AUTH_OBSERVE: observer', 'missing'), 0, production_policy=True))
     def test_duplicate_summary(self): self.assertTrue(assess(self.good + self.proof, 0, production_policy=True))
     def test_application_caps(self): self.assertTrue(assess(self.good.replace('caps=0', 'caps=1', 1), 0, production_policy=True))
+    def test_retired_scan_names_do_not_qualify_current_policy(self):
+        old = self.good.replace('StartControllerScan', 'StartDiscovery').replace('StopControllerScan', 'StopDiscovery')
+        self.assertNotEqual(old, self.good)
+        self.assertTrue(assess(old, 0, production_policy=True))
 
 
 class KernelAuthorizationVerdict(unittest.TestCase):

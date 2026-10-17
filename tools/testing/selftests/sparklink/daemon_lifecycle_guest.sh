@@ -23,7 +23,7 @@ wait_ready() {
 [ "$(user 'id -u')" = 1000 ] || fail 'ordinary application uid'
 echo 'DAEMON_UID: 1000'
 daemon_uid=0
-/bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd.log 2>&1 &
+/bin/slkd --session -n > /tmp/slkd.log 2>&1 &
 wait_ready 1
 pid=$(pidof slkd)
 [ -n "$pid" ] || fail 'daemon pid'
@@ -114,7 +114,7 @@ if [ "$SPARKLINK_TEST_MANAGEMENT_HANDOFF" = 1 ]; then
     if [ "$SPARKLINK_TEST_DIAGNOSTIC_TOOLS" = 1 ]; then
         tool_released "$replacement" "$second"
     fi
-    /bin/slkd --session --storage /tmp/bonds -n > /tmp/slkd-restarted.log 2>&1 &
+    /bin/slkd --session -n > /tmp/slkd-restarted.log 2>&1 &
     wait_ready 2
     next_pid=$(pidof slkd)
     [ -n "$next_pid" ] && [ "$next_pid" != "$pid" ] || fail 'new daemon PID'

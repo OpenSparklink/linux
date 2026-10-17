@@ -6,6 +6,7 @@ Host prepares a disposable guest, no host sudo/USB access required. This proves
 userspace/kernel lifecycle integration only, never WS73 firmware or RF behavior.
 """
 import argparse
+import importlib.util
 from datetime import datetime, timezone
 import json
 import os
@@ -14,7 +15,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from vm_test_utils import file_record, load_qmp, wait_marker
+from vm_test_utils import file_record, load_qmp, wait_marker, copy_elf
+from run_native_open_test import checked_kernel_inputs, checked_ws73_module
 from qemu_verdict import KERNEL_FAULT
 from snoop_verdict import assess_snoop, capture_files
 
@@ -42,26 +44,17 @@ def kernel_authorization_counts():
     return tuple(counts)
 
 
-def require_config(path, authorization=False):
+def require_config(path, authorization=False, ws73_module=None):
     config = path.read_text().splitlines()
-    names = ['RUST', 'SPARKLINK', 'SPARKLINK_WS73_USB']
+    names = ['RUST', 'SPARKLINK']
+    if 'CONFIG_SPARKLINK_WS73_USB=y' not in config and not (ws73_module is not None and 'CONFIG_SPARKLINK_WS73_USB=m' in config):
+        raise RuntimeError('required WS73 built-in or explicit module missing;reject unqualified image')
     if authorization:
         names += ['SPARKLINK_GENL', 'CONFIGFS_FS']
     for name in names:
         if f'CONFIG_{name}=y' not in config:
             raise RuntimeError(f'required CONFIG_{name}=y missing; reject unqualified image')
 
-
-def copy_elf(source, target, root):
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-    dependencies = subprocess.check_output(['ldd', str(source)], text=True)
-    for dependency in re.findall(r'(?:=>\s+)?(/[^\s()]+)', dependencies):
-        path = Path(dependency)
-        if path.is_file():
-            dest = root / str(path).lstrip('/')
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, dest)
 
 
 def assess(console, code, radio=False, production_policy=False, kernel_authorization=False, management_handoff=False, diagnostic_tools=False, snoop_tools=False):
@@ -97,7 +90,9 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
         if re.findall(r'^DAEMON_AUTHORIZATION: (.*)$', console, re.M) != expected:
             errors.append('missing/duplicate/invalid production authorization proof')
         denials = re.findall(r'^AUTH_DENIED: (.*)$', console, re.M)
-        if denials != ['own-service', 'StartDiscovery', 'StopDiscovery', 'SubmitScanning',
+        # ADR0004 renamed controller-wide scan management. Old discovery lease
+        # labels do not qualify the current privileged methods.
+        if denials != ['own-service', 'StartControllerScan', 'StopControllerScan', 'SubmitScanning',
                        'SubmitStopScanning', 'SubmitStopAdvertising', 'SubmitAdvertising',
                        'unique-owner-write', 'interface-less-write', 'interface-less-read',
                        'Properties.Set', 'future-method', 'foreign-interface',
@@ -295,8 +290,10 @@ def assess_radio(console):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ['kernel-build', 'qemu', 'busybox', 'userspace', 'dbus-daemon', 'output']:
+    for name in ['kernel-build', 'qemu', 'qemu-data', 'busybox', 'userspace', 'dbus-daemon', 'output']:
         p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument('--ws73-module', type=Path, help='explicit signed module for a modular sealed kernel')
+    p.add_argument('--build-dir', type=Path, help='fixed incremental Cargo target; shared policy by default')
     p.add_argument('--radio-policy', action='store_true', help='basic policy and explicit synthetic cross-controller medium; never real RF')
     p.add_argument('--production-policy', action='store_true', help='installed D-Bus policy, root daemon, uid-1000 control group and uid-1001 observer')
     p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd current ioctl/retired ABI credential-drop matrix')
@@ -322,14 +319,17 @@ def main():
                 'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
     process = monitor = None
     try:
-        kernel = a.kernel_build.resolve() / 'arch/x86/boot/bzImage'
-        require_config(a.kernel_build.resolve() / '.config', a.kernel_authorization)
+        kernel = a.kernel_build.resolve() / 'artifacts/arch/x86/boot/bzImage'
+        manifest['kernel_inputs'] = checked_kernel_inputs(a.kernel_build.resolve(), a.ws73_module)
+        require_config(a.kernel_build.resolve() / 'artifacts/.config', a.kernel_authorization, a.ws73_module)
         userspace = a.userspace.resolve()
         if a.production_policy:
             policy = userspace / 'data/dbus/sparklink.conf'
             manifest['production_policy_input'] = file_record(policy)
-        manifest['inputs'] = [file_record(path) for path in [kernel, a.kernel_build / '.config', a.qemu, a.busybox,
+        manifest['inputs'] = [file_record(path) for path in [kernel, a.kernel_build / 'artifacts/.config', a.qemu, a.busybox,
             a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c', HERE / 'vm_test_utils.py']]
+        manifest['inputs'] += [file_record(p) for p in a.qemu_data.resolve(strict=True).rglob('*') if p.is_file()]
+        manifest['inputs'].append(file_record(HERE / 'run_native_open_test.py'))
         if a.kernel_authorization:
             manifest['inputs'] += [file_record(HERE / name) for name in ['kernel_authorization_test.c', 'retired_ioctl_cases.h', 'retired_ioctl_numbers.h']]
         if a.management_handoff:
@@ -349,60 +349,73 @@ def main():
             ['git', 'ls-files', '--modified', '--others', '--exclude-standard'], cwd=SOURCE, text=True).splitlines()
             if (SOURCE / x).is_file()]
         manifest['userspace_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=userspace, text=True).strip()
+        helper = userspace / 'tools/build_resources.py'
+        spec = importlib.util.spec_from_file_location('daemon_gate_build_resources', helper)
+        resources = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resources)
+        build_env, budget = resources.environment()
+        target_dir = (a.build_dir or resources.workspace() / resources.configuration()['cargo_native_development_target']).resolve()
+        build_env['CARGO_TARGET_DIR'] = str(target_dir)
+        manifest['build_resources'] = budget
+        manifest['build_resource_helper'] = file_record(helper)
+        manifest['target_directory'] = str(target_dir)
         with (output / 'build.log').open('w') as log:
-            build = ['cargo', 'build', '-p', 'slkd', '-p', 'slctl']
+            build = ['cargo', 'build', '--offline', '--locked', '-p', 'slkd', '-p', 'slctl']
             if a.diagnostic_tools:
                 build += ['-p','slkconfig']
             if a.snoop_tools:
                 build += ['-p','slkmon','-p','slkdump']
             if a.production_policy:
                 build += ['--bins', '--examples']
-            subprocess.run(build, cwd=userspace,
-                           stdout=log, stderr=subprocess.STDOUT, check=True)
+            build = resources.command_with_jobs(build, budget['jobs'])
+            manifest['build_command'] = build
+            with resources.build_lock() as build_fd:
+                subprocess.run(build, cwd=userspace, env=build_env, pass_fds=(build_fd,),
+                               stdout=log, stderr=subprocess.STDOUT, check=True)
         root = output / 'initramfs'
         (root / 'bin').mkdir(parents=True)
         shutil.copy2(a.busybox, root / 'bin/busybox')
         if a.kernel_authorization:
             with (output / 'kernel-authorization-build.log').open('w') as log:
-                subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+                subprocess.run(['gcc', '-O2', '-Wall', '-Wextra', '-Werror',
                     '-o', str(root / 'bin/kernel-authorization'), str(HERE / 'kernel_authorization_test.c')],
                     stdout=log, stderr=subprocess.STDOUT, check=True)
         if a.management_handoff:
             with (output / 'management-build.log').open('w') as log:
-                subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+                subprocess.run(['gcc', '-O2', '-Wall', '-Wextra', '-Werror',
                     '-o', str(root / 'bin/daemon-management'), str(HERE / 'daemon_management_test.c')],
                     stdout=log, stderr=subprocess.STDOUT, check=True)
         if a.snoop_tools:
             with (output / 'snoop-build.log').open('w') as log:
-                subprocess.run(['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+                subprocess.run(['gcc', '-O2', '-Wall', '-Wextra', '-Werror',
                     '-o', str(root / 'bin/daemon-snoop'), str(HERE / 'daemon_snoop_test.c')],
                     stdout=log, stderr=subprocess.STDOUT, check=True)
-        for name in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'su', 'id', 'grep',
+        for name in ['insmod', 'sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'su', 'id', 'grep',
                      'awk', 'seq', 'cat', 'pidof', 'chmod', 'mkdir']:
             (root / 'bin' / name).symlink_to('busybox')
         for name in ['slkd', 'slctl']:
-            copy_elf(userspace / 'target/debug' / name, root / 'bin' / name, root)
+            copy_elf(target_dir / 'debug' / name, root / 'bin' / name, root)
         if a.diagnostic_tools:
-            copy_elf(userspace / 'target/debug/slkconfig', root / 'bin/slkconfig', root)
+            copy_elf(target_dir / 'debug/slkconfig', root / 'bin/slkconfig', root)
         if a.snoop_tools:
             for name in ['slkmon','slkdump']:
-                copy_elf(userspace / 'target/debug' / name, root / 'bin' / name, root)
-            manifest['unstripped_snoop_programs'] = [file_record(userspace/'target/debug'/name) for name in ['slkmon','slkdump']]
+                copy_elf(target_dir / 'debug' / name, root / 'bin' / name, root)
+            manifest['unstripped_snoop_programs'] = [file_record(target_dir/'debug'/name) for name in ['slkmon','slkdump']]
             for name in ['slkd','slctl','slkmon','slkdump']:
                 subprocess.run(['strip','--strip-debug',str(root/'bin'/name)],check=True)
         if a.production_policy:
-            copy_elf(userspace / 'target/debug/examples/bus_policy_probe', root / 'bin/bus-policy-probe', root)
+            copy_elf(target_dir / 'debug/examples/bus_policy_probe', root / 'bin/bus-policy-probe', root)
             # Additional debug Rust ELF can exhaust a 512M guest's initramfs.
             # Strip only disposable copies; preserve original/program hashes.
-            manifest['unstripped_programs'] = [file_record(userspace / name) for name in
-                ['target/debug/slkd', 'target/debug/slctl', 'target/debug/examples/bus_policy_probe']]
+            manifest['unstripped_programs'] = [file_record(target_dir / name) for name in
+                ['debug/slkd', 'debug/slctl', 'debug/examples/bus_policy_probe']]
             for name in ['slkd', 'slctl', 'bus-policy-probe']:
                 subprocess.run(['strip', '--strip-debug', str(root / 'bin' / name)], check=True)
             manifest['guest_strip_debug'] = True
         if a.diagnostic_tools:
             # Always keep the disposable initramfs bounded, including session mode.
             subprocess.run(['strip','--strip-debug',str(root/'bin/slkconfig')],check=True)
-            manifest['unstripped_diagnostic_program']=file_record(userspace/'target/debug/slkconfig')
+            manifest['unstripped_diagnostic_program']=file_record(target_dir/'debug/slkconfig')
             manifest['guest_diagnostic_strip_debug'] = True
         copy_elf(a.dbus_daemon, root / 'bin/dbus-daemon', root)
         programs = ['slkd', 'slctl', 'dbus-daemon'] + (['bus-policy-probe'] if a.production_policy else []) + (['kernel-authorization'] if a.kernel_authorization else [])
@@ -416,6 +429,17 @@ def main():
         for name in ['proc', 'sys', 'dev', 'etc', 'tmp']:
             (root / name).mkdir()
         (root / 'tmp').chmod(0o1777)
+        for name in ['kernel-authorization', 'daemon-management', 'daemon-snoop']:
+            program = root / 'bin' / name
+            if program.is_file():
+                # Same shared ELF staging as Native-open; no host static libc required.
+                temporary = output / (name + '-compiled')
+                shutil.move(program, temporary)
+                manifest['inputs'] += [file_record(p) for p in copy_elf(temporary, program, root)]
+        if a.ws73_module:
+            manifest['ws73_module'] = checked_ws73_module(a.ws73_module, a.kernel_build)
+            manifest['inputs'].append(manifest['ws73_module']['file'])
+            shutil.copy2(a.ws73_module, root / 'ws73.ko')
         (root / 'etc/passwd').write_text('root:x:0:0:root:/:/bin/sh\nws73:x:1000:1000:test:/tmp:/bin/sh\n')
         (root / 'etc/group').write_text('root:x:0:\nws73:x:1000:ws73\n')
         (root / 'etc/shadow').write_text('root::0:0:99999:7:::\nws73::0:0:99999:7:::\n')
@@ -474,6 +498,11 @@ poweroff -f
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin','export PATH=/bin\nexport SPARKLINK_TEST_DIAGNOSTIC_TOOLS=1'))
         if a.snoop_tools:
             f = root / 'init'; f.write_text(f.read_text().replace('export PATH=/bin','export PATH=/bin\nexport SPARKLINK_TEST_SNOOP_TOOLS=1'))
+        if a.ws73_module:
+            init = root / 'init'
+            init.write_text(init.read_text().replace('for n in $(seq 1 100); do [ -c /dev/sparklink ]',
+                'insmod /ws73.ko || { echo DAEMON_FAILURE: module; dmesg; poweroff -f; exit 1; }\n'
+                'for n in $(seq 1 100); do [ -c /dev/sparklink ]'))
         (root / 'init').chmod(0o755)
         archive = output / 'initramfs.cpio.gz'
         with (output / 'pack.log').open('wb') as log, archive.open('wb') as packed:
@@ -490,7 +519,7 @@ poweroff -f
         with tempfile.TemporaryDirectory(prefix='sparklink-daemon-qmp-') as tmp:
             socket = Path(tmp) / 'monitor.sock'
             console = output / 'console.log'
-            command = [str(a.qemu.resolve()), '-kernel', str(kernel), '-initrd', str(archive),
+            command = [str(a.qemu.resolve()), '-L', str(a.qemu_data.resolve()), '-kernel', str(kernel), '-initrd', str(archive),
                 '-append', 'console=ttyS0 loglevel=5 log_buf_len=4M panic=1 oops=panic',
                 '-serial', f'file:{console}', '-display', 'none', '-no-reboot', '-m', '512M', '-smp', '2',
                 '-qmp', f'unix:{socket},server=on,wait=off', '-device', 'qemu-xhci,id=xhci',

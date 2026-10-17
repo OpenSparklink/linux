@@ -206,8 +206,12 @@ int main(int argc, char **argv)
 	struct sle_mgmt_stats stats_before, stats_after;
 	__u16 mask_before, mask_after;
 	if (fd < 0 || ioctl(fd, SL_IOCTL_DEV_SELECT, &selected) || ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &before) ||
-	    before.flags != 1 || ioctl(fd, SL_IOCTL_MGMT_STATS, &stats_before) || ioctl(fd, SL_IOCTL_DEV_LIST, &mask_before))
+	    before.flags != 1 || ioctl(fd, SL_IOCTL_DEV_LIST, &mask_before))
 		return failure("baseline Ready/management state");
+	memset(&stats_before, 0xa5, sizeof(stats_before)); stats_after = stats_before;
+	if (ioctl(fd, SL_IOCTL_MGMT_STATS, &stats_after) != -1 || errno != EOPNOTSUPP ||
+	    memcmp(&stats_before, &stats_after, sizeof(stats_before)))
+		return failure("Native must not expose retired zero-counter projections");
 	uid_t uids[] = { 1001, 1000, 0 }; gid_t gids[] = { 1001, 1002, 0 };
 	for (unsigned i = 0; i < COUNT(uids); ++i) {
 		pid_t pid = fork();
@@ -218,7 +222,7 @@ int main(int argc, char **argv)
 	}
 	after = (struct sle_controller_snapshot){ .version = 1, .generation = gen };
 	if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &after) || memcmp(&before, &after, sizeof(before)) ||
-	    ioctl(fd, SL_IOCTL_MGMT_STATS, &stats_after) || memcmp(&stats_before, &stats_after, sizeof(stats_before)) ||
+	    (ioctl(fd, SL_IOCTL_MGMT_STATS, &stats_after) != -1 || errno != EOPNOTSUPP) || memcmp(&stats_before, &stats_after, sizeof(stats_before)) ||
 	    ioctl(fd, SL_IOCTL_DEV_LIST, &mask_after) || mask_before != mask_after)
 		return failure("denied calls changed registration, snapshot or command admission");
 	close(fd);

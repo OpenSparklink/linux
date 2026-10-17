@@ -413,3 +413,25 @@ fresh/prefix/idempotent patch application and drift refusal, optionally against
 the actual binary in a paused TCG guest matching no physical device. Neither
 check qualifies live in-flight cancellation, encryption, peer delivery or
 natural recovery; those need separate VM-only real-device gates.
+
+### Current Native lifecycle and credential runners
+
+`run_native_open_test.py` and `run_daemon_lifecycle.py` consume the sealed
+`NATIVE_BUILD_ARTIFACTS_VERIFIED` receipt and verify every input's hash and size.
+Pass `--qemu-data` explicitly; modular kernels also require a matching signed
+`--ws73-module`. Build the Native open fixture separately under the shared
+resource budget and pass `--fixture-module`; runners never build or load a host
+module. See `--help` and the current commands in `ws73-development.rst`.
+
+`check-ws73-model-chip.py --output <fresh-directory> --sanitize` exercises the
+actual model dispatch/queue and production HCC/request/reply parser. Its clock
+and controller state are explicit fixtures. The runtime chip response is a
+synthetic U/USB sample, not ROM identification or chip authentication. The
+full-frame check retains the rejected PLAT subtype counterexample; payload-only
+checking cannot establish HCC compatibility. No command fallback is generated.
+
+The credential runner can exercise the production policy on a private bus;
+this does not establish system-bus installation, udev deployment, real firmware,
+RF delivery or nonmanual recovery. Native management statistics remain
+unsupported. Typed replay and immutable snapshot checks replace the obsolete
+counter projection; they do not prove physical debt conservation.

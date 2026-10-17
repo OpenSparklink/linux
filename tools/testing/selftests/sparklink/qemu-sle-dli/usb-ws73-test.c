@@ -130,6 +130,7 @@ static void queue_frame(USBWs73Test *s, uint8_t service, uint8_t queue,
     s->packet_size[tail] = 92 + slot;
     put32(p, 2); put32(p + 4, 92 + slot); put16(p + 12, slot);
     p[92] = service << 4; p[93] = queue; put16(p + 94, length);
+    if (service == 1 && queue == 9) { p[92] |= 9; } /* PLAT_MSG_TRANSFER */
     if (service == 10 && s->runtime_sle_subtypes) { p[92] |= (s->commands - 1) & 15; }
     memcpy(p + 96, data, length);
 }
@@ -406,6 +407,16 @@ static bool outgoing(USBWs73Test *s, const uint8_t *p, size_t n)
     }
     if (le32(p) || n < 128 || le32(p + 4) != n) { return false; }
     if (p[64] == 0x19 && p[65] == 9) {
+        if (le16(p + 68) == 16) {
+            /* Explicit runtime-only U/USB fixture for SDK plat_misc's
+             * GET_CHIP_TYPE. No ROM, chip authentication or firmware runs.
+             * Unknown/malformed requests still stall; never default them U. */
+            uint8_t reply[14] = { 10, 0, 10, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0 };
+            if (!s->opened || !s->pm || !s->custom || n != 128 ||
+                le16(p + 66) != 32 || le16(p + 70) != 1 || p[72]) { return false; }
+            queue_frame(s, 1, 9, reply, sizeof(reply));
+            return true;
+        }
         if (n != 128 || le16(p + 66) != 32 || le16(p + 68) || le16(p + 70) != 4) { return false; }
         s->pm = true;
         return true;

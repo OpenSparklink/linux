@@ -180,12 +180,14 @@ static int query(int fd, const struct sci_dev_info *info, unsigned int opcode, u
         management_mode(fd, generation, SLE_MANAGEMENT_DIAGNOSTIC)) return -1;
     struct sle_diagnostic_submit cmd = { .version = 1, .generation = generation,
         .request_id = ++request_id, .timeout_ms = 5000, .opcode = opcode, .action = 1 };
-    struct sle_mgmt_stats before, after;
+    struct sle_mgmt_stats unsupported, unchanged;
     unsigned int length = opcode == 0x0403 ? 10 : opcode == 0x0404 ? 5 : 6;
     double deadline = now() + 5;
-    if (ioctl(fd, SL_IOCTL_MGMT_STATS, &before) || before.pending ||
+    memset(&unsupported, 0xa5, sizeof(unsupported)); unchanged = unsupported;
+    if (ioctl(fd, SL_IOCTL_MGMT_STATS, &unsupported) != -1 || errno != EOPNOTSUPP ||
+        memcmp(&unsupported, &unchanged, sizeof(unsupported)) ||
         ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) || !cmd.seq)
-        return fail("typed query admission/quiet baseline");
+        return fail("typed query admission/Native stats refusal");
     struct sle_diagnostic_result result;
     for (;;) {
         result = (struct sle_diagnostic_result){ .version = 1, .generation = generation, .seq = cmd.seq };
@@ -206,10 +208,12 @@ static int query(int fd, const struct sci_dev_info *info, unsigned int opcode, u
     }
     if (!status && opcode == 0x0404 && memcmp(result.data, "\x02\x01\x00\x01\x20", 5))
         return fail("complete version tuple");
-    if (ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || after.pending ||
-        after.total_submitted != before.total_submitted + 1 ||
-        after.total_resolved != before.total_resolved + 1 || after.total_timeouts != before.total_timeouts)
-        return fail("typed transaction accounting");
+    struct sle_diagnostic_submit replay = cmd; replay.seq = 0;
+    if (ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &replay) || memcmp(&replay, &cmd, sizeof(cmd)))
+        return fail("same author request must replay the original admission");
+    struct sle_diagnostic_result repeated = { .version = 1, .generation = generation, .seq = cmd.seq };
+    if (ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &repeated) || memcmp(&repeated, &result, sizeof(result)))
+        return fail("typed result must remain author-bound and non-destructive");
     return 0;
 }
 
@@ -220,15 +224,15 @@ static int exercise(int fd, const struct sci_dev_info *info)
         management_mode(fd, generation, SLE_MANAGEMENT_DIAGNOSTIC)) return -1;
     struct sle_diagnostic_submit invalid = { .version = 1, .generation = generation,
         .request_id = UINT64_MAX, .timeout_ms = 5000, .opcode = 0x0401, .action = 1 };
-    struct sle_mgmt_stats before, after;
-    if (ioctl(fd, SL_IOCTL_MGMT_STATS, &before)) return fail("typed invalid baseline");
+    struct sle_controller_snapshot before = { .version = 1, .generation = generation }, after = before;
+    if (ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &before)) return fail("typed invalid snapshot baseline");
     if (ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &invalid) != -1 || errno != EOPNOTSUPP)
         return fail("typed unsupported opcode");
     invalid.opcode = 0x0403;
     invalid.timeout_ms = 5001;
     if (ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &invalid) != -1 || errno != EINVAL ||
-        ioctl(fd, SL_IOCTL_MGMT_STATS, &after) || memcmp(&before, &after, sizeof(before)))
-        return fail("typed invalid deadline changed admission/credit");
+        ioctl(fd, SL_IOCTL_CONTROLLER_SNAPSHOT, &after) || memcmp(&before, &after, sizeof(before)))
+        return fail("typed invalid deadline changed controller snapshot");
     for (unsigned int i = 0; i < 8; i++)
         if (query(fd, info, 0x0406, 0) || query(fd, info, 0x0403, 0)) return -1;
     if (query(fd, info, 0x0404, 0) || query(fd, info, 0x0402, 0)) return -1;

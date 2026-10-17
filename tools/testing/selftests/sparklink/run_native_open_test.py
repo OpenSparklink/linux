@@ -13,22 +13,49 @@ import shutil
 import subprocess
 
 from qemu_verdict import KERNEL_FAULT
-from vm_test_utils import file_record
+from vm_test_utils import file_record, copy_elf
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
 
 
-def checked_kernel_inputs(build):
-    config = (build / '.config').read_text()
-    for symbol in ['RUST', 'SPARKLINK', 'SPARKLINK_WS73_USB', 'MODULES']:
+def checked_kernel_inputs(build, ws73_module=None):
+    """Consume the existing sealed native-artifact receipt, not mutable O=."""
+    manifest_path = build / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get('status') != 'NATIVE_BUILD_ARTIFACTS_VERIFIED':
+        raise RuntimeError('verified native build artifacts required')
+    config = (build / 'artifacts/.config').read_text()
+    for symbol in ['RUST', 'SPARKLINK', 'MODULES']:
         if f'CONFIG_{symbol}=y\n' not in config:
             raise RuntimeError('missing kernel configuration: ' + symbol)
-    manifest = json.loads((build / 'manifest.json').read_text())
-    for record in manifest['artifacts']:
-        if file_record(Path(record['path'])) != record:
+    if 'CONFIG_SPARKLINK_WS73_USB=y\n' not in config:
+        if 'CONFIG_SPARKLINK_WS73_USB=m\n' not in config or ws73_module is None:
+            raise RuntimeError('modular WS73 requires the explicit matching module')
+    records = []
+    for name, original in manifest['inputs'].items():
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError('invalid sealed artifact path')
+        path = build / ('vmlinux' if name == 'vmlinux' else 'artifacts/' + name)
+        record = file_record(path)
+        if record['sha256'] != original['sha256'] or path.stat().st_size != original['size']:
             raise RuntimeError('kernel artifact does not match compiled manifest')
-    return [file_record(build / 'manifest.json'), *manifest['artifacts']]
+        records.append(record)
+    required = {'.config', 'arch/x86/boot/bzImage', 'Module.symvers', 'include/config/kernel.release'}
+    if not required <= manifest['inputs'].keys():
+        raise RuntimeError('required sealed kernel artifact missing')
+    return [file_record(manifest_path), *records]
+
+
+def checked_ws73_module(module, build):
+    info = {name: subprocess.check_output(['modinfo', '-F', name, str(module)], text=True).strip()
+            for name in ['name', 'vermagic', 'signer', 'depends']}
+    release = (build / 'artifacts/include/config/kernel.release').read_text().strip()
+    if (info['name'] != 'sparklink_ws73_usb' or not info['signer'] or info['depends']
+            or info['vermagic'].split()[0] != release):
+        raise RuntimeError('matching signed standalone WS73 module required')
+    return dict(file=file_record(module), info=info)
 
 
 def assess(console, qemu_exit):
@@ -165,9 +192,12 @@ def assess_userfault(console, qemu_exit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kernel-build', type=Path, required=True)
-    parser.add_argument('--module-build', type=Path)
-    parser.add_argument('--fixture-module', type=Path)
+    parser.add_argument('--fixture-module', type=Path, required=True,
+                        help='matching signed test module; build separately under the shared CPU budget')
+    parser.add_argument('--ws73-module', type=Path,
+                        help='explicit signed WS73 module for CONFIG_SPARKLINK_WS73_USB=m')
     parser.add_argument('--qemu', type=Path, required=True)
+    parser.add_argument('--qemu-data', type=Path, required=True)
     parser.add_argument('--busybox', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--userfault', action='store_true', help='management usercopy WP gate; needs CONFIG_USERFAULTFD=y')
@@ -177,9 +207,10 @@ def main():
     manifest = dict(status='RUNNING', physical_acceptance=False,
                     scope='blocked native callback fixture and synthetic WS73 survivor')
     try:
-        kernel = args.kernel_build.resolve() / 'arch/x86/boot/bzImage'
-        manifest['kernel_inputs'] = checked_kernel_inputs(args.kernel_build.resolve())
-        if args.userfault and 'CONFIG_USERFAULTFD=y\n' not in (args.kernel_build / '.config').read_text():
+        kernel = args.kernel_build.resolve() / 'artifacts/arch/x86/boot/bzImage'
+        config = args.kernel_build / 'artifacts/.config'
+        manifest['kernel_inputs'] = checked_kernel_inputs(args.kernel_build.resolve(), args.ws73_module)
+        if args.userfault and 'CONFIG_USERFAULTFD=y\n' not in config.read_text():
             raise RuntimeError('userfault gate needs CONFIG_USERFAULTFD=y')
         manifest['userfault'] = args.userfault
         if args.userfault:
@@ -191,26 +222,22 @@ def main():
         if args.userfault:
             sources += [HERE / 'ws73_native_rpc_fault_test.c']
         manifest['sources'] = [file_record(p) for p in sources]
-        manifest['inputs'] = [file_record(p) for p in [kernel, args.kernel_build / '.config',
+        manifest['inputs'] = [file_record(p) for p in [kernel, config,
                                                       args.qemu, args.busybox]]
-        if args.fixture_module:
-            module = args.fixture_module.resolve()
-            manifest['module_input'] = file_record(module)
-        else:
-            build = (args.module_build or args.kernel_build).resolve()
-            if hashlib.sha256((build / '.config').read_bytes()).digest() != \
-                    hashlib.sha256((args.kernel_build / '.config').read_bytes()).digest():
-                raise RuntimeError('module/kernel config mismatch')
-            module_build = output / 'module-build'
-            shutil.copytree(HERE / 'native-open', module_build)
-            command = ['make', '-C', str(SOURCE), 'O=' + str(build), 'LLVM=1',
-                       'CC=/usr/bin/clang', 'HOSTCC=/usr/bin/clang',
-                       'M=' + str(module_build), 'modules']
-            manifest['module_compile_args'] = command
-            manifest['module_symvers'] = file_record(build / 'Module.symvers')
-            with (output / 'module-build.log').open('wb') as log:
-                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
-            module = module_build / 'native_open_fixture.ko'
+        data_inputs = sorted(p for p in args.qemu_data.resolve(strict=True).rglob('*') if p.is_file())
+        if not data_inputs:
+            raise RuntimeError('QEMU data inputs must not be empty')
+        manifest['inputs'] += [file_record(p) for p in data_inputs]
+        module = args.fixture_module.resolve(strict=True)
+        fixture_info = {name: subprocess.check_output(['modinfo', '-F', name, str(module)], text=True).strip()
+                        for name in ['name', 'vermagic', 'signer', 'depends']}
+        release = (args.kernel_build / 'artifacts/include/config/kernel.release').read_text().strip()
+        if (fixture_info['name'] != 'native_open_fixture' or not fixture_info['signer']
+                or fixture_info['depends'] or fixture_info['vermagic'].split()[0] != release):
+            raise RuntimeError('matching signed standalone Native open fixture required')
+        manifest['module_input'] = file_record(module)
+        manifest['module_info'] = fixture_info
+        manifest['inputs'].append(manifest['module_input'])
         initroot = output / 'initramfs'
         for name in ['bin', 'dev', 'proc', 'sys', 'lib/firmware/sparklink/ws73']:
             (initroot / name).mkdir(parents=True)
@@ -218,12 +245,19 @@ def main():
         for applet in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'insmod', 'rmmod']:
             (initroot / 'bin' / applet).symlink_to('busybox')
         shutil.copy2(module, initroot / 'native_open_fixture.ko')
+        if args.ws73_module:
+            manifest['ws73_module'] = checked_ws73_module(args.ws73_module, args.kernel_build)
+            manifest['inputs'].append(manifest['ws73_module']['file'])
+            shutil.copy2(args.ws73_module, initroot / 'ws73.ko')
         source = HERE / ('ws73_native_rpc_fault_test.c' if args.userfault else 'ws73_native_open_test.c')
-        command = ['gcc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
-                   *(['-pthread'] if args.userfault else []), str(source), '-o', str(initroot / 'bin/open_test')]
+        command = ['gcc', '-O2', '-Wall', '-Wextra', '-Werror',
+                   *(['-pthread'] if args.userfault else []), str(source), '-o', str(output / 'open-test')]
         manifest['guest_compile_args'] = command
         with (output / 'guest-build.log').open('wb') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        dynamic_inputs = copy_elf(output / 'open-test', initroot / 'bin/open_test', initroot)
+        manifest['inputs'] += [file_record(p) for p in dynamic_inputs]
+        manifest['guest_compiler'] = subprocess.check_output(['gcc', '--version'], text=True).splitlines()[0]
         firmware = initroot / 'lib/firmware/sparklink/ws73'
         (firmware / 'bsle_custom.bin').write_bytes(bytes(range(140)))
         (firmware / 'pm_config.bin').write_bytes(bytes.fromhex('01000000'))
@@ -247,6 +281,11 @@ dmesg
 echo "RUNTIME_KERNEL_LOG_END"
 poweroff -f
 ''')
+        if args.ws73_module:
+            init = initroot / 'init'
+            init.write_text(init.read_text().replace('insmod /native_open_fixture.ko',
+                'insmod /ws73.ko || { echo NATIVE_FAILURE: ws73-module; poweroff -f; exit 1; }\n'
+                'insmod /native_open_fixture.ko'))
         (initroot / 'init').chmod(0o755)
         manifest['guest_files'] = [file_record(p) for p in sorted(initroot.rglob('*'))
                                    if p.is_file() and not p.is_symlink()]
@@ -259,7 +298,8 @@ poweroff -f
         archive.write_bytes(gzip.compress(packed, mtime=0))
         manifest['initramfs'] = file_record(archive)
         console = output / 'console.log'
-        command = [str(args.qemu.resolve()), '-kernel', str(kernel), '-initrd', str(archive),
+        command = [str(args.qemu.resolve()), '-L', str(args.qemu_data.resolve()),
+                   '-kernel', str(kernel), '-initrd', str(archive),
                    '-append', 'console=ttyS0 loglevel=5 log_buf_len=4M panic=1 oops=panic',
                    '-serial', 'file:' + str(console), '-display', 'none', '-no-reboot',
                    '-m', '256M', '-smp', '2', '-device', 'qemu-xhci,id=xhci',
@@ -280,7 +320,7 @@ poweroff -f
         for record in manifest['sources'] + manifest['inputs']:
             if file_record(Path(record['path'])) != record:
                 manifest['errors'].append('input changed during test: ' + record['path'])
-        manifest['kernel_inputs_after'] = checked_kernel_inputs(args.kernel_build.resolve())
+        manifest['kernel_inputs_after'] = checked_kernel_inputs(args.kernel_build.resolve(), args.ws73_module)
         if manifest['kernel_inputs'] != manifest['kernel_inputs_after']:
             manifest['errors'].append('compiled kernel inputs changed during test')
         manifest['status'] = 'FAIL' if manifest['errors'] else 'PASS'

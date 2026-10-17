@@ -18,7 +18,7 @@ import time
 
 
 def body(source, name):
-    match = re.search(r'static (?:void|int|bool|unsigned|uint32_t) (?:LIBUSB_CALL )?'+re.escape(name)+r'\([^;]*?\)\n\{', source)
+    match = re.search(r'static (?:void|int|bool|unsigned(?: int)?|uint32_t) (?:LIBUSB_CALL )?'+re.escape(name)+r'\([^;]*?\)\s*\{', source)
     if not match:
         raise ValueError('missing production function: '+name)
     depth = 1

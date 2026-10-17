@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import subprocess
+import shutil
+import re
 import time
 HERE = Path(__file__).resolve().parent
 
@@ -39,3 +41,17 @@ def load_qmp():
     return module.Qmp
 
 
+
+def copy_elf(source, target, root):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    inputs = [Path(source)]
+    dependencies = subprocess.check_output(['ldd', str(source)], text=True)
+    for dependency in re.findall(r'(?:=>\s+)?(/[^\s()]+)', dependencies):
+        path = Path(dependency)
+        if path.is_file():
+            dest = root / str(path).lstrip('/')
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+            inputs.append(path)
+    return inputs

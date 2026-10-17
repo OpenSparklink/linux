@@ -621,7 +621,9 @@ is now supplied by userspace; Host Ready alone cannot certify its RF behavior.
 The reproducible software integration gate is::
 
   python3 tools/testing/selftests/sparklink/run_daemon_lifecycle.py \
-    --kernel-build <build-dir> --qemu <model-enabled-qemu> \
+    --kernel-build <sealed-native-artifact-directory> \
+    --ws73-module <matching-signed-ws73-module-if-modular> \
+    --qemu <model-enabled-qemu> --qemu-data <matching-qemu-data-directory> \
     --busybox <static-busybox> --userspace <sparklink-checkout> \
     --dbus-daemon <dbus-daemon> --output <new-evidence-directory>
 
@@ -647,7 +649,7 @@ The verifier rejects wrong addresses/generations, stale sequences, timeouts,
 loss, failed/missing/duplicate completions and misplaced lifecycle evidence.
 
 This model is an explicit synthetic medium, not an RF recording. Production
-policy does not reside in the model: libsparklink supplies full typed requests,
+policy does not reside in the model: slkd uses slk-native for typed requests,
 the driver independently validates/encodes them, and actual firmware status
 remains authoritative. The real North Star and four-controller parallel pairs
 still require physical devices, qualified configuration and receiver USB/HCC/DLI
@@ -805,16 +807,27 @@ must keep its index reserved; retained old descriptors and stale unregister
 identities are checked again while later registrations reuse that index.
 The test also requires a clean fixture module unload and full kernel log.
 
-Run with an already compiled matching kernel build tree (for Module.symvers
-and generated headers), a frozen image/config manifest, test QEMU and BusyBox::
+Build the fixture module separately against the matching kernel build tree
+under the shared build-resource budget, then use the sealed native-artifact
+directory (``manifest.json`` plus ``artifacts/`` and ``vmlinux``), explicit
+signed modules, matching QEMU data and BusyBox::
 
   python3 tools/testing/selftests/sparklink/run_native_open_test.py \
     --kernel-build /absolute/frozen-image \
-    --module-build /absolute/kernel-build \
-    --qemu /absolute/qemu-system-x86_64 \
+    --fixture-module /absolute/matching/native_open_fixture.ko \
+    --ws73-module /absolute/matching/sparklink_ws73_usb.ko \
+    --qemu /absolute/qemu-system-x86_64 --qemu-data /absolute/qemu-data \
     --busybox /absolute/busybox --output /absolute/new-test-output
 
-The fixture is loaded only inside that guest. Historical comparison needs a
+Omit ``--ws73-module`` only when the driver is built in. Native statistics
+projections are unsupported; the current probe checks that refusal and typed
+request/result replay, not historical global counter increments. Dynamic ELF
+dependencies are staged into the guest and hashed. The fixture and driver are
+loaded only inside that guest. Add ``--userfault`` for the two kernel-origin
+usercopy barriers. These gates do not qualify physical WS73 or natural recovery.
+
+The following measurements describe historical artifacts, not the current
+image. Historical comparison needs a
 module compiled for the old kernel's release; do not force-load a mismatched
 module. The final guest executable and fixture C object are byte-identical in
 the #71 comparison; module release metadata differs. The old snapshot waits
