@@ -19,10 +19,15 @@ struct sparklink_virtual_status {
 	 * Neither means Host resolution, controller completion or peer delivery.
 	 */
 	__u64 generation, submitted, delivered, dropped, failed;
+	/* Callback has returned from production ingress, not protocol completion
+	 * or Host acceptance. Independent of delivered's attempt counter.
+	 */
+	__u64 reply_callbacks_returned;
 	__u32 id, live, pending, reserved;
 };
 
 #define SPARKLINK_VIRTUAL_CONFIG _IOW('V', 0, struct sparklink_virtual_control)
+/* The former 56-byte status command is retired, not a compatibility facade. */
 #define SPARKLINK_VIRTUAL_STATUS _IOR('V', 1, struct sparklink_virtual_status)
 /* Explicit TEST backend only: one well-framed standard hardware-error event.
  * The input is a u32 in [0,255]. No production Native ioctl injection exists.

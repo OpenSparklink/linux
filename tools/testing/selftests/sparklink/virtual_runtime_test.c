@@ -270,6 +270,12 @@ static struct controller diagnostic_fd_lifetime(struct controller c, struct cont
 static void hardware_error_fault(struct controller peer)
 {
     struct controller c = create();
+    _Static_assert(sizeof(struct sparklink_virtual_status) == 64, "private status callback barrier ABI");
+    unsigned char retired_status[56], untouched[56];
+    memset(retired_status, 0xa5, sizeof(retired_status)); memcpy(untouched, retired_status, sizeof(untouched));
+    CHECK(ioctl(c.control, _IOC(_IOC_READ, 'V', 1, 56), retired_status) == -1 && errno == ENOTTY);
+    CHECK(!memcmp(retired_status, untouched, sizeof(untouched)));
+    CHECK(ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, (void *)(uintptr_t)1) == -1 && errno == EFAULT);
     uint32_t code = 256;
     CHECK(ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, &code) == -1 && errno == EINVAL);
     CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
@@ -308,12 +314,11 @@ static void hardware_error_fault(struct controller peer)
     struct sparklink_virtual_status physical;
     do {
         CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &physical));
-        if (physical.delivered) break;
+        if (physical.reply_callbacks_returned) break;
         CHECK(now() < deadline); usleep(1000);
     } while (1);
-    CHECK(physical.submitted == 1 && physical.delivered == 1 && !physical.pending);
+    CHECK(physical.submitted == 1 && physical.delivered == 1 && physical.reply_callbacks_returned == 1 && !physical.pending);
     code = 8; CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, &code));
-    usleep(10000);
     snap = snapshot(c); CHECK(snap.flags == SLE_CONTROLLER_FAULT && snap.error == -EIO && !snap.command_credits);
     CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &stats) && !stats.pending && stats.total_resolved == 2);
     for (unsigned i=0; i<2; i++) {
@@ -326,7 +331,7 @@ static void hardware_error_fault(struct controller peer)
     CHECK(replacement.status.id == c.status.id && replacement.status.generation > c.status.generation);
     query(replacement, 0x0406, 6); stale(c);
     CHECK(!close(replacement.control) && !close(replacement.fd) && !close(c.fd));
-    printf("VIRTUAL_HARDWARE_ERROR_PASS: id=%u generation=%llu authors=2 submitted=1 late_reply=ignored credit=0 inherited_CAP=EPERM invalid=EINVAL peer=1 reuse=1 raw_code=7 no_rf=1\n", c.status.id, (unsigned long long)c.status.generation);
+    printf("VIRTUAL_HARDWARE_ERROR_PASS: id=%u generation=%llu authors=2 submitted=1 late_reply=ignored callback_return=1 credit=0 inherited_CAP=EPERM invalid=EINVAL bad_pointer=EFAULT retired_status=ENOTTY peer=1 reuse=1 raw_code=7 no_rf=1\n", c.status.id, (unsigned long long)c.status.generation);
 }
 
 static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
@@ -348,7 +353,7 @@ static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
 		struct sparklink_virtual_status status;
 		do {
 			CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &status));
-			if (status.delivered) break;
+			if (status.reply_callbacks_returned) break;
 			CHECK(now() < deadline);
 			usleep(1000);
 		} while (1);

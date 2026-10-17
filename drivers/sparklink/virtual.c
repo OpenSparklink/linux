@@ -24,6 +24,7 @@ struct sparklink_virtual {
 	struct sparklink_native_info info;
 	struct sparklink_virtual_control control;
 	u64 submitted, delivered, dropped, failed;
+	u64 reply_callbacks_returned;
 	u8 reply[18];
 	int reply_length;
 	bool live, pending;
@@ -66,6 +67,9 @@ static void virtual_deliver(struct work_struct *work)
 	 */
 	sparklink_backend_standard_receive(identity.id, identity.generation,
 					    reply, length, 1, 0);
+	mutex_lock(&v->lock);
+	v->reply_callbacks_returned++;
+	mutex_unlock(&v->lock);
 }
 
 static int virtual_open(void *context, u16 id, u64 generation)
@@ -252,6 +256,7 @@ static long virtual_control_ioctl(struct file *file, unsigned int cmd, unsigned 
 			.generation = v->identity.generation, .id = v->identity.id,
 			.submitted = v->submitted, .delivered = v->delivered,
 			.dropped = v->dropped, .failed = v->failed,
+			.reply_callbacks_returned = v->reply_callbacks_returned,
 			.live = v->live, .pending = v->pending,
 		};
 		mutex_unlock(&v->lock);
