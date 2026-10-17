@@ -18,8 +18,8 @@ def run(output):
     sources = {n:(net/n).read_text() for n in ['sle_native.rs','sle_dli.rs','sle_uapi.rs']}
     fixture = (here/'backend_bus_fixture.rs').read_text()
     dli=sources['sle_dli.rs']; native=sources['sle_native.rs']
-    fixture=fixture.replace('// @@BUS_ENUM@@','#[repr(u8)]\n#[derive(Copy,Clone,Debug,PartialEq,Eq)]\n'+block(dli,dli.index('pub enum SleBus {')))
-    fixture=fixture.replace('// @@INFO_STRUCT@@',block(dli,dli.index('pub struct SleControllerInfo {')))
+    fixture=fixture.replace('// @@BUS_ENUM@@','#[repr(u8)]\n#[derive(Copy,Clone,Debug,PartialEq,Eq)]\n'+block(dli,dli.index('pub(crate) enum SleBus {')))
+    fixture=fixture.replace('// @@INFO_STRUCT@@',block(dli,dli.index('pub(crate) struct SleControllerInfo {')))
     fixture=fixture.replace('// @@NATIVE_INFO@@','#[derive(Clone,Copy)]\n'+block(native,native.index('pub(crate) struct NativeInfo {')))
     fixture=fixture.replace('// @@PROJECTION@@',function(native[native.index('impl SleController for NativeController'):],'info'))
     fixture=fixture.replace('// @@CONVERSION@@',function(native,'backend_bus'))

@@ -35,8 +35,8 @@ TEST_PROGS += run_usb_binding.py
 TEST_PROGS += run_standard_provider.py
 TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
-TEST_PROGS += test_virtual_vm_verdict.py
-TEST_FILES += run_virtual_vm.py
+TEST_PROGS += test_virtual_vm_verdict.py run_standard_events.py
+TEST_FILES += run_virtual_vm.py standard_event_fixture.rs retired-standard-events
 
 include ../lib.mk
 

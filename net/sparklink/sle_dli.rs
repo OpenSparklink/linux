@@ -8,17 +8,16 @@
 //! its worker submits through CommandPort and actual commit tickets.
 //! The small SleController view supplies metadata and joined close only.
 //!
-//! The DLI packet model uses typed channels identical to the standard:
-//!   - Command (Host → Controller): opcode + parameters
-//!   - Event   (Controller → Host): event code + parameters
-//!   - Async unicast data: link_id + payload
-//!   - Sync unicast data:  link_id + payload
-//!   - Async multicast data
+//! Production event values have an explicit Host or Native worker consumer.
+//! Standard-profile command replies/credits and critical HardwareError are
+//! supported; unconsumed historical business events are isolated in selftests.
+//! Connected WS73 data and security retain their Native lifetime-bound ingress;
+//! packet names do not imply support for synchronous or multicast modes.
 //!
 //! Opcode encoding follows TXS-10003-2025: upper 6 bits = command
 //! group (OGF), lower 10 bits = command within the group (OCF).
 
-#![allow(dead_code, unreachable_pub)]
+#![deny(dead_code, unreachable_pub)]
 
 use kernel::alloc::KVec;
 use kernel::prelude::*;
@@ -47,15 +46,6 @@ pub(crate) struct ControllerEventRing {
 }
 
 impl ControllerEventRing {
-    pub(crate) fn new() -> Self {
-        Self {
-            events: [const { (None, None) }; CTRL_EVENT_RING_SIZE],
-            head: 0,
-            tail: 0,
-            dropped: 0,
-        }
-    }
-
     /// Initialize the ingress array in its final heap allocation.
     pub(crate) fn new_boxed() -> Result<KBox<Self>> {
         KBox::init(init!(Self {
@@ -79,11 +69,6 @@ impl ControllerEventRing {
         true
     }
 
-    /// Push an event without device routing (processed on active device).
-    pub(crate) fn push(&mut self, ev: SleEvent) {
-        self.push_tagged(None, ev);
-    }
-
     /// Pop the next event along with its source device id.
     pub(crate) fn pop_tagged(&mut self) -> Option<(Option<u16>, SleEvent)> {
         if self.head == self.tail {
@@ -92,14 +77,6 @@ impl ControllerEventRing {
         let (dev_id, ev) = core::mem::take(&mut self.events[self.head]);
         self.head = (self.head + 1) % CTRL_EVENT_RING_SIZE;
         ev.map(|e| (dev_id, e))
-    }
-
-    pub(crate) fn pop(&mut self) -> Option<SleEvent> {
-        self.pop_tagged().map(|(_, ev)| ev)
-    }
-
-    pub(crate) fn pending(&self) -> usize {
-        (self.tail + CTRL_EVENT_RING_SIZE - self.head) % CTRL_EVENT_RING_SIZE
     }
 }
 
@@ -111,7 +88,7 @@ impl ControllerEventRing {
 /// providers: only USB and the explicit test provider are constructible here.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SleBus {
+pub(crate) enum SleBus {
     None = 0,
     Usb = 4,
     Test = 6,
@@ -120,7 +97,7 @@ pub enum SleBus {
 /// Registration observation only. Runtime/Native snapshots own queried wire
 /// capabilities and retain the full version/feature tuples. No inferred MTU,
 /// mode, security policy or independently writable Ready state belongs here.
-pub struct SleControllerInfo {
+pub(crate) struct SleControllerInfo {
     /// Validated provider provenance; None is an unpopulated reservation.
     pub bus: SleBus,
     /// Observed address, or zero before bootstrap.
@@ -141,7 +118,7 @@ impl Default for SleControllerInfo {
 /// Group numbers in comments follow the standard document sections.
 #[repr(u16)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SleOpcode {
+pub(crate) enum SleOpcode {
     // --- Group 1: Basic (OGF=0x01, wire 0x04xx, section 8.1) ---
     /// 读控制器指令长度 (8.1.1)
     ReadCmdLen = 0x0401,
@@ -418,7 +395,7 @@ pub enum SleOpcode {
 /// Completion status for a command.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SleStatus {
+pub(crate) enum SleStatus {
     Success = 0x00,
     UnknownCommand = 0x01,
     InvalidParameters = 0x02,
@@ -435,23 +412,23 @@ pub enum SleStatus {
 // ---------------------------------------------------------------------------
 
 /// An event from the controller to the host.
-pub enum SleEvent {
-    /// Unsolicited opcode-zero command credit update; not a transaction result.
+pub(crate) enum SleEvent {
+    /// Unsolicited credit update, never a transaction result.
     CommandCredits { credits: u8 },
-    /// Command completed with status and optional return data.
+    /// Standard-profile completed command;author resolved by the Host.
     CommandComplete {
         opcode: SleOpcode,
         command_credits: u8,
         status: SleStatus,
         data: KVec<u8>,
     },
-    /// Command pending (asynchronous processing started).
+    /// Standard-profile pending/failure status.
     CommandStatus {
         opcode: SleOpcode,
         command_credits: u8,
         status: SleStatus,
     },
-    /// Native dialect command result: exact opcode and status, without enum aliases.
+    /// Exact Native dialect opcode/status;not an enum alias.
     NativeCommandReply {
         opcode: u16,
         command_credits: u8,
@@ -459,292 +436,12 @@ pub enum SleEvent {
         complete: bool,
         data: KVec<u8>,
     },
-    /// Native controller relay, lifetime frozen at ingress, never security trust.
+    /// Native relay payload with ingress-frozen lifetime.
     NativeControllerData { lifetime:u64, handle:u16, index:u16, data:KVec<u8> },
-    /// Native schema validated; actual lifetime frozen before RX queueing. Not trust.
+    /// Actual installation observation with ingress-frozen lifetime/revision.
     NativeSecurityInstallation {lifetime:u64, security_revision:u64, handle:u16, event:u16, status:u8, enabled:u8},
-    /// Advertising / broadcast report received during scanning.
-    AdvReport {
-        addr: [u8; 6],
-        rssi: i8,
-        discovery_level: u8,
-        data: KVec<u8>,
-    },
-    /// Connection established.
-    ConnComplete {
-        handle: u16,
-        addr: [u8; 6],
-        status: SleStatus,
-    },
-    /// Data received on a connection.
-    DataReceived { handle: u16, data: KVec<u8> },
-    /// Connection lost.
-    Disconnected { handle: u16, reason: u8 },
-    /// Encryption status changed on a connection.
-    EncryptionChanged { handle: u16, enabled: bool },
-    /// Pairing request from a remote peer.
-    PairRequest { addr: [u8; 6], method: u8 },
-    /// Controller hardware error.
+    /// Controller-scoped critical fault;cannot infer a connection handle.
     HardwareError { code: u8 },
-    /// Broadcast / advertising terminated by the controller.
-    BroadcastEnd { reason: u8 },
-    /// PHY parameters updated on a connection.
-    PhyUpdate {
-        handle: u16,
-        mcs_index: u8,
-        bandwidth_mhz: u8,
-    },
-    /// Connection parameters updated.
-    ConnParamUpdate {
-        handle: u16,
-        interval: u16,
-        latency: u16,
-        timeout: u16,
-    },
-    /// Data length changed on a connection.
-    DataLenChange {
-        handle: u16,
-        max_tx_octets: u16,
-        max_rx_octets: u16,
-    },
-    /// Controller data buffer overflow.
-    DataBufOverflow { link_type: u8 },
-    /// Remote peer requests connection parameter change.
-    PeerConnParamReq {
-        handle: u16,
-        interval_min: u16,
-        interval_max: u16,
-        latency: u16,
-        timeout: u16,
-    },
-
-    // --- HIGH priority (§9.1.7, §9.1.8, §9.1.11) ---
-    /// TX power change report (§9.1.7).
-    PowerChangeReport {
-        handle: u16,
-        reason: u8,
-        frame_type: u8,
-        bandwidth: u8,
-        pilot_density: u8,
-        tx_power: i8,
-        power_level: u8,
-        offset: i8,
-    },
-    /// Number of completed packets (§9.1.8).
-    NumCompletedPackets { handle: u16, num_completed: u8 },
-    /// Link encryption parameter request (§9.1.11).
-    EncryptionParamReq { handle: u16 },
-
-    // --- MEDIUM — Peer Info (§9.1.13, §9.1.15–§9.1.16, §9.1.20–§9.1.21) ---
-    /// Controller control signaling data (§9.1.13).
-    ControllerSignalData {
-        handle: u16,
-        signal_id: u16,
-        data: KVec<u8>,
-    },
-    /// Read peer features complete (§9.1.15).
-    ReadPeerFeatures {
-        handle: u16,
-        status: u8,
-        features: [u8; 10],
-    },
-    /// Read peer version info complete (§9.1.16).
-    ReadPeerVersion {
-        handle: u16,
-        status: u8,
-        version: u8,
-        manufacturer: u16,
-        subversion: u16,
-    },
-    /// Read peer TX power complete (§9.1.20).
-    ReadPeerPower {
-        handle: u16,
-        status: u8,
-        frame_type: u8,
-        bandwidth: u8,
-        pilot_density: u8,
-        tx_power: i8,
-        power_level: u8,
-    },
-    /// Inquiry (scan) request report (§9.1.21).
-    InquiryRequestReport {
-        adv_handle: u8,
-        addr_type: u8,
-        addr: [u8; 6],
-        rssi: i8,
-        data: KVec<u8>,
-    },
-
-    // --- MEDIUM — Pairing (§9.1.23–§9.1.32) ---
-    // NOTE: PairRequest (§9.1.22) already exists above.
-    /// Pairing information exchange request (§9.1.23).
-    PairInfoExchange {
-        handle: u16,
-        io_cap: u8,
-        oob_flag: u8,
-        auth_req: u8,
-        max_key_len: u8,
-        sec_dist: u8,
-        psk_ind: u8,
-        crypto_cap: [u8; 4],
-    },
-    /// Pairing information report (§9.1.24).
-    PairInfoReport {
-        handle: u16,
-        io_cap: u8,
-        oob_flag: u8,
-        auth_req: u8,
-        max_key_len: u8,
-        sec_dist: u8,
-        psk_ind: u8,
-        crypto_cap: [u8; 4],
-    },
-    /// Pairing option report (§9.1.25).
-    PairOptionReport {
-        handle: u16,
-        key_len: u8,
-        auth_method: u8,
-        crypto_alg: [u8; 4],
-        public_key: KVec<u8>,
-    },
-    /// Peer public key report (§9.1.26).
-    PeerPublicKey { handle: u16, public_key: KVec<u8> },
-    /// Pairing extended data report (§9.1.27).
-    PairExtData {
-        handle: u16,
-        ext_pubkey_x: KVec<u8>,
-        ext_pubkey_y: KVec<u8>,
-    },
-    /// Keypress notification (§9.1.28).
-    KeypressNotify { handle: u16, action: [u8; 4] },
-    /// Pairing random number report (§9.1.29).
-    PairRandom { handle: u16, random: [u8; 16] },
-    /// Pairing confirm code report (§9.1.30).
-    PairConfirm { handle: u16, confirm: [u8; 16] },
-    /// DH key check report (§9.1.31).
-    DHKeyCheck { handle: u16, dhkey_check: [u8; 16] },
-    /// Pairing failure report (§9.1.32).
-    PairFailure { handle: u16, reason: u8 },
-
-    // --- LOW — Narrowband Measurement (§9.1.33–§9.1.39) ---
-    /// Narrowband measurement info (§9.1.33).
-    NarrowbandMeasInfo {
-        handle: u16,
-        meas_type: u16,
-        status: u8,
-        config_index: u8,
-    },
-    /// Narrowband measurement state change (§9.1.34).
-    NarrowbandMeasStateChange {
-        status: u8,
-        config_index: u8,
-        meas_state: u8,
-    },
-    /// Narrowband measurement parameter report (§9.1.35).
-    NarrowbandMeasParamReport {
-        handle: u16,
-        status: u8,
-        config_index: u8,
-    },
-    /// Local narrowband measurement capabilities (§9.1.36).
-    LocalNarrowbandMeasCap {
-        status: u8,
-        antenna_count: u8,
-        signal_cap: [u8; 4],
-        report_cap: [u8; 4],
-    },
-    /// Peer narrowband measurement capabilities (§9.1.37).
-    PeerNarrowbandMeasCap {
-        handle: u16,
-        status: u8,
-        antenna_count: u8,
-        signal_cap: [u8; 4],
-        report_cap: [u8; 4],
-    },
-    /// Measurement state change (§9.1.38).
-    MeasStateChange {
-        source: u16,
-        status: u8,
-        instance_handle: u8,
-        instance_state: u8,
-    },
-    /// Measurement quantity report (§9.1.39).
-    MeasQuantityReport {
-        source: u16,
-        meas_source: u16,
-        seq: u16,
-        instance_handle: u8,
-        meas_count: u8,
-    },
-
-    // --- LOW — SLB (§9.1.40–§9.1.45) ---
-    /// SLB advertising report (§9.1.40).
-    SlbAdvReport {
-        mac_addr: [u8; 6],
-        channel: u16,
-        bandwidth: u8,
-        rssi: i8,
-        data: KVec<u8>,
-    },
-    /// SLB connection established (§9.1.41).
-    SlbConnComplete {
-        handle: u16,
-        status: u8,
-        peer_addr: [u8; 6],
-    },
-    /// SLB unicast logical channel established (§9.1.42).
-    SlbUcastChannelComplete {
-        channel_handle: u16,
-        conn_handle: u16,
-        status: u8,
-        max_pkt_len: u16,
-        max_pkt_count: u16,
-    },
-    /// SLB unicast logical channel updated (§9.1.43).
-    SlbUcastChannelUpdate {
-        channel_handle: u16,
-        status: u8,
-        max_pkt_len: u16,
-        max_pkt_count: u16,
-    },
-    /// SLB logical channel deleted (§9.1.44).
-    SlbChannelDelete { channel_handle: u16, status: u8 },
-    /// SLB completed packets count (§9.1.45).
-    SlbNumCompletedPackets {
-        channel_handle: u16,
-        num_completed: u8,
-    },
-
-    // --- LOW — Sync Link (§9.1.46–§9.1.51) ---
-    /// Time synchronization status update (§9.1.46).
-    TimeSyncStatusUpdate {
-        sync_status: u8,
-        clock_source: u8,
-        accuracy: u32,
-    },
-    /// Time synchronization request (§9.1.47).
-    TimeSyncRequest { time_seq: u32, send_time: [u8; 8] },
-    /// Synchronous unicast link setup request (§9.1.48).
-    SyncUcastSetupRequest {
-        async_handle: u16,
-        sync_handle: u16,
-        event_group_set_id: u8,
-        event_group_id: u8,
-    },
-    /// Synchronous unicast link setup complete (§9.1.49).
-    SyncUcastSetupComplete {
-        async_handle: u16,
-        sync_handle: u16,
-        status: u8,
-    },
-    /// Synchronous multicast link setup request (§9.1.50).
-    SyncMcastSetupRequest { async_handle: u16, sync_handle: u16 },
-    /// Synchronous multicast link setup complete (§9.1.51).
-    SyncMcastSetupComplete {
-        async_handle: u16,
-        sync_handle: u16,
-        status: u8,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +451,7 @@ pub enum SleEvent {
 /// Borrowed metadata and joined transport close for the registered provider.
 /// Commands use the retained CommandPort and identity-bound Host tickets;
 /// transport open belongs to Runtime open, never application fd construction.
-pub trait SleController: Send + Sync {
+pub(crate) trait SleController: Send + Sync {
     fn info(&self) -> SleControllerInfo;
     fn close(&self);
 }
@@ -765,7 +462,7 @@ pub trait SleController: Send + Sync {
 
 /// Common registered provider. Bus/dialect live in validated descriptor metadata,
 /// not in independent USB/WS73 installation or lifetime implementations.
-pub enum ControllerBackend {
+pub(crate) enum ControllerBackend {
     Native(super::sle_native::NativeController),
 }
 
@@ -790,7 +487,7 @@ impl ControllerBackend {
 // transport-level byte arrays directly (T/XS 10003-2025 section 8).
 
 /// Convert a raw u16 to SleOpcode, returning None for unknown values.
-pub fn sle_opcode_from_u16(v: u16) -> Option<SleOpcode> {
+pub(crate) fn sle_opcode_from_u16(v: u16) -> Option<SleOpcode> {
     match v {
         0x0401 => Some(SleOpcode::ReadCmdLen),
         0x0402 => Some(SleOpcode::ReadCtrlBuffer),
