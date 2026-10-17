@@ -16,7 +16,7 @@ const UNSUPPORTED: i32 = -(kernel::bindings::EOPNOTSUPP as i32);
 use super::sle_command_plan::{DiscoveryIntent, RecipeTag};
 use super::sle_uapi::{SleDiscoveryAdvConfig, SleDiscoveryScanConfig, SleDiscoverySubmit, SleConnectionSubmit, SleConnectionParameters};
 use super::sle_dev::DeviceIdentity;
-use super::sle_dli::{SleBus, SleController, SleControllerInfo, SleEvent, SleOpcode};
+use super::sle_dli::{SleBus, SleController, SleControllerInfo, SleEvent};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
