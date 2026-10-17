@@ -2294,6 +2294,42 @@ out:
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
 }
+struct sl_prepare_read {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+	struct sparklink_send_constraint value;
+};
+static int sl_prepare_tx(void *context, u64 revision)
+{
+	struct sl_prepare_read *r = context;
+	struct sl_connection_session *s = r->session;
+	struct sl_basic_channel *c = r->channel;
+	unsigned long flags;
+	int ret;
+	spin_lock_irqsave(&s->lock, flags);
+	if (!sl_binding_live(c->binding) || !sl_channel_active(s->progress))
+		ret = -ENOTCONN;
+	else if (sl_dynamic_status(c))
+		ret = sl_dynamic_status(c);
+	else if (!sl_permits(s, c, SL_GRANT_TX) ||
+		 sl_security_check(s, c, revision))
+		ret = -EACCES;
+	else if (s->progress.phase != SL_CH_OPEN)
+		ret = -EAGAIN;
+	else {
+		r->value.generation = s->generation;
+		r->value.lifetime = s->lifetime;
+		r->value.controller = s->controller;
+		r->value.handle = s->handle;
+		r->value.local_tcid = c->local_tcid;
+		r->value.remote_tcid = c->remote_tcid;
+		r->value.pi = c->pi;
+		r->value.security_epoch = revision;
+		ret = sl_constraint_check(s, c, &r->value, revision);
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	return ret;
+}
 static int sl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
 	struct sl_connection_session *s;
@@ -2304,12 +2340,40 @@ static int sl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 
 	if (cmd != SPARKLINK_CHANNEL_INFO &&
 	    cmd != SPARKLINK_CHANNEL_TX_STATUS &&
-	    cmd != SPARKLINK_SESSION_TX_STATUS)
+	    cmd != SPARKLINK_SESSION_TX_STATUS &&
+	    cmd != SPARKLINK_CHANNEL_PREPARE_TX)
 		return -ENOIOCTLCMD;
 	s = sl_binding_session(sock->sk);
 	if (!s)
 		return -ENOTCONN;
-	if (cmd == SPARKLINK_CHANNEL_INFO) {
+	if (cmd == SPARKLINK_CHANNEL_PREPARE_TX) {
+		struct sl_prepare_read prepared = {
+			.session = s, .channel = sl_bound_channel(sock->sk, s)
+		};
+		if (copy_from_user(&prepared.value, (void __user *)arg,
+				   sizeof(prepared.value))) {
+			ret = -EFAULT;
+			goto done;
+		}
+		if (prepared.value.version != 1 || prepared.value.size != 48 ||
+		    prepared.value.minimum > 2 ||
+		    !prepared.value.deadline_monotonic_ns ||
+		    prepared.value.reserved || prepared.value.generation ||
+		    prepared.value.lifetime || prepared.value.security_epoch ||
+		    prepared.value.controller || prepared.value.handle ||
+		    prepared.value.local_tcid || prepared.value.remote_tcid ||
+		    prepared.value.pi) {
+			ret = -EINVAL;
+			goto done;
+		}
+		ret = sparklink_native_session_admit(s->controller,
+						     s->generation, s->lifetime,
+						     s->handle, s->epoch,
+						     sl_prepare_tx, &prepared);
+		if (!ret && copy_to_user((void __user *)arg, &prepared.value,
+					 sizeof(prepared.value)))
+			ret = -EFAULT;
+	} else if (cmd == SPARKLINK_CHANNEL_INFO) {
 		read = (struct sl_info_read){ .session = s,
 					      .channel = sl_bound_channel(
 						      sock->sk, s),
@@ -2347,6 +2411,7 @@ static int sl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 				 sizeof(session_read.value)))
 			ret = -EFAULT;
 	}
+done:
 	sl_connection_session_put(s);
 	return ret;
 }

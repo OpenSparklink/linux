@@ -95,6 +95,13 @@ struct sparklink_send_constraint {
     __aligned_u64 deadline_monotonic_ns; /* original CLOCK_MONOTONIC, at most5s ahead */
 };
 
+/* Prepare an intent through this already-authorized TX fd. Input version1,
+ * size48, minimum and original deadline; all identity/reserved fields zero.
+ * Output fills scope/current epoch, never renews a Grant or reserves credit.
+ * Snapshot alone authorizes nothing: sendmsg must carry the returned intent.
+ */
+#define SPARKLINK_CHANNEL_PREPARE_TX _IOWR('S', 0xe3, struct sparklink_send_constraint)
+
 /* Read-only delegated socket snapshot. No lease token or trusted security
  * projection. Success requires current Runtime authorization and completed
  * CMTC negotiation; EAGAIN before open, ENOTCONN after local close.

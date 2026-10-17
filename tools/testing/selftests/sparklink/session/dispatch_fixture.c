@@ -161,6 +161,9 @@ static int skb_copy_datagram_msg(struct sk_buff *skb,int offset,struct msghdr *m
 }
 static void skb_free_datagram(struct sock *sk,struct sk_buff *skb){assert(!host_locked&&sk==current_session->channels[sl_sk(sk)->channel_slot].sk);kfree_skb(skb);}
 static unsigned int copy_limit = 40;
+static unsigned long copy_from_user(void *to,const void *from,unsigned long size){
+ assert(!host_locked&&!irq_disabled);memcpy(to,from,size);return 0;
+}
 static unsigned long copy_to_user(void *out,const void *in,unsigned long size){
  assert(!host_locked&&!irq_disabled&&!current_session->lock.held);
  unsigned long copied=copy_limit<size?copy_limit:size;memcpy(out,in,copied);return size-copied;
@@ -1034,7 +1037,29 @@ static void send_constraint_tests(void) {
  assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EACCES);
  fixture_security_revision=1;fixture_security_level=0;
 }
+static void prepare_intent_tests(void) {
+ struct sl_connection_session s;struct sl_socket_binding b={0};init_batch(&s,&b);
+ struct socket sock={.sk=&b.sk};copy_limit=48;fixture_security_revision=2;fixture_security_level=1;
+ struct sparklink_send_constraint input={.version=1,.size=48,.minimum=1,.deadline_monotonic_ns=fixture_now_ns+1000000000ULL},value=input;
+ unsigned before=fragment_count;
+ assert(!sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value));
+ assert(value.generation==7&&value.lifetime==11&&value.handle==3&&value.controller==1&&value.security_epoch==2&&value.local_tcid==31&&value.remote_tcid==31&&value.pi==241&&value.minimum==1&&value.deadline_monotonic_ns==input.deadline_monotonic_ns);
+ assert(!allocations&&fragment_count==before&&!s.channels[0].tx.qlen&&!b.grant.security);
+ assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-EINVAL);
+ value=input;value.minimum=2;struct sparklink_send_constraint saved=value;
+ assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-EACCES&&!memcmp(&value,&saved,sizeof(value)));
+ value=input;value.deadline_monotonic_ns=1;assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-ETIMEDOUT);
+ value=input;value.reserved=1;assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-EINVAL);
+ value=input;b.grant.directions=SL_GRANT_RX;assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-EACCES);b.grant.directions=3;
+ fixture_security_level=2;assert(sl_grant_init_security(&b.grant,b.grant.scope,3,2,2,2));
+ fixture_security_revision=3;value=input;value.minimum=0;
+ assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-EACCES); /* never renew an old protected Grant */
+ fixture_security_revision=2;value=input;authority=false;assert(sl_ioctl(&sock,SPARKLINK_CHANNEL_PREPARE_TX,(unsigned long)&value)==-EACCES);authority=true;
+ assert(!allocations&&fragment_count==before&&!s.channels[0].tx.qlen);
+ fixture_security_revision=1;fixture_security_level=0;copy_limit=40;
+}
 int main(void){
+ prepare_intent_tests();
  send_constraint_tests();
  identifier_zero_request_tests();negotiated_limit_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
