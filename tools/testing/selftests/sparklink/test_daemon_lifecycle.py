@@ -75,20 +75,22 @@ class DiagnosticVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         ManagementVerdict.setUpClass()
-        pre = ('TOOL_DIAGNOSTIC_BEGIN\nTOOL_DIAGNOSTIC_DENIALS: index=0 generation=3 managed_busy=1 uid1000_caps0=1 schema=2 stale=1 legacy_reset=1 no_admission=1 observer=1\n')
+        pre = ('TOOL_DIAGNOSTIC_BEGIN\nTOOL_DIAGNOSTIC_DENIALS: index=0 generation=3 managed_busy=1 uid1000_caps0=1 schema=2 stale=1 retired_reset=1 no_admission=1 observer=1\n')
         out = []
         for i,g in [(0,3),(1,2)]:
-            out.append(f'TOOL_DIAGNOSTIC_SEED: index={i} generation={g} baseline_empty=1 unread_query=1')
-            for seq,(op,drained,data) in enumerate([('0403',2,'02'*10),('0406',0,'027300000002'),('0404',0,'0201000120'),('0402',0,'fe0005000000')],2):
-                out.append(f'NativeDiagnosticQuery: index={i} generation={g} opcode=0x{op} admission_seq={seq} status=0x00 drained={drained} data={data}')
-        out.append('TOOL_DIAGNOSTIC_END: queried=2 queries=8 stale_commands=2 stale_pairs=2 free=2')
+            out.append(f'TOOL_DIAGNOSTIC_SEED: index={i} generation={g} typed_complete=1 previous_author=EPERM')
+            for seq,(op,data) in enumerate([('0403','02'*10),('0406','027300000002'),('0404','0201000120'),('0402','fe0005000000')],2):
+                out.append(f'NativeDiagnosticQuery: index={i} generation={g} opcode=0x{op} admission_seq={seq} status=0x00 data={data}')
+        out.append('TOOL_DIAGNOSTIC_END: queried=2 queries=8 typed_seeds=2 previous_author_denied=2 free=2')
         cls.good = ManagementVerdict.good.replace('DAEMON_MANAGEMENT_RELEASE:',pre+'DAEMON_MANAGEMENT_RELEASE:',1).replace('DAEMON_MANAGEMENT_RESTART:','\n'.join(out)+'\nDAEMON_MANAGEMENT_RESTART:',1)
 
     def test_complete(self): self.assertEqual(assess(self.good,0,management_handoff=True,diagnostic_tools=True),[])
     def test_unrequested(self): self.assertTrue(assess(self.good,0,management_handoff=True))
     def test_missing_denials(self): self.assertTrue(assess_diagnostic(self.good.replace('managed_busy=1','managed_busy=0')))
-    def test_stale_reply(self): self.assertTrue(assess_diagnostic(self.good.replace('drained=2','drained=0',1)))
-    def test_wrong_controller(self): self.assertTrue(assess_diagnostic(self.good.replace('opcode=0x0406 admission_seq=3 status=0x00 drained=0 data=027300000002','opcode=0x0406 admission_seq=3 status=0x00 drained=0 data=027300000001',1)))
+    def test_previous_author_result_leak(self): self.assertTrue(assess_diagnostic(self.good.replace('previous_author=EPERM','previous_author=success',1)))
+    def test_historical_shared_queue_grammar(self): self.assertTrue(assess_diagnostic(self.good.replace('typed_complete=1 previous_author=EPERM','baseline_empty=1 unread_query=1',1)))
+    def test_seed_not_complete(self): self.assertTrue(assess_diagnostic(self.good.replace('typed_complete=1','typed_complete=0',1)))
+    def test_wrong_controller(self): self.assertTrue(assess_diagnostic(self.good.replace('opcode=0x0406 admission_seq=3 status=0x00 data=027300000002','opcode=0x0406 admission_seq=3 status=0x00 data=027300000001',1)))
     def test_short_features(self): self.assertTrue(assess_diagnostic(self.good.replace('data='+'02'*10,'data='+'02'*9,1)))
     def test_failed_status(self): self.assertTrue(assess_diagnostic(self.good.replace('status=0x00','status=0xfd',1)))
     def test_generation(self): self.assertTrue(assess_diagnostic(self.good.replace('NativeDiagnosticQuery: index=0 generation=3','NativeDiagnosticQuery: index=0 generation=1',1)))
@@ -177,9 +179,9 @@ class KernelAuthorizationVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.protected_count, cls.observe_count = kernel_authorization_counts()
-        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected={cls.protected_count} denied={cls.protected_count} observe={cls.observe_count} configfs_denied=5 genl_denied=5 unknown=ENOTTY\n'
+        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected={cls.protected_count} denied={cls.protected_count} observe={cls.observe_count} retired_enotty=101 configfs_absent=5 genl_denied=5 unknown=ENOTTY\n'
                              for uid,gid in [(1001,1001),(1000,1002),(0,0)])
-        cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 observe_no_power_sync=1\n'
+        cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 retired_mutations_absent=1\n'
         cls.good = GOOD + cls.matrix + cls.state
 
     def test_complete(self): self.assertEqual(assess(self.good, 0, kernel_authorization=True), [])
@@ -196,10 +198,11 @@ class KernelAuthorizationVerdict(unittest.TestCase):
         self.assertTrue(assess(stale, 0, kernel_authorization=True))
 
     def test_missing_fd_inheritance(self): self.assertTrue(assess(self.good.replace('inherited_fd=1','inherited_fd=0',1),0,kernel_authorization=True))
-    def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('configfs_denied=5','configfs_denied=4',1),0,kernel_authorization=True))
+    def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('retired_enotty=101 configfs_absent=5','retired_enotty=101 configfs_absent=4',1),0,kernel_authorization=True))
+    def test_retired_commands_missing(self): self.assertTrue(assess(self.good.replace('retired_enotty=101','retired_enotty=100',1),0,kernel_authorization=True))
     def test_genl_bypass(self): self.assertTrue(assess(self.good.replace('genl_denied=5','genl_denied=4',1),0,kernel_authorization=True))
     def test_changed_state(self): self.assertTrue(assess(self.good.replace('unchanged=1','unchanged=0'),0,kernel_authorization=True))
-    def test_observer_changed_power(self): self.assertTrue(assess(self.good.replace('observe_no_power_sync=1','observe_no_power_sync=0'),0,kernel_authorization=True))
+    def test_observer_changed_power(self): self.assertTrue(assess(self.good.replace('retired_mutations_absent=1','retired_mutations_absent=0'),0,kernel_authorization=True))
     def test_duplicate_matrix(self): self.assertTrue(assess(self.good+self.matrix,0,kernel_authorization=True))
     def test_guest_failure(self): self.assertTrue(assess(self.good+'KERNEL_AUTH_FAILURE: permission\n',0,kernel_authorization=True))
 

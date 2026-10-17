@@ -8,7 +8,15 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
-#include "retired-event-poll/legacy_abi.h"
+#include <time.h>
+
+static double now(void)
+{
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t)) exit(1);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
 
 int main(int argc, char **argv)
 {
@@ -45,31 +53,38 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2], "seed")) {
         struct sle_management_request claim = { .version = 1, .generation = generation, .mode = SLE_MANAGEMENT_DIAGNOSTIC };
-        struct sle_dli_cmd cmd = { .opcode = 0x0406, .param_len = 1 };
-        if (ioctl(fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &claim)) {
-            perror("diagnostic seed"); return 1;
+        struct sle_diagnostic_submit cmd = { .version = 1, .generation = generation,
+            .request_id = 1, .timeout_ms = 5000, .opcode = 0x0406, .action = 1 };
+        if (ioctl(fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &claim) ||
+            ioctl(fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &cmd) || !cmd.seq) {
+            perror("typed diagnostic seed admission"); return 1;
         }
-        /* Establish a controlled empty baseline after previous typed recipes. */
-        int drained=0;
-        for (;;) {
-            struct sle_dli_event old={0};
-            if (ioctl(fd, SL_IOCTL_DLI_POLL_EVENT, &old)) {
-                if (errno==EAGAIN) break;
-                perror("diagnostic seed drain"); return 1;
-            }
-            if (++drained>256) return 1;
-        }
-        if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &cmd)) { perror("diagnostic seed send"); return 1; }
-        int quiet = 0;
-        for (int n=0; n<600; n++) {
-            struct sle_mgmt_stats stats = {0};
-            if (ioctl(fd, SL_IOCTL_MGMT_STATS, &stats)) return 1;
-            if (!stats.pending) { quiet=1; break; }
-            usleep(10000);
-        }
-        if (!quiet || ioctl(fd, SL_IOCTL_MANAGEMENT_RELEASE, &claim)) return 1;
-        /* Deliberately leave the completed MAC reply unread across handoff. */
-        printf("TOOL_DIAGNOSTIC_SEED: index=%u generation=%llu baseline_empty=1 unread_query=1\n",index,generation);
+        double deadline = now() + 5;
+        struct sle_diagnostic_result result;
+        do {
+            result = (struct sle_diagnostic_result){ .version = 1, .generation = generation, .seq = cmd.seq };
+            if (ioctl(fd, SL_IOCTL_DIAGNOSTIC_RESULT, &result)) return 1;
+            if (result.state != 1) break;
+            usleep(1000);
+        } while (now() < deadline);
+        if (result.state != 2 || result.error || result.status || result.opcode != 0x0406 ||
+            result.seq != cmd.seq || result.generation != generation || result.data_len != 6 ||
+            memcmp(result.data, controller.address, 6) ||
+            ioctl(fd, SL_IOCTL_MANAGEMENT_RELEASE, &claim)) return 1;
+        /* The completed result is retained under its author, never a shared
+         * event to drain. A different current Diagnostic owner cannot read it. */
+        int other = open("/dev/sparklink", O_RDWR | O_CLOEXEC);
+        struct sle_management_request next = { .version = 1, .generation = generation,
+            .mode = SLE_MANAGEMENT_DIAGNOSTIC };
+        if (other < 0 || ioctl(other, SL_IOCTL_DEV_SELECT, &selected) ||
+            ioctl(other, SL_IOCTL_MANAGEMENT_ACQUIRE, &next)) return 1;
+        result = (struct sle_diagnostic_result){ .version = 1, .generation = generation, .seq = cmd.seq };
+        struct sle_diagnostic_result unchanged = result;
+        if (ioctl(other, SL_IOCTL_DIAGNOSTIC_RESULT, &result) != -1 || errno != EPERM ||
+            memcmp(&result, &unchanged, sizeof(result)) ||
+            ioctl(other, SL_IOCTL_MANAGEMENT_RELEASE, &next)) return 1;
+        close(other);
+        printf("TOOL_DIAGNOSTIC_SEED: index=%u generation=%llu typed_complete=1 previous_author=EPERM\n", index, generation);
         close(fd); return 0;
     }
     printf("DAEMON_MANAGEMENT_OBSERVE: index=%u generation=%llu state=%s token_hidden=1 adv=%u scan=%u\n",

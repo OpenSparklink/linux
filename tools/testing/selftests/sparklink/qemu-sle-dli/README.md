@@ -264,16 +264,14 @@ python3 run-usb-host-boundaries.py \
     ...
 ```
 
-### 与测试框架集成
+### 当前测试入口
 
-```bash
-# 方式一：指定自定义 QEMU + 启用设备
-SLE_DLI_DEVICE=1 bash run_qemu_test.sh
-
-# 方式二：指定自定义 QEMU 路径
-QEMU_BIN=qemu-sle-dli/bin/bin/qemu-system-x86_64 \
-SLE_DLI_DEVICE=1 bash run_qemu_test.sh
-```
+旧 `run_qemu_test.sh`／`run_runtime_lifecycle.py` 与 raw DLI 测试套件已归档到
+`../retired-raw-uapi/`，不能用其历史 PASS 作为当前镜像资格。
+当前默认 Core/Host/ledger 的实际 VM 入口为 `../run_virtual_vm.py`；
+Native 部分初始化和 kernel-origin usercopy 使用 `../run_native_open_test.py`。
+准确参数见各入口 `--help`，必须绑定匹配的 kernel、模块、工具与完整日志。
+Virtual、合成 WS73 USB 和真实 WS73 是不同验收范围，不相互替代。
 
 ## 设备属性
 
@@ -299,13 +297,13 @@ HCC/BSLE and metadata reply fixture. There is no boot ROM, firmware execution
 or RF medium. Never use its synthetic configuration or metadata as hardware
 calibration or real WS73 evidence.
 
-Use `run_runtime_lifecycle.py --native-ws73` for the production driver's native
-URBs, Host credit/status handling and two-owner remove/re-add gate. Add
-`--native-ws73-fault` for a malformed aggregate on A with B left usable. The
-same runner's default standard-DLI test remains independent. See
-`Documentation/networking/ws73-development.rst` for scope and commands.
+The former raw-event lifecycle runner is archived, not a current gate.
+The retained `run_native_open_test.py` uses typed DiagnosticSubmit/Result for
+its synthetic WS73 survivor. Controlled USB-terminal, repeated-status and
+recovery scenarios from the old runner require migration before new acceptance;
+current Virtual tests do not claim all those hardware-driver scenarios.
 
-`--native-ws73-tx-barrier` independently enables `runtime-out-delay-ms=2000` on
+The historical runner's `--native-ws73-tx-barrier` independently enables `runtime-out-delay-ms=2000` on
 the first fixture. It defers the first post-bootstrap ReadLocalFeatures OUT
 using an asynchronous USB packet while delivering the device Complete on IN.
 Read-only `runtime-out-pending` and `runtime-out-replied` properties provide the

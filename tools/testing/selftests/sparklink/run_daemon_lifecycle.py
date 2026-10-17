@@ -14,7 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from run_runtime_lifecycle import file_record, load_qmp, wait_marker
+from vm_test_utils import file_record, load_qmp, wait_marker
 from qemu_verdict import KERNEL_FAULT
 from snoop_verdict import assess_snoop, capture_files
 
@@ -112,9 +112,9 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
     if kernel_authorization:
         matrix = re.findall(r'^KERNEL_AUTHORIZATION: (.*)$', console, re.M)
         protected_count, observe_count = kernel_authorization_counts()
-        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected={protected_count} denied={protected_count} observe={observe_count} configfs_denied=5 genl_denied=5 unknown=ENOTTY'
+        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected={protected_count} denied={protected_count} observe={observe_count} retired_enotty=101 configfs_absent=5 genl_denied=5 unknown=ENOTTY'
                     for uid, gid in [(1001,1001), (1000,1002), (0,0)]]
-        if matrix != expected or re.findall(r'^KERNEL_AUTHORIZATION_STATE: (.*)$', console, re.M) != ['unchanged=1 native_admission=0 observe_no_power_sync=1']:
+        if matrix != expected or re.findall(r'^KERNEL_AUTHORIZATION_STATE: (.*)$', console, re.M) != ['unchanged=1 native_admission=0 retired_mutations_absent=1']:
             errors.append('kernel authorization matrix missing, duplicated or incomplete')
         if 'KERNEL_AUTH_FAILURE:' in console:
             errors.append('kernel authorization assertion failed')
@@ -149,29 +149,26 @@ def assess_diagnostic(console):
     if len(views) != 5:
         return ['diagnostic selected identities missing']
     a,b = views[3],views[4]
-    expected_denial = f'TOOL_DIAGNOSTIC_DENIALS: index={a[0]} generation={a[1]} managed_busy=1 uid1000_caps0=1 schema=2 stale=1 legacy_reset=1 no_admission=1 observer=1'
+    expected_denial = f'TOOL_DIAGNOSTIC_DENIALS: index={a[0]} generation={a[1]} managed_busy=1 uid1000_caps0=1 schema=2 stale=1 retired_reset=1 no_admission=1 observer=1'
     if (re.findall(r'^TOOL_DIAGNOSTIC_DENIALS:.*$',console,re.M) != [expected_denial] or
         console.count('TOOL_DIAGNOSTIC_') != 5):
         errors.append('diagnostic denial matrix incomplete or duplicated')
-    seeds = re.findall(r'^TOOL_DIAGNOSTIC_SEED: index=(\d+) generation=(\d+) baseline_empty=1 unread_query=1$',console,re.M)
-    if seeds != [(a[0],a[1]),(b[0],b[1])]: errors.append('diagnostic stale seed identity missing')
-    queries = re.findall(r'^NativeDiagnosticQuery: index=(\d+) generation=(\d+) opcode=0x([0-9a-f]{4}) admission_seq=([1-9][0-9]*) status=0x00 drained=([0-9]+) data=([0-9a-f]+)$',console,re.M)
+    seeds = re.findall(r'^TOOL_DIAGNOSTIC_SEED: index=(\d+) generation=(\d+) typed_complete=1 previous_author=EPERM$',console,re.M)
+    if seeds != [(a[0],a[1]),(b[0],b[1])]: errors.append('diagnostic typed seed/author isolation missing')
+    queries = re.findall(r'^NativeDiagnosticQuery: index=(\d+) generation=(\d+) opcode=0x([0-9a-f]{4}) admission_seq=([1-9][0-9]*) status=0x00 data=([0-9a-f]+)$',console,re.M)
     expected = []
     for i,g,addr in [a,b]:
         mac = addr.replace(':','').lower()
         expected += [(i,g,opcode,data) for opcode,data in [
             ('0403',mac[-2:]*10),('0406',mac),('0404','0201000120'),('0402','fe0005000000')]]
-    if ([(i,g,op,data) for i,g,op,seq,d,data in queries] != expected or
+    if ([(i,g,op,data) for i,g,op,seq,data in queries] != expected or
         console.count('NativeDiagnosticQuery:') != 8):
-        errors.append('diagnostic actual query values/identity/length/drain incomplete')
-    for n,record in enumerate(queries):
-        if int(record[4]) not in ({2,3} if n%4==0 else {0,1}):
-            errors.append('diagnostic stale pair not drained or excessive old replies')
+        errors.append('diagnostic actual typed query identity/values/length incomplete')
     for group in [queries[:4],queries[4:]]:
         if len(group)==4 and [int(x[3]) for x in group] != sorted(set(int(x[3]) for x in group)):
             errors.append('diagnostic admission sequences reused or reversed')
     labels = ['DAEMON_MANAGEMENT_BEGIN','TOOL_DIAGNOSTIC_BEGIN',expected_denial,'DAEMON_MANAGEMENT_RELEASE:',
-              'TOOL_DIAGNOSTIC_END: queried=2 queries=8 stale_commands=2 stale_pairs=2 free=2','DAEMON_MANAGEMENT_RESTART:']
+              'TOOL_DIAGNOSTIC_END: queried=2 queries=8 typed_seeds=2 previous_author_denied=2 free=2','DAEMON_MANAGEMENT_RESTART:']
     positions = [console.find(x) for x in labels]
     if (min(positions)<0 or positions!=sorted(positions) or
         console.count('TOOL_DIAGNOSTIC_BEGIN')!=1 or console.count(labels[4])!=1):
@@ -302,9 +299,9 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--radio-policy', action='store_true', help='basic policy and explicit synthetic cross-controller medium; never real RF')
     p.add_argument('--production-policy', action='store_true', help='installed D-Bus policy, root daemon, uid-1000 control group and uid-1001 observer')
-    p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd ioctl/configfs credential-drop matrix')
+    p.add_argument('--kernel-authorization', action='store_true', help='actual inherited-fd current ioctl/retired ABI credential-drop matrix')
     p.add_argument('--management-handoff', action='store_true', help='active radio cleanup on SIGTERM, same-generation successor, SIGINT cleanup; NO RF')
-    p.add_argument('--diagnostic-tools', action='store_true', help='actual selected slkconfig observation/denial/exclusive native query and stale-drain gate')
+    p.add_argument('--diagnostic-tools', action='store_true', help='actual selected slkconfig observation/denial/exclusive typed query and previous-author isolation gate')
     p.add_argument('--snoop-tools', action='store_true', help='actual independent slkmon/slkdump captures, permission/loss/copyout/retirement; NO RF')
     a = p.parse_args()
     if a.management_handoff and not a.radio_policy:
@@ -332,9 +329,9 @@ def main():
             policy = userspace / 'data/dbus/sparklink.conf'
             manifest['production_policy_input'] = file_record(policy)
         manifest['inputs'] = [file_record(path) for path in [kernel, a.kernel_build / '.config', a.qemu, a.busybox,
-            a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c']]
+            a.dbus_daemon, Path(__file__), HERE / 'daemon_lifecycle_guest.sh', HERE / 'daemon_radio_guest.sh', HERE / 'qemu-sle-dli/usb-ws73-test.c', HERE / 'vm_test_utils.py']]
         if a.kernel_authorization:
-            manifest['inputs'].append(file_record(HERE / 'kernel_authorization_test.c'))
+            manifest['inputs'] += [file_record(HERE / name) for name in ['kernel_authorization_test.c', 'retired_ioctl_cases.h', 'retired_ioctl_numbers.h']]
         if a.management_handoff:
             manifest['inputs'].append(file_record(HERE / 'daemon_management_test.c'))
         if a.diagnostic_tools:

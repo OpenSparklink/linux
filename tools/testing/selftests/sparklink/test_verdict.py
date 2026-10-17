@@ -134,104 +134,13 @@ class ConsoleVerdict(unittest.TestCase):
         self.assertEqual(self.verdict(good_console() + "  SKIP: missing backend\n"), 1)
 
 
-class ActualSuiteAndRunner(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        compiler = shutil.which(os.environ.get("CC", "gcc"))
-        if compiler is None:
-            raise RuntimeError("C compiler required for verdict regression checks")
-        cls.temporary = tempfile.TemporaryDirectory(prefix="sparklink-verdict-")
-        cls.directory = Path(cls.temporary.name)
-        cls.binary = cls.directory / "suite"
-        subprocess.run([compiler, "-Wall", "-Wextra", "-O2", "-o", cls.binary,
-                        SOURCE / "sparklink_test.c"], check=True)
-        harness = cls.directory / "intentional.c"
-        harness.write_text('''#define main original_suite_main
-#include "''' + str(SOURCE / "sparklink_test.c") + '''"
-#undef main
-int main(int argc, char **argv)
-{
-    if (argc != 2)
-        return 2;
-    if (!strcmp(argv[1], "helper")) {
-        errno = EIO;
-        check("intentional helper failure", -1);
-    } else if (!strcmp(argv[1], "direct")) {
-        test_fail("  FAIL: intentional direct assertion\\n");
-    } else if (!strcmp(argv[1], "real-case")) {
-        test_dev_info(-1);
-    } else if (!strcmp(argv[1], "skip")) {
-        test_skip("  SKIP: intentionally unavailable backend\\n");
-    } else if (!strcmp(argv[1], "pass")) {
-        check("intentional success", 0);
-    } else {
-        return 2;
-    }
-    return test_exit_status();
-}
-''')
-        cls.harness = cls.directory / "intentional"
-        subprocess.run([compiler, "-Wall", "-Wextra", "-O2", "-o", cls.harness,
-                        harness], check=True)
+class VerdictCli(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="sparklink-verdict-")
+        self.directory = Path(self.temporary.name)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.temporary.cleanup()
-
-    def test_actual_assertion_failure_exit_codes(self):
-        for mode in ("helper", "direct", "real-case"):
-            with self.subTest(mode=mode):
-                result = subprocess.run([self.harness, mode], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("  FAIL:", result.stdout)
-
-    def test_actual_success_and_skip_exit_codes(self):
-        for mode, status in (("pass", 0), ("skip", 4)):
-            with self.subTest(mode=mode):
-                result = subprocess.run([self.harness, mode], capture_output=True, text=True)
-                self.assertEqual(result.returncode, status)
-
-    def test_actual_manifest_covers_every_case(self):
-        result = subprocess.run([self.binary, "--list-tests"], check=True,
-                                capture_output=True, text=True)
-        cases = result.stdout.splitlines()
-        self.assertEqual(len(cases), len(set(cases)))
-        self.assertIn("test_dev_count", cases)
-        self.assertIn("test_genetlink", cases)
-        self.assertGreater(len(cases), 90)
-        source = (SOURCE / "sparklink_test.c").read_text()
-        self.assertNotRegex(source, r'\bprintf\(\s*"  FAIL:')
-
-    def test_requested_missing_model_skips_before_launch(self):
-        fake_qemu = self.directory / "qemu-no-sle"
-        fake_qemu.write_text('''#!/bin/sh
-if [ "$1" = "-device" ] && [ "$2" = "help" ]; then
-    echo 'name "qemu-xhci", bus PCI'
-    exit 0
-fi
-echo 'unexpected VM launch' >&2
-exit 99
-''')
-        fake_qemu.chmod(0o755)
-        environment = dict(os.environ, QEMU_BIN=str(fake_qemu), SLE_DLI_DEVICE="2")
-        result = subprocess.run(["bash", SOURCE / "run_qemu_test.sh"], env=environment,
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 4)
-        self.assertIn("SKIP:", result.stdout)
-        self.assertNotIn("unexpected VM launch", result.stderr)
-
-    def test_disabled_model_is_explicit_skip(self):
-        environment = dict(os.environ, SLE_DLI_DEVICE="0")
-        result = subprocess.run(["bash", SOURCE / "run_qemu_test.sh"], env=environment,
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 4)
-        self.assertIn("SKIP:", result.stdout)
-
-    def test_invalid_model_count_is_rejected(self):
-        environment = dict(os.environ, SLE_DLI_DEVICE="-1")
-        result = subprocess.run(["bash", SOURCE / "run_qemu_test.sh"], env=environment,
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 1)
+    def tearDown(self):
+        self.temporary.cleanup()
 
     def test_cli_rejects_false_pass_artifact(self):
         console = self.directory / "false-pass.log"

@@ -13,7 +13,7 @@ import shutil
 import subprocess
 
 from qemu_verdict import KERNEL_FAULT
-from run_runtime_lifecycle import file_record
+from vm_test_utils import file_record
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
@@ -86,7 +86,7 @@ def assess(console, qemu_exit):
                     ('SNAPSHOT', '2'), ('PENDING', '2'), ('WATCH_ARMED', '2'), ('WAKE', '2'), ('RETIRING', '2'), ('CASE', '2'),
                     ('SNAPSHOT', '3'), ('PENDING', '3'), ('WATCH_ARMED', '3'), ('WAKE', '3'), ('RETIRING', '3'), ('CASE', '3')]:
         errors.append('out-of-order open lifecycle phases')
-    exact = ['NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1',
+    exact = ['NATIVE_TYPED_HOST: index=0 queries=18 features=80 version=5 unsupported_opcode=1 invalid_timeout=1',
              'NATIVE_OPEN_LIFECYCLE: PASS synthetic_only=1 cases=4',
              'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0']
     for marker in exact:
@@ -143,7 +143,7 @@ def assess_userfault(console, qemu_exit):
         errors.append('usercopy phases out of order')
     if any(p in console for p in ['RPC_FAULT_QUERY_BLOCKED:', 'RPC_FAULT_WAKE_TIMEOUT:', 'RPC_FAULT_LATE_LEASE:']):
         errors.append('blocked progress or late lease')
-    exact = ['NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1',
+    exact = ['NATIVE_TYPED_HOST: index=0 queries=18 features=80 version=5 unsupported_opcode=1 invalid_timeout=1',
              'RPC_FAULT_LIFECYCLE: PASS synthetic_only=1 cases=2',
              'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0']
     if any(console.splitlines().count(p) != 1 for p in exact):
@@ -184,10 +184,10 @@ def main():
         manifest['userfault'] = args.userfault
         if args.userfault:
             manifest['scope'] = 'actual kernel ioctl usercopy WP, observation/admission retirement; synthetic only'
-        sources = [HERE / 'ws73_native_open_test.c', HERE / 'ws73_native_runtime_test.c',
+        sources = [HERE / 'ws73_native_open_test.c', HERE / 'native_runtime_probe.h', HERE / 'retired_ioctl_numbers.h',
                    HERE / 'native-open/native_open_fixture.c', HERE / 'native-open/native_open_fixture.h',
                    HERE / 'native-open/Makefile', Path(__file__).resolve(), HERE / 'qemu_verdict.py',
-                   HERE / 'run_runtime_lifecycle.py']
+                   HERE / 'vm_test_utils.py']
         if args.userfault:
             sources += [HERE / 'ws73_native_rpc_fault_test.c']
         manifest['sources'] = [file_record(p) for p in sources]

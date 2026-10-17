@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Native API fixture plus a synthetic WS73 survivor; never physical evidence. */
-#pragma push_macro("main")
-#undef main
-#define main ws73_native_lifecycle_main
-#include "ws73_native_runtime_test.c"
-#undef main
-#pragma pop_macro("main")
+#include "native_runtime_probe.h"
 #include "native-open/native_open_fixture.h"
 #include <sys/epoll.h>
 
@@ -76,8 +71,8 @@ static int opening_observe(int fd, struct native_open_probe *p)
 		if (ioctl(fd, SL_IOCTL_MANAGEMENT_ACQUIRE, &request) != -1 || errno != EAGAIN || request.lease)
 			return fail("opening lease counter or premature admission");
 	}
-	struct sle_dli_cmd raw = { .opcode = 0x0403 };
-	if (ioctl(fd, SL_IOCTL_DLI_SEND_CMD, &raw) != -1 || errno != EPERM ||
+	unsigned char raw[256] = { 0 };
+	if (ioctl(fd, SL_TEST_RETIRED_DLI_SEND_CMD, raw) != -1 || errno != ENOTTY ||
 	    ioctl(fd, SL_IOCTL_MANAGEMENT_QUERY, &q) || q.state != SLE_MANAGEMENT_FREE ||
 	    q.lease || q.flags || q.error || fixture(NATIVE_OPEN_QUERY, p) ||
 	    p->flags != 1 || p->gets != 1 || p->puts || p->closes || p->sends)

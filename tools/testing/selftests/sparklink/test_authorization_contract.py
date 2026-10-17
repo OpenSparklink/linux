@@ -22,10 +22,10 @@ class AuthorizationContract(unittest.TestCase):
         for kind, access in [('protected','Protected'),('observe','Observe')]:
             guest = re.search(rf'{kind}\[\] = \{{(.*?)\}};', source, re.S)[1]
             policy = (ROOT / 'net/sparklink/sle_authorization.rs').read_text()
-            branch = re.search(rf'((?:\s*(?:\| )?SL_IOCTL_\w+)+) => Ok\(Access::{access}\)', policy)[1]
+            branch = re.search(rf'((?:\s*(?:\| )?SL_IOCTL_\w+)+)\s+=> Ok\(Access::{access}\)', policy)[1]
             expected = re.findall(r'SL_IOCTL_\w+',branch)
             if kind == 'protected':
-                privileged = re.search(r'((?:\s*(?:\| )?SL_IOCTL_\w+)+) => Ok\(Access::PrivilegedObserve\)', policy)[1]
+                privileged = re.search(r'((?:\s*(?:\| )?SL_IOCTL_\w+)+)\s+=> Ok\(Access::PrivilegedObserve\)', policy)[1]
                 expected += re.findall(r'SL_IOCTL_\w+',privileged)
             self.assertCountEqual(re.findall(r'SL_IOCTL_\w+',guest),expected)
 

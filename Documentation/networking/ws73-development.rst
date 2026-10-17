@@ -5,6 +5,13 @@ Mixed historical WS73 lab notes
 
     Prerequisites and board inputs must be checked against the selected current runner. Missing-input and early Runtime milestones below describe earlier lab states. Use the current VM-only how-to and CURRENT_CAPABILITIES; no host installation is authorized.
 
+    The raw ``run_qemu_test.sh`` and ``run_runtime_lifecycle.py`` examples
+    below are archived with the old ABI, not current runnable instructions.
+    Their original sources and migration map are in
+    ``tools/testing/selftests/sparklink/retired-raw-uapi/``. Current VM gates
+    use ``run_virtual_vm.py`` and ``run_native_open_test.py`` with matched
+    artifacts; synthetic results never replace physical WS73 acceptance.
+
     Original source: e78b88f050aa98f7e8c83ff12c828eb172968d66. Historical evidence does not qualify the current image.
 
 WS73 development lab

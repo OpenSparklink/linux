@@ -12,7 +12,7 @@ def golden():
         'RPC_FAULT_ARMED: mode=acquire id=1 generation=4 kernel_wp=1 thread=1 epoll_empty=1',
         'RPC_FAULT_WAKE: mode=acquire elapsed_ms=0.001 event_hup=1 snoop_hup=1 copy_blocked=1',
         'RPC_FAULT_CASE: mode=acquire copy_release=1 result=ENODEV get=1 put=1 close=1 sends=0 old_fd=ENODEV new_lease=1 survivor=1',
-        'NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1',
+        'NATIVE_TYPED_HOST: index=0 queries=18 features=80 version=5 unsupported_opcode=1 invalid_timeout=1',
         'RPC_FAULT_LIFECYCLE: PASS synthetic_only=1 cases=2',
         'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0',
         'RUNTIME_KERNEL_LOG_BEGIN', '[    0.000000] Linux version fixture', 'RUNTIME_KERNEL_LOG_END', ''])

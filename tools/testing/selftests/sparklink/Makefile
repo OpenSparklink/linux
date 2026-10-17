@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 
-TEST_GEN_PROGS := sparklink_test ws73_bsle_test ws73_dli_test ws73_discovery_test
+TEST_GEN_PROGS := ws73_bsle_test ws73_dli_test ws73_discovery_test
 TEST_GEN_PROGS += ws73_recovery_test sparklink_backend_test
 TEST_GEN_PROGS += ws73_acb_test
 TEST_GEN_PROGS += ws73_chip_test
@@ -8,18 +8,17 @@ TEST_GEN_PROGS += virtual_codec_test
 TEST_GEN_PROGS += sle_channel_wire_test sle_channel_signal_test
 TEST_GEN_PROGS += sle_channel_state_test sle_channel_table_test
 TEST_GEN_PROGS_EXTENDED += ssap_removed_uapi_test sparklink_socket_type_test
-TEST_GEN_PROGS_EXTENDED += sparklink_runtime_test ws73_native_runtime_test sparklink_host_plan_test sparklink_discovery_operation_test
-TEST_GEN_PROGS_EXTENDED += ws73_native_tx_fault_test
+TEST_GEN_PROGS_EXTENDED += sparklink_host_plan_test sparklink_discovery_operation_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_open_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_rpc_fault_test
 TEST_GEN_PROGS_EXTENDED += sparklink_event_copy_test
 TEST_GEN_PROGS_EXTENDED += sparklink_diagnostic_result_test
 TEST_GEN_PROGS_EXTENDED += sparklink_setup_release_test
 TEST_GEN_PROGS_EXTENDED += genl_registry_test
-TEST_GEN_PROGS_EXTENDED += protocol_state_unsupported_test
+TEST_GEN_PROGS_EXTENDED += retired_uapi_test
 TEST_GEN_PROGS_EXTENDED += virtual_runtime_test
 
-TEST_PROGS := run_qemu_test.sh run_security_remediation.py run_backend_containment.py
+TEST_PROGS := run_security_remediation.py run_backend_containment.py
 TEST_PROGS += run_crypto_mechanism_faults.py
 TEST_PROGS += run_security_relay.py
 TEST_PROGS += run_connection_tx.py run_ssap_containment.py run_native_connection_contract.py
@@ -36,7 +35,9 @@ TEST_PROGS += run_standard_provider.py
 TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
 TEST_PROGS += test_virtual_vm_verdict.py run_standard_events.py test_dli_parser_budget.py
-TEST_FILES += dli_parser_budget.py
+TEST_PROGS += run_raw_uapi_retirement.py
+TEST_FILES += native_runtime_probe.h vm_test_utils.py retired-raw-uapi
+TEST_FILES += dli_parser_budget.py retired_uapi_test.c retired_ioctl_cases.h retired_ioctl_numbers.h file_affinity_probe.h
 TEST_FILES += run_virtual_vm.py standard_event_fixture.rs retired-standard-events retired-registry-version
 
 include ../lib.mk
@@ -59,13 +60,10 @@ $(OUTPUT)/ws73_acb_test: ws73_acb_test.c ../../../../drivers/sparklink/ws73/wire
 $(OUTPUT)/ws73_recovery_test: ws73_recovery_test.c ../../../../drivers/sparklink/ws73/recovery.h
 	$(CC) $(CFLAGS) $< $(LDLIBS) -o $@
 
-$(OUTPUT)/ws73_native_tx_fault_test: ws73_native_tx_fault_test.c ws73_native_runtime_test.c
+$(OUTPUT)/ws73_native_open_test: ws73_native_open_test.c native_runtime_probe.h retired_ioctl_numbers.h native-open/native_open_fixture.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-$(OUTPUT)/ws73_native_open_test: ws73_native_open_test.c ws73_native_runtime_test.c native-open/native_open_fixture.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $< $(LDLIBS) -o $@
-
-$(OUTPUT)/ws73_native_rpc_fault_test: ws73_native_rpc_fault_test.c ws73_native_open_test.c ws73_native_runtime_test.c native-open/native_open_fixture.h
+$(OUTPUT)/ws73_native_rpc_fault_test: ws73_native_rpc_fault_test.c ws73_native_open_test.c native_runtime_probe.h retired_ioctl_numbers.h native-open/native_open_fixture.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $< $(LDLIBS) -pthread -o $@
 
 RUSTC ?= rustc

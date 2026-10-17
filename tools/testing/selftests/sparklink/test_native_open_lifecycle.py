@@ -17,7 +17,7 @@ def golden():
         lines += [f'NATIVE_OPEN_CASE: slot={i} mode={i % 2} retiring={int(i >= 2)} result={result} '
                   f'close={int(i % 2 == 0)} get=1 put=1 sends=0 survivor=1 stale=1']
     return '\n'.join(lines + [
-        'NATIVE_HOST: index=0 queries=18 features=80 version=5 dialect_reject=1',
+        'NATIVE_TYPED_HOST: index=0 queries=18 features=80 version=5 unsupported_opcode=1 invalid_timeout=1',
         'NATIVE_OPEN_LIFECYCLE: PASS synthetic_only=1 cases=4',
         'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0',
         'RUNTIME_KERNEL_LOG_BEGIN', '[    0.000000] Linux version fixture', 'RUNTIME_KERNEL_LOG_END', ''])

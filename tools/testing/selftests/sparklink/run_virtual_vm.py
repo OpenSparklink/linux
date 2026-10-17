@@ -21,8 +21,10 @@ def verify_console(log, qemu_exit):
             or log.count('VIRTUAL_STANDARD_SNOOP_PASS:') != 2
             or len(re.findall(r'VIRTUAL_HARDWARE_ERROR_PASS: id=\d+ generation=\d+ requests=2 submitted=1 late_reply=ignored callback_return=1 credit=0 inherited_CAP=EPERM invalid=EINVAL bad_pointer=EFAULT retired_status=ENOTTY peer=1 reuse=1 raw_code=7 no_rf=1', log)) != 2
             or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
-            or log.count('PROTOCOL_STATE_REFUSAL_PASS:') != 4
-            or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
+            or len(re.findall(r'RETIRED_UAPI_ENOTTY_PASS: uid=(?:0|1000) cases=101 unchanged=101 checks=303 invalid_user_address=1 mixed_stats=ENOTTY',log)) != 4
+            or log.count('RETIRED_UAPI_ENOTTY_PASS: uid=1000') != 2
+            or log.count('RETIRED_UAPI_ENOTTY_PASS: uid=0') != 2
+            or log.count('VIRTUAL_POWER_RETIRED_ABI_PASS:') != 4
             or log.count('VIRTUAL_GLOBAL_POWER_POLICY_PASS:') != 2
             or log.count('GENL_REGISTRY_PASS:') != 10
             or log.count('GENL_REGISTRY_PASS: uid=1000') != 2
@@ -57,7 +59,11 @@ def run(args):
               'runner_sha256':sha(Path(__file__)), 'private_virtual_header_sha256':sha(here.parents[3]/'drivers/sparklink/virtual.h'),
               'module_info': info, 'source_sha256': sha(here / 'virtual_runtime_test.c'),
               'registry_probe_sha256': sha(here / 'genl_registry_test.c'),
-              'protocol_state_probe_sha256': sha(here / 'protocol_state_unsupported_test.c'),
+              'retired_uapi_probe_sha256': sha(here / 'retired_uapi_test.c'),
+              'retired_numbers_sha256': sha(here / 'retired_ioctl_numbers.h'),
+              'retired_cases_sha256': sha(here / 'retired_ioctl_cases.h'),
+              'file_affinity_sha256': sha(here / 'file_affinity_probe.h'),
+              'current_uapi_sha256': sha(here.parents[3]/'include/uapi/linux/sparklink_ioctl.h'),
               'inputs': {name: sha(path) for name, path in paths.items() if path.is_file()}}
     manifest = out / 'manifest.json'
 
@@ -140,7 +146,7 @@ busybox poweroff -f
                       hardware_error_results=[line for line in log.splitlines() if 'VIRTUAL_HARDWARE_ERROR_PASS:' in line],
                       standard_snoop_results=[line for line in log.splitlines() if 'VIRTUAL_STANDARD_SNOOP_PASS:' in line], module_rounds=2,
                       registry_results=[line for line in log.splitlines() if 'GENL_REGISTRY_PASS:' in line],
-                      protocol_state_results=[line for line in log.splitlines() if 'PROTOCOL_STATE_REFUSAL_PASS:' in line],
+                      retired_uapi_results=[line for line in log.splitlines() if 'RETIRED_UAPI_ENOTTY_PASS:' in line],
                       power_results=[line for line in log.splitlines() if 'VIRTUAL_POWER_' in line or 'VIRTUAL_GLOBAL_POWER_' in line],
                       query_results=[line for line in log.splitlines() if 'VIRTUAL_RUNTIME_PASS:' in line],
                       diagnostic_fd_results=[line for line in log.splitlines()

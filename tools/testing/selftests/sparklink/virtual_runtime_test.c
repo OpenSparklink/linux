@@ -13,8 +13,8 @@
 #include <grp.h>
 #define GENL_REGISTRY_EMBEDDED
 #include "genl_registry_test.c"
-#define PROTOCOL_STATE_EMBEDDED
-#include "protocol_state_unsupported_test.c"
+#define RETIRED_UAPI_EMBEDDED
+#include "retired_uapi_test.c"
 #include <time.h>
 #include <unistd.h>
 #include "../../../../include/uapi/linux/sparklink_ioctl.h"
@@ -69,8 +69,8 @@ static struct controller create(void)
 	struct sle_diagnostic_submit unauthorized = { .version = 1, .generation = c.status.generation,
 		.request_id = 1, .timeout_ms = 5000, .opcode = 0x0404, .action = 1 };
 	CHECK(ioctl(c.fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &unauthorized) == -1 && errno == EPERM);
-	struct sle_dli_cmd legacy = { .opcode = 0x0404 };
-	CHECK(ioctl(c.fd, SL_IOCTL_DLI_SEND_CMD, &legacy) == -1 && errno == EOPNOTSUPP);
+	unsigned char legacy[256];memset(legacy,0xa5,sizeof(legacy));
+	CHECK(ioctl(c.fd, SL_TEST_RETIRED_DLI_SEND_CMD, legacy) == -1 && errno == ENOTTY);
 
 	struct sle_management_request lease = { .version = 1,
 		.generation = c.status.generation, .mode = SLE_MANAGEMENT_DIAGNOSTIC };
@@ -364,19 +364,19 @@ static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
 	printf("VIRTUAL_FAULT: delay=%u drop=%u fail=%u peer_query=1 no_revive=1\n", delay, drop, fail);
 }
 
-static void rejected_power(int fd, int ordinary)
+static void rejected_power(int fd)
 {
-    const unsigned long commands[] = { SL_IOCTL_PM_INFO, SL_IOCTL_PM_SET_STATE,
-        SL_IOCTL_PM_SET_INTERVAL, SL_IOCTL_PM_FORCE_ACTIVE, SL_IOCTL_PM_TICK,
-        SL_IOCTL_PM_ACTIVITY };
+    const unsigned long commands[] = { SL_TEST_RETIRED_PM_INFO, SL_TEST_RETIRED_PM_SET_STATE,
+        SL_TEST_RETIRED_PM_SET_INTERVAL, SL_TEST_RETIRED_PM_FORCE_ACTIVE, SL_TEST_RETIRED_PM_TICK,
+        SL_TEST_RETIRED_PM_ACTIVITY };
     for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
         unsigned char data[64], original[64]; memset(data, 0xa5, sizeof(data));
         memcpy(original, data, sizeof(data));
         CHECK(ioctl(fd, commands[i], data) == -1);
-        CHECK(errno == (ordinary && i ? EPERM : EOPNOTSUPP));
+        CHECK(errno == ENOTTY);
         CHECK(!memcmp(data, original, sizeof(data)));
     }
-    printf("VIRTUAL_POWER_UNSUPPORTED_PASS: uid=%u commands=6 unchanged=6\n", getuid());
+    printf("VIRTUAL_POWER_RETIRED_ABI_PASS: uid=%u commands=6 unchanged=6\n", getuid());
 }
 
 int main(void)
@@ -384,8 +384,8 @@ int main(void)
 	struct controller a = create(), b = create();
 	CHECK(a.status.id != b.status.id && a.status.generation != b.status.generation);
 	CHECK(!registry_probe(2));
-	CHECK(!protocol_state_probe(a.fd));
-	rejected_power(a.fd, 0);
+	CHECK(!retired_uapi_probe(a.fd));
+	rejected_power(a.fd);
     const char *retired_attrs[] = {"max_connections", "adv_interval_ms", "scan_window_ms", "power_mode", "controller_type"};
     for (unsigned i = 0; i < sizeof(retired_attrs)/sizeof(retired_attrs[0]); i++) {
         char path[128]; snprintf(path, sizeof(path), "/sys/kernel/config/sparklink/%s", retired_attrs[i]);
@@ -396,8 +396,8 @@ int main(void)
 	pid_t observer = fork(); CHECK(observer >= 0);
 	if (!observer) {
 		CHECK(!setgroups(0, NULL) && !setgid(1000) && !setuid(1000));
-		CHECK(!protocol_state_probe(a.fd));
-		rejected_power(a.fd, 1);
+		CHECK(!retired_uapi_probe(a.fd));
+		rejected_power(a.fd);
 		int result = registry_probe(2); fflush(stdout); _exit(result);
 	}
 	int status; CHECK(waitpid(observer, &status, 0) == observer && WIFEXITED(status) && !WEXITSTATUS(status));
