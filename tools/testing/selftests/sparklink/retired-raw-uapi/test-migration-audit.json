@@ -1,0 +1,24 @@
+{
+  "base": "2d268bd0dfe53496d10309e645733d1a6cbe9a89",
+  "files": {
+    "sparklink_test.c": "d5482f5cced695bfede3e18429255dae64fbc2690e9e08bd7ee54b6f27a399e2",
+    "sparklink_runtime_test.c": "10013abb16bc9220ac58901bdaabe0739824fb2ebcfd9e66e9cdcbb6079def3c",
+    "sparklink_ctl.c": "4ae9db0ed1b71226ca9fd0736c93b203ba4e33123d85f97070a64b9a9f95919d",
+    "ws73_native_runtime_test.c": "309cc8b8f0f23bdd9f705c612962d3d95f4530e20ed337b72db92a12a97ee13f",
+    "ws73_native_tx_fault_test.c": "dd878c5fdb176ae9ca7e4f1fafbce32e0579458054254b4885313a36e235295a",
+    "run_qemu_test.sh": "208b5f0d96e16c1c0809cdbc83d16cf864de643ae6c0904e32365f934d52409e",
+    "run_runtime_lifecycle.py": "a4fcd5f9e7311346776a5d7422157e693eb91c4028a2afd379e318e8a0ade4a4",
+    "test_runtime_lifecycle.py": "817fc2b8b70ebd0504c57dcfa1d832c521dfdb753b7bbcebb2668606b732205d",
+    "test_native_runtime_lifecycle.py": "cd8344278d091354ccac8fd25f42529c6f772baae740635e7f79c86aba4aa809",
+    "test_native_link_events.py": "557b63014626abef5561bbbfc429a2db5103fd78668da155a29ec9bc698eec1f",
+    "test_verdict.py": "a95775c3c07fc5b2ded86c181db642d57503c1a9e2239c929572632d9425f382",
+    "kernel_authorization_test.c": "3145f685f30082972e359a6619b1e6adc8feb4b64c1f745260778a093ed3574b",
+    "daemon_management_test.c": "5f78b4cc322d479dd13217b99c57faa9557d2c7eabb8b764411b903463d51849"
+  },
+  "status": "MIGRATION_NOT_RUNTIME_VALIDATED",
+  "current_replacements": {
+    "native_open_and_rpc": "native_runtime_probe.h: same actual ioctl helpers, typed DiagnosticSubmit/Result with explicit generation/request/seq/deadline and unchanged result/count checks; new grammar needs VM requalification",
+    "standard_runtime": "run_virtual_vm.py actual provider/Host/worker tests plus current ticket/ingress/bus/snapshot fixtures; NOT full old-suite coverage",
+    "remaining": "Synthetic WS73 hotplug/fault/raw-loop runners archived; reimplement valuable controlled USB terminal/credit/cancel cases through current typed interfaces before claiming them. History is not current acceptance."
+  }
+}

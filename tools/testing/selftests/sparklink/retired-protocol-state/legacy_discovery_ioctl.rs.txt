@@ -1,0 +1,22 @@
+        SL_IOCTL_START_ADV => {
+            let uparams: SleAdvParams = read_user_struct(arg)?;
+            do_start_adv(context, u32::from(uparams.interval_ms), uparams.discovery_level)?;
+            Ok(0)
+        }
+        SL_IOCTL_STOP_ADV => {
+            do_stop_adv(context)?;
+            Ok(0)
+        }
+        SL_IOCTL_START_SCAN => {
+            let uparams: SleScanParams = read_user_struct(arg)?;
+            do_start_scan(context,
+                u32::from(uparams.window_ms),
+                u32::from(uparams.interval_ms),
+                uparams.filter_discovery_level,
+            )?;
+            Ok(0)
+        }
+        SL_IOCTL_STOP_SCAN => {
+            do_stop_scan(context)?;
+            Ok(0)
+        }

@@ -1,0 +1,78 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Run from the kernel tree:
+  CC=clang python3 tools/testing/selftests/sparklink/run_security_remediation.py
+
+Requires Rust with the current kernel-supported syntax and a C compiler with
+ASan/UBSan runtimes. LeakSanitizer requires an environment without ptrace.
+Missing tools/runtimes or failed assertions fail the test; there is no fallback
+PASS or skipped assertion. No production fault switches are introduced.
+
+The runner copies the unchanged test-only historical crypto source and archived security model
+from ../retired-security-state/ to a private
+build directory, appends child tests for private state, and links controllable FFI
+dependencies. It compiles the exact archived C CTR function against counted
+allocation/crypto dependencies. These verify errno propagation, fail-closed legacy
+pairing, KDF commit, counter overflow and failure commit of data/IV/address. They
+are not real crypto algorithms, standard vectors, peer interoperability or RF.
+
+This archived pairing model is unavailable in production. Actual per-connection
+Native relay/P256/CMAC mechanisms have separate source-bound qualification; these
+fixture results do not establish their authentication or interoperability.
+Unpublished legacy test ioctl numbers still exist for caller migration, but their
+production handlers return EOPNOTSUPP. Tests call retained actual wrappers instead. Model tests are historical; the default runtime has no SecurityInner/RpaManager.
+The real WS73 Native discovery implementation is untouched and needs regression
+on each new kernel in a VM with real devices before hardware preservation claims.
+
+SDK111 security event envelope proof (CBMC 6.11.0):
+  cbmc tools/testing/selftests/sparklink/security/relay_envelope_cbmc.c \
+    --function main --unwind 266 --unwinding-assertions --bounds-check \
+    --pointer-check --signed-overflow-check --unsigned-overflow-check \
+    --conversion-check --trace
+
+The harness includes the actual driver dli.c. Packets are nondeterministic,
+0..265 bytes, dynamically allocated at the advertised input size; allocation
+failure is not excluded. All header/status/handle/index/payload bytes are free.
+Properties cover recognition, exact nested lengths and memory/arithmetic safety.
+No alignment/padding from the reference Host's C structures is assumed. The
+scope does not cover framing above 265 bytes, RF, command serialization,
+generation/lifetime attribution, key validation, or security state transitions.
+Record the exact source/harness hashes, command, tool version and terminal result
+for each run. Timeout, missing tools, unsupported or incomplete unwinding are
+NOT_PROVEN, never a hardware or pairing PASS.
+
+Production relay Session transitions (no RF or trusted state qualification):
+  python3 tools/testing/selftests/sparklink/run_security_relay.py --output REPORT
+  python3 tools/testing/selftests/sparklink/run_security_relay.py --kani --output REPORT
+
+Verbatim source: net/sparklink/sle_security_relay_state.rs. Regression uses
+rustc --test -Dwarnings; formal uses a private mirrored tree with the SAME source,
+not extracted/replaced state methods. Eight transition steps, two queued PDUs,
+one active packet, payload0..3 bytes in the transition harness, unwind12. A second
+harness constructs an arbitrary u64 counter, including overflow, and checks a
+three-byte parameter snapshot. Native tests separately cover all payload0..256
+boundaries, every identity component, original deadline, pre-submit and in-flight
+withdrawal, successful Status versus Complete, uncertain failure and isolation.
+
+No proof of fd/dup/VFS semantics, real locks, authority allocation, callback join,
+wire Complete uniqueness, retry/reuse barrier or crypto/protocol negotiation is
+claimed. The submit callback is an explicit atomic accepted/never-queued fixture;
+physical reset/barrier correctness is external and remains unproved. The production
+constructor must be owned once by the physical Session, not recreated per fd or
+grant. Never equate the local cookie guard with generation on the actual wire.
+Missing/unsupported/timed-out tools fail this runner. Timeout kills and joins the
+verifier process group. Generated artifacts stay in a private temporary tree;
+with --output, the exact verifier log is preserved next to the report.
+
+The limited capability-only exchange adds two selectable proof harnesses:
+  python3 tools/testing/selftests/sparklink/run_security_relay.py --kani \
+    --kani-harness capability_withdraw_deadline_and_submit --output REPORT
+  python3 tools/testing/selftests/sparklink/run_security_relay.py --kani \
+    --kani-harness capability_requires_peer_and_terminal_complete --output REPORT
+
+These execute the same production methods, one fixed 10-byte offer, one command
+and terminal reply, arbitrary u64 commit time, nondeterministic accepted/NEVER
+queued callback, and both RX/Complete orders. No second Engine or trusted result.
+The caller's lock/identity and atomic driver submission contract are assumptions,
+not proofs of the actual Host/HCD implementation. Unsupported diagnostics remain
+NOT_PROVEN even if the tool exits zero and generated checks report no failures.

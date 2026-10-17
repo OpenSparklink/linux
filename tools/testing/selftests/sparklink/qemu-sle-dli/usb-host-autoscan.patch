@@ -1,0 +1,43 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -1869,6 +1869,9 @@
+ 
+ static QEMUTimer *usb_auto_timer;
+ static VMChangeStateEntry *usb_vmstate;
++/* usb_host_close() requests another scan. A nested scan must not reset
++ * seen counters while its caller still traverses hostdevs. */
++static bool usb_auto_check_running;
+ 
+ static void usb_host_vm_state(void *unused, bool running, RunState state)
+ {
+@@ -1897,12 +1900,21 @@
+     struct libusb_device_descriptor ddesc;
+     int i, n;
+ 
++    if (usb_auto_check_running) {
++        return;
++    }
++    usb_auto_check_running = true;
+     if (usb_host_init() != 0) {
++        usb_auto_check_running = false;
+         return;
+     }
+ 
+     if (runstate_is_running()) {
+         n = libusb_get_device_list(ctx, &devs);
++        if (n < 0) {
++            /* Enumeration failure is not evidence that every device left. */
++            goto reschedule;
++        }
+         for (i = 0; i < n; i++) {
+             if (libusb_get_device_descriptor(devs[i], &ddesc) != 0) {
+                 continue;
+@@ -1968,6 +1980,8 @@
+         }
+     }
+ 
++reschedule:
++    usb_auto_check_running = false;
+     if (!usb_vmstate) {
+         usb_vmstate = qemu_add_vm_change_state_handler(usb_host_vm_state, NULL);
+     }

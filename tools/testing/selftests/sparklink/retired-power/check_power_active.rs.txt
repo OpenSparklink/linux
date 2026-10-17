@@ -1,0 +1,8 @@
+    fn check_power_active() -> Result {
+        let mode = sle_configfs::power_mode();
+        if mode >= 2 {
+            // Idle or suspended — reject active operations.
+            return Err(EPERM);
+        }
+        Ok(())
+    }

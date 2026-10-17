@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "base_kernel": "b35d0313d29f5797aefdef045b8d559a50a82c09",
+  "status": "DRAFT_NOT_COMPILED_OR_QUALIFIED",
+  "immediate_delete": [
+    {
+      "entry": "DliOgf/dli_opcode/dli_ogf/dli_ocf/DliEventCode",
+      "production_callers": [],
+      "effect": "unused declaration-only catalog; wire parser/typed opcode catalog unchanged",
+      "source_sha256": "4bb133ac7a897b76aec2d414d46380edb69749f50690f3c350ce604cd25f21f7"
+    },
+    {
+      "entry": "SleControllerInfo name/features/features_ext/max_pdu_payload/max_connections/max_mtu/max_mps/transport_modes/measurement_cap/security_cap",
+      "production_callers": [
+        "NativeController.info wrote, no production reads"
+      ],
+      "replacement": "NativeInfo/fill_snapshot retain actual wire metadata; Runtime owns credit and status"
+    }
+  ],
+  "move_to_test": [
+    {
+      "entry": "DliPacketType/bus/old metadata and Native info projection",
+      "callers": [
+        "retired UART/SPI/USB/serdev tests",
+        "historical bus projection cases"
+      ],
+      "paths": [
+        "retired-dli-metadata/legacy_metadata.rs",
+        "retired-dli-metadata/native_info.rs",
+        "retired-dli-metadata/backend_bus_fixture.rs"
+      ],
+      "gate": "historical cases in independent executable; never default kernel"
+    }
+  ],
+  "wait_for_replacement": [
+    {
+      "entry": "remaining DLI event fields/global lint mask",
+      "reason": "standard codec validation versus unconsumed business event payload requires separate migration, not mechanical removal"
+    },
+    {
+      "entry": "raw ioctl/auth/selftests and private ABI fixtures",
+      "reason": "full-chain numbered caller inventory still required"
+    },
+    {
+      "entry": "registry packed firmware observation",
+      "reason": "exact current install/pending fixture migration with current Native snapshot remains separate"
+    }
+  ],
+  "regression": [
+    "actual backend install19/pending9 plus history6",
+    "current snapshot5 plus historical bus5",
+    "retired transport5/USB metadata history",
+    "strict whole production Rust component",
+    "exact compiled kernel and VM-only real discovery/connect/socket/length/Owned/relay gates"
+  ],
+  "not_proven": [
+    "formal refinement",
+    "concurrent kernel lifetime",
+    "natural recovery",
+    "complete architecture"
+  ]
+}

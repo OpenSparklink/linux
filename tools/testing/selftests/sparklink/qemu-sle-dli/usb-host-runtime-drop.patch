@@ -1,0 +1,38 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -506,6 +506,17 @@
+     return true;
+ }
+ 
++static void usb_host_test_record_drop(USBHostDevice *s, USBHostRequest *r)
++{
++    s->test_runtime_hold_drops++;
++    g_autofree char *sha256 = g_compute_checksum_for_data(
++        G_CHECKSUM_SHA256, r->buffer, r->xfer->actual_length);
++    fprintf(stderr, "WS73_TEST_RUNTIME_HOLD_DROP: dev %u:%u bytes=%d "
++            "drops=%" PRIu64 " sha256=%s\n",
++            s->bus_num, s->addr, r->xfer->actual_length,
++            s->test_runtime_hold_drops, sha256);
++}
++
+ static void usb_host_test_release_hold(USBHostDevice *s, bool bounded)
+ {
+     USBHostRequest *r = s->test_runtime_held;
+@@ -622,7 +633,7 @@
+         }
+     }
+     if (held) {
+-        s->test_runtime_hold_drops++;
++        usb_host_test_record_drop(s, r);
+         usb_host_req_free(r); /* host transfer already completed; no callback */
+     }
+ }
+@@ -1609,7 +1620,7 @@
+         bool held = usb_host_test_clear_hold(s, r);
+         r->p = NULL; /* mark as dead */
+         if (held) {
+-            s->test_runtime_hold_drops++;
++            usb_host_test_record_drop(s, r);
+             usb_host_req_free(r);
+         } else {
+             libusb_cancel_transfer(r->xfer);

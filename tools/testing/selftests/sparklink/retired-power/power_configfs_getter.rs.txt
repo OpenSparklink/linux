@@ -1,0 +1,6 @@
+/// Get the configured power mode.
+/// 0 = active, 1 = sniff, 2 = idle.
+pub(crate) fn power_mode() -> u8 {
+    POWER_MODE.load(Ordering::Relaxed)
+}
+

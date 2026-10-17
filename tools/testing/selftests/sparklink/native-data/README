@@ -1,0 +1,39 @@
+Native ACB production-source boundaries
+======================================
+
+run_native_data.py compiles the complete current native receive/send/take
+bodies, DataCredits, NativeData and canonical LinkObservation. Signature-only
+extern spelling is normalized for the balanced-body extractor. The allocation,
+IRQ locks, owner registry, Backend, USB result and wakeup dependencies are
+fixtures. No USB, kernel boot, ordinary-user socket or peer application runs.
+
+Coverage: controller/generation/lifetime RX attribution, FIFO and packet limit,
+non-consuming EMSGSIZE, actual credit reserve/NOCP release, zero/excess/unknown
+completion, early completion before transport return, old debt at handle reuse,
+uncertain transport, two-owner isolation and unchanged command-event delegation.
+The production sources and fixture compile with warnings denied; no global
+dead-code suppression is used. Existing atomic publisher tests cover lock order
+and independent data wakeup even if the controller event log cannot publish.
+
+The internal native ACB seam is not a userspace ioctl or a channel socket.
+Legacy handle-only send remains unsupported. WS73 sends one full SDU using
+queried size limits; Runtime owns packet credit, not the driver. Queued RX is
+bounded to sixteen packets of at most 2047 bytes, tied to a canonical lifetime,
+and retired at known link changes. No DTAP frame is parsed as a legacy raw PDU.
+
+Still required: real A3/NOCP and peer receive evidence; CMTC capability/TCID/PI
+handling; bounded socket TX queues, ordinary-user poll/close/link-down, real
+bidirectional payload validation; fragmentation and data-flow fault gates.
+NOCP lacks lifetime on the wire. Old debt blocks a reused handle until actual
+matching counts settle it; neither Down nor USB success invents a credit.
+Uncertain accounting stops data transmission for that controller generation.
+It does not change command credit or reset another controller. Hardware debt
+clearing and nonmanual recovery are unqualified; related issues remain open.
+
+SDK111 real VM142 produced a 28-byte PB-first fragment for a 62-byte SDU,
+despite queried TX capacity 254. RX now reassembles PB-first/middle/last per
+registration/lifetime/handle, up to 2047 bytes, with a five-second absolute
+deadline reclaimed by the per-controller heartbeat. First ingress reserves
+the whole buffer outside IRQ locks; continuation cannot grow beyond it.
+Expired, oversized, orphan or old-lifetime fragments never become complete
+data or return a TX credit. Valid PB/priority flags are not USB/device faults.

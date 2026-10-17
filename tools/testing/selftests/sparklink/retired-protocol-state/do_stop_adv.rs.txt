@@ -1,0 +1,8 @@
+fn do_stop_adv(context: &RuntimeContext) -> Result<i32> {
+    let mut ss = context.lock()?;
+    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+    if !s.adv_scan.is_advertising() { return Err(EBUSY); }
+    s.controller.enable_broadcast(false)?;
+    s.adv_scan.stop_advertising()?;
+    Ok(0)
+}

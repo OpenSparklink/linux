@@ -1,0 +1,32 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -1877,6 +1877,18 @@
+     }
+ }
+
++/* A fixed physical port can re-enumerate between autoscan ticks. Matching
++ * its new address must not keep the old handle alive indefinitely. Only
++ * schedule the existing serialized removal path; it cancels old transfers
++ * before auto-opening the replacement, with this object's reset/detach policy.
++ */
++static int usb_host_port_reenumerated(USBHostDevice *s, libusb_device *dev)
++{
++    return s->dh != NULL && s->match.bus_num > 0 && s->match.port != NULL &&
++           s->bus_num == libusb_get_bus_number(dev) &&
++           s->addr != libusb_get_device_address(dev);
++}
++
+ static void usb_host_auto_check(void *unused)
+ {
+     struct USBHostDevice *s;
+@@ -1926,6 +1938,10 @@
+
+                 /* We got a match */
+                 s->seen++;
++                if (usb_host_port_reenumerated(s, devs[i])) {
++                    usb_host_nodev(s);
++                    continue;
++                }
+                 if (s->errcount >= 3) {
+                     continue;
+                 }

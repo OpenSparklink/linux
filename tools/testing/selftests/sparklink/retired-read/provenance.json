@@ -1,0 +1,9 @@
+{
+  "origin": "46f3b77f2662351c8b75c19b1abdcde776b85198",
+  "scope": "exact old read/queue/copy regression only, no current ABI qualification",
+  "source_hashes": {
+    "net/sparklink/sparklink_core.rs": "73c20f1563f19c47a05347a0104bac86825b3aa42ec0ec8e38c13a5bd6c22f50",
+    "net/sparklink/sle_workers.rs": "c4c5601e0c5f5899e07d8f471aeece46e80d1950d9ccaf2bef93f65165ad9a2a",
+    "net/sparklink/sle_event.rs": "406cf69542a18de7b3f1827a117429f2ff3e1e613ff3bc0b0cfd332b026f9bbd"
+  }
+}

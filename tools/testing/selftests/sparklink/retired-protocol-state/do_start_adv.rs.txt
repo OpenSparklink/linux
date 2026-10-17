@@ -1,0 +1,32 @@
+fn do_start_adv(context: &RuntimeContext, interval_ms: u32, discovery_level: u8) -> Result<i32> {
+    let interval = if interval_ms == 0 {
+        u32::from(sle_configfs::adv_interval_ms())
+    } else {
+        interval_ms
+    };
+    let params = AdvParams {
+        discovery_level,
+        interval_slots: interval * 8,
+        broadcast_type: sle_pdu::BroadcastType::AccessibleScannable,
+        tx_power: 0,
+    };
+    let mut ss = context.lock()?;
+    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+    if s.local_role != GtRole::GNode {
+        return Err(EPERM);
+    }
+    s.adv_scan.start_advertising(params)?;
+    // Services are owned by the future userspace Engine, not a kernel DB.
+    // Explicit Native advertising data remains on its existing typed path.
+    let _ = s.adv_scan.build_adv_pdu(&[], &[]);
+    match s.controller.enable_broadcast(true) {
+        Ok(()) => {
+            drain_controller_events(s);
+        }
+        Err(e) => {
+            s.adv_scan.abort_advertising();
+            return Err(e);
+        }
+    }
+    Ok(0)
+}

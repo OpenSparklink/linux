@@ -1,0 +1,24 @@
+Historical PHY model, test-only
+===============================
+
+legacy_model.rs was moved out of net/sparklink/sle_phy.rs for R09 cleanup.
+It contains the old local MCS/MIMO/default PHY/parameter encoder model. These
+tables and codecs have not been qualified against the current standard/WS73
+firmware, and are not reference vectors or a supported hardware interface.
+
+run_phy_model.py compiles this isolated model and the unchanged production
+channel-map/hopping helpers with dependency fixtures under -D warnings. The
+three tests retain local boundary/roundtrip/history coverage, without global
+dead_code suppression or a second copy of production channel-map algorithms.
+The actual unsupported PHY match arm is compiled separately, with only its
+constant identifiers and kernel Error constructor supplied by fixtures.
+
+These are development checks, not VFS, hardware completion, security, AFH
+standard conformance, lockdep or RF acceptance. The production PHY observation,
+setter, local selection/hopping/SINR ioctls return EOPNOTSUPP. The legacy
+adapter-global encryption enable rejects even artificially pre-populated
+Paired keys; future authenticated per-connection installation/completion is
+still required. No defaults or local estimates are reported as hardware state.
+
+ChannelMap/HoppingState remain in the legacy connection path pending the
+connection/socket migration; their presence does not qualify link/PHY support.

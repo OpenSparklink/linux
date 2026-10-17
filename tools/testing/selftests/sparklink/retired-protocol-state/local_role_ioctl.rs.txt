@@ -1,0 +1,26 @@
+        SL_IOCTL_SET_ROLE => {
+            let role_byte: u8 = read_user_struct(arg)?;
+            let role = match role_byte {
+                0 => GtRole::TNode,
+                1 => GtRole::GNode,
+                _ => return Err(EINVAL),
+            };
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            if s.conn.active_handles().1 > 0 {
+                dev_warn!(
+                    me.dev,
+                    "sparklink: cannot change role with active connections\n"
+                );
+                return Err(EBUSY);
+            }
+            s.local_role = role;
+            dev_info!(me.dev, "sparklink: local role set to {:?}\n", role);
+            Ok(0)
+        }
+        SL_IOCTL_GET_ROLE => {
+            let ss = context.lock()?;
+            let s = ss.as_ref().ok_or(ENODEV)?;
+            write_user_struct(arg, &(s.local_role as u8))?;
+            Ok(0)
+        }

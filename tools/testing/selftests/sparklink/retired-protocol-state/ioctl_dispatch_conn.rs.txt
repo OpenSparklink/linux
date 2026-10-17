@@ -1,0 +1,246 @@
+
+
+fn ioctl_dispatch_conn(context: &RuntimeContext, _me: Pin<&SparkLinkCtl>, cmd: u32, arg: usize) -> Result<isize> {
+    match cmd {
+        SL_IOCTL_CONNECT => {
+            let cp: SleConnectParams = read_user_struct(arg)?;
+            let role = if cp.gt_role == 1 {
+                GtRole::GNode
+            } else {
+                GtRole::TNode
+            };
+            let handle = {
+                let mut ss = context.lock()?;
+                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+                let handle = s.conn.connect(cp.peer_addr, role)?;
+                match s.controller.create_connection(&cp.peer_addr) {
+                    Ok(()) => {
+                        drain_controller_events(s);
+                        s.conn.confirm_connecting_by_addr(&cp.peer_addr);
+                    }
+                    Err(e) => {
+                        s.conn.abort_connecting(handle);
+                        return Err(e);
+                    }
+                }
+                handle
+            };
+            Ok(handle as isize)
+        }
+        SL_IOCTL_DISCONNECT => {
+            let handle: u16 = read_user_struct(arg)?;
+            let (_handle, _peer_addr, _old_state, _new_state) = {
+                let mut ss = context.lock()?;
+                let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+                let handle = s.conn.resolve_handle(handle)?;
+                let peer_addr = s.conn.info(handle).map(|e| e.peer_addr).unwrap_or([0u8; 6]);
+                let old_state = s.conn.info(handle).map(|e| e.state as u8).unwrap_or(0);
+                let asynchronous = s.controller.uses_command_host();
+                let wire_handle = if asynchronous {
+                    s.conn.controller_handle(handle)?
+                } else {
+                    Some(handle)
+                };
+                s.conn.disconnect(handle)?;
+                // Before ConnectionEstablished, retain the outgoing entry.
+                // Its completion learns the controller handle and sends the
+                // deferred disconnect; a queued command is not a disconnect.
+                if let Some(wire_handle) = wire_handle {
+                    match s.controller.disconnect(wire_handle) {
+                        Ok(()) => {
+                            drain_controller_events(s);
+                            if !asynchronous && s.conn
+                                .info(handle)
+                                .map(|e| e.state == ConnState::DisconnectPending)
+                                .unwrap_or(false)
+                            {
+                                s.conn.confirm_disconnecting(handle);
+                            }
+                        }
+                        Err(error) => {
+                            s.conn.abort_disconnecting(handle);
+                            return Err(error);
+                        }
+                    }
+                }
+                let new_state = s.conn.info(handle).map(|e| e.state as u8).unwrap_or(0);
+                (handle, peer_addr, old_state, new_state)
+            };
+            Ok(0)
+        }
+        SL_IOCTL_CONN_INFO => {
+            let req: SleConnInfo = read_user_struct(arg)?;
+            let ss = context.lock()?;
+            let s = ss.as_ref().ok_or(ENODEV)?;
+            let handle = if req.handle == 0 {
+                let (handles, count) = s.conn.active_handles();
+                if count == 0 {
+                    return Err(EPIPE);
+                }
+                handles[0]
+            } else {
+                req.handle
+            };
+            let entry = s.conn.info(handle)?;
+            let mut info: SleConnInfo = unsafe { core::mem::zeroed() };
+            info.handle = entry.handle;
+            info.state = entry.state as u8;
+            info.peer_addr = entry.peer_addr;
+            info.local_role = entry.local_role as u8;
+            info.bandwidth_mhz = entry.params.bandwidth_mhz;
+            info.mcs_index = entry.params.mcs_index;
+            info.event_group_period = entry.params.event_group_period;
+            info.supervision_timeout = entry.params.supervision_timeout;
+            info.tx_seq = entry.seq.tx_seq;
+            info.rx_seq = entry.seq.rx_seq;
+            // Legacy direct submission has no queued payloads. Acceptance is
+            // not a remote delivery acknowledgement or an async queue depth.
+            info.tx_pending = 0;
+            info.rx_pending = entry.rx_queue.len() as u16;
+            info.tx_bytes = entry.tx_bytes;
+            info.rx_bytes = entry.rx_bytes;
+            info.data_mtu = entry.channels.data.mtu;
+            info.data_mps = entry.channels.data.mps;
+            info.data_mode = entry.channels.data.mode as u8;
+            info.svc_mtu = entry.channels.svc_mgmt.mtu;
+            info.smtc_tx_credits = entry.channels.svc_mgmt.tx_credits;
+            info.smtc_rx_credits = entry.channels.svc_mgmt.rx_credits;
+            info.dudtc_tx_credits = entry.channels.data.tx_credits;
+            info.dudtc_rx_credits = entry.channels.data.rx_credits;
+            drop(ss);
+            write_user_struct(arg, &info)?;
+            Ok(0)
+        }
+        SL_IOCTL_CONN_SEND => ioctl_conn_send(context, arg),
+        SL_IOCTL_CONN_RECV => ioctl_conn_recv(context, arg),
+        SL_IOCTL_INJECT_CONN_RESP => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        SL_IOCTL_INJECT_CONN_DATA => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        SL_IOCTL_CONN_COUNT => {
+            let ss = context.lock()?;
+            let s = ss.as_ref().ok_or(ENODEV)?;
+            Ok(s.conn.active_count() as isize)
+        }
+        SL_IOCTL_CONN_LIST => {
+            let ss = context.lock()?;
+            let s = ss.as_ref().ok_or(ENODEV)?;
+            let (handles, count) = s.conn.active_handles();
+            let mut list: SleConnList = unsafe { core::mem::zeroed() };
+            let count = count.min(8);
+            list.count = count as u16;
+            list.handles[..count].copy_from_slice(&handles[..count]);
+            drop(ss);
+            write_user_struct(arg, &list)?;
+            Ok(0)
+        }
+        SL_IOCTL_SET_CONN_MTU => {
+            let params: SleConnMtuParams = read_user_struct(arg)?;
+            let mps = if params.mps > 0 {
+                Some(params.mps)
+            } else {
+                None
+            };
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(params.handle)?;
+            s.conn.set_data_mtu(handle, params.mtu, mps)?;
+            Ok(0)
+        }
+        SL_IOCTL_CONN_READ_PEER_FEATURES => {
+            let req: SleConnPeerCap = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(req.handle)?;
+            let entry = s.conn.info(handle)?;
+            if !entry.peer_cap.features_valid {
+                let hb = handle.to_le_bytes();
+                s.controller
+                    .send_command(sle_dli::SleOpcode::ReadFeatures, &hb)?;
+                drain_controller_events(s);
+            }
+            let entry = s.conn.info(handle)?;
+            let mut out: SleConnPeerCap = unsafe { core::mem::zeroed() };
+            out.handle = handle;
+            out.features = entry.peer_cap.features;
+            out.features_valid = if entry.peer_cap.features_valid { 1 } else { 0 };
+            out.version = entry.peer_cap.version;
+            out.manufacturer = entry.peer_cap.manufacturer;
+            out.subversion = entry.peer_cap.subversion;
+            out.version_valid = if entry.peer_cap.version_valid { 1 } else { 0 };
+            drop(ss);
+            write_user_struct(arg, &out)?;
+            Ok(0)
+        }
+        SL_IOCTL_CONN_READ_PEER_VERSION => {
+            let req: SleConnPeerCap = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(req.handle)?;
+            let entry = s.conn.info(handle)?;
+            if !entry.peer_cap.version_valid {
+                let hb = handle.to_le_bytes();
+                s.controller
+                    .send_command(sle_dli::SleOpcode::ReadVersion, &hb)?;
+                drain_controller_events(s);
+            }
+            let entry = s.conn.info(handle)?;
+            let mut out: SleConnPeerCap = unsafe { core::mem::zeroed() };
+            out.handle = handle;
+            out.features = entry.peer_cap.features;
+            out.features_valid = if entry.peer_cap.features_valid { 1 } else { 0 };
+            out.version = entry.peer_cap.version;
+            out.manufacturer = entry.peer_cap.manufacturer;
+            out.subversion = entry.peer_cap.subversion;
+            out.version_valid = if entry.peer_cap.version_valid { 1 } else { 0 };
+            drop(ss);
+            write_user_struct(arg, &out)?;
+            Ok(0)
+        }
+        SL_IOCTL_CONN_UPDATE_PARAMS => {
+            let up: SleConnParamUpdate = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(up.handle)?;
+            let interval = if up.interval_max > 0 {
+                up.interval_max
+            } else {
+                up.interval_min
+            };
+            s.conn
+                .update_conn_params(handle, interval, up.latency, up.supervision_timeout)?;
+            let mut params = [0u8; 10];
+            params[0..2].copy_from_slice(&handle.to_le_bytes());
+            params[2..4].copy_from_slice(&up.interval_min.to_le_bytes());
+            params[4..6].copy_from_slice(&up.interval_max.to_le_bytes());
+            params[6..8].copy_from_slice(&up.latency.to_le_bytes());
+            params[8..10].copy_from_slice(&up.supervision_timeout.to_le_bytes());
+            s.controller
+                .send_command(sle_dli::SleOpcode::ConnParamUpdate, &params)?;
+            Ok(0)
+        }
+        SL_IOCTL_CONN_PHY_UPDATE => {
+            let pu: SleConnPhyUpdate = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(pu.handle)?;
+            let mcs = if pu.mcs_index != 0xFF {
+                pu.mcs_index
+            } else {
+                s.conn.info(handle)?.params.mcs_index
+            };
+            let bw = if pu.bandwidth_mhz != 0 {
+                pu.bandwidth_mhz
+            } else {
+                s.conn.info(handle)?.params.bandwidth_mhz
+            };
+            s.conn.update_phy_params(handle, mcs, bw)?;
+            let mut params = [0u8; 4];
+            params[0..2].copy_from_slice(&handle.to_le_bytes());
+            params[2] = mcs;
+            params[3] = bw;
+            s.controller
+                .send_command(sle_dli::SleOpcode::SetPhyParam, &params)?;
+            Ok(0)
+        }
+        _ => Err(EINVAL),
+    }
+}

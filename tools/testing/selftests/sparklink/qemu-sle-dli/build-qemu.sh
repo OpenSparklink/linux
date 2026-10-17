@@ -21,7 +21,11 @@ QEMU_SRC="$WORK_DIR/qemu-${QEMU_VERSION}"
 QEMU_BUILD="$WORK_DIR/build"
 DEVICE_SRC="$SCRIPT_DIR/usb-sle-dli.c"
 INSTALL_DIR="$SCRIPT_DIR/bin"
-NPROC="$(nproc)"
+NPROC="${JOBS:-$(nproc)}"
+if [[ ! "$NPROC" =~ ^[1-9][0-9]*$ ]]; then
+    echo "JOBS must be a positive integer" >&2
+    exit 1
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +72,15 @@ patch_qemu() {
 
     info "Installing usb-sle-dli device into QEMU source..."
     cp "$DEVICE_SRC" "$dest"
+    cp "$SCRIPT_DIR/usb-ws73-test.c" "$QEMU_SRC/hw/usb/dev-ws73-test.c"
+    python3 "$SCRIPT_DIR/apply-usb-host-boundary.py" "$QEMU_SRC"
+
+    # glibc 2.43 preserves memchr's const qualifier with GCC 16. QEMU 9.2's
+    # bundled libfdt only reads this separator, so retain that qualifier.
+    if [[ "$QEMU_VERSION" == "9.2.0" ]]; then
+        local overlay="$QEMU_SRC/subprojects/dtc/libfdt/fdt_overlay.c"
+        sed -i 's/char \*sep, \*endptr;/const char *sep; char *endptr;/' "$overlay"
+    fi
 
     # Add the device to QEMU's USB Kconfig
     local kconfig="$QEMU_SRC/hw/usb/Kconfig"
@@ -91,6 +104,10 @@ EOF
         info "  Added dev-sle-dli.c to hw/usb/meson.build"
     fi
 
+    if ! grep -q "dev-ws73-test" "$meson"; then
+        echo "system_ss.add(when: 'CONFIG_USB_SLE_DLI', if_true: files('dev-ws73-test.c'))" >> "$meson"
+    fi
+
     info "QEMU source patched"
 }
 
@@ -112,16 +129,16 @@ build_qemu() {
         --disable-opengl \
         --disable-virglrenderer \
         --enable-kvm \
+        --enable-libusb \
         --disable-linux-aio \
         --disable-debug-info \
-        --disable-werror \
-        2>&1 | tail -5
+        --disable-werror
 
     info "Building QEMU (${NPROC} jobs)..."
-    make -j"$NPROC" 2>&1 | tail -5
+    make -j"$NPROC"
 
     info "Installing to $INSTALL_DIR..."
-    make install 2>&1 | tail -3
+    make install
 
     local qemu_bin="$INSTALL_DIR/bin/qemu-system-x86_64"
     if [[ -x "$qemu_bin" ]]; then
@@ -157,4 +174,4 @@ info "Done. Custom QEMU with usb-sle-dli is at:"
 info "  $INSTALL_DIR/bin/qemu-system-x86_64"
 info ""
 info "Usage with SparkLink tests:"
-info "  QEMU_BIN=$INSTALL_DIR/bin/qemu-system-x86_64 bash ../run_qemu_test.sh"
+info "  Current VM probes: python3 ../run_virtual_vm.py --help; python3 ../run_native_open_test.py --help"
