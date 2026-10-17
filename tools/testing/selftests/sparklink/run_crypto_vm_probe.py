@@ -24,7 +24,7 @@ def main():
     def save():manifest.write_text(json.dumps(record,indent=2)+'\n')
     save();build=a.output/'module';build.mkdir()
     (build/'probe.c').write_text('#include "'+str(here/'security/crypto_vm_probe.c')+'"\n')
-    (build/'Makefile').write_text('obj-m := sparklink_crypto_probe.o\nsparklink_crypto_probe-y := probe.o\nccflags-y += -Werror\n')
+    (build/'Makefile').write_text('obj-m := sparklink_crypto_probe.o\nsparklink_crypto_probe-y := probe.o\nccflags-y += -Werror -I'+str(source/'net/sparklink')+'\n')
     try:
         with (a.output/'build.log').open('w') as log:subprocess.run(['make','LLVM=1','-C',str(a.kernel_build),'M='+str(build),'W=1','modules'],stdout=log,stderr=subprocess.STDOUT,check=True)
         module=build/'sparklink_crypto_probe.ko'
