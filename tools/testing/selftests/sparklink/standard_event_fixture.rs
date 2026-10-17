@@ -14,7 +14,8 @@ impl<T:Clone> KVec<T> {
  fn as_slice(&self)->&[T]{&self.0}
 }
 impl<T> std::ops::Deref for KVec<T>{type Target=[T];fn deref(&self)->&[T]{&self.0}}
-mod sle_uapi {pub const DLI_PARAM_MAX:usize=255;}
+mod sle_uapi {// @@PRODUCTION_BUDGET@@
+}
 mod sle_dli {
  use super::*;
  // @@OPCODE@@
@@ -75,6 +76,8 @@ fn event(code:u16,params:&[u8])->Option<SleEvent>{event_to_sle(&DliUsbEvent{even
  assert!(matches!(event(2,&[4,4,1,0]),Some(SleEvent::CommandComplete{..})));
 }
 #[test] fn actual_parser_and_rejected_event_do_not_hold_state(){
+ let n=sle_uapi::DLI_PARAM_MAX;let mut bytes=vec![2,0,n as u8,(n>>8) as u8];bytes.extend(std::iter::repeat_n(0,n));assert_eq!(parse_event_packet(&bytes).unwrap().params.len(),n);
+ let over=n+1;let mut bytes=vec![2,0,over as u8,(over>>8) as u8];bytes.extend(std::iter::repeat_n(0,over));assert!(parse_event_packet(&bytes).is_err());
  for bad in [vec![],vec![1,0,0],vec![1,0,1,0],vec![1,0,0,1]]{assert!(parse_event_packet(&bad).is_err());}
  let p=parse_event_packet(&[10,0,1,0,7]).unwrap();assert!(matches!(event_to_sle(&p),Some(SleEvent::HardwareError{code:7})));
  let p=parse_event_packet(&[5,0,3,0,0,0,0]).unwrap();assert!(event_to_sle(&p).is_none());

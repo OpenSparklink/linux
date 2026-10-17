@@ -20,7 +20,8 @@ enum DliPacketType { Command = 0xa1, AsyncUnicast = 0xa3 }
 #[repr(u16)]
 #[derive(Clone, Copy)]
 enum SleOpcode { Reset = 0x401 }
-mod sle_uapi { pub const DLI_PARAM_MAX: usize = 255; }
+mod sle_uapi { // @@PRODUCTION_BUDGET@@
+}
 mod archived {
     use super::*;
     // @@ARCHIVE@@
@@ -40,9 +41,20 @@ mod live {
     fn actual_parser_exact_empty_and_maximum_payload() {
         let empty = parse_event_packet(&[2, 0, 0, 0]).unwrap();
         assert_eq!(empty.event_code, 2); assert!(empty.params.is_empty());
-        let mut bytes = vec![2, 0, 255, 0]; bytes.extend(0..=254);
+        let size = sle_uapi::DLI_PARAM_MAX;
+        let mut bytes = vec![2, 0, size as u8, (size >> 8) as u8];
+        bytes.extend((0..size).map(|i| i as u8));
         let event = parse_event_packet(&bytes).unwrap();
         assert_eq!(event.event_code, 2); assert_eq!(&*event.params, &bytes[4..]);
+        let over = size + 1;
+        let mut bytes = vec![2,0,over as u8,(over >> 8) as u8];
+        bytes.extend(std::iter::repeat_n(0,over));
+        assert!(matches!(parse_event_packet(&bytes),Err(EINVAL)));
+        for n in [255usize,256] {
+            if n <= size { continue; }
+            let mut bytes=vec![2,0,n as u8,(n >> 8) as u8];bytes.extend(std::iter::repeat_n(0,n));
+            assert!(matches!(parse_event_packet(&bytes),Err(EINVAL)));
+        }
     }
     #[test]
     fn actual_parser_trailing_bytes_not_part_of_declared_payload() {
