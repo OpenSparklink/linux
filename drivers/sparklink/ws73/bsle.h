@@ -29,6 +29,8 @@ struct ws73_bsle_io {
 	unsigned int *sequence;
 	unsigned long long (*now_ms)(void *context);
 	int (*send)(void *context, size_t size);
+	/* Query-only bounded write; timeout is remaining original budget. */
+	int (*send_timed)(void *context, size_t size, unsigned int timeout_ms);
 	int (*receive)(void *context, unsigned int timeout_ms);
 	int (*notification)(void *context, unsigned int timeout_ms, unsigned int *bits);
 	int (*open)(void *context);

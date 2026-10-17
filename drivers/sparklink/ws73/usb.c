@@ -223,7 +223,8 @@ static const struct {
 	{ 0x40017750, 63 },
 };
 
-static int ws73_write(struct ws73_usb *ws, const void *data, size_t len)
+static int ws73_write_timed(struct ws73_usb *ws, const void *data, size_t len,
+			    unsigned int requested)
 {
 	int ret, actual;
 	unsigned int timeout;
@@ -232,7 +233,7 @@ static int ws73_write(struct ws73_usb *ws, const void *data, size_t len)
 		return -ENODEV;
 	if (!len || len > WS73_FW_CHUNK)
 		return -EINVAL;
-	timeout = ws73_io_timeout(ws, WS73_TX_TIMEOUT);
+	timeout = ws73_io_timeout(ws, requested);
 	if (!timeout)
 		return -ETIMEDOUT;
 	if (data != ws->tx)
@@ -243,6 +244,11 @@ static int ws73_write(struct ws73_usb *ws, const void *data, size_t len)
 	if (ret)
 		return ret;
 	return actual == len ? 0 : -EREMOTEIO;
+}
+
+static int ws73_write(struct ws73_usb *ws, const void *data, size_t len)
+{
+	return ws73_write_timed(ws, data, len, WS73_TX_TIMEOUT);
 }
 
 static int ws73_read(struct ws73_usb *ws, size_t len)
@@ -489,6 +495,14 @@ static int ws73_runtime_send(void *context, size_t size)
 	struct ws73_usb *ws = context;
 
 	return ws73_write(ws, ws->tx, size);
+}
+
+static int ws73_runtime_send_timed(void *context, size_t size,
+				  unsigned int timeout_ms)
+{
+	struct ws73_usb *ws = context;
+
+	return ws73_write_timed(ws, ws->tx, size, timeout_ms);
 }
 
 static int ws73_runtime_receive(void *context, unsigned int timeout_ms)
@@ -1102,6 +1116,7 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 		.sequence = &ws->tx_sequence,
 		.now_ms = ws73_now_ms,
 		.send = ws73_runtime_send,
+		.send_timed = ws73_runtime_send_timed,
 		.receive = ws73_runtime_receive,
 		.notification = ws73_notification,
 		.open = ws73_open_sle,

@@ -24,7 +24,7 @@ static void put32(unsigned char *p, unsigned int n)
 }
 struct fixture {
 	unsigned long long now;
-	unsigned int sends, reads;
+	unsigned int sends, reads, notifications, timeouts[3];
 	int mode;
 	unsigned char model;
 };
@@ -37,6 +37,20 @@ static int send_packet(void *p, size_t n)
 	struct fixture *f = p;
 	f->sends++;
 	return f->mode == 1 ? -EPIPE : (n == 36 || n == 128 ? 0 : -EINVAL);
+}
+static int send_timed(void *p, size_t n, unsigned int timeout)
+{
+	struct fixture *f = p;
+
+	CHECK(f->sends < 3 && timeout > 0 && timeout <= 2000 - f->now);
+	f->timeouts[f->sends] = timeout;
+	if (f->mode == 17)
+		f->now += timeout;
+	if (f->mode == 18)
+		f->now += timeout < 700 ? timeout : 700;
+	if (f->mode == 19)
+		f->now += f->sends ? timeout : 1999;
+	return send_packet(p, n);
 }
 static void response(unsigned char *p, unsigned char model)
 {
@@ -76,6 +90,8 @@ static int receive_packet(void *p, unsigned int timeout)
 		put16(rx + 14, 64);
 	if (f->mode == 8)
 		f->now = 2000;
+	if (f->mode == 20)
+		f->now = 2000;
 	if (f->mode == 10)
 		put16(rx + 94, 97);
 	if (f->mode == 11) {
@@ -101,6 +117,7 @@ static int receive_packet(void *p, unsigned int timeout)
 static int notification(void *p, unsigned int timeout, unsigned int *bits)
 {
 	struct fixture *f = p;
+	f->notifications++;
 	f->now += timeout;
 	*bits = f->mode == 9 ? 64 : 0;
 	return 0;
@@ -119,6 +136,7 @@ int main(void)
 				   .sequence = &sequence,
 				   .now_ms = now,
 				   .send = send_packet,
+				   .send_timed = send_timed,
 				   .receive = receive_packet,
 				   .notification = notification };
 	int expected[] = { 0,	       -EPIPE,	    -ETIMEDOUT, -ENODEV,
@@ -151,6 +169,28 @@ int main(void)
 				CHECK(out.model == 7 && out.bus == 7);
 			}
 		}
+	for (unsigned int mode = 17; mode <= 20; mode++) {
+		f = (struct fixture){ .mode = mode };
+		sequence = 0;
+		out = (struct ws73_chip_info){ 7, 7 };
+		CHECK(ws73_chip_query(&io, &out) == -ETIMEDOUT);
+		CHECK(out.model == 7 && out.bus == 7 && f.now == 2000);
+		CHECK(f.notifications == 0);
+		if (mode == 17)
+			CHECK(f.sends == 1 && f.reads == 0);
+		if (mode == 18)
+			CHECK(f.sends == 3 && f.reads == 0 &&
+			      f.timeouts[0] == 2000 && f.timeouts[1] == 1300 &&
+			      f.timeouts[2] == 600);
+		if (mode == 19)
+			CHECK(f.sends == 2 && f.reads == 0 &&
+			      f.timeouts[1] == 1);
+		if (mode == 20)
+			CHECK(f.sends == 3 && f.reads == 1);
+	}
+	f = (struct fixture){ .now = ~0ULL - 1000 };
+	CHECK(ws73_chip_query(&io, &out) == -EOVERFLOW);
+	CHECK(f.sends == 0 && f.reads == 0 && f.notifications == 0);
 	for (unsigned int mode = 0;
 	     mode < sizeof(expected) / sizeof(expected[0]); mode++)
 		for (unsigned int model = 0; model < 3; model++) {

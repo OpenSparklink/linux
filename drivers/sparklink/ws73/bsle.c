@@ -123,31 +123,37 @@ static int ws73_chip_receive(void *context, unsigned int service,
 int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
 {
 	struct ws73_chip_query_state state = {};
-	unsigned long long deadline;
+	unsigned long long deadline, now;
+	unsigned int step;
 	int ret;
 
 	if (!io || !info || !io->tx || !io->rx || !io->sequence ||
-	    !io->now_ms || !io->send || !io->receive || !io->notification ||
+	    !io->now_ms || !io->send_timed || !io->receive || !io->notification ||
 	    io->rx_capacity < WS73_WIRE_RX_HEADER_SIZE || io->rx_capacity > WS73_WIRE_RX_MAX)
 		return -EINVAL;
 	/* Includes TX and all unrelated/empty replies. No retry renews it. */
-	deadline = io->now_ms(io->context) + 2000;
-	ret = ws73_send_control(io, 1, WS73_WIRE_PLAT_QUEUE);
-	if (!ret)
-		ret = ws73_send_control(io, 0, 0);
-	if (ret)
-		return ret;
-	ret = ws73_wire_chip_request(io->tx, io->tx_capacity, *io->sequence);
-	if (ret < 0)
-		return ret;
-	(*io->sequence)++;
-	ret = io->send(io->context, ret);
-	if (ret)
-		return ret;
+	now = io->now_ms(io->context);
+	if (now > ~0ULL - 2000)
+		return -EOVERFLOW;
+	deadline = now + 2000;
+	for (step = 0; step < 3; step++) {
+		ret = step == 2 ? ws73_wire_chip_request(io->tx, io->tx_capacity, *io->sequence) :
+			ws73_wire_control(io->tx, io->tx_capacity, *io->sequence,
+					   step == 0, step == 0 ? WS73_WIRE_PLAT_QUEUE : 0);
+		if (ret < 0)
+			return ret;
+		now = io->now_ms(io->context);
+		if (now >= deadline)
+			return -ETIMEDOUT;
+		(*io->sequence)++;
+		ret = io->send_timed(io->context, ret, deadline - now);
+		if (ret)
+			return ret;
+	}
 	for (;;) {
-		unsigned long long now = io->now_ms(io->context);
 		unsigned int timeout, bits = 0;
 
+		now = io->now_ms(io->context);
 		if (now >= deadline)
 			return -ETIMEDOUT;
 		timeout = deadline - now;
@@ -163,6 +169,8 @@ int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
 			if (ret)
 				return ret;
 		}
+		if (io->now_ms(io->context) >= deadline)
+			return -ETIMEDOUT;
 		ret = io->notification(io->context, 1, &bits);
 		if (ret < 0 && ret != -ETIMEDOUT)
 			return ret;
