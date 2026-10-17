@@ -331,7 +331,7 @@ static void hardware_error_fault(struct controller peer)
     CHECK(replacement.status.id == c.status.id && replacement.status.generation > c.status.generation);
     query(replacement, 0x0406, 6); stale(c);
     CHECK(!close(replacement.control) && !close(replacement.fd) && !close(c.fd));
-    printf("VIRTUAL_HARDWARE_ERROR_PASS: id=%u generation=%llu authors=2 submitted=1 late_reply=ignored callback_return=1 credit=0 inherited_CAP=EPERM invalid=EINVAL bad_pointer=EFAULT retired_status=ENOTTY peer=1 reuse=1 raw_code=7 no_rf=1\n", c.status.id, (unsigned long long)c.status.generation);
+    printf("VIRTUAL_HARDWARE_ERROR_PASS: id=%u generation=%llu requests=2 submitted=1 late_reply=ignored callback_return=1 credit=0 inherited_CAP=EPERM invalid=EINVAL bad_pointer=EFAULT retired_status=ENOTTY peer=1 reuse=1 raw_code=7 no_rf=1\n", c.status.id, (unsigned long long)c.status.generation);
 }
 
 static void fault(unsigned int delay, unsigned int drop, unsigned int fail,

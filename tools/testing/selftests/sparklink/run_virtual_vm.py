@@ -19,7 +19,7 @@ def verify_console(log, qemu_exit):
     if (qemu_exit or log.count('VIRTUAL_RUNTIME_PASS:') != 2
             or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
             or log.count('VIRTUAL_STANDARD_SNOOP_PASS:') != 2
-            or len(re.findall(r'VIRTUAL_HARDWARE_ERROR_PASS: id=\d+ generation=\d+ authors=2 submitted=1 late_reply=ignored callback_return=1 credit=0 inherited_CAP=EPERM invalid=EINVAL bad_pointer=EFAULT retired_status=ENOTTY peer=1 reuse=1 raw_code=7 no_rf=1', log)) != 2
+            or len(re.findall(r'VIRTUAL_HARDWARE_ERROR_PASS: id=\d+ generation=\d+ requests=2 submitted=1 late_reply=ignored callback_return=1 credit=0 inherited_CAP=EPERM invalid=EINVAL bad_pointer=EFAULT retired_status=ENOTTY peer=1 reuse=1 raw_code=7 no_rf=1', log)) != 2
             or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
             or log.count('PROTOCOL_STATE_REFUSAL_PASS:') != 4
             or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
