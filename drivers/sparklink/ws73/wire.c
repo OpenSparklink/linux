@@ -114,7 +114,7 @@ int ws73_wire_chip_reply(const unsigned char *data, size_t size,
 		return -EPROTO;
 	if (wire_u16(data) != 10) /* D2H_*_GET_CHIP_TYPE_COMPLETE */
 		return -ENOMSG;
-	if (wire_u16(data + 2) != 10 || size < 14 ||
+	if (wire_u16(data + 2) < 10 || wire_u16(data + 2) > size - 4 || size < 14 ||
 	    wire_u32(data + 8) != 2)
 		return -EPROTO;
 	if (wire_u32(data + 4))
@@ -282,8 +282,15 @@ int ws73_wire_receive(const unsigned char *data, size_t size,
 					return -EPROTO;
 			break;
 		}
-		if (slot < 4 || slot > size - offset ||
-		    wire_u16(data + offset + 2) > slot - 4)
+		if (slot < 4 || slot > size - offset)
+			return -EPROTO;
+		/* SDK110 OAM/platform RX advertises the whole allocation,
+		 * including its four-byte HCC header (real E GET_CHIP_TYPE:
+		 * slot=96, pay_len=96, platform len=88). This is confined to
+		 * the exact platform route; never relax SLE/ACB bounds. */
+		if (wire_u16(data + offset + 2) > slot - 4 &&
+		    !(data[offset] == 0x19 && data[offset + 1] == WS73_WIRE_PLAT_QUEUE &&
+		      wire_u16(data + offset + 2) == slot))
 			return -EPROTO;
 		/* SDK SLE RX routes by service/queue and ignores sub_type.
 		 * Real 1.10.111 buffer Complete has tag a1, not a0. Keep
@@ -308,13 +315,18 @@ int ws73_wire_receive(const unsigned char *data, size_t size,
 		const unsigned char *netbuf = data + offset;
 		unsigned int service = netbuf[0] >> 4;
 		unsigned int queue = netbuf[1];
+		size_t payload = wire_u16(netbuf + 2);
 		int ret;
+
+		if (netbuf[0] == 0x19 && queue == WS73_WIRE_PLAT_QUEUE &&
+		    payload == wire_u16(data + 12 + i * 2))
+			payload -= 4;
 
 		if ((service == WS73_WIRE_BSLE_SERVICE && queue == WS73_WIRE_BSLE_QUEUE) ||
 		    (service == WS73_WIRE_SLE_SERVICE && queue == WS73_WIRE_SLE_QUEUE) ||
 		    (service == WS73_WIRE_PLAT_SERVICE && queue == WS73_WIRE_PLAT_QUEUE)) {
 			ret = consumer(context, service, queue, netbuf + 4,
-				       wire_u16(netbuf + 2));
+				       payload);
 			if (ret)
 				return ret;
 		}

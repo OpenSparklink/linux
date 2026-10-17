@@ -40,17 +40,20 @@ static int send_packet(void *p, size_t n)
 }
 static void response(unsigned char *p, unsigned char model)
 {
-	memset(p, 0, 156);
+	memset(p, 0xa5, 188);
+	memset(p, 0, 92);
 	put32(p, 2);
-	put32(p + 4, 156);
-	put16(p + 12, 64);
+	put32(p + 4, 188);
+	put16(p + 12, 96);
 	p[92] = 0x19;
 	p[93] = 9;
-	put16(p + 94, 14);
+	put16(p + 94, 96);
 	put16(p + 96, 10);
-	put16(p + 98, 10);
+	put16(p + 98, 88);
+	put32(p + 100, 0);
 	put32(p + 104, 2);
 	p[108] = model;
+	p[109] = 0;
 }
 static unsigned char *rx;
 static int receive_packet(void *p, unsigned int timeout)
@@ -73,7 +76,27 @@ static int receive_packet(void *p, unsigned int timeout)
 		put16(rx + 14, 64);
 	if (f->mode == 8)
 		f->now = 2000;
-	return 156;
+	if (f->mode == 10)
+		put16(rx + 94, 97);
+	if (f->mode == 11) {
+		rx[92] = 0xa0;
+		rx[93] = 8;
+	}
+	if (f->mode == 12)
+		put16(rx + 98, 89);
+	if (f->mode == 13)
+		put32(rx + 104, 3);
+	if (f->mode == 14)
+		put32(rx + 100, 1);
+	if (f->mode == 15)
+		rx[109] = 3;
+	if (f->mode == 16) {
+		memcpy(rx + 188, rx + 92, 96);
+		put16(rx + 14, 96);
+		put32(rx + 4, 284);
+		return 284;
+	}
+	return 188;
 }
 static int notification(void *p, unsigned int timeout, unsigned int *bits)
 {
@@ -100,7 +123,9 @@ int main(void)
 				   .notification = notification };
 	int expected[] = { 0,	       -EPIPE,	    -ETIMEDOUT, -ENODEV,
 			   -EOVERFLOW, -EOPNOTSUPP, -ETIMEDOUT, -EPROTO,
-			   -ETIMEDOUT, -EIO };
+			   -ETIMEDOUT, -EIO,	    -EPROTO,	-EPROTO,
+			   -EPROTO,    -EPROTO,	    -EIO,	-EOPNOTSUPP,
+			   -EPROTO };
 	rx = incoming;
 	CHECK(ws73_wire_chip_request(tx, 128, 99) == 128);
 	CHECK(tx[64] == 0x19 && tx[65] == 9 && tx[68] == 16 && tx[70] == 1 &&
@@ -126,7 +151,8 @@ int main(void)
 				CHECK(out.model == 7 && out.bus == 7);
 			}
 		}
-	for (unsigned int mode = 0; mode < 10; mode++)
+	for (unsigned int mode = 0;
+	     mode < sizeof(expected) / sizeof(expected[0]); mode++)
 		for (unsigned int model = 0; model < 3; model++) {
 			f = (struct fixture){ .mode = mode, .model = model };
 			sequence = 0;
@@ -162,7 +188,7 @@ int main(void)
 	put32(raw + 8, 1);
 	CHECK(ws73_wire_chip_reply(raw, 32, &out) == -EPROTO);
 	put32(raw + 8, 2);
-	put16(raw + 2, 11);
+	put16(raw + 2, 33);
 	CHECK(ws73_wire_chip_reply(raw, 32, &out) == -EPROTO);
 	put16(raw, 9);
 	CHECK(ws73_wire_chip_reply(raw, 32, &out) == -ENOMSG);
