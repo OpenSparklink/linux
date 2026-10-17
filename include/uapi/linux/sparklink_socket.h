@@ -57,6 +57,29 @@ struct sockaddr_sparklink_dynamic {
 #define SPARKLINK_SOCKET_SECURITY_AUTHENTICATED 2
 /* Dynamic protected modes remain unsupported; no implicit downgrade. */
 #define SPARKLINK_SOCKET_USER_PI 241
+/* Unpublished message context. No trusted identity, Bond or local policy.
+ * recvmsg emits one SOL_SPARKLINK/RX_SECURITY ancillary record per datagram,
+ * including PEEK/zero-length data. recv() may ignore it. Missing/CTRUNC is not
+ * a security fact. epoch belongs to the original ACB receipt, not dequeue time.
+ * KNOWN means the sole Owner could correlate that receipt when routing it;
+ * CURRENT is rechecked at authorized dequeue. A later key cannot upgrade a
+ * queued message. Both flags/grade are observations, never future TX consent.
+ * No TX ancillary is implemented yet: all sendmsg control input is rejected.
+ * 40 bytes, identical native/compat; controller/channel identity is local fd.
+ */
+#define SOL_SPARKLINK 288
+#define SPARKLINK_SCM_RX_SECURITY 1
+#define SPARKLINK_MESSAGE_SECURITY_VERSION 1
+#define SPARKLINK_MESSAGE_SECURITY_KNOWN 1U
+#define SPARKLINK_MESSAGE_SECURITY_CURRENT 2U
+struct sparklink_message_security {
+    __u16 version, size;
+    __u32 security;
+    __aligned_u64 generation, lifetime, security_epoch;
+    __u16 controller, handle;
+    __u8 local_tcid, remote_tcid, pi, flags;
+};
+
 /* Read-only delegated socket snapshot. No lease token or trusted security
  * projection. Success requires current Runtime authorization and completed
  * CMTC negotiation; EAGAIN before open, ENOTCONN after local close.

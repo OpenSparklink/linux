@@ -23,6 +23,7 @@
 #include "sle_channel_wire.h"
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
+#include "sle_message_security.h"
 #include "sle_channel_table.h"
 #include "sle_dynamic_state.h"
 #include "sle_fragment_cursor.h"
@@ -34,6 +35,9 @@
 
 _Static_assert(sizeof(struct sl_fragment_cursor) <= sizeof_field(struct sk_buff, cb),
 	       "fragment cursor fits private skb control buffer");
+_Static_assert(sizeof(struct sparklink_message_security) == 40 &&
+               sizeof(struct sparklink_message_security) <= sizeof_field(struct sk_buff, cb),
+               "message context layout and skb ownership");
 _Static_assert(sizeof(struct sockaddr_sparklink_dynamic) == 64,
 	       "dynamic address layout");
 _Static_assert(SL_FIXED_CHANNELS == 2 && SL_CHANNEL_USER_SLOT == 0 &&
@@ -629,6 +633,74 @@ static int sl_dynamic_consent(void *context, u64 security_revision,
 	spin_unlock(&s->lock);
 	return ret;
 }
+struct sl_routed_data {
+	struct sl_connection_session *session;
+	struct sl_basic_channel *channel;
+	const struct sl_channel_frame *frame;
+	struct sk_buff *skb;
+	struct sock *wake;
+	u64 receipt_revision;
+	unsigned int pdu_length;
+};
+/* Host/data/gate -> Session -> RX. All allocation/copy and wakeups are outside
+ * this callback. It publishes immutable receipt facts, never a policy grant. */
+static int sl_deliver(void *context, u64 current_revision)
+{
+	struct sl_routed_data *r = context;
+	struct sl_connection_session *s = r->session;
+	struct sl_basic_channel *c = r->channel;
+	const struct sl_channel_frame *frame = r->frame;
+	struct sparklink_message_security *metadata = (void *)r->skb->cb;
+	unsigned long flags;
+	int level;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) &&
+	    sl_permits(s, c, SL_GRANT_RX) &&
+	    !sl_security_check(s, c, current_revision) &&
+	    (!sl_sk(c->sk)->grant.security ||
+	     sl_sk(c->sk)->grant.security_epoch == r->receipt_revision) &&
+	    (!c->dynamic || c->negotiation.phase == SL_DYN_OPEN) &&
+	    frame->tcid == c->local_tcid && frame->pi == c->pi &&
+	    frame->length <= c->mtu && r->pdu_length <= c->mps) {
+		*metadata = (struct sparklink_message_security){
+			.version = SPARKLINK_MESSAGE_SECURITY_VERSION,
+			.size = sizeof(*metadata),
+			.controller = s->controller,
+			.handle = s->handle,
+			.generation = s->generation,
+			.lifetime = s->lifetime,
+			.security_epoch = r->receipt_revision,
+			.local_tcid = c->local_tcid,
+			.remote_tcid = c->remote_tcid,
+			.pi = c->pi,
+		};
+		/* An old/uncorrelated receipt remains unknown, never gets today's
+		 * grade. Whole protected bindings reject it above; basic RX may expose
+		 * unknown facts for policy to reject without pretending it was secure. */
+		level = r->receipt_revision == current_revision ?
+				sl_security_owner_level_rust(s->security,
+							     current_revision) :
+				-EACCES;
+		sl_message_receipt_observe(metadata, current_revision, level);
+		spin_lock(&c->rx.lock);
+		if (c->rx.qlen < SL_CHANNEL_RX &&
+		    atomic_read(&c->sk->sk_rmem_alloc) <
+			    READ_ONCE(c->sk->sk_rcvbuf) &&
+		    sk_rmem_schedule(c->sk, r->skb, r->skb->truesize)) {
+			skb_set_owner_r(r->skb, c->sk);
+			__skb_queue_tail(&c->rx, r->skb);
+			r->skb = NULL;
+			r->wake = c->sk;
+			sock_hold(r->wake);
+		}
+		spin_unlock(&c->rx.lock);
+	}
+	if (r->skb)
+		c->rx_dropped++;
+	spin_unlock_irqrestore(&s->lock, flags);
+	return 0;
+}
 /* Exactly one session worker consumes the connection's ACB queue. Decode once,
  * route CMTC to session state, then route DTAP by local TCID/PI to channel RX. */
 static void sl_route(struct sl_connection_session *s, const u8 *bytes,
@@ -673,7 +745,8 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes,
 				return;
 			}
 			if (!s->response_pending)
-				s->response_deadline = jiffies + msecs_to_jiffies(5000);
+				s->response_deadline =
+					jiffies + msecs_to_jiffies(5000);
 			s->response_pending = true;
 			s->response_id = identifier;
 			s->response_mask = mask;
@@ -702,31 +775,24 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes,
 	skb = alloc_skb(frame.length, GFP_KERNEL);
 	if (!skb)
 		return;
+	memset(skb->cb, 0, sizeof(skb->cb));
 	memcpy(skb_put(skb, frame.length), frame.data, frame.length);
-	spin_lock_irqsave(&s->lock, flags);
-	if (s->progress.phase == SL_CH_OPEN && sl_binding_live(c->binding) &&
-	    sl_permits(s, c, SL_GRANT_RX) &&
-	    (!sl_sk(c->sk)->grant.security ||
-	     sl_sk(c->sk)->grant.security_epoch == security_revision) &&
-	    (!c->dynamic || c->negotiation.phase == SL_DYN_OPEN) &&
-	    frame.tcid == c->local_tcid && frame.pi == c->pi &&
-	    frame.length <= c->mtu && length <= c->mps) {
-		spin_lock(&c->rx.lock);
-		if (c->rx.qlen < SL_CHANNEL_RX &&
-		    atomic_read(&c->sk->sk_rmem_alloc) <
-			    READ_ONCE(c->sk->sk_rcvbuf) &&
-		    sk_rmem_schedule(c->sk, skb, skb->truesize)) {
-			skb_set_owner_r(skb, c->sk);
-			__skb_queue_tail(&c->rx, skb);
-			skb = NULL;
-			sk = c->sk;
-			sock_hold(sk);
-		}
-		spin_unlock(&c->rx.lock);
+	{
+		struct sl_routed_data r = { .session = s,
+					    .channel = c,
+					    .frame = &frame,
+					    .skb = skb,
+					    .receipt_revision =
+						    security_revision,
+					    .pdu_length = length };
+		/* Retirement may win before delivery; it cannot mint known/current
+		 * facts or attach data to a successor controller/lifetime. */
+		sparklink_native_session_admit(s->controller, s->generation,
+					       s->lifetime, s->handle, s->epoch,
+					       sl_deliver, &r);
+		skb = r.skb;
+		sk = r.wake;
 	}
-	if (skb)
-		c->rx_dropped++;
-	spin_unlock_irqrestore(&s->lock, flags);
 	kfree_skb(skb);
 	if (sk) {
 		sk->sk_data_ready(sk);
@@ -735,7 +801,8 @@ static void sl_route(struct sl_connection_session *s, const u8 *bytes,
 }
 /* No physical prefix exists: queue timeout retires only its application
  * Binding. It cannot consume another Channel's queues or stop the controller. */
-static void sl_fail_channel(struct sl_connection_session *s, struct sl_basic_channel *c, int error)
+static void sl_fail_channel(struct sl_connection_session *s,
+			    struct sl_basic_channel *c, int error)
 {
 	unsigned long flags;
 	struct sock *sk;
@@ -1695,7 +1762,7 @@ static int sl_sendmsg(struct socket *sock, struct msghdr *msg, size_t length)
 	ret = sparklink_native_session_admit(s->controller, s->generation, s->lifetime, s->handle, s->epoch, sl_tx_access, &access);
 	if (ret)
 		goto put;
-	if (msg->msg_name || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
+	if (msg->msg_name || msg->msg_controllen || msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) { ret = -EOPNOTSUPP; goto put; }
 	if (length > sl_channel_payload_limit(sl_snapshot(s), c->remote_tcid)) { ret = -EMSGSIZE; goto put; }
 	while (!sl_can_write(s, c)) {
 		if (!timeout) { ret = -EAGAIN; goto put; }
@@ -1735,6 +1802,7 @@ struct sl_receive {
 	struct sock *sk;
 	struct sk_buff *skb, *last;
 	int flags;
+	struct sparklink_message_security security;
 };
 /* Runtime holds Host/data/gate: RX admission linearizes at peek reference or
  * unlink under Session/RX locks. No allocation, wait or user copy here. PEEK
@@ -1746,7 +1814,7 @@ static int sl_take(void *context, u64 security_revision)
 	struct sl_connection_session *s = receive->session;
 	struct sl_basic_channel *c = receive->channel;
 	unsigned long irq_flags;
-	int ret;
+	int ret, level;
 
 	spin_lock_irqsave(&s->lock, irq_flags);
 	ret = sock_error(receive->sk);
@@ -1766,12 +1834,18 @@ static int sl_take(void *context, u64 security_revision)
 		ret = -EACCES;
 		goto unlock;
 	}
+	level = sl_security_owner_level_rust(s->security, security_revision);
 	spin_lock(&c->rx.lock);
 	receive->last = c->rx.prev;
 	receive->skb = skb_peek(&c->rx);
 	if (!receive->skb) {
 		ret = c->peer_closed ? -ENOTCONN : -EAGAIN;
 	} else {
+		const struct sparklink_message_security *original =
+			(const void *)receive->skb->cb;
+		receive->security = *original;
+		receive->security.flags = sl_message_receipt_dequeue_flags(
+			original, security_revision, level);
 		if (receive->flags & MSG_PEEK)
 			skb_get(receive->skb);
 		else
@@ -1783,11 +1857,14 @@ unlock:
 	spin_unlock_irqrestore(&s->lock, irq_flags);
 	return ret;
 }
-static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, int flags)
+static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length,
+		      int flags)
 {
 	struct sl_connection_session *s = sl_binding_session(sock->sk);
 	struct sl_basic_channel *c = s ? sl_bound_channel(sock->sk, s) : NULL;
-	struct sl_receive receive = { .session = s, .channel = c, .sk = sock->sk, .flags = flags };
+	struct sl_receive receive = {
+		.session = s, .channel = c, .sk = sock->sk, .flags = flags
+	};
 	struct sk_buff *skb;
 	long timeout = sock_rcvtimeo(sock->sk, flags & MSG_DONTWAIT);
 	int error, copied;
@@ -1801,8 +1878,9 @@ static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, in
 	for (;;) {
 		receive.last = NULL;
 		receive.skb = NULL;
-		error = sparklink_native_session_admit(s->controller, s->generation,
-			s->lifetime, s->handle, s->epoch, sl_take, &receive);
+		error = sparklink_native_session_admit(
+			s->controller, s->generation, s->lifetime, s->handle,
+			s->epoch, sl_take, &receive);
 		if (!error)
 			break;
 		if (error != -EAGAIN || !timeout || !receive.last) {
@@ -1812,9 +1890,10 @@ static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, in
 		/* Stock wait registers first and compares the saved queue tail.
 		 * Every normal wake retries actual locked authorization/dequeue. */
 		if (__skb_wait_for_more_packets(sock->sk, &c->rx, &error,
-					       &timeout, receive.last)) {
-			int status = sparklink_native_session_status(s->controller, s->generation,
-				s->lifetime, s->handle, s->epoch);
+						&timeout, receive.last)) {
+			int status = sparklink_native_session_status(
+				s->controller, s->generation, s->lifetime,
+				s->handle, s->epoch);
 			copied = status ? status : (error ? error : -ENOTCONN);
 			goto put;
 		}
@@ -1824,6 +1903,10 @@ static int sl_recvmsg(struct socket *sock, struct msghdr *msg, size_t length, in
 	if ((size_t)copied < skb->len)
 		msg->msg_flags |= MSG_TRUNC;
 	error = skb_copy_datagram_msg(skb, 0, msg, copied);
+	if (!error) {
+		put_cmsg(msg, SOL_SPARKLINK, SPARKLINK_SCM_RX_SECURITY,
+			 sizeof(receive.security), &receive.security);
+	}
 	if (!error && flags & MSG_TRUNC)
 		copied = skb->len;
 	skb_free_datagram(sock->sk, skb);

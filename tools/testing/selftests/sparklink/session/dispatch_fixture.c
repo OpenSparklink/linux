@@ -21,6 +21,7 @@ static unsigned long jiffies = 42;
 #include "sle_dynamic_state.h"
 #include "sle_fragment_cursor.h"
 #include "sparklink_socket.h"
+#include "sle_message_security.h"
 #define __user
 #define ENOIOCTLCMD 515
 #include <stddef.h>
@@ -90,13 +91,18 @@ struct socket {struct sock *sk;int state;};
 #define TCP_CLOSE 7
 #define SHUTDOWN_MASK 3
 #define WRITE_ONCE(x,v) ((x)=(v))
-struct msghdr {int msg_flags;u8 bytes[2047];};
+struct msghdr {int msg_flags;u8 bytes[2047];struct sparklink_message_security security;unsigned int security_records;};
 typedef u32 __poll_t;typedef int poll_table;struct file {int unused;};
 static void sock_poll_wait(struct file *file,struct socket *sock,poll_table *wait){(void)file;(void)sock;(void)wait;}
 static int skb_queue_empty(struct sk_buff_head *q){return !q->qlen;}
 static unsigned int skb_queue_len(struct sk_buff_head *q){return q->qlen;}
 static struct sl_connection_session *current_session;
 static bool authority=true,host_locked,copy_fault;
+static void put_cmsg(struct msghdr *msg,int level,int type,int len,const void *data){
+ assert(!host_locked&&!irq_disabled);assert(level==SOL_SPARKLINK&&type==SPARKLINK_SCM_RX_SECURITY&&len==40);
+ memcpy(&msg->security,data,len);msg->security_records++;
+}
+
 static long receive_timeout;
 static int status_error;
 static unsigned int wait_calls,wait_case;
@@ -271,15 +277,41 @@ static void receive_tests(void){
   init_receive(&s,sk);wait_case=kind;
   int ret=sl_recvmsg(&sock,&msg,100,0);
   if(kind==0)assert(ret==-EAGAIN);
-  else if(kind==1){assert(ret==-EACCES&&s.channels[0].rx.qlen==1);assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);}
+  else if(kind==1){assert(ret==-EACCES&&s.channels[0].rx.qlen==0&&allocations==0);assert(sl_recvmsg(&sock,&msg,100,MSG_DONTWAIT)==-EACCES);}
   else if(kind==2)assert(ret==9&&!memcmp(msg.bytes,"wake data",9));
   else if(kind==3)assert(ret==-EINTR);
   else if(kind==4)assert(ret==-EACCES);
-  else assert(ret==-EAGAIN&&s.channels[0].rx.qlen==1);
+  else assert(ret==-EAGAIN&&s.channels[0].rx.qlen==0&&allocations==0);
   assert(wait_calls==1&&s.refs.refs==1);
   while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  }
  assert(allocations==0&sk->sk_rmem_alloc==0);
+}
+static void message_security_tests(void) {
+ struct sl_connection_session s;struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
+ struct socket sock={.sk=&b.sk};struct msghdr msg={0};
+ init_receive(&s,&b.sk);fixture_security_revision=2;fixture_security_level=1;
+ route(&s,31,241,"protected receipt");
+ assert(sl_recvmsg(&sock,&msg,100,MSG_PEEK)==17&&msg.security_records==1);
+ assert(msg.security.version==1&&msg.security.size==40&&msg.security.security==1&&msg.security.flags==3);
+ assert(msg.security.generation==7&&msg.security.lifetime==11&&msg.security.security_epoch==2);
+ assert(msg.security.controller==1&&msg.security.handle==3&&msg.security.local_tcid==31&&msg.security.remote_tcid==31&&msg.security.pi==241);
+ /* Same payload after a new mechanism: historical grade/epoch never upgrade,
+  * CURRENT is a fresh dequeue observation, not stored into the queued skb. */
+ fixture_security_revision=3;fixture_security_level=2;
+ assert(sl_recvmsg(&sock,&msg,100,MSG_PEEK)==17&&msg.security.flags==1&&msg.security.security==1&&msg.security.security_epoch==2);
+ assert(sl_recvmsg(&sock,&msg,100,0)==17&&msg.security.flags==1&&!s.channels[0].rx.qlen);
+ /* Old receipt routed after rekey remains unknown even though today's grade2. */
+ u8 wire[20];int n=sl_channel_frame_encode(wire,sizeof(wire),31,241,(const u8 *)"old",3);
+ sl_route(&s,wire,n,2);assert(sl_recvmsg(&sock,&msg,100,0)==3);
+ assert(msg.security.security_epoch==2&&!msg.security.flags&&!msg.security.security);
+ /* A grade2 observation cannot turn an already known basic packet into grade2. */
+ fixture_security_revision=4;fixture_security_level=0;route(&s,31,241,"");
+ fixture_security_level=2;assert(sl_recvmsg(&sock,&msg,0,0)==0);
+ assert(msg.security.flags==3&&msg.security.security==0&&msg.security.security_epoch==4);
+ /* Runtime retirement rejects delivery before queueing, retaining no buffer. */
+ authority=false;route(&s,31,241,"after revoke");assert(!s.channels[0].rx.qlen&&!allocations);
+ authority=true;fixture_security_revision=1;fixture_security_level=0;
 }
 static void direction_tests(void){
  struct sl_connection_session s;struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;struct socket sock={.sk=sk};struct msghdr msg={0};
@@ -943,6 +975,9 @@ int main(void){
  s.channels[0].local_tcid=SL_CHANNEL_CUTC;s.channels[0].remote_tcid=SL_CHANNEL_CUTC;s.channels[0].pi=241;s.channels[0].mtu=249;s.channels[0].mps=254;s.channels[0].sk=sk;
  assert(sl_binding_attach(&s.channels[0].binding));
  init_grant(&s,sk,SL_GRANT_TX|SL_GRANT_RX);
+ /* This fixture lookup must refer to this live test Session. Earlier cases
+  * used stack-local Sessions; production Runtime holds a real retained kref. */
+ current_session=&s;authority=true;status_error=0;
  route(&s,SL_CHANNEL_CUTC,241,"real codec");assert(s.channels[0].rx.qlen==1&sk->wakes==1&sk->refs==1);
  route(&s,32,241,"wrong TCID");route(&s,SL_CHANNEL_CUTC,242,"wrong PI");assert(s.channels[0].rx.qlen==1&&s.channels[0].rx_dropped==0);
  for(unsigned int i=1;i<SL_CHANNEL_RX;i++)route(&s,SL_CHANNEL_CUTC,241,"bounded");
@@ -971,7 +1006,7 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
+ batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();message_security_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
 	session_status_tests();
  protected_grant_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
