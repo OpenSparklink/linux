@@ -8,14 +8,17 @@ ASan/UBSan runtimes. LeakSanitizer requires an environment without ptrace.
 Missing tools/runtimes or failed assertions fail the test; there is no fallback
 PASS or skipped assertion. No production fault switches are introduced.
 
-The runner copies the unchanged retained kernel crypto source and exact archived security model to a private
+The runner copies the unchanged test-only historical crypto source and archived security model
+from ../retired-security-state/ to a private
 build directory, appends child tests for private state, and links controllable FFI
-dependencies. It compiles the exact production C CTR function against counted
+dependencies. It compiles the exact archived C CTR function against counted
 allocation/crypto dependencies. These verify errno propagation, fail-closed legacy
 pairing, KDF commit, counter overflow and failure commit of data/IV/address. They
 are not real crypto algorithms, standard vectors, peer interoperability or RF.
 
-Pairing is deliberately unavailable pending authenticated per-connection state.
+This archived pairing model is unavailable in production. Actual per-connection
+Native relay/P256/CMAC mechanisms have separate source-bound qualification; these
+fixture results do not establish their authentication or interoperability.
 Unpublished legacy test ioctl numbers still exist for caller migration, but their
 production handlers return EOPNOTSUPP. Tests call retained actual wrappers instead. Model tests are historical; the default runtime has no SecurityInner/RpaManager.
 The real WS73 Native discovery implementation is untouched and needs regression

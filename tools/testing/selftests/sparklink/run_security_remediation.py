@@ -27,7 +27,7 @@ def function(text, name):
 def run(output):
     here = Path(__file__).resolve().parent
     root = here.parents[3]
-    paths = [root/'net/sparklink'/name for name in ('sle_crypto.rs', 'sle_crypto_ffi.c')]
+    paths = [here/'retired-security-state'/name for name in ('sle_crypto.rs', 'sle_crypto_ffi.c')]
     paths.append(here/'retired-security-state/sle_security.rs')
     contents = {p.name: p.read_bytes() for p in paths}
     with tempfile.TemporaryDirectory(prefix='sparklink-security-') as temp:
@@ -50,10 +50,10 @@ def run(output):
         subprocess.run([str(tmp/'ctr-test')], check=True)
     for path in paths:
         if path.read_bytes() != contents[path.name]:
-            raise RuntimeError('production input changed during test')
+            raise RuntimeError('historical test input changed during test')
     record = {'status': 'HISTORICAL_SECURITY_FAILURE_BOUNDARY_PASS', 'physical_acceptance': False,
-              'scope': 'retained kernel Rust crypto wrappers + C CTR body and exact retired security model; mocked dependencies, not current runtime, crypto vectors or RF',
-              'sources': {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()},
+              'scope': 'test-only historical Rust crypto wrappers + C CTR body and exact retired security model; mocked dependencies, not current runtime, crypto vectors or RF',
+              'sources': {str(path.relative_to(root)): hashlib.sha256(contents[path.name]).hexdigest() for path in paths},
               'ctr_body_sha256': hashlib.sha256(ctr.encode()).hexdigest(),
               'rust_tests': 7, 'c_fault_stages': 5,
               'remaining': ['Per-connection authenticated pairing/relay/real encryption installation',

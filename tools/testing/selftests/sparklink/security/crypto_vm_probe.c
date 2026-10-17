@@ -5,7 +5,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/string.h>
-#include "../../../../../net/sparklink/sle_crypto_ffi.c"
+#include "../retired-security-state/sle_crypto_ffi.c"
 #include "../../../../../net/sparklink/sle_pair_material.c"
 
 static int pair_material_vectors(void)

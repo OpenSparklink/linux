@@ -13,7 +13,7 @@ def main():
     if not 10<=a.timeout<=300:p.error('timeout10..300 required')
     here=Path(__file__).resolve().parent;source=here.parents[3]
     identity=subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip()
-    scope=['net/sparklink/sle_crypto_ffi.c','net/sparklink/sle_pair_crypto.c','net/sparklink/sle_pair_material.c','net/sparklink/sle_pair_material.h',str((here/'security/crypto_vm_probe.c').relative_to(source)),str(Path(__file__).relative_to(source))]
+    scope=[str((here/'retired-security-state/sle_crypto_ffi.c').relative_to(source)),'net/sparklink/sle_pair_crypto.c','net/sparklink/sle_pair_material.c','net/sparklink/sle_pair_material.h',str((here/'security/crypto_vm_probe.c').relative_to(source)),str(Path(__file__).relative_to(source))]
     if subprocess.check_output(['git','status','--porcelain','--',*scope],cwd=source):raise RuntimeError('probe source scope must be committed and clean')
     a.kernel_build=a.kernel_build.resolve();a.output=a.output.resolve();a.output.mkdir(mode=0o700)
     artifacts=json.loads(a.kernel_artifacts.read_text());assert artifacts['status']=='NATIVE_BUILD_ARTIFACTS_VERIFIED'
