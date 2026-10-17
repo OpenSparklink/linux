@@ -32,6 +32,7 @@ pub mod time { pub fn msecs_to_jiffies(ms: u32) -> u64 { u64::from(ms) } }
 #[path = "sle_command_plan.rs"] mod sle_command_plan;
 #[allow(dead_code)] // Whole production queue also supplies unrelated recipe operations.
 #[path = "sle_command_queue.rs"] mod sle_command_queue;
+#[allow(dead_code, reason="Full production module; this fixture exercises only documented pending/admission subset")]
 #[path = "sle_mgmt.rs"] mod sle_mgmt;
 use prelude::*;
 use sle_mgmt::CmdPendingQueue;

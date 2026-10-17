@@ -237,7 +237,6 @@ impl NativeController {
         })
     }
 
-
 }
 
 impl super::ControllerRuntime {
@@ -440,15 +439,6 @@ impl SleController for NativeController {
         }
     }
 
-    fn open(&self) -> Result {
-        // SAFETY: registration assigned this identity before opening RX.
-        Self::result(unsafe {
-            sparklink_native_transport_open(self.transport, self.identity.id, self.identity.generation)
-        })?;
-        self.opened.store(true, Ordering::Release);
-        Ok(())
-    }
-
     fn close(&self) {
         if self.opened.swap(false, Ordering::AcqRel) {
             // SAFETY: close joins callbacks while the context is retained.
@@ -456,15 +446,6 @@ impl SleController for NativeController {
         }
     }
 
-    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
-        if !self.opened.load(Ordering::Acquire) { return Err(EAGAIN); }
-        self.validate_command(opcode as u16, params)?;
-        let owner = super::sle_ingress::ingress_owner(self.identity).ok_or(ENODEV)?;
-        super::sle_ingress::enqueue_command(&owner, opcode as u16, params, None)
-    }
-
-    fn send_data(&self, _handle: u16, _data: &[u8]) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
-    fn reset(&self) -> Result { Err(Error::from_errno(UNSUPPORTED)) }
 }
 
 /// Caller owns the reservation until successful install, cancellation or removal.

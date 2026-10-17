@@ -125,25 +125,6 @@ impl CommandHost {
         if let Some(relay)=&active.relay {relay.commit(submit)} else {submit()}
     }
 
-    pub(crate) fn enqueue(&mut self, opcode: u16, params: &[u8], seq: u32) -> Result {
-        if let Some(error) = self.fault {
-            return Err(error);
-        }
-        let cookie = self.next_cookie;
-        let next_cookie = cookie.checked_add(1).ok_or(EOVERFLOW)?;
-        self.requests.push_cookie(opcode, params, seq, cookie)?;
-        self.next_cookie = next_cookie;
-        if opcode == SleOpcode::EnableBroadcast as u16 {
-            self.broadcast_cookie = cookie;
-            self.supersede_recipe(DiscoveryIntent::Advertising(false));
-        }
-        if opcode == SleOpcode::EnableScan as u16 {
-            self.scan_cookie = cookie;
-            self.supersede_recipe(DiscoveryIntent::Scanning(false));
-        }
-        Ok(())
-    }
-
     /// Metadata-only diagnostic admission supplies the original absolute
     /// deadline; queue wait does not grant a fresh full timeout on transmission.
     pub(crate) fn enqueue_diagnostic(&mut self, opcode: u16, params: &[u8], seq: u32, deadline: u64) -> Result {
@@ -162,11 +143,6 @@ impl CommandHost {
         }
         // active/reply/credits/deadline remain untouched. Cancelling an on-wire
         // author waits for its real reply or a normal uncertain-outcome fault.
-    }
-
-    fn supersede_recipe(&mut self, intent: DiscoveryIntent) {
-        self.requests.remove_recipes(intent);
-        self.cancel_recipe_progress(intent);
     }
 
     fn cancel_recipe_progress(&mut self, intent: DiscoveryIntent) {

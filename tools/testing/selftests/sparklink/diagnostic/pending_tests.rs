@@ -5,19 +5,19 @@ mod diagnostic_pending_tests {
     #[test]
     fn resolved_slot_retained_until_bounded_replacement() {
         let mut q = CmdPendingQueue::new();
-        let seq = q.submit(0x0403).unwrap(); q.assign_owner(seq, 42);
+        let seq = q.submit_with_timeout(0x0403, CMD_TIMEOUT_MS).unwrap(); q.assign_request(seq, 42, 0);
         assert!(q.resolve_seq(seq, 0, &[1]));
-        for _ in 0..31 { q.submit(0x0402).unwrap(); }
+        for _ in 0..31 { q.submit_with_timeout(0x0402, CMD_TIMEOUT_MS).unwrap(); }
         assert_eq!(q.find_by_seq(seq).unwrap().file_id, 42);
-        q.submit(0x0402).unwrap();
+        q.submit_with_timeout(0x0402, CMD_TIMEOUT_MS).unwrap();
         assert!(q.find_by_seq(seq).is_none());
         assert_eq!(q.pending_count, 32);
-        assert_eq!(q.submit(0x0402), Err(EBUSY));
+        assert_eq!(q.submit_with_timeout(0x0402, CMD_TIMEOUT_MS), Err(EBUSY));
     }
     #[test]
     fn duplicate_or_unmatched_reply_cannot_rewrite_completed_result() {
         let mut q = CmdPendingQueue::new();
-        let seq = q.submit(0x0403).unwrap();
+        let seq = q.submit_with_timeout(0x0403, CMD_TIMEOUT_MS).unwrap();
         assert!(!q.resolve_seq(0, 0, &[9]));
         assert!(!q.resolve_seq(seq + 1, 0, &[9]));
         assert!(q.resolve_seq(seq, 0, &[1]));
@@ -33,7 +33,7 @@ mod diagnostic_pending_tests {
         let e = q.find_by_seq(seq).unwrap();
         assert_eq!((e.error, e.result_status(), e.data_len), (-110, None, 0));
         assert!(!q.resolve_seq(seq, 0, &[9]));
-        let rejected = q.submit(0x0402).unwrap(); q.rollback(rejected);
+        let rejected = q.submit_with_timeout(0x0402, CMD_TIMEOUT_MS).unwrap(); q.rollback(rejected);
         assert!(q.find_by_seq(rejected).is_none());
         assert_eq!((q.pending_count, q.total_timeouts, q.total_submitted), (0, 1, 1));
     }
@@ -41,13 +41,13 @@ mod diagnostic_pending_tests {
     fn sequence_exhaustion_fails_without_alias_or_accounting_change() {
         let mut q = CmdPendingQueue::new();
         q.next_seq = u32::MAX;
-        assert_eq!(q.submit(0x0403), Err(EOVERFLOW));
+        assert_eq!(q.submit_with_timeout(0x0403, CMD_TIMEOUT_MS), Err(EOVERFLOW));
         assert_eq!((q.pending_count, q.total_submitted, q.tail), (0, 0, 0));
     }
     #[test]
     fn local_host_failure_keeps_errno_and_never_fabricates_controller_status() {
         let mut q = CmdPendingQueue::new();
-        let seq = q.submit(0x0406).unwrap();
+        let seq = q.submit_with_timeout(0x0406, CMD_TIMEOUT_MS).unwrap();
         q.fail_seq(seq, -110); q.fail_seq(seq, -5);
         assert!(!q.resolve_seq(seq, 0, &[9]));
         let e = q.find_by_seq(seq).unwrap();

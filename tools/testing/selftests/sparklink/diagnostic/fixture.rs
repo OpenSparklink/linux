@@ -42,9 +42,10 @@ pub mod sle_command_queue {
                            _: Option<()>, _: u64) -> Result<(), QueueError> { Ok(()) }
     }
 }
+#[allow(dead_code, reason="Full production module; this fixture exercises only documented pending/admission subset")]
 #[path = "sle_mgmt.rs"] mod sle_mgmt;
 use prelude::*;
-use sle_mgmt::CmdPendingQueue;
+use sle_mgmt::{CmdPendingQueue,CMD_TIMEOUT_MS};
 use std::pin::Pin;
 use std::sync::{Mutex, MutexGuard};
 struct TestMutex<T>(Mutex<T>);
@@ -98,8 +99,8 @@ fn setup(author: u64) -> (RuntimeContext, SparkLinkCtl, u32) {
     let _ = core::mem::size_of::<sle_mgmt::CmdRequest>();
     let identity = Identity { generation: 7 };
     let mut queue = CmdPendingQueue::new();
-    let seq = queue.submit(0x0403).unwrap();
-    queue.assign_owner(seq, author);
+    let seq = queue.submit_with_timeout(0x0403, CMD_TIMEOUT_MS).unwrap();
+    queue.assign_request(seq, author, 0);
     let ctx = RuntimeContext {
         owner: Some(Owner { identity, protocol_profile: 1,
                           schedule_gate: TestMutex::new(false),

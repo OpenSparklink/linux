@@ -39,7 +39,7 @@ def run(output):
     assert 'test result: ok. 6 passed; 0 failed' in opened
     assert 'test result: ok. 9 passed; 0 failed' in text
     assert all(source_path(net,n).read_text()==s for n,s in inputs.items())
-    record={'status':'ACTUAL_USB_PENDING_RESERVATION_PASS','tests':15, 'pending_allocator_tests':9, 'retired_static_open_adoption_tests':6,'sources':{n:hashlib.sha256(s.encode()).hexdigest() for n,s in inputs.items()},'scope':'actual constructor/pending allocator/generation/get/unregister/common reservation/cancel and Native wrapper/exact two-phase detach and retired static USB listener/open adoption history; current lifecycle is common Native/provider open; logging/Mutex/info types/stats dependencies, not concurrent registry or callbacks/kernel/physical USB qualification','hardware_acceptance':False}
+    record={'status':'ACTUAL_USB_PENDING_RESERVATION_PASS','tests':15, 'pending_allocator_tests':9, 'retired_static_open_adoption_tests':6,'sources':{n:hashlib.sha256(s.encode()).hexdigest() for n,s in inputs.items()},'scope':'actual constructor/pending allocator/generation/get/unregister/common reservation/cancel and Native wrapper/exact two-phase detach and retired static USB listener/open adoption history; current lifecycle is common Native/provider open; logging/Mutex/info types dependencies, not concurrent registry or callbacks/kernel/physical USB qualification','hardware_acceptance':False}
     if output:output.write_text(json.dumps(record,indent=2)+'\n')
     print(json.dumps(record))
 

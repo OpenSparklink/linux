@@ -2,11 +2,11 @@
 
 //! SparkLink Driver Layer Interface (DLI).
 //!
-//! Defines the abstract interface between the SparkLink host protocol
-//! stack and hardware controller drivers, following T/XS 10003-2025.
-//! Every SLE radio chip driver implements the [`SleController`] trait;
-//! the core dispatches operations through this trait without knowing
-//! the underlying transport (USB, UART, SPI, or SDIO).
+//! Internal metadata and standard event definitions for registered providers.
+//! Drivers register a retained Backend descriptor. The unique Runtime Host
+//! owns command admission, protocol credit and physical reply obligations;
+//! its worker submits through CommandPort and actual commit tickets.
+//! The small SleController view supplies metadata and joined close only.
 //!
 //! The DLI packet model uses typed channels identical to the standard:
 //!   - Command (Host → Controller): opcode + parameters
@@ -1132,47 +1132,15 @@ pub enum SleEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Controller trait — the DLI (T/XS 10003-2025)
+// Registered provider metadata/close view
 // ---------------------------------------------------------------------------
 
-/// The SparkLink Driver Layer Interface.
-///
-/// Each SLE controller driver (USB, UART, SPI, etc.) implements
-/// this trait. The host protocol stack holds a reference to the active
-/// controller and calls these methods to drive the radio.
-///
-/// The command/event model follows TXS-10003-2025:
-///   - Commands use opcodes encoded as (OGF << 10) | OCF.
-///   - Synchronous commands return a CommandComplete event immediately.
-///   - Asynchronous commands return CommandStatus first, then later a
-///     domain-specific completion event (ConnEstablished, etc.).
+/// Borrowed metadata and joined transport close for the registered provider.
+/// Commands use the retained CommandPort and identity-bound Host tickets;
+/// transport open belongs to Runtime open, never application fd construction.
 pub trait SleController: Send + Sync {
-    /// Return static controller info (name, bus, address, capabilities).
     fn info(&self) -> SleControllerInfo;
-
-    /// Open the controller. Called once when the first userspace fd opens
-    /// `/dev/sparklink`. Drivers should power on the radio and perform
-    /// initial firmware handshake.
-    fn open(&self) -> Result;
-
-    /// Close the controller. Called when the last userspace fd closes.
     fn close(&self);
-
-    /// Send a DLI command to the controller.
-    ///
-    /// `opcode` uses the TXS-10003-2025 encoding. `params` carries the
-    /// command-specific payload bytes. Returns `Ok(())` once the command
-    /// is accepted; results arrive through the registration-owned Host/ingress.
-    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result;
-
-    /// Send asynchronous unicast data on a connection.
-    ///
-    /// `handle` identifies the connection. The driver queues the data
-    /// for transmission and returns immediately.
-    fn send_data(&self, handle: u16, data: &[u8]) -> Result;
-
-    /// Reset the controller to a known-good state.
-    fn reset(&self) -> Result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,7 +1168,6 @@ impl ControllerBackend {
         provider
     }
 }
-
 
 // -- High-level convenience wrappers ----------------------------------------
 // These encapsulate DLI parameter encoding so the core layer never builds
@@ -1353,75 +1320,6 @@ impl ControllerBackend {
         }
     }
 
-
-
-
-    /// Send a command using a raw opcode value (u16).
-    ///
-    /// Used by the management plane DLI_SEND_CMD ioctl where the opcode
-    /// comes from userspace as a raw u16.
-    pub fn send_command_raw(&self, raw_opcode: u16, params: &[u8]) -> Result {
-        // Validate that raw_opcode is a known SleOpcode discriminant.
-        // We cannot use transmute on arbitrary u16 values as that is UB.
-        let opcode = sle_opcode_from_u16(raw_opcode).ok_or(EINVAL)?;
-        self.send_command(opcode, params)
-    }
-
-    /// Enable or disable broadcasting (section 8.2.4).
-    pub fn enable_broadcast(&self, enable: bool) -> Result {
-        self.send_command(SleOpcode::EnableBroadcast, &[u8::from(enable)])
-    }
-
-    /// Enable or disable scanning (section 8.3.3).
-    pub fn enable_scan(&self, enable: bool) -> Result {
-        self.send_command(SleOpcode::EnableScan, &[u8::from(enable)])
-    }
-
-    /// Initiate a connection to a peer (section 8.4.1).
-    pub fn create_connection(&self, peer_addr: &[u8; 6]) -> Result {
-        self.send_command(SleOpcode::CreateConnection, peer_addr)
-    }
-
-    /// Disconnect a link identified by `handle` (section 8.4.3).
-    pub fn disconnect(&self, handle: u16) -> Result {
-        let h = handle.to_le_bytes();
-        self.send_command(SleOpcode::Disconnect, &h)
-    }
-
-    /// Request pairing with the given method byte (§8.6.4).
-    ///
-    /// Standard format: [handle:2(LE16)][auth_req:1]
-    /// The handle is the connection handle; auth_req encodes security
-    /// attribute (bits 0-1), MITM flag (bit 2), and keyboard hint (bit 3).
-    pub fn request_pair(&self, handle: u16, auth_req: u8, method_hint: u8) -> Result {
-        let h = handle.to_le_bytes();
-        self.send_command(SleOpcode::RequestPair, &[h[0], h[1], auth_req, method_hint])
-    }
-
-    /// Send PairInfoExchangeReply command (§8.6.9, opcode 0x1C09).
-    pub fn pair_info_exchange_reply(&self, params: &[u8]) -> Result {
-        self.send_command(SleOpcode::PairInfoExchange, params)
-    }
-
-    /// Send PairOptionAccept command (§8.6.11, opcode 0x1C0B).
-    pub fn pair_option_accept(&self, params: &[u8]) -> Result {
-        self.send_command(SleOpcode::PairOptionAccept, params)
-    }
-
-    /// Send PairRandom command (§8.6.14, opcode 0x1C0E).
-    pub fn pair_random(&self, params: &[u8]) -> Result {
-        self.send_command(SleOpcode::PairRandom, params)
-    }
-
-    /// Send PairConfirm command (§8.6.15, opcode 0x1C0F).
-    pub fn pair_confirm(&self, params: &[u8]) -> Result {
-        self.send_command(SleOpcode::PairConfirm, params)
-    }
-
-    /// Send DHKeyVerify command (§8.6.16, opcode 0x1C10).
-    pub fn dhkey_verify(&self, params: &[u8]) -> Result {
-        self.send_command(SleOpcode::DhkeyVerify, params)
-    }
 }
 
 impl SleController for ControllerBackend {
@@ -1431,33 +1329,10 @@ impl SleController for ControllerBackend {
         }
     }
 
-    fn open(&self) -> Result {
-        match self {
-            Self::Native(c) => c.open(),
-        }
-    }
-
     fn close(&self) {
         match self {
             Self::Native(c) => c.close(),
         }
     }
 
-    fn send_command(&self, opcode: SleOpcode, params: &[u8]) -> Result {
-        match self {
-            Self::Native(c) => c.send_command(opcode, params),
-        }
-    }
-
-    fn send_data(&self, handle: u16, data: &[u8]) -> Result {
-        match self {
-            Self::Native(c) => c.send_data(handle, data),
-        }
-    }
-
-    fn reset(&self) -> Result {
-        match self {
-            Self::Native(c) => c.reset(),
-        }
-    }
 }

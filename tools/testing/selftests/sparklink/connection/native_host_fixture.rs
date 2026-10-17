@@ -41,9 +41,6 @@ pub(crate) enum SleEvent {
  NativeCommandReply{opcode:u16,command_credits:u8,status:u8,complete:bool,data:Vec<u8>},
  Other,
 }
-impl CmdRequestQueue {
-// @@PUSH_COOKIE@@
-}
 // @@ACTUAL_HOST@@
 // @@COMMAND_CALLBACK@@
 // @@COMMAND_OUTCOME@@

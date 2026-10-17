@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! SparkLink management plane — command pending queue with timeout.
+//! Owner-private retained Diagnostic results with original deadlines.
 //!
-//! Provides a fixed-size ring of `CmdPendingEntry` objects that track
-//! in-flight commands sent to the DLI controller.  The `EventPump`
-//! resolves entries when `CommandComplete` / `CommandStatus` events
-//! arrive; stale entries are expired based on a jiffies deadline.
-//!
-//! This replaces the previous fire-and-forget `send_command` model and
-//! mirrors the Bluetooth `hci_sent_cmd` / `req_wait_q` mechanism in a
-//! simplified form suitable for the kernel Rust crate.
+//! Wire admission, command credit and physical reply obligations belong to the
+//! per-Runtime Host. This ledger resolves only its captured sequence; it does
+//! not select an author by opcode or provide an alternate raw command path.
 
-#![allow(dead_code)]
+#![cfg_attr(not(test), deny(dead_code))]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::prelude::*;
@@ -91,9 +86,7 @@ impl CmdPendingEntry {
         status != CMD_STATUS_PENDING && status & CMD_RESOLVED_BIT != 0
     }
 
-    /// Resolve this entry with a CommandComplete result.
-    ///
-    /// Stores an exact bounded response; oversized data fails with EMSGSIZE.
+    /// Resolve this exact entry with a bounded physical reply.
     pub(crate) fn resolve(&mut self, dli_status: u8, response: &[u8]) {
         if response.len() > CMD_DATA_MAX {
             self.error = -(kernel::bindings::EMSGSIZE as i32);
@@ -187,7 +180,8 @@ impl CmdPendingQueue {
         })
     }
 
-    /// Create an empty queue.
+    /// Test-only constructor; production uses the in-place initializer.
+    #[cfg(test)]
     pub(crate) const fn new() -> Self {
         const NONE: Option<CmdPendingEntry> = None;
         Self {
@@ -199,12 +193,6 @@ impl CmdPendingQueue {
             total_resolved: 0,
             total_timeouts: 0,
         }
-    }
-
-    /// Submit a new command. Returns the sequence number on success,
-    /// or `EBUSY` if the queue is full.
-    pub(crate) fn submit(&mut self, opcode: u16) -> Result<u32> {
-        self.submit_with_timeout(opcode, CMD_TIMEOUT_MS)
     }
 
     /// Submit a new command with a custom timeout.
@@ -231,21 +219,6 @@ impl CmdPendingQueue {
         self.pending_count += 1;
         self.total_submitted += 1;
         Ok(seq)
-    }
-
-    /// Find the oldest pending entry matching `opcode` and resolve it.
-    ///
-    /// Returns `true` if a matching entry was found and resolved.
-    pub(crate) fn resolve(&mut self, opcode: u16, status: u8, data: &[u8]) -> bool {
-        for entry in self.entries.iter_mut().flatten() {
-            if entry.opcode == opcode && entry.is_pending() {
-                entry.resolve(status, data);
-                self.pending_count = self.pending_count.saturating_sub(1);
-                self.total_resolved += 1;
-                return true;
-            }
-        }
-        false
     }
 
     /// Resolve only the sequence captured when this owner's command was
@@ -303,14 +276,6 @@ impl CmdPendingQueue {
             }
         }
         expired
-    }
-
-    /// Associate an admitted sequence with the originating open file. Caller
-    /// holds the same per-Runtime protocol mutex through submit/enqueue/tag.
-    pub(crate) fn assign_owner(&mut self, seq: u32, file_id: u64) {
-        if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.seq == seq) {
-            entry.file_id = file_id;
-        }
     }
 
     /// Retained admission identity belongs to one original open file.
@@ -378,18 +343,4 @@ impl CmdRequestQueue {
         })
     }
 
-    pub(crate) fn push(&mut self, opcode: u16, params: &[u8]) -> Result {
-        self.push_tracked(opcode, params, 0)
-    }
-
-    pub(crate) fn push_tracked(&mut self, opcode: u16, params: &[u8], seq: u32) -> Result {
-        self.push_cookie(opcode, params, seq, 0)
-    }
-
-    pub(crate) fn push_cookie(&mut self, opcode: u16, params: &[u8], seq: u32, cookie: u64) -> Result {
-        // SAFETY: reads the kernel clock; no user memory or I/O.
-        let deadline = unsafe { kernel::bindings::jiffies_64 }
-            .wrapping_add(msecs_to_jiffies(CMD_TIMEOUT_MS) as u64);
-        self.push_tagged(opcode, params, seq, cookie, None, deadline).map_err(Error::from)
-    }
 }

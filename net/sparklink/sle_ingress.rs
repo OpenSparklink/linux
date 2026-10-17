@@ -78,7 +78,6 @@ pub(crate) fn drain_runtime_events(
 
 /// Inline draining never removes events belonging to another device.
 
-
 pub(crate) struct RxDropStats {
     pub(crate) ring: u32,
     pub(crate) command_complete: u32,
@@ -138,25 +137,5 @@ pub(crate) fn enqueue_rx(owner: &kernel::sync::Arc<super::ControllerRuntime>, ev
     drop(stopping);
     drop(host);
     owner.schedule_rx(0);
-}
-
-/// Common software command admission. Dialect validation belongs to the
-/// provider before this call and again before physical submission. This only
-/// queues Host work, never performs transport I/O or invents a reply/credit.
-pub(crate) fn enqueue_command(
-    owner: &kernel::sync::Arc<super::ControllerRuntime>, opcode: u16, params: &[u8],
-    intent: Option<super::sle_command_plan::DiscoveryIntent>,
-) -> Result {
-    use super::sle_command_plan::RecipePart;
-    let mut host = owner.host.lock();
-    let gate = owner.schedule_gate.lock();
-    if *gate { return Err(ENODEV); }
-    let result = if let Some(intent) = intent {
-        host.enqueue_recipe(intent, &[RecipePart { opcode, params }])
-    } else { host.enqueue(opcode, params, 0) };
-    drop(gate); drop(host);
-    result?;
-    owner.kick_commands();
-    Ok(())
 }
 
