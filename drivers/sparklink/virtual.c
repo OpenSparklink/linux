@@ -219,6 +219,33 @@ static long virtual_control_ioctl(struct file *file, unsigned int cmd, unsigned 
 	struct sparklink_virtual_status status = {};
 	int ret = 0;
 
+	if (cmd == SPARKLINK_VIRTUAL_HARDWARE_ERROR) {
+		struct sparklink_native_identity identity;
+		u32 code;
+		u8 event[] = { 0x0a, 0, 1, 0, 0 };
+
+		/* A passed test-control fd must not bypass the current credential. */
+		if (!capable(CAP_NET_ADMIN))
+			return -EPERM;
+		if (copy_from_user(&code, (void __user *)arg, sizeof(code)))
+			return -EFAULT;
+		if (code > 255)
+			return -EINVAL;
+		mutex_lock(&v->lock);
+		if (!v->live) {
+			mutex_unlock(&v->lock);
+			return -ENODEV;
+		}
+		identity = v->identity;
+		mutex_unlock(&v->lock);
+		/* The File reference retains v. Ingress checks this immutable identity;
+		 * no lock spans the callback and no physical hardware is touched.
+		 */
+		event[4] = (u8)code;
+		sparklink_backend_standard_receive(identity.id, identity.generation,
+						  event, sizeof(event), 1, 0);
+		return 0; /* Input delivered to the parser, not a fabricated Complete. */
+	}
 	if (cmd == SPARKLINK_VIRTUAL_STATUS) {
 		mutex_lock(&v->lock);
 		status = (struct sparklink_virtual_status) {

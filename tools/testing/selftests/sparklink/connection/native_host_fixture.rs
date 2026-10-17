@@ -1,3 +1,7 @@
+mod hardware_fault_allocator {pub trait Init<T>{}pub struct Stub<T>(pub std::marker::PhantomData<T>);impl<T> Init<T> for Stub<T>{}}
+macro_rules! init {($($tokens:tt)*)=>{crate::hardware_fault_allocator::Stub::<Self>(std::marker::PhantomData)};}
+#[allow(dead_code, reason="Actual complete pending module;allocator/event queue dependencies outside this worker subset")]
+#[path="hardware_fault_pending.rs"] mod hardware_fault_pending;
 #[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;
 #[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 // SPDX-License-Identifier: GPL-2.0-only
@@ -9,7 +13,7 @@
 #[path="sle_grant.rs"] mod sle_grant;
 #[path="sle_connection_operation.rs"] mod sle_connection_operation;
 #[path="sle_link_observation.rs"] mod sle_link_observation;
-mod sle_dli {pub(crate) use super::actual_host::SleStatus;}
+mod sle_dli {pub(crate) use super::actual_host::{SleStatus,SleEvent};}
 #[allow(dead_code)]
 mod actual_host {
 use super::*;
@@ -19,7 +23,10 @@ use sle_discovery_operation::{Operations,Operation,State,AdmissionError};
 type Error=i32; type Result<T=()>=std::result::Result<T,Error>;
 const EAGAIN:i32=-11;const EINVAL:i32=-22;const EBUSY:i32=-16;const EEXIST:i32=-17;const ENOENT:i32=-2;
 const EOVERFLOW:i32=-75;const ETIMEDOUT:i32=-110;const EIO:i32=-5;
-mod kernel {pub mod bindings {
+pub(crate) mod kernel {
+pub mod prelude {pub type Result<T=()>=std::result::Result<T,i32>;pub const EINVAL:i32=-22;pub const EBUSY:i32=-16;pub const EOVERFLOW:i32=-75;}
+pub mod time {pub fn msecs_to_jiffies(ms:u32)->u64{u64::from(ms)}}
+pub mod bindings {pub const EMSGSIZE:u32=90;pub const ETIMEDOUT:u32=110;
  pub const EACCES:u32=13;pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;pub const EALREADY:u32=114;
  #[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;
  pub unsafe fn ktime_get_boottime()->i64 {unsafe{jiffies_64 as i64 * 1000000}}
@@ -39,13 +46,14 @@ pub(crate) enum SleEvent {
  CommandComplete{opcode:SleOpcode,command_credits:u8,status:SleStatus,data:Vec<u8>},
  CommandStatus{opcode:SleOpcode,command_credits:u8,status:SleStatus},
  NativeCommandReply{opcode:u16,command_credits:u8,status:u8,complete:bool,data:Vec<u8>},
+ HardwareError{code:u8},
  Other,
 }
 // @@ACTUAL_HOST@@
 // @@COMMAND_CALLBACK@@
 // @@COMMAND_OUTCOME@@
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
- connections:sle_connection_operation::Connections::new(),credits:1,credit_revision:0,active:None,reply:None,fault:None,next_cookie:1,
+ connections:sle_connection_operation::Connections::new(),credits:1,credit_revision:0,active:None,reply:None,fault:None,hardware_error:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
  grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){super::sle_security_relay::clock(now);unsafe{kernel::bindings::jiffies_64=now}}
@@ -449,4 +457,45 @@ fn relay_host() -> (CommandHost,super::sle_security_relay::Command) {
  assert!(h.take_reply().is_some());assert_eq!(h.credits,1);assert_ne!(c.commit(||panic!("revoked reused")),0);
 }
 
+
+#[test] fn hardware_fault_latches_before_worker_and_retains_reserved_obligation() {
+ clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],41,100).unwrap();let q=h.next(|_|true).unwrap().unwrap();
+ h.command_committed(q.cookie);
+ assert!(h.receive(SleEvent::HardwareError{code:7}).is_none());
+ assert_eq!(h.controller_status(),(0,false,Some(EIO)));assert!(!h.admits_data());assert!(!h.link_snapshot().1);
+ let active=h.active.as_ref().unwrap();assert_eq!((active.cookie,active.seq,active.transport_submitted),(q.cookie,41,true));
+ assert_eq!(h.validate_command_commit(q.cookie,q.opcode),Err(EIO));assert_eq!(h.abort_unsubmitted(q.cookie,-12),Err(EIO));
+ assert_eq!(h.take_hardware_error(),Some(7));assert_eq!(h.take_hardware_error(),None);
+ assert_eq!(h.controller_status(),(0,false,Some(EIO)));assert_eq!(h.fail(EIO),Some(41));assert_eq!(h.fail(-110),None);
+ assert_eq!(h.fault,Some(EIO));assert_eq!(h.credits,0);
+}
+#[test] fn hardware_fault_blocks_reply_credit_and_already_retained_success() {
+ for already_replied in [false,true] {
+  clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],41,100).unwrap();let q=h.next(|_|true).unwrap().unwrap();
+  h.command_committed(q.cookie);h.transport_complete(q.cookie);
+  if already_replied {assert!(h.receive(SleEvent::NativeCommandReply{opcode:q.opcode,command_credits:1,status:0,complete:true,data:vec![]}).is_none());}
+  h.receive(SleEvent::HardwareError{code:0});
+  h.receive(SleEvent::NativeCommandReply{opcode:q.opcode,command_credits:255,status:0,complete:true,data:vec![]});
+  h.receive(SleEvent::CommandCredits{credits:255});
+  assert!(h.take_reply().is_none());assert!(!h.transport_complete(q.cookie));assert_eq!(h.credits,0);assert!(h.active.is_some());
+  assert_eq!(h.fail(EIO),Some(41));assert_eq!(h.credits,0);
+ }
+}
+#[test] fn hardware_fault_first_observation_and_other_controller_remain_independent() {
+ clock(1);let mut a=host();let mut b=host();b.enqueue_diagnostic(0x0404,&[],8,100).unwrap();let q=b.next(|_|true).unwrap().unwrap();
+ a.receive(SleEvent::HardwareError{code:3});a.receive(SleEvent::HardwareError{code:4});assert_eq!(a.take_hardware_error(),Some(3));
+ a.receive(SleEvent::HardwareError{code:5});assert_eq!(a.take_hardware_error(),None);
+ assert_eq!(b.controller_status(),(0,true,None));assert_eq!(b.validate_command_commit(q.cookie,q.opcode),Ok(()));
+ assert_eq!(a.resume_management(),Err(EIO));assert!(b.admits_data());
+ b.command_committed(q.cookie);b.transport_complete(q.cookie);
+ b.receive(SleEvent::NativeCommandReply{opcode:q.opcode,command_credits:1,status:0,complete:true,data:vec![9]});assert_eq!(b.take_reply().unwrap().seq,8);
+}
+#[test] fn hardware_fault_does_not_replace_an_earlier_fault_or_rewrite_deadline() {
+ clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],41,100).unwrap();let q=h.next(|_|true).unwrap().unwrap();
+ let deadline=h.active.as_ref().unwrap().deadline;clock(99);h.receive(SleEvent::HardwareError{code:2});assert_eq!(h.active.as_ref().unwrap().deadline,deadline);
+ assert_eq!(h.validate_command_commit(q.cookie,q.opcode),Err(EIO));h.fail(EIO);clock(1000);h.fail(-110);assert_eq!(h.fault,Some(EIO));
+ let mut prior=host();prior.fail(-71);prior.receive(SleEvent::HardwareError{code:9});assert_eq!(prior.fault,Some(-71));assert_eq!(prior.take_hardware_error(),None);
+}
+
+include!("hardware_error_worker_fixture.rs");
 }

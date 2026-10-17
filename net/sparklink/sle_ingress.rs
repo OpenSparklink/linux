@@ -115,8 +115,8 @@ pub(crate) fn enqueue_rx(owner: &kernel::sync::Arc<super::ControllerRuntime>, ev
     }
     let event = host.receive(event);
     let Some(event) = event else {
-        // A matching reply is retained in the Host's reserved slot. It
-        // cannot be lost when discovery/data fill the ordinary RX ring.
+        // A matching reply or critical fault is retained in the Host, not the
+        // ordinary ring. Even a full ring cannot lose its processing wake.
         drop(stopping);
         drop(host);
         owner.schedule_rx(0);

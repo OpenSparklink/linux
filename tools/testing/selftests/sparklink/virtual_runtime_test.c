@@ -266,6 +266,69 @@ static struct controller diagnostic_fd_lifetime(struct controller c, struct cont
 	return observer;
 }
 
+/* Explicit test-only error travels through the real parser/Host/worker. */
+static void hardware_error_fault(struct controller peer)
+{
+    struct controller c = create();
+    uint32_t code = 256;
+    CHECK(ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, &code) == -1 && errno == EINVAL);
+    CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        CHECK(!setgroups(0, NULL) && !setgid(1000) && !setuid(1000));
+        code = 7;
+        CHECK(ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, &code) == -1 && errno == EPERM);
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    CHECK(snapshot(c).flags == SLE_CONTROLLER_SETUP);
+    config(c, 1000, 0, 0);
+    uint32_t seq[2] = {submit(c, 0x0404), submit(c, 0x0404)};
+    pending(c);
+    code = 7; CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, &code));
+    double deadline = now() + 3;
+    struct sle_controller_snapshot snap;
+    struct sle_diagnostic_result result;
+    for (unsigned i = 0; i < 2; i++) {
+        do {
+            result = (struct sle_diagnostic_result){.version=1, .generation=c.status.generation, .seq=seq[i]};
+            CHECK(!ioctl(c.fd, SL_IOCTL_DIAGNOSTIC_RESULT, &result));
+            if (result.state == 3) break;
+            CHECK(result.state == 1 && now() < deadline); usleep(1000);
+        } while (1);
+        CHECK(result.error == -EIO && !result.data_len);
+    }
+    snap = snapshot(c); CHECK(snap.flags == SLE_CONTROLLER_FAULT && snap.error == -EIO && !snap.command_credits);
+    struct sle_mgmt_stats stats;
+    CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &stats) && !stats.pending && stats.total_resolved == 2);
+    struct sle_diagnostic_submit rejected = {.version=1,.generation=c.status.generation,.request_id=++request_id,.timeout_ms=5000,.opcode=0x0404,.action=1};
+    CHECK(ioctl(c.fd, SL_IOCTL_DIAGNOSTIC_SUBMIT, &rejected) == -1 && errno == EIO);
+    /* A late real backend callback does not repay or reopen the faulted Host. */
+    struct sparklink_virtual_status physical;
+    do {
+        CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_STATUS, &physical));
+        if (physical.delivered) break;
+        CHECK(now() < deadline); usleep(1000);
+    } while (1);
+    CHECK(physical.submitted == 1 && physical.delivered == 1 && !physical.pending);
+    code = 8; CHECK(!ioctl(c.control, SPARKLINK_VIRTUAL_HARDWARE_ERROR, &code));
+    usleep(10000);
+    snap = snapshot(c); CHECK(snap.flags == SLE_CONTROLLER_FAULT && snap.error == -EIO && !snap.command_credits);
+    CHECK(!ioctl(c.fd, SL_IOCTL_MGMT_STATS, &stats) && !stats.pending && stats.total_resolved == 2);
+    for (unsigned i=0; i<2; i++) {
+        result=(struct sle_diagnostic_result){.version=1,.generation=c.status.generation,.seq=seq[i]};
+        CHECK(!ioctl(c.fd,SL_IOCTL_DIAGNOSTIC_RESULT,&result) && result.state==3 && result.error==-EIO);
+    }
+    query(peer, 0x0406, 6);
+    CHECK(!close(c.control)); stale(c);
+    struct controller replacement = create();
+    CHECK(replacement.status.id == c.status.id && replacement.status.generation > c.status.generation);
+    query(replacement, 0x0406, 6); stale(c);
+    CHECK(!close(replacement.control) && !close(replacement.fd) && !close(c.fd));
+    printf("VIRTUAL_HARDWARE_ERROR_PASS: id=%u generation=%llu authors=2 submitted=1 late_reply=ignored credit=0 inherited_CAP=EPERM invalid=EINVAL peer=1 reuse=1 raw_code=7 no_rf=1\n", c.status.id, (unsigned long long)c.status.generation);
+}
+
 static void fault(unsigned int delay, unsigned int drop, unsigned int fail,
 		  struct controller peer)
 {
@@ -334,6 +397,7 @@ int main(void)
 	}
 	int status; CHECK(waitpid(observer, &status, 0) == observer && WIFEXITED(status) && !WEXITSTATUS(status));
 	standard_snoop(a,b);
+	hardware_error_fault(b);
 	config(a, 20, 0, 0);
 	const uint16_t queries[] = { 0x0401, 0x0402, 0x0403, 0x0404, 0x0406 };
 	const unsigned int lengths[] = { 2, 6, 10, 5, 6 };

@@ -74,9 +74,17 @@ fn progress_connection_cleanup(owner: &Arc<ControllerRuntime>, state: &Controlle
     result
 }
 
-/// Consume the retained management reply under this owner's protocol mutex.
-/// Generic/discovery ingress pressure cannot steal the result or its sequence.
-fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerState) -> bool {
+/// Consume critical faults before retained replies under the protocol mutex.
+/// Neither depends on capacity in the ordinary RX event ring. Never join or
+/// invalidate this Runtime from its own worker; existing retirement owns that.
+fn process_host_events(owner: &Arc<ControllerRuntime>, state: &mut ControllerState) -> bool {
+    let hardware_error = owner.host.lock().take_hardware_error();
+    if let Some(code) = hardware_error {
+        fail_host(owner, state, EIO);
+        pr_warn!("sparklink: sle{} generation={} controller hardware error code={:#04x}; Host quarantined\n",
+                 owner.identity.id, owner.identity.generation, code);
+        return true;
+    }
     let reply = owner.host.lock().take_reply();
     let Some(reply) = reply else {
         return false;
@@ -110,7 +118,9 @@ fn process_host_reply(owner: &Arc<ControllerRuntime>, state: &mut ControllerStat
 
 fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error: Error) {
     let mut host = owner.host.lock();
-    if let Some(seq) = host.fail(error) {
+    let seq = host.fail(error);
+    let error = host.controller_status().2.unwrap_or(error);
+    if let Some(seq) = seq {
         state.cmd_pending.fail_seq(seq, error.to_errno());
     }
     while let Some(request) = host.cancel_next() {
@@ -198,7 +208,7 @@ impl WorkItem<0> for ControllerRuntime {
                 let Some(runtime) = Option::as_mut(&mut *guard) else {
                     return;
                 };
-                if process_host_reply(&this, runtime) {
+                if process_host_events(&this, runtime) {
                     pumped += 1;
                     drained += 1;
                 }

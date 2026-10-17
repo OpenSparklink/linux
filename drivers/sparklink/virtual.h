@@ -15,7 +15,8 @@ struct sparklink_virtual_control {
 
 struct sparklink_virtual_status {
 	/* submitted counts driver attempts, delivered counts ingress attempts;
-	 * neither means Host resolution, controller completion or peer delivery.
+	 * delivered covers delayed command replies, not injected hardware errors.
+	 * Neither means Host resolution, controller completion or peer delivery.
 	 */
 	__u64 generation, submitted, delivered, dropped, failed;
 	__u32 id, live, pending, reserved;
@@ -23,5 +24,9 @@ struct sparklink_virtual_status {
 
 #define SPARKLINK_VIRTUAL_CONFIG _IOW('V', 0, struct sparklink_virtual_control)
 #define SPARKLINK_VIRTUAL_STATUS _IOR('V', 1, struct sparklink_virtual_status)
+/* Explicit TEST backend only: one well-framed standard hardware-error event.
+ * The input is a u32 in [0,255]. No production Native ioctl injection exists.
+ */
+#define SPARKLINK_VIRTUAL_HARDWARE_ERROR _IOW('V', 2, __u32)
 
 #endif

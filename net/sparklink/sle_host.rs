@@ -47,6 +47,9 @@ pub(crate) struct CommandHost {
     active: Option<InFlight>,
     reply: Option<(SleEvent, u64)>,
     fault: Option<Error>,
+    // Reserved critical observation, never an authorization or Ready source.
+    // First-fault code waits for the process worker even if the RX ring is full.
+    hardware_error: Option<u8>,
     next_cookie: u64,
     broadcast_cookie: u64,
     scan_cookie: u64,
@@ -78,6 +81,7 @@ impl CommandHost {
                 active: None,
                 reply: None,
                 fault: None,
+                hardware_error: None,
             next_cookie: 1,
             broadcast_cookie: 0,
             scan_cookie: 0,
@@ -688,6 +692,18 @@ impl CommandHost {
     /// Consume a matching response into its reserved slot. Other events
     /// retain their normal routing; they cannot complete a raw transaction.
     pub(crate) fn receive(&mut self, event: SleEvent) -> Option<SleEvent> {
+        if let SleEvent::HardwareError { code } = &event {
+            if self.fault.is_none() {
+                self.hardware_error = Some(*code);
+                // Callback-safe bounded state changes only. Keep active/reply
+                // references until the worker resolves the captured author.
+                self.latch_fault(EIO);
+            }
+            return None;
+        }
+        // Late credit/replies cannot reopen this quarantined Host or publish a
+        // success. Its physical obligations require the existing stop/barrier.
+        if self.fault.is_some() { return Some(event); }
         let opcode = match &event {
             SleEvent::CommandCredits { credits } => {
                 self.update_credits(*credits);
@@ -767,6 +783,7 @@ impl CommandHost {
     /// The protocol consumer releases the on-wire slot. Keeping it occupied
     /// until consumption bounds management delivery even if RX is busy.
     pub(crate) fn take_reply(&mut self) -> Option<HostReply> {
+        if self.fault.is_some() { return None; }
         if !self.active.as_ref().is_some_and(|active| active.transport_done) { return None; }
         let (event, received) = self.reply.take()?;
         let active = self.active.take()?;
@@ -912,9 +929,9 @@ impl CommandHost {
             || self.next_deadline().is_some_and(|deadline| now >= deadline)
     }
 
-    /// Latch a fault; never invent credits after uncertain transport outcome.
-    /// The caller drains remaining requests and resolves that owner's entries.
-    pub(crate) fn fail(&mut self, error: Error) -> Option<u32> {
+    /// Callback-safe admission barrier; retain active physical references for
+    /// the process-context consumer. No I/O, allocation, join or refund.
+    fn latch_fault(&mut self, error: Error) {
         if self.fault.is_none() && self.revoking && !self.revoke_reply {
             self.revoke_opcode = self.active.as_ref().map_or(0, |active| active.opcode);
         }
@@ -922,6 +939,18 @@ impl CommandHost {
         self.operations.fault(error.to_errno());
         self.connections.fault(error.to_errno());
         self.credits = 0;
+    }
+
+    /// Consume the reserved diagnostic once. Fault remains authoritative after
+    /// this take, so draining a code can never make this controller Ready.
+    pub(crate) fn take_hardware_error(&mut self) -> Option<u8> {
+        self.hardware_error.take()
+    }
+
+    /// Latch a fault; never invent credits after uncertain transport outcome.
+    /// The caller drains remaining requests and resolves that owner's entries.
+    pub(crate) fn fail(&mut self, error: Error) -> Option<u32> {
+        self.latch_fault(error);
         self.reply = None;
         if let Some((_, progress)) = &mut self.recipe { progress.cancel(); }
         self.active.take().map(|active| {

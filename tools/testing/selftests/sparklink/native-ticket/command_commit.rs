@@ -38,3 +38,13 @@ unsafe extern "C" fn atomic_submit(context:*mut c_void)->i32 {
   assert_eq!(context.calls.get(),if case==5{1}else{0});assert!(!owner.host.lock().active.as_ref().unwrap().transport_submitted);
  }
 }
+
+#[test] fn hardware_fault_prevents_actual_atomic_command_submission() {
+ clock(1);let mut h=host();h.enqueue_diagnostic(0x0404,&[],9,100).unwrap();let q=h.next(|_|true).unwrap().unwrap();
+ let owner=ControllerRuntime{identity:DeviceIdentity{id:1,generation:2},host:FixtureLock(std::sync::Mutex::new(h)),schedule_gate:FixtureLock(std::sync::Mutex::new(false)),transport_open:AtomicBool::new(true)};
+ owner.host.lock().receive(SleEvent::HardwareError{code:7});
+ let mut ticket=NativeCommandTicket{owner:&owner,cookie:q.cookie,opcode:q.opcode,attempted:Cell::new(false),submitted:Cell::new(false),materialized:Cell::new(false)};
+ let mut context=Submit{owner:&owner,calls:Cell::new(0),result:0};
+ assert_eq!(unsafe{sparklink_native_command_commit_rust((&mut ticket as *mut NativeCommandTicket<'_>).cast(),1,2,Some(atomic_submit),(&mut context as *mut Submit<'_>).cast())},-5);
+ assert_eq!(context.calls.get(),0);assert!(!ticket.submitted.get());assert!(owner.host.lock().active.is_some());
+}

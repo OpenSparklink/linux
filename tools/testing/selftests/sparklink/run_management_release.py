@@ -44,7 +44,7 @@ def run(output):
                          'cancel_unsubmitted_policy', 'controller_status', 'discovery_radio',
                          'current_recipe', 'can_send', 'retained_revocation',
                          'retained_revocation_ready', 'next', 'cancel_recipe_progress', 'enqueue_recipe_until', 'enqueue_recipe',
-                         'begin_revoke', 'revocation_result', 'fail'])
+                         'begin_revoke', 'revocation_result', 'latch_fault', 'fail'])
     fixture = (here/'diagnostic/management_release_fixture.rs').read_text()
     fixture = fixture.replace('// @@HOST_METHODS@@', methods.replace('Error::from_errno(', 'error_from_errno(')).replace('// @@CORE_DECISION@@', decision.replace('Error::from_errno(', 'error_from_errno(')).replace('// @@CORE_COMMIT@@', commit)
     host = inputs['sle_host.rs'].decode()

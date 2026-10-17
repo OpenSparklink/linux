@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,6 +14,26 @@ import subprocess
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+
+def verify_console(log, qemu_exit):
+    if (qemu_exit or log.count('VIRTUAL_RUNTIME_PASS:') != 2
+            or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
+            or log.count('VIRTUAL_STANDARD_SNOOP_PASS:') != 2
+            or len(re.findall(r'VIRTUAL_HARDWARE_ERROR_PASS: id=\d+ generation=\d+ authors=2 submitted=1 late_reply=ignored credit=0 inherited_CAP=EPERM invalid=EINVAL peer=1 reuse=1 raw_code=7 no_rf=1', log)) != 2
+            or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
+            or log.count('PROTOCOL_STATE_REFUSAL_PASS:') != 4
+            or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
+            or log.count('VIRTUAL_GLOBAL_POWER_POLICY_PASS:') != 2
+            or log.count('GENL_REGISTRY_PASS:') != 10
+            or log.count('GENL_REGISTRY_PASS: uid=1000') != 2
+            or 'VIRTUAL_MODULE_ROUND_PASS:2' not in log or 'VIRTUAL_VM_PASS' not in log
+            or any(marker in log for marker in ('VIRTUAL_VM_FAIL', 'VIRTUAL_RUNTIME_FAIL',
+                                                'Kernel panic', 'BUG:', 'WARNING:'))):
+        raise RuntimeError('VM gates failed; retain transcript')
+    fault_ids = set(re.findall(r'VIRTUAL_HARDWARE_ERROR_PASS: id=(\d+) generation=(\d+)', log))
+    logged_faults = set(re.findall(r'sle(\d+) generation=(\d+) controller hardware error code=0x07; Host quarantined', log))
+    if len(fault_ids) != 2 or not fault_ids <= logged_faults:
+        raise ValueError('missing generation-bound hardware fault diagnostics')
 
 def run(args):
     here = Path(__file__).resolve().parent
@@ -32,7 +53,8 @@ def run(args):
     if 'INTERP' in subprocess.check_output(['readelf', '-l', str(paths['busybox'])], text=True):
         raise ValueError('static busybox required')
     record = {'status': 'PREPARING', 'physical_acceptance': False,
-              'scope': 'Empty-USB KVM, actual test provider + Core/Host; no RF/data/recovery proof',
+              'scope': 'Empty-USB KVM,actual optional test provider plus production parser/Host/ledger/worker and ticket barrier;controlled hardware-error input is not a real WS73 fault or RF/recovery proof',
+              'runner_sha256':sha(Path(__file__)), 'private_virtual_header_sha256':sha(here.parents[3]/'drivers/sparklink/virtual.h'),
               'module_info': info, 'source_sha256': sha(here / 'virtual_runtime_test.c'),
               'registry_probe_sha256': sha(here / 'genl_registry_test.c'),
               'protocol_state_probe_sha256': sha(here / 'protocol_state_unsupported_test.c'),
@@ -47,6 +69,7 @@ def run(args):
         binary = root / 'bin/test'
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O2', '-Wall', '-Wextra',
                         '-Werror', str(here / 'virtual_runtime_test.c'), '-o', str(binary)], check=True)
+        record['test_binary_sha256'] = sha(binary)
         libs = subprocess.check_output(['ldd', str(binary)], text=True)
         resolved = []
         for line in libs.splitlines():
@@ -109,23 +132,12 @@ busybox poweroff -f
                                     stdin=subprocess.DEVNULL, timeout=120)
         log = (out / 'console.log').read_text(errors='replace')
         record.update(qemu_exit=result.returncode, console_sha256=sha(out / 'console.log'))
-        if (result.returncode or log.count('VIRTUAL_RUNTIME_PASS:') != 2
-                or log.count('VIRTUAL_QUERY_RELEASE_PASS:') != 2
-                or log.count('VIRTUAL_STANDARD_SNOOP_PASS:') != 2
-                or log.count('VIRTUAL_DIAGNOSTIC_FD_PASS:') != 2
-                or log.count('PROTOCOL_STATE_REFUSAL_PASS:') != 4
-                or log.count('VIRTUAL_POWER_UNSUPPORTED_PASS:') != 4
-                or log.count('VIRTUAL_GLOBAL_POWER_POLICY_PASS:') != 2
-                or log.count('GENL_REGISTRY_PASS:') != 10
-                or log.count('GENL_REGISTRY_PASS: uid=1000') != 2
-                or 'VIRTUAL_MODULE_ROUND_PASS:2' not in log or 'VIRTUAL_VM_PASS' not in log
-                or any(marker in log for marker in ('VIRTUAL_VM_FAIL', 'VIRTUAL_RUNTIME_FAIL',
-                                                    'Kernel panic', 'BUG:', 'WARNING:'))):
-            raise RuntimeError('VM gates failed; retain transcript')
         if any(sha(path) != record['inputs'][name]
                for name, path in paths.items() if path.is_file()):
             raise RuntimeError('input changed during VM')
+        verify_console(log, result.returncode)
         record.update(status='PASS_VIRTUAL_CORE_HOST_VM',
+                      hardware_error_results=[line for line in log.splitlines() if 'VIRTUAL_HARDWARE_ERROR_PASS:' in line],
                       standard_snoop_results=[line for line in log.splitlines() if 'VIRTUAL_STANDARD_SNOOP_PASS:' in line], module_rounds=2,
                       registry_results=[line for line in log.splitlines() if 'GENL_REGISTRY_PASS:' in line],
                       protocol_state_results=[line for line in log.splitlines() if 'PROTOCOL_STATE_REFUSAL_PASS:' in line],
