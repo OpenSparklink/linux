@@ -126,6 +126,8 @@ struct ws73_usb {
 	unsigned int command_credits;
 	struct ws73_dli_info info;
 	struct ws73_chip_info chip_info;
+	struct ws73_sle_efuse_info address_source;
+	int address_source_error;
 	struct ws73_dli_result dli_result;
 };
 
@@ -1131,6 +1133,11 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 
 	ret = ws73_reserve_backend(ws);
 	if (ret) goto out;
+	/* One interface/bootstrap sample, never inherited as a usable address
+	 * or used to change controller/Grant/security state.
+	 */
+	memset(&ws->address_source, 0, sizeof(ws->address_source));
+	ws->address_source_error = -ENODATA;
 	ws73_pending_status(ws, READ_ONCE(ws->stage), 0);
 	mutex_lock(&ws73_ports_lock);
 	ret = ws->port->budget.exhausted ||
@@ -1198,6 +1205,25 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	}
 	dev_info(&ws->intf->dev, "HCC reported WS73%c bus=USB (not firmware attestation)\n",
 		 "USE"[ws->chip_info.model]);
+	ret = ws73_sle_efuse_query(&io, &ws->address_source);
+	ws->address_source_error = ret;
+	/* An absent optional response does not synthesize an address or Ready.
+	 * Its timed-out reply is a platform message, not a DLI command/credit.
+	 * Transport failures and malformed related replies still fail startup.
+	 */
+	if (ret && ret != -ETIMEDOUT)
+		goto out;
+	if (ret)
+		dev_info(&ws->intf->dev, "SLE address source unavailable: %d\n", ret);
+	else if (ws->address_source.status)
+		dev_info(&ws->intf->dev,
+			 "HCC read-only SLE eFuse id=125 status=%08x length=%u bytes=unavailable\n",
+			 ws->address_source.status, ws->address_source.size);
+	else
+		dev_info(&ws->intf->dev,
+			 "HCC read-only SLE eFuse id=125 status=%08x length=%u bytes=%*phN (not address validation)\n",
+			 ws->address_source.status, ws->address_source.size,
+			 (int)ws->address_source.size, ws->address_source.address);
 	ws->dli_result.status = 0x100;
 	ret = ws73_dli_query(&io, &credits, &ws->info, &ws->dli_result);
 	if (ret)
@@ -1427,6 +1453,40 @@ static ssize_t chip_information_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(chip_information);
 
+static ssize_t sle_address_source_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	ssize_t ret;
+
+	/* Same phase-lock/metadata publication contract as chip_information.
+	 * This is a firmware read observation, not a security or RF address API.
+	 */
+	if (!mutex_trylock(&ws->phase_lock))
+		return -EAGAIN;
+	/* Acquire pairs with runtime_start's release publication of metadata. */
+	if (!smp_load_acquire(&ws->metadata_valid)) {
+		mutex_unlock(&ws->phase_lock);
+		return -ENODATA;
+	}
+	if (ws->address_source_error)
+		ret = sysfs_emit(buf,
+			"source=HCC_READ_EFUSE id=125 response=0 error=%d status=unknown length=0 bytes=unknown\n",
+			ws->address_source_error);
+	else if (ws->address_source.status)
+		ret = sysfs_emit(buf,
+			"source=HCC_READ_EFUSE id=125 response=1 error=0 status=%08x length=%u bytes=unavailable\n",
+			ws->address_source.status, ws->address_source.size);
+	else
+		ret = sysfs_emit(buf,
+			"source=HCC_READ_EFUSE id=125 response=1 error=0 status=%08x length=%u bytes=%*phN\n",
+			ws->address_source.status, ws->address_source.size,
+			(int)ws->address_source.size, ws->address_source.address);
+	mutex_unlock(&ws->phase_lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(sle_address_source);
+
 static ssize_t native_runtime_show(struct device *dev,
                                   struct device_attribute *attr, char *buf)
 {
@@ -1462,6 +1522,7 @@ static struct attribute *ws73_attrs[] = {
 	&dev_attr_native_runtime.attr,
 	&dev_attr_controller_information.attr,
 	&dev_attr_chip_information.attr,
+	&dev_attr_sle_address_source.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ws73);

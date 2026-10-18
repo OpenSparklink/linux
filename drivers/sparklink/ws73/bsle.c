@@ -94,40 +94,51 @@ static int ws73_send_control(struct ws73_bsle_io *io, unsigned int descriptor,
 	return io->send(io->context, ret);
 }
 
-struct ws73_chip_query_state {
-	struct ws73_chip_info info;
+enum ws73_platform_query {
+	WS73_QUERY_CHIP,
+	WS73_QUERY_SLE_EFUSE,
+};
+
+struct ws73_platform_query_state {
+	enum ws73_platform_query operation;
+	union {
+		struct ws73_chip_info chip;
+		struct ws73_sle_efuse_info efuse;
+	} info;
 	int complete;
 };
 
-static int ws73_chip_receive(void *context, unsigned int service,
+static int ws73_platform_receive(void *context, unsigned int service,
 			     unsigned int queue, const unsigned char *data, size_t size)
 {
-	struct ws73_chip_query_state *state = context;
-	struct ws73_chip_info candidate;
+	struct ws73_platform_query_state *state = context;
+	struct ws73_platform_query_state candidate = {};
 	int ret;
 
 	if (service != WS73_WIRE_PLAT_SERVICE || queue != WS73_WIRE_PLAT_QUEUE)
 		return 0;
-	ret = ws73_wire_chip_reply(data, size, &candidate);
+	ret = state->operation == WS73_QUERY_CHIP ?
+		ws73_wire_chip_reply(data, size, &candidate.info.chip) :
+		ws73_wire_sle_efuse_reply(data, size, &candidate.info.efuse);
 	if (ret == -ENOMSG)
 		return 0;
 	if (ret)
 		return ret;
 	if (state->complete)
 		return -EPROTO; /* no ambiguous duplicate response */
-	state->info = candidate;
+	state->info = candidate.info;
 	state->complete = 1;
 	return 0;
 }
 
-int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
+static int ws73_platform_query(struct ws73_bsle_io *io,
+			       struct ws73_platform_query_state *state)
 {
-	struct ws73_chip_query_state state = {};
 	unsigned long long deadline, now;
 	unsigned int step;
 	int ret;
 
-	if (!io || !info || !io->tx || !io->rx || !io->sequence ||
+	if (!io || !state || !io->tx || !io->rx || !io->sequence ||
 	    !io->now_ms || !io->send_timed || !io->receive || !io->notification ||
 	    io->rx_capacity < WS73_WIRE_RX_HEADER_SIZE || io->rx_capacity > WS73_WIRE_RX_MAX)
 		return -EINVAL;
@@ -137,9 +148,13 @@ int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
 		return -EOVERFLOW;
 	deadline = now + 2000;
 	for (step = 0; step < 3; step++) {
-		ret = step == 2 ? ws73_wire_chip_request(io->tx, io->tx_capacity, *io->sequence) :
-			ws73_wire_control(io->tx, io->tx_capacity, *io->sequence,
-					   step == 0, step == 0 ? WS73_WIRE_PLAT_QUEUE : 0);
+		if (step != 2)
+			ret = ws73_wire_control(io->tx, io->tx_capacity, *io->sequence,
+					       step == 0, step == 0 ? WS73_WIRE_PLAT_QUEUE : 0);
+		else if (state->operation == WS73_QUERY_CHIP)
+			ret = ws73_wire_chip_request(io->tx, io->tx_capacity, *io->sequence);
+		else
+			ret = ws73_wire_sle_efuse_request(io->tx, io->tx_capacity, *io->sequence);
 		if (ret < 0)
 			return ret;
 		now = io->now_ms(io->context);
@@ -165,7 +180,7 @@ int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
 		if (ret > 0) {
 			if ((size_t)ret > io->rx_capacity)
 				return -EOVERFLOW;
-			ret = ws73_wire_receive(io->rx, ret, ws73_chip_receive, &state);
+			ret = ws73_wire_receive(io->rx, ret, ws73_platform_receive, state);
 			if (ret)
 				return ret;
 		}
@@ -178,11 +193,35 @@ int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
 			return -EIO;
 		if (io->now_ms(io->context) >= deadline)
 			return -ETIMEDOUT;
-		if (state.complete) {
-			*info = state.info;
+		if (state->complete)
 			return 0;
-		}
 	}
+}
+
+int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info)
+{
+	struct ws73_platform_query_state state = { .operation = WS73_QUERY_CHIP };
+	int ret;
+
+	if (!info)
+		return -EINVAL;
+	ret = ws73_platform_query(io, &state);
+	if (!ret)
+		*info = state.info.chip;
+	return ret;
+}
+
+int ws73_sle_efuse_query(struct ws73_bsle_io *io, struct ws73_sle_efuse_info *info)
+{
+	struct ws73_platform_query_state state = { .operation = WS73_QUERY_SLE_EFUSE };
+	int ret;
+
+	if (!info)
+		return -EINVAL;
+	ret = ws73_platform_query(io, &state);
+	if (!ret)
+		*info = state.info.efuse;
+	return ret;
 }
 
 static int ws73_bsle_validate(struct ws73_bsle_io *io, const unsigned char *pm, size_t pm_size,

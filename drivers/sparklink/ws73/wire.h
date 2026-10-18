@@ -33,6 +33,21 @@ int ws73_wire_chip_request(unsigned char *out, size_t capacity,
 int ws73_wire_chip_reply(const unsigned char *data, size_t size,
 			 struct ws73_chip_info *info);
 
+/* Read-only vendor diagnostic, not the operating RF address or a trusted
+ * identity. There is deliberately no caller-selected eFuse id or write API.
+ * A zero status/zero value is an observation, not a usable address claim.
+ */
+struct ws73_sle_efuse_info {
+	unsigned int status;
+	unsigned char size; /* reported output size; address copied only on status=0 */
+	unsigned char address[6];
+};
+
+int ws73_wire_sle_efuse_request(unsigned char *out, size_t capacity,
+			       unsigned int sequence);
+int ws73_wire_sle_efuse_reply(const unsigned char *data, size_t size,
+			     struct ws73_sle_efuse_info *info);
+
 /* Codec functions do not allocate, do I/O, or keep any global state. */
 int ws73_wire_control(unsigned char *out, size_t capacity,
 		      unsigned int sequence, unsigned int descriptor,

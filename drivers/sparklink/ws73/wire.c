@@ -125,6 +125,51 @@ int ws73_wire_chip_reply(const unsigned char *data, size_t size,
 	return 0;
 }
 
+int ws73_wire_sle_efuse_request(unsigned char *out, size_t capacity,
+			       unsigned int sequence)
+{
+	if (!out || capacity < 128)
+		return -EINVAL;
+	wire_package(out, 128, sequence);
+	out[64] = 0x19;
+	out[65] = WS73_WIRE_PLAT_QUEUE;
+	out[66] = 32;
+	out[68] = 11; /* H2D_PLAT_CFG_MSG_READ_EFUSE, never WRITE_EFUSE (10). */
+	out[70] = 2;
+	out[72] = 125; /* SDK EXT_EFUSE_SLE_EFUSE_ID, six bytes only. */
+	out[73] = 6;
+	return 128;
+}
+
+int ws73_wire_sle_efuse_reply(const unsigned char *data, size_t size,
+			     struct ws73_sle_efuse_info *info)
+{
+	struct ws73_sle_efuse_info candidate = {};
+	unsigned int output;
+
+	if (!data || !info || size < 4)
+		return -EPROTO;
+	if (wire_u16(data) != 5) /* D2H_PLAT_CFG_MSG_READ_EFUSE_COMPLETE. */
+		return -ENOMSG;
+	if (size < 12 || wire_u16(data + 2) < 8 ||
+	    wire_u16(data + 2) > size - 4)
+		return -EPROTO;
+	output = wire_u32(data + 8);
+	candidate.status = wire_u32(data + 4);
+	/* Preserve firmware errors and reported output length, withholding error
+	 * data. Never interpret allocation padding or an error as an address.
+	 */
+	if ((output != 6 && (output || !candidate.status)) ||
+	    output > wire_u16(data + 2) - 8 || output > size - 12)
+		return -EPROTO;
+	candidate.size = output;
+	/* Failed firmware reads may leave their output buffer uninitialized. */
+	if (output && !candidate.status)
+		memcpy(candidate.address, data + 12, output);
+	*info = candidate;
+	return 0;
+}
+
 int ws73_wire_command(unsigned char *out, size_t capacity, unsigned int sequence,
 		      unsigned int opcode, const unsigned char *params, size_t size)
 {

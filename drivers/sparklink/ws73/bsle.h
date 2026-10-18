@@ -43,6 +43,11 @@ struct ws73_bsle_io {
  */
 int ws73_chip_query(struct ws73_bsle_io *io, struct ws73_chip_info *info);
 
+/* Same exclusive bootstrap owner and two-second original bound. This only
+ * samples the firmware's SLE eFuse field; it cannot configure an address.
+ */
+int ws73_sle_efuse_query(struct ws73_bsle_io *io, struct ws73_sle_efuse_info *info);
+
 /* The PM word and 140-byte customization are deployment inputs, not guesses.
  * Success only opens the vendor transport; DLI queries are still mandatory.
  */
