@@ -197,6 +197,32 @@ static int sl_dynamic_status(struct sl_basic_channel *c)
 		return -ENOTCONN;
 	}
 }
+/* Same detach-under-queue-lock/free-outside-lock semantics as skb_queue_purge.
+ * These skbs are still author-owned and have no accepted physical prefix.
+ * Stage 3 records their local queue retirement, never a credit refund or a
+ * Session/USB drain. A begun PDU remains in tx_inflight and is not touched.
+ */
+static void sl_purge_tx(struct sl_connection_session *s,
+			struct sl_basic_channel *c)
+{
+	struct sk_buff_head discarded;
+	struct sk_buff *skb;
+	unsigned long flags;
+
+	__skb_queue_head_init(&discarded);
+	spin_lock_irqsave(&c->tx.lock, flags);
+	skb_queue_splice_init(&c->tx, &discarded);
+	spin_unlock_irqrestore(&c->tx.lock, flags);
+	while ((skb = __skb_dequeue(&discarded))) {
+		struct sl_fragment_cursor *cursor = (void *)skb->cb;
+
+		trace_sparklink_session_queue(s->controller, s->generation,
+			s->lifetime, s->epoch, cursor->observation,
+			c - s->channels, skb->len, cursor->deadline, 3);
+		kfree_skb_reason(skb, SKB_DROP_REASON_QUEUE_PURGE);
+	}
+}
+
 static void sl_session_destroy(struct kref *refs)
 {
 	struct sl_connection_session *s = container_of(refs, struct sl_connection_session, refs);
@@ -206,7 +232,7 @@ static void sl_session_destroy(struct kref *refs)
 	WARN_ON(s->tx_inflight);
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		WARN_ON(s->channels[i].sk);
-		skb_queue_purge(&s->channels[i].tx);
+		sl_purge_tx(s, &s->channels[i]);
 		skb_queue_purge(&s->channels[i].rx);
 	}
 	sl_security_owner_destroy_rust(s->security);
@@ -862,7 +888,7 @@ static void sl_fail_channel(struct sl_connection_session *s,
 	if (sk)
 		sock_hold(sk);
 	spin_unlock_irqrestore(&s->lock, flags);
-	skb_queue_purge(&c->tx);
+	sl_purge_tx(s, c);
 	skb_queue_purge(&c->rx);
 	if (sk) {
 		sl_socket_fault(sk, error);
@@ -1168,8 +1194,7 @@ static void sl_dynamic_work(struct sl_connection_session *s)
 				if (sk)
 					sock_hold(sk);
 				spin_unlock_irqrestore(&s->lock, flags);
-				skb_queue_purge(
-					&c->tx); /* already-begun PDU is Session-owned */
+				sl_purge_tx(s, c); /* begun PDU is Session-owned */
 				if (sk) {
 					if (!granted)
 						sl_socket_fault(sk,
@@ -1488,7 +1513,7 @@ void sl_connection_session_stop(void *opaque, int error)
 		sl_connection_session_put(s); /* queued work owned one reference */
 	sl_retire_tx(s); /* joined worker cannot hold the borrowed operation */
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
-		skb_queue_purge(&s->channels[i].tx);
+		sl_purge_tx(s, &s->channels[i]);
 		skb_queue_purge(&s->channels[i].rx);
 	}
 }
@@ -2479,7 +2504,7 @@ static int sl_release(struct socket *sock)
 	}
 	spin_unlock_irqrestore(&binding->lock, binding_flags);
 	if (s) {
-		skb_queue_purge(&c->tx);
+		sl_purge_tx(s, c);
 		skb_queue_purge(&c->rx);
 		if (held)
 			sock_put(held);

@@ -35,8 +35,9 @@ TRACE_EVENT(sparklink_session_work,
 		__entry->stop, __entry->elapsed_ns, __entry->planned_delay, __entry->error)
 );
 
-/* Queue stages 0/1/2 are software admission/dequeue/operation retirement,
- * not USB, controller or peer completion. bytes includes the DTAP header. */
+/* Queue stages 0/1/2 are software admission/dequeue/operation retirement;
+ * stage 3 is author-owned queued discard without an accepted physical prefix.
+ * None is USB, controller or peer completion. bytes includes the DTAP header. */
 TRACE_EVENT(sparklink_session_queue,
 	TP_PROTO(u16 controller, u64 generation, u64 lifetime, u64 epoch,
 		 u64 sequence, int slot, unsigned int bytes, unsigned long deadline, u8 stage),

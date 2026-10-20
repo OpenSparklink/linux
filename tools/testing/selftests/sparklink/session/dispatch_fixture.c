@@ -57,7 +57,9 @@ static u64 fixture_now_ns, fragment_cost_ns;
 static u64 ktime_get_ns(void){return fixture_now_ns;}
 #include "sle_tx_budget.h"
 struct observed_tx {u64 sequence;unsigned int offset,length,boundary;int slot,result;u8 stage;};
-static struct observed_tx observed_tx[4096];static unsigned int observed_count,observed_queue[3];
+static struct observed_tx observed_tx[4096];static unsigned int observed_count,observed_queue[4];
+struct observed_discard {u16 controller;u64 generation,lifetime,epoch,sequence;int slot;unsigned int bytes;unsigned long deadline;};
+static struct observed_discard discarded[4096];static unsigned int discard_count;
 /* Tracepoint API dependency: record arguments only; no Ready/credit or data.
  * Real tracepoint registration/format/loss/overhead requires the kernel VM. */
 static void trace_sparklink_session_tx(u16 id,u64 gen,u64 life,u64 service,u64 sequence,int slot,unsigned int pb,unsigned int length,unsigned int offset,int result,u32 wait,u8 stage){
@@ -65,11 +67,14 @@ static void trace_sparklink_session_tx(u16 id,u64 gen,u64 life,u64 service,u64 s
  observed_tx[observed_count++]=(struct observed_tx){sequence,offset,length,pb,slot,result,stage};
 }
 static void trace_sparklink_session_queue(u16 id,u64 gen,u64 life,u64 epoch,u64 sequence,int slot,unsigned int length,unsigned long deadline,u8 stage){
- (void)id;(void)gen;(void)life;(void)epoch;(void)sequence;(void)slot;(void)length;(void)deadline;assert(stage<3);observed_queue[stage]++;
+ assert(stage<4);observed_queue[stage]++;
+ if(stage==3){assert(discard_count<4096);discarded[discard_count++]=(struct observed_discard){id,gen,life,epoch,sequence,slot,length,deadline};}
 }
 static struct sk_buff *alloc_skb(unsigned int length,int flags){(void)flags;assert(length<=2047);allocations++;struct sk_buff *skb=calloc(1,sizeof(struct sk_buff));skb->truesize=512;skb->users=1;return skb;}
 static void *skb_put(struct sk_buff *skb,unsigned int length){assert(length<=sizeof(skb->data));skb->len=length;return skb->data;}
 static void kfree_skb(struct sk_buff *skb){if(skb){assert(skb->users);if(--skb->users)return;allocations--;if(skb->owner)skb->owner->sk_rmem_alloc-=skb->truesize;free(skb);}}
+#define SKB_DROP_REASON_QUEUE_PURGE 123
+static void kfree_skb_reason(struct sk_buff *skb,int reason){assert(reason==SKB_DROP_REASON_QUEUE_PURGE);kfree_skb(skb);}
 static void __skb_queue_tail(struct sk_buff_head *q,struct sk_buff *skb){assert(q->lock.held);if(q->tail)q->tail->next=skb;else q->head=skb;q->tail=skb;q->prev=skb;q->qlen++;}
 static void sock_hold(struct sock *s){s->refs++;}
 static void sock_put(struct sock *s){assert(s->refs>0);s->refs--;}
@@ -178,6 +183,19 @@ static struct sk_buff *skb_dequeue(struct sk_buff_head *q){
  spin_unlock_irqrestore(&q->lock,flags);return skb;
 }
 static void skb_queue_purge(struct sk_buff_head *q){struct sk_buff *skb;while((skb=skb_dequeue(q)))kfree_skb(skb);}
+/* Kernel queue primitive dependencies for the actual purge body. The private
+ * detached list needs no lock; this fixture is not a Linux concurrency proof. */
+static void __skb_queue_head_init(struct sk_buff_head *q){*q=(struct sk_buff_head){0};}
+static void skb_queue_splice_init(struct sk_buff_head *from,struct sk_buff_head *to){
+ assert(from->lock.held&&!to->head&&!to->qlen);
+ to->head=from->head;to->tail=from->tail;to->prev=from->prev;to->qlen=from->qlen;
+ from->head=from->tail=from->prev=NULL;from->qlen=0;
+}
+static struct sk_buff *__skb_dequeue(struct sk_buff_head *q){
+ assert(!q->lock.held);struct sk_buff *skb=q->head;
+ if(skb){q->head=skb->next;if(!q->head)q->tail=NULL;q->qlen--;skb->next=NULL;}
+ return skb;
+}
 static void skb_queue_head(struct sk_buff_head *q,struct sk_buff *skb){
  spin_lock(&q->lock);skb->next=q->head;q->head=skb;if(!q->tail)q->tail=skb;q->qlen++;spin_unlock(&q->lock);
 }
@@ -854,6 +872,29 @@ static void second_batch_channel(struct sl_connection_session *s,struct sl_socke
  c->sk=&b->sk;c->local_tcid=c->remote_tcid=10;c->mtu=2042;c->mps=2047;b->channel_slot=1;
  assert(sl_binding_attach(&c->binding));init_grant(s,&b->sk,SL_GRANT_TX|SL_GRANT_RX);
 }
+static void queued_discard_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding b[2]={0};
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);
+ unsigned int before=discard_count,physical_count=fragment_count;
+ sl_purge_tx(&s,&s.channels[0]);assert(discard_count==before);
+ enqueue_fragment_test(&s.channels[0],10);enqueue_fragment_test(&s.channels[0],20);
+ enqueue_fragment_test(&s.channels[1],30);
+ ((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->observation=101;
+ ((struct sl_fragment_cursor *)s.channels[0].tx.tail->cb)->observation=102;
+ s.tx_inflight=alloc_skb(40,0);s.tx_started=true;s.fragment_slot=1;
+ struct sk_buff *begun=s.tx_inflight,*peer=s.channels[1].tx.head;
+ sl_purge_tx(&s,&s.channels[0]);assert(!s.channels[0].tx.qlen&&discard_count==before+2);
+ assert(s.tx_inflight==begun&&s.tx_started&&s.fragment_slot==1);
+ assert(s.channels[1].tx.head==peer&&s.channels[1].tx.qlen==1&&fragment_count==physical_count);
+ for(unsigned int n=0;n<2;n++){
+  struct observed_discard *d=&discarded[before+n];
+  assert(d->controller==1&&d->generation==7&&d->lifetime==11&&d->epoch==1);
+  assert(d->sequence==101+n&&d->slot==0&&d->bytes==10+10*n&&d->deadline==5042);
+ }
+ sl_purge_tx(&s,&s.channels[0]);assert(discard_count==before+2);
+ sl_purge_tx(&s,&s.channels[1]);assert(discard_count==before+3);
+ kfree_skb(begun);s.tx_inflight=NULL;assert(!allocations);
+}
 static void batch_worker_tests(void){
  struct sl_connection_session s;struct sl_socket_binding b[2]={0};struct sl_tx_budget q;
  init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);
@@ -1152,7 +1193,7 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();message_security_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
+ queued_discard_tests();batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();message_security_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
 	session_status_tests();
  protected_grant_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;
