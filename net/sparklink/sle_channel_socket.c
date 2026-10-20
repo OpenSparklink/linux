@@ -5,6 +5,7 @@
 #include <linux/compat.h>
 #include <linux/uaccess.h>
 #include <linux/errno.h>
+#include <linux/hrtimer.h>
 #include <linux/kref.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
@@ -74,6 +75,10 @@ struct sl_connection_session {
 	unsigned long deadline;
 	unsigned long unknown_deadline; /* worker-only bounded snapshot uncertainty */
 	struct delayed_work work;
+	/* Runtime/table owns the Session until stop joins timer then worker.
+	 * This timer borrows that owner reference; it only queues a state hint.
+	 */
+	struct hrtimer wake_timer;
 	struct sl_basic_channel channels[SL_SESSION_CHANNELS];
 	unsigned int next_signal_id, next_tcid; /* Session lock, never reused */
 	struct sl_channel_signal
@@ -229,6 +234,7 @@ static void sl_session_destroy(struct kref *refs)
 	unsigned int i;
 
 	WARN_ON(delayed_work_pending(&s->work));
+	WARN_ON(hrtimer_active(&s->wake_timer));
 	WARN_ON(s->tx_inflight);
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		WARN_ON(s->channels[i].sk);
@@ -286,9 +292,18 @@ static void sl_schedule(struct sl_connection_session *s, unsigned long delay)
 	unsigned long flags;
 	spin_lock_irqsave(&s->lock, flags);
 	if (sl_channel_active(s->progress)) {
-		sl_connection_session_get(s);
-		if (!queue_delayed_work(system_unbound_wq, &s->work, delay))
-			sl_connection_session_put(s);
+		if (delay) {
+			/* timer_list's outer wheel can round a five-second arm up
+			 * by 512ms at HZ=1000. Preserve the selected original due
+			 * time using hrtimer; never run protocol work in its callback.
+			 */
+			hrtimer_start(&s->wake_timer, ns_to_ktime(jiffies_to_nsecs(delay)),
+				      HRTIMER_MODE_REL_SOFT);
+		} else {
+			sl_connection_session_get(s);
+			if (!queue_delayed_work(system_unbound_wq, &s->work, 0))
+				sl_connection_session_put(s);
+		}
 	}
 	spin_unlock_irqrestore(&s->lock, flags);
 }
@@ -296,8 +311,9 @@ static void sl_schedule(struct sl_connection_session *s, unsigned long delay)
  * The Session lock serializes queue admission with stop's close-before-join.
  * A fresh queue owns one kref, including a requeue while the callback runs;
  * modifying an already pending item keeps its original queue reference.
- * Event readiness and original deadlines share one work item; events only
- * advance it. Closed admission is serialized before cancel/join.
+ * Ready events enqueue this one work item immediately. The separate original-
+ * deadline timer only hints through this same admission. Closed admission is
+ * serialized before timer cancel/join and then work cancel/join.
  */
 void sl_connection_session_kick(void *opaque)
 {
@@ -310,6 +326,27 @@ void sl_connection_session_kick(void *opaque)
 		if (mod_delayed_work(system_unbound_wq, &s->work, 0))
 			sl_connection_session_put(s);
 	}
+	spin_unlock_irqrestore(&s->lock, flags);
+}
+static enum hrtimer_restart sl_deadline_wake(struct hrtimer *timer)
+{
+	struct sl_connection_session *s = container_of(timer, struct sl_connection_session, wake_timer);
+
+	/* No borrowed pointer escapes; Runtime's owner survives hrtimer_cancel.
+	 * kick takes a queue ref only after checking active under Session lock.
+	 */
+	sl_connection_session_kick(s);
+	return HRTIMER_NORESTART;
+}
+static void sl_cancel_wake_hint(struct sl_connection_session *s)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&s->lock, flags);
+	/* Never join while holding the callback's Session lock. A running
+	 * callback may leave one coalesced hint, not a new deadline or authority.
+	 */
+	hrtimer_try_to_cancel(&s->wake_timer);
 	spin_unlock_irqrestore(&s->lock, flags);
 }
 static void sl_socket_fault(struct sock *sk, int error)
@@ -1439,6 +1476,8 @@ again:
 	if (plan.pending)
 		sl_schedule(s, plan.delay);
 put:
+	if (!plan.pending)
+		sl_cancel_wake_hint(s);
 	if (!sl_channel_active(sl_snapshot(s)))
 		sl_retire_tx(s);
 	trace_sparklink_session_work(s->controller, s->generation, s->lifetime,
@@ -1465,6 +1504,7 @@ void *sl_connection_session_create(u16 controller, u64 generation, u64 lifetime,
 	s->controller = controller; s->generation = generation; s->lifetime = lifetime; s->handle = handle; s->epoch = epoch;
 	spin_lock_init(&s->lock);
 	INIT_DELAYED_WORK(&s->work, sl_work);
+	hrtimer_setup(&s->wake_timer, sl_deadline_wake, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		struct sl_basic_channel *c = &s->channels[i];
 		skb_queue_head_init(&c->tx);
@@ -1509,6 +1549,10 @@ void sl_connection_session_stop(void *opaque, int error)
 			sock_put(sockets[i]); /* session's binding reference */
 		}
 	}
+	/* Owner/action ref is still held. No Session lock across either join;
+	 * close above rejects timer/event callbacks before the owner can drop.
+	 */
+	hrtimer_cancel(&s->wake_timer);
 	if (cancel_delayed_work_sync(&s->work))
 		sl_connection_session_put(s); /* queued work owned one reference */
 	sl_retire_tx(s); /* joined worker cannot hold the borrowed operation */
@@ -2295,7 +2339,10 @@ sl_read_session_status(const struct sparklink_credit_snapshot *credit,
 		v->flags |= SPARKLINK_SESSION_WORK_RUNNING;
 	else if (s->response_pending || s->rejection_count)
 		v->flags |= SPARKLINK_SESSION_BASE_PENDING;
-	if (delayed_work_pending(&s->work))
+	/* Pending execution includes the original timeout hint, not a promise
+	 * that a workqueue reference exists or callbacks have drained.
+	 */
+	if (delayed_work_pending(&s->work) || hrtimer_active(&s->wake_timer))
 		v->flags |= SPARKLINK_SESSION_WORK_QUEUED;
 	for (i = 0; i < SL_SESSION_CHANNELS; i++) {
 		struct sl_basic_channel *c = &s->channels[i];

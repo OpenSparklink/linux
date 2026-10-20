@@ -14,7 +14,7 @@ void verify_wake_sequences(void) {
  if (initial == 3) sl_channel_start(&s.progress,0,0);
  if (initial == 4) sl_channel_close(&s.progress);
  for (unsigned int i = 0; i < 20; i++) {
-  unsigned int op = nondet_uint(); __CPROVER_assume(op < 6);
+  unsigned int op = nondet_uint(); __CPROVER_assume(op < 9);
   switch (op) {
    case 0: sl_connection_session_kick(&s); break;
    case 1: {
@@ -28,11 +28,14 @@ void verify_wake_sequences(void) {
    case 3: if (s.work.running) finish(&s); break;
    case 4: stop(&s); break;
    case 5: sl_connection_session_kick(&s);sl_connection_session_kick(&s);break;
+   case 6: if (s.wake_timer.pending) fire(&s); break;
+   case 7: sl_cancel_wake_hint(&s); break;
+   case 8: sl_deadline_wake(&s.wake_timer); break; /* overapproximate late hint while owner retained */
   }
   __CPROVER_assert(s.refs == 1U+(unsigned)s.work.pending+(unsigned)s.work.running,"one reference per queued/running invocation");
-  __CPROVER_assert(sl_channel_active(s.progress) || !s.work.pending,"closed rejects new queue");
-  __CPROVER_assert(!s.work.pending || s.work.delay<=5000,"bounded original timer or immediate event");
+  __CPROVER_assert(sl_channel_active(s.progress) || (!s.work.pending&&!s.wake_timer.pending),"closed rejects new queue");
+  __CPROVER_assert((!s.work.pending || !s.work.delay)&&(!s.wake_timer.pending || s.wake_timer.delay<=jiffies_to_nsecs(5000)),"bounded original timer or immediate event");
  }
  stop(&s); if (s.work.running) finish(&s);
- __CPROVER_assert(s.refs==1&&!s.work.pending&&!s.work.running,"close/cancel/finish settle queue refs");
+ __CPROVER_assert(s.refs==1&&!s.work.pending&&!s.work.running&&!s.wake_timer.pending,"close/cancel/finish settle queue refs");
 }

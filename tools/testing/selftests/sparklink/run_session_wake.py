@@ -41,7 +41,7 @@ def check_cbmc(directory, fixture, bodies, harness, net):
             terminal = [item['cProverStatus'] for item in raw if 'cProverStatus' in item]
             diagnostics = [item for item in raw if item.get('messageType') in ('WARNING', 'ERROR')]
             expected = {'one reference per queued/running invocation', 'closed rejects new queue',
-                        'pending event never postponed by timer', 'close/cancel/finish settle queue refs'}
+                        'pending event never postponed by timer', 'close/cancel/finish settle queue refs', 'bounded original timer or immediate event'}
             assert expected <= {p.get('description') for p in properties}
             row = dict(kind=kind, exit=process.returncode, property_count=len(properties),
                        statuses=sorted(statuses), terminal=terminal, diagnostics=diagnostics,
@@ -71,7 +71,7 @@ def check_cbmc(directory, fixture, bodies, harness, net):
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?void ' + name + r'\([^;{]*\)\s*\{', source, re.M)
+    match = re.search(r'^(?:static )?(?:void|enum hrtimer_restart) ' + name + r'\([^;{]*\)\s*\{', source, re.M)
     if not match:
         raise ValueError('missing production function: ' + name)
     i, depth = match.end(), 1
@@ -94,7 +94,10 @@ def run(output, cbmc_output=None):
     paths.append(Path(__file__).resolve())
     originals = {p: p.read_bytes() for p in paths}
     source = originals[paths[0]].decode()
-    bodies = '\n'.join(function(source, name) for name in ['sl_schedule', 'sl_connection_session_kick'])
+    bodies = '\n'.join(function(source, name) for name in ['sl_schedule', 'sl_connection_session_kick', 'sl_deadline_wake', 'sl_cancel_wake_hint'])
+    stop = function(source, 'sl_connection_session_stop')
+    assert stop.index('sl_channel_close') < stop.index('hrtimer_cancel') < stop.index('cancel_delayed_work_sync'), 'close before timer join before work join'
+    assert source.count('hrtimer_setup(&s->wake_timer, sl_deadline_wake, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT)') == 1
     fixture = originals[paths[1]].decode().replace('/* @@FUNCTIONS@@ */', bodies)
     if output and output.exists():
         raise ValueError('do not overwrite evidence')
@@ -109,7 +112,7 @@ def run(output, cbmc_output=None):
                         originals[paths[2]].decode(), net) if cbmc_output else None
     assert all(p.read_bytes() == data for p, data in originals.items())
     report = dict(status='ACTUAL_SESSION_WAKE_SEQUENTIAL_DEPENDENCIES_PASS',
-                  scope='Actual C enqueue bodies;explicit single-thread workqueue/spinlock/kref API dependencies. Pending coalescence,running requeue,earlier event not postponed,closed admission,queue ref settlement. Not Linux workqueue correctness,concurrent callback UAF,formal or real-device qualification.',
+                  scope='Actual C enqueue/hrtimer callback/nonjoining disarm bodies;explicit single-thread workqueue/hrtimer/spinlock/kref API dependencies,HZ1000. Positive delays borrow Runtime owner for timer;pending/running work keeps separate queue refs. Pending coalescence,running requeue,event not postponed,closed late hint,nonjoining disarm,queue ref settlement. Not Linux workqueue correctness,concurrent callback UAF,formal or real-device qualification.',
                   production_bodies_sha256=hashlib.sha256(bodies.encode()).hexdigest(),
                   sources={str(p.relative_to(root)): hashlib.sha256(b).hexdigest() for p, b in originals.items()},
                   compiler=subprocess.check_output([os.environ.get('CC', 'clang'), '--version'], text=True).splitlines()[0],

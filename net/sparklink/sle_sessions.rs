@@ -26,6 +26,8 @@ unsafe impl Sync for Session {}
 impl Drop for Session {
     fn drop(&mut self) {
         // SAFETY: each table entry owns exactly the constructor's reference.
+        // Published active objects reach stop's timer-then-worker join before
+        // this owner can be dropped. Unpublished candidates never arm work.
         unsafe { sl_connection_session_put(self.pointer) };
     }
 }

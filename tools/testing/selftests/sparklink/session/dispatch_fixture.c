@@ -46,6 +46,8 @@ struct socket;
 struct sock {struct socket *sk_socket;unsigned int refs,wakes;int sk_rmem_alloc,sk_rcvbuf,sk_err,sk_state,sk_shutdown;void (*sk_data_ready)(struct sock *);void (*sk_error_report)(struct sock *);void (*sk_state_change)(struct sock *);};
 struct kref {unsigned int refs;};
 struct delayed_work {int unused;};
+struct hrtimer {bool active;};
+static bool hrtimer_active(const struct hrtimer *t) { return t->active; }
 static bool fixture_work_pending;
 static bool delayed_work_pending(struct delayed_work *w)
 {
@@ -567,6 +569,12 @@ static void session_status_tests(void)
 	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
 			 (unsigned long)&value));
 	assert(value.flags == SPARKLINK_SESSION_BASE_PENDING);
+	s.wake_timer.active = true;
+	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
+			 (unsigned long)&value));
+	assert(value.flags == (SPARKLINK_SESSION_BASE_PENDING |
+			       SPARKLINK_SESSION_WORK_QUEUED));
+	s.wake_timer.active = false;
 	s.channels[5].negotiation.phase = SL_DYN_UNUSED;
 	assert(!sl_ioctl(&sock, SPARKLINK_SESSION_TX_STATUS,
 			 (unsigned long)&value));
