@@ -644,6 +644,7 @@ struct sl_dynamic_submit {
 	struct sl_basic_channel *channel;
 	enum sl_dynamic_phase phase;
 	size_t pdu_bytes;
+	u64 observation; /* worker-owned control namespace, never a wire identifier */
 };
 static int sl_dynamic_consent(void *context, u64 security_revision,
 			      int (*submit)(void *), void *argument)
@@ -676,6 +677,9 @@ static int sl_dynamic_consent(void *context, u64 security_revision,
 			sl_dynamic_submitted(&c->negotiation);
 		}
 	}
+	trace_sparklink_session_tx(s->controller, s->generation, s->lifetime,
+		s->service_sequence, a->observation, -1, 0, a->pdu_bytes, 0,
+		ret, SPARKLINK_ACB_WAIT_NONE, 2);
 	spin_unlock(&s->lock);
 	return ret;
 }
@@ -1183,11 +1187,20 @@ static void sl_dynamic_work(struct sl_connection_session *s)
 						    SL_CHANNEL_CMTC, 0, signal,
 						    n);
 		consent.pdu_bytes = n > 0 ? n : 0;
-		ret = n < 0 ? n :
-			      sparklink_native_acb_send_deferred(
-				      s->controller, s->generation, s->lifetime,
-				      s->handle, 0, wire, n, s->epoch,
-				      sl_dynamic_consent, &consent, &wait);
+		if (n < 0) {
+			ret = n;
+		} else {
+			consent.observation = ++s->tx_sequence;
+			trace_sparklink_session_tx(s->controller, s->generation,
+				s->lifetime, s->service_sequence, consent.observation,
+				-1, 0, n, 0, -EINPROGRESS, SPARKLINK_ACB_WAIT_NONE, 0);
+			ret = sparklink_native_acb_send_deferred(s->controller,
+				s->generation, s->lifetime, s->handle, 0, wire, n,
+				s->epoch, sl_dynamic_consent, &consent, &wait);
+			trace_sparklink_session_tx(s->controller, s->generation,
+				s->lifetime, s->service_sequence, consent.observation,
+				-1, 0, n, 0, ret, wait, 1);
+		}
 		sl_send_result(s, ret, wait);
 		if (!ret)
 			wake = true;

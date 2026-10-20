@@ -707,6 +707,18 @@ static void dynamic_protocol_tests(void){
  assert(c->negotiation.phase==SL_DYN_RETIRED&&!app.grant.scope.lifetime);
  assert(sl_permits(&s,&s.channels[0],SL_GRANT_TX));
 }
+/* Observe the actual dynamic worker and its real consent body. The fixture
+ * transport may fail before successful submission; no event grants credit or
+ * changes the asserted protocol result. Real tracepoint/USB join is VM-only. */
+static void dynamic_trace(unsigned int before,u64 sequence,unsigned int length,int result){
+ assert(observed_count==before+3);
+ for(unsigned int i=0;i<3;i++){
+  struct observed_tx *t=&observed_tx[before+i];
+  assert(t->sequence==sequence&&t->slot==-1&&t->length==length&&!t->offset&&!t->boundary);
+  assert(t->stage==(i==0?0:i==1?2:1));
+  assert(t->result==(i==0?-EINPROGRESS:result));
+ }
+}
 static void dynamic_worker_tests(void){
  struct sl_connection_session s;
  struct sl_socket_binding fixed={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};
@@ -718,18 +730,21 @@ static void dynamic_worker_tests(void){
  control_budget=0;control_failure=0;control_count=0;
  assert(!sparklink_native_session_admit(1,7,11,3,1,sl_dynamic_publish,&admission));
  struct sl_basic_channel *c=&s.channels[2];
- sl_dynamic_work(&s);assert(!control_count&&c->negotiation.phase==SL_DYN_CONNECT&&!app.grant.scope.lifetime);
- control_budget=1;sl_dynamic_work(&s);assert(control_count==1&&control_lengths[0]==26&&c->negotiation.phase==SL_DYN_CONNECT_SENT&&!app.grant.scope.lifetime);
+ unsigned int observed=observed_count;sl_dynamic_work(&s);assert(!control_count&&c->negotiation.phase==SL_DYN_CONNECT&&!app.grant.scope.lifetime);
+ dynamic_trace(observed,1,26,-EAGAIN);
+ control_budget=1;observed=observed_count;sl_dynamic_work(&s);assert(control_count==1&&control_lengths[0]==26&&c->negotiation.phase==SL_DYN_CONNECT_SENT&&!app.grant.scope.lifetime);
+ dynamic_trace(observed,2,26,0);
  struct sl_channel_frame frame;struct sl_channel_signal m;
  assert(!sl_channel_frame_decode(control_bytes[0],control_lengths[0],&frame));
  assert(frame.tcid==SL_CHANNEL_CMTC&&!sl_channel_signal_decode(frame.data,frame.length,&m));
  assert(m.code==SL_CMTC_CONNECT_REQ&&m.source==0x80&&m.identifier==1&&m.destination_port==20&&m.source_port==10);
- sl_dynamic_work(&s);assert(control_count==1); /* no duplicate setup submission */
+ observed=observed_count;sl_dynamic_work(&s);assert(control_count==1&&observed_count==observed); /* no duplicate setup submission */
  /* Peer close overtakes its response: cleanup has real echo, no Grant; a
   * later valid success must not reopen it or affect the fixed sibling. */
  struct sl_channel_signal close={.code=SL_CMTC_CLOSE_REQ,.identifier=0,.source=0x91,.destination=0x80};
  route_signal(&s,close);assert(c->negotiation.phase==SL_DYN_CLOSE_RESPONSE&&!app.grant.scope.lifetime);
- control_budget=1;sl_dynamic_work(&s);assert(control_count==2&&control_lengths[1]==11&&c->negotiation.phase==SL_DYN_RETIRED);
+ control_budget=1;observed=observed_count;sl_dynamic_work(&s);assert(control_count==2&&control_lengths[1]==11&&c->negotiation.phase==SL_DYN_RETIRED);
+ dynamic_trace(observed,3,11,0);
  assert(!sl_channel_frame_decode(control_bytes[1],control_lengths[1],&frame));
  assert(!sl_channel_signal_decode(frame.data,frame.length,&m)&&m.code==SL_CMTC_CLOSE_RSP&&m.identifier==0&&m.source==0x91&&m.destination==0x80);
  assert(sl_poll(NULL,&sock,NULL)==(EPOLLERR|EPOLLHUP));
@@ -753,6 +768,10 @@ static void dynamic_worker_tests(void){
  control_budget=1;sl_dynamic_work(&s);assert(c->negotiation.phase==SL_DYN_OPEN&&app.grant.scope.remote_tcid==0xa3&&control_count==1&&control_lengths[0]==12);
  assert(!sl_channel_frame_decode(control_bytes[0],control_lengths[0],&frame)&&!sl_channel_signal_decode(frame.data,frame.length,&m));
  assert(m.code==SL_CMTC_CONNECT_RSP&&m.identifier==255&&m.source==0xa3&&m.destination==0x80&&!m.result);
+ /* A failed actual consent must not become successful trace acceptance. */
+ c->negotiation.phase=SL_DYN_CLOSE;c->dynamic_deadline=jiffies+100;
+ observed=observed_count;control_failure=-EIO;sl_dynamic_work(&s);
+ dynamic_trace(observed,3,10,-EIO);assert(control_count==1&&c->negotiation.phase==SL_DYN_FAILED&&c->dynamic_error==-EIO);control_failure=0;
  assert(!allocations);
 }
 static void scheduling_tests(void) {

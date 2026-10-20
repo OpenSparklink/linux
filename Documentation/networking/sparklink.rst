@@ -83,10 +83,13 @@ and Ticket. The atomic hint is not a replacement for these locked states.
 
 The unique worker now selects the earliest original negotiation, dynamic
 channel, queued/begun PDU or pending control-response deadline. An idle open
-Session does not queue maintenance work. A pass drains at most 16 RX PDUs and
-advances each of the six channel slots at most once; residual progress requests
-another immediate pass, preserving a begun physical PB sequence. Queue admission
-and real RX/NOCP notifications remain the only normal readiness sources.
+Session does not queue maintenance work. A pass drains at most 16 RX PDUs. TX
+uses an eight-attempt, 4096-byte, two-millisecond admission quantum and rotates
+the six channel slots at PDU boundaries; a begun PB sequence retains the physical
+connection. The time budget limits the next attempt, not the duration of an
+already started synchronous transport call. Residual runnable progress requests
+another immediate pass. Queue admission and real RX/NOCP notifications remain
+the only normal readiness sources.
 
 Only an actual data-credit reserve failure marks the internal CREDIT wait.
 Other EAGAIN results retain a finite 10 ms retry bounded by the operation's
@@ -100,6 +103,14 @@ Source, sequential dependency fixtures and bounded helper checks do not grant
 new real-device, concurrency or performance qualification. Actual callback/
 queue/drain interleavings, starvation/load and same-configuration device
 comparisons still require the separately recorded gates.
+
+The existing Session TX trace records dynamic CMTC connect, response and close
+attempts in the same control-observation namespace as other CMTC sends. Begin,
+actual Runtime-ticket consent and joined return are separate stages. A failed
+consent is not successful USB acceptance, and USB acceptance is not controller
+completion or peer delivery. Trace-only sequence numbers do not replace wire
+identifiers, deadlines, Grant or credit. Missing dynamic-control observations
+must fail the complete trace/USB join rather than silently excluding packets.
 
 UAPI has not been published: callers, Rust/C/Python bindings and tests may be
 migrated together without an old ABI compatibility period. Match actual headers
