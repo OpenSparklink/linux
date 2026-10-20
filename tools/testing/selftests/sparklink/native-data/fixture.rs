@@ -44,7 +44,7 @@ impl Host{fn controller_status(&self)->(u32,bool,Option<Error>){(0,true,self.fau
 // @@ADMITTED@@
 fn security_receipt(&mut self,handle:u16)->Option<(u64,u64)>{self.links.security_receipt(handle)}
 fn link_snapshot(&self)->(u64,bool,[Option<sle_link_observation::Link>;16]){self.links.snapshot()}}
-struct Poll;impl Poll{fn notify_all(&self){}}
+struct Poll(Cell<usize>);impl Poll{fn notify_all(&self){self.0.set(self.0.get()+1);}}
 struct Dummy{transport:*mut c_void}
 impl Dummy{fn command_transport(&self)->NativeCommandTransport{NativeCommandTransport{transport:self.transport}}}
 struct NativeCommandTransport{transport:*mut c_void}
@@ -61,7 +61,7 @@ struct Owner{
 }
 impl Owner{fn new(id:u16,generation:u64)->Rc<Self>{Rc::new(Self{
  identity:DeviceIdentity{id,generation},host:Lock::new(Host{grants:{let mut g=sle_grant::LeaseAuthority::new();assert!(g.activate(1,true));g},links:LinkObservation::new(),data_revoked:false,fault:None}),
- data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll,sessions:Lock::new([const{None};16]),schedule_gate:Lock::new(false),
+ data:Lock::new(sle_native_data::NativeData::new(254,5)),data_poll:Poll(Cell::new(0)),sessions:Lock::new([const{None};16]),schedule_gate:Lock::new(false),
  native_lifecycle:Lock::new(()),state:Lock::new(Some(State{controller:sle_dli::ControllerBackend::Native(Dummy{transport:(id as usize+1) as *mut c_void})})),
  transport_open:AtomicBool::new(true),commands:RefCell::new(Vec::new()),
  session_data_pending:AtomicBool::new(false),
@@ -205,11 +205,54 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
  assert_eq!(receive(1,8,&acb(0x1000,b"other")),0);
  assert_eq!(take(0,7,1,0,20).0,-11);
  assert_eq!(receive(0,7,&acb(0x2000,b"middle")),0);
+ assert_eq!((a.rx_schedules.get(),b.rx_schedules.get()),(0,0));
+ assert_eq!((a.data_poll.0.get(),b.data_poll.0.get()),(0,0));
  assert_eq!(receive(1,8,&acb(0x3000,b"last")),0);
  assert_eq!(receive(0,7,&acb(0x3000,b"last")),0);
+ assert_eq!((a.rx_schedules.get(),b.rx_schedules.get()),(1,1));
+ assert_eq!((a.data_poll.0.get(),b.data_poll.0.get()),(1,1));
  assert_eq!(take(0,7,1,0,20),(0,b"firstmiddlelast".to_vec()));
  assert_eq!(take(1,8,1,0,20),(0,b"otherlast".to_vec()));
  assert!(a.commands.borrow().is_empty());
+}
+#[test] fn dropped_or_incomplete_rx_never_notifies_but_later_complete_pdu_does(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ for packet in [acb(0x3000,b"orphan"),acb(1,b"unknown handle"),acb(0x1000,b"first"),acb(0x2000,b"middle")] {
+  assert_eq!(receive(0,7,&packet),0);
+ }
+ assert_eq!(a.rx_schedules.get(),0);assert_eq!(a.data_poll.0.get(),0);
+ assert!(!a.session_data_pending.load(Ordering::Acquire));
+ for _ in 0..16 {assert_eq!(receive(0,7,&acb(0,b"queued")),0);}
+ assert_eq!(a.rx_schedules.get(),16);assert_eq!(a.data_poll.0.get(),16);
+ // A full queue drops a complete PDU without creating a new readiness hint.
+ a.session_data_pending.store(false,Ordering::Release);
+ assert_eq!(receive(0,7,&acb(0,b"full")),0);
+ assert_eq!(a.rx_schedules.get(),16);assert_eq!(a.data_poll.0.get(),16);
+ assert!(!a.session_data_pending.load(Ordering::Acquire));
+ assert_eq!(take(0,7,1,0,20),(0,b"queued".to_vec()));
+ assert_eq!(receive(0,7,&acb(0,b"resumed")),0);
+ assert_eq!(a.rx_schedules.get(),17);assert_eq!(a.data_poll.0.get(),17);
+ assert_eq!(b.rx_schedules.get(),0);assert_eq!(b.data_poll.0.get(),0);
+}
+#[test] fn partial_rx_preserves_pending_credit_hint_and_original_expiry(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ assert_eq!(send(0,7,1,0,b"one debt"),0);
+ let polls_before=a.data_poll.0.get(); // TX accounting already notifies poll.
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,1]),0);
+ assert_eq!(a.rx_schedules.get(),1);assert_eq!(a.data_poll.0.get(),polls_before+1);
+ assert!(a.session_data_pending.load(Ordering::Acquire));
+ assert_eq!(receive(0,7,&acb(0x1000,b"first")),0);
+ NOW.with(|n|*n.borrow_mut()=4_000_000_000);
+ assert_eq!(receive(0,7,&acb(0x2000,b"middle")),0);
+ assert_eq!(a.rx_schedules.get(),1);assert_eq!(a.data_poll.0.get(),polls_before+1);
+ assert!(a.session_data_pending.load(Ordering::Acquire));
+ NOW.with(|n|*n.borrow_mut()=5_000_000_002);
+ assert_eq!(receive(0,7,&acb(0x3000,b"expired")),0);
+ assert_eq!(a.rx_schedules.get(),1);assert_eq!(take(0,7,1,0,100).0,-11);
+ assert_eq!(receive(0,7,&acb(0,b"new complete")),0);
+ assert_eq!(a.rx_schedules.get(),2);assert_eq!(a.data_poll.0.get(),polls_before+2);
+ assert_eq!(take(0,7,1,0,100),(0,b"new complete".to_vec()));
+ assert_eq!(b.rx_schedules.get(),0);
 }
 #[test] fn stale_expired_oversized_and_orphan_fragments_do_not_deliver_or_refill(){
  let(a,_)=setup();link(&a,0,1);

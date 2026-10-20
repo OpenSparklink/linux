@@ -41,7 +41,9 @@ impl NativeData {
 
     /// First fragments reserve the entire bounded buffer before IRQ locks.
     /// Continuations can only copy into already allocated spare capacity.
-    pub(crate) fn receive(&mut self, packet: Packet, boundary: u8, now: u64) -> Result {
+    /// True means a complete PDU was queued, not merely that a fragment was
+    /// accepted. Only that transition gives a reader new consumable input.
+    pub(crate) fn receive(&mut self, packet: Packet, boundary: u8, now: u64) -> Result<bool> {
         self.expire(now);
         let existing = self.partial.iter().position(|p| p.as_ref().is_some_and(|(p, _)|
             p.handle == packet.handle && p.lifetime == packet.lifetime));
@@ -57,7 +59,7 @@ impl NativeData {
                 return Err(Error::from_errno(-(kernel::bindings::ENOBUFS as i32)));
             };
             self.partial[index] = Some((packet, now.saturating_add(5_000_000_000)));
-            return Ok(());
+            return Ok(false);
         }
         let Some(index) = existing else {
             self.dropped = self.dropped.saturating_add(1); return Err(EINVAL);
@@ -77,15 +79,15 @@ impl NativeData {
         if current.0.bytes.extend_from_slice(&packet.bytes, GFP_ATOMIC).is_err() { return Err(ENOMEM); }
         if boundary == 3 {
             let (complete, _) = self.partial[index].take().unwrap();
-            self.push(complete)?;
+            return self.push(complete);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Already copied outside IRQ-safe locks; packet/byte limits are fixed.
-    pub(crate) fn push(&mut self, packet: Packet) -> Result {
+    fn push(&mut self, packet: Packet) -> Result<bool> {
         if let Some(slot) = self.packets.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(packet); Ok(())
+            *slot = Some(packet); Ok(true)
         } else {
             self.dropped = self.dropped.saturating_add(1);
             Err(Error::from_errno(-(kernel::bindings::ENOBUFS as i32)))

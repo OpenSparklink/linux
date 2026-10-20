@@ -704,15 +704,22 @@ pub(crate) unsafe extern "C" fn sparklink_native_receive_rust(
         if *gate { return ENODEV.to_errno(); }
         let retired = if known { Some(data.reconcile(&links)) } else { None };
         let link = if known { links.iter().flatten().find(|link| link.handle == handle) } else { None };
-        if let Some(link) = link {
-            let _ = data.receive(super::sle_native_data::Packet { lifetime: link.lifetime, security_revision: link.security_revision, handle, bytes }, boundary, now);
+        let queued = if let Some(link) = link {
+            matches!(data.receive(super::sle_native_data::Packet { lifetime: link.lifetime, security_revision: link.security_revision, handle, bytes }, boundary, now), Ok(true))
         } else {
             data.dropped = data.dropped.saturating_add(1);
-        }
+            false
+        };
         drop(gate); drop(data); drop(host);
         drop(retired);
-        owner.data_poll.notify_all();
-        owner.kick_session_data();
+        // Intermediate PB fragments and bounded drops do not make data
+        // readable. Do not wake every Session to retry TX without new RX or
+        // credit; leave any already-published hint intact. NOCP and lifecycle
+        // notifications retain their independent paths below and in Runtime.
+        if queued {
+            owner.data_poll.notify_all();
+            owner.kick_session_data();
+        }
         return 0; // bounded ingress drop is not a USB/device recovery request
     }
     if packet[0] != 0xa2 || count != length - 5 { return PROTOCOL_ERROR; }

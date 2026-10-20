@@ -37,3 +37,12 @@ deadline reclaimed by the per-controller heartbeat. First ingress reserves
 the whole buffer outside IRQ locks; continuation cannot grow beyond it.
 Expired, oversized, orphan or old-lifetime fragments never become complete
 data or return a TX credit. Valid PB/priority flags are not USB/device faults.
+
+RX readiness is published only after a complete PDU enters the bounded queue.
+PB first/middle and orphan, expired, unknown-link or full-queue drops do not
+wake Session TX retries. A partial input cannot clear a pending data/credit
+hint. Real NOCP and lifecycle notifications keep their separate paths.
+The production-function fixture counts actual ingress notification calls,
+checks successful reassembly, queue-full/resume, original expiry and peer
+isolation. Its RefCell locks, allocations, clock and counters remain explicit
+dependencies, not kernel wakeup/concurrency or hardware/performance proof.
