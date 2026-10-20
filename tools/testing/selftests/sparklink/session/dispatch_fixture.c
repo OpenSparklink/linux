@@ -899,14 +899,49 @@ static void batch_worker_tests(void){
  init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);packet_budget=0;
  enqueue_fragment_test(&s.channels[0],255);enqueue_fragment_test(&s.channels[1],4);
  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
- assert(q.packets==1&&fragment_count==0&&!s.tx_inflight&&s.tx_next==1);
+ assert(q.packets==1&&fragment_count==0&&!s.tx_inflight&&s.tx_next==0);
  assert(!s.work_retry&&!s.work_progress&&!s.tx_budget_exhausted);
  plan=sl_next_schedule(&s);assert(plan.pending&&plan.delay==5000);
  packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
- assert(fragment_count==2&&fragment_pb[0]==0&&fragment_pb[1]==1); /* channel1 got next first */
+ assert(fragment_count==2&&fragment_pb[0]==1&&fragment_pb[1]==3); /* credit wait did not spend channel0 turn */
  assert(s.work_progress&&s.tx_blocked&&!s.work_retry);
  plan=sl_next_schedule(&s);assert(plan.pending&&plan.delay==5000); /* progress before CREDIT is not readiness now */
  packet_budget=1;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
+ /* Counterexample from the real short/long run: the last long fragment
+  * fills the pool, then a selected short PDU waits. Repeated empty-pool work
+  * must not move its turn to another queued long PDU. Budget restoration here
+  * is an explicit Runtime/USB dependency, not a fabricated production NOCP. */
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);s.tx_next=1;
+ enqueue_fragment_test(&s.channels[0],66);
+ enqueue_fragment_test(&s.channels[1],255);enqueue_fragment_test(&s.channels[1],255);
+ packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==2&&fragment_pb[0]==1&&fragment_pb[1]==3&&s.tx_next==0&&s.tx_blocked);
+ unsigned long short_deadline=((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline;
+ for(unsigned int empty=0;empty<3;empty++){
+  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+  assert(q.packets==1&&s.tx_next==0&&fragment_count==2&&!s.tx_inflight&&s.channels[0].tx.qlen==1);
+  assert(((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline==short_deadline);
+ }
+ packet_budget=1;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==3&&fragment_pb[2]==0&&fragment_size[2]==66&&!s.channels[0].tx.qlen);
+ assert(s.channels[1].tx.qlen==1&&s.tx_next==1&&!s.tx_inflight);
+ packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
+ /* Retaining a credit turn neither refreshes its deadline nor blocks peers
+  * after the selected queued author expires. */
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);packet_budget=0;
+ enqueue_fragment_test(&s.channels[0],66);enqueue_fragment_test(&s.channels[1],255);
+ ((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline=50;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&s.tx_next==0);
+ jiffies=50;packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(b[0].sk.sk_err==ETIMEDOUT&&!sl_binding_live(s.channels[0].binding));
+ assert(sl_binding_live(s.channels[1].binding)&&fragment_count==2&&fragment_pb[0]==1&&fragment_pb[1]==3&&!allocations);
+ jiffies=42;
+ /* Other retry causes keep the previous finite retry/rotation policy. */
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);fragment_failure=-EAGAIN;
+ enqueue_fragment_test(&s.channels[0],66);enqueue_fragment_test(&s.channels[1],66);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(s.tx_next==1&&s.work_retry&&fragment_count==0);
+ fragment_failure=0;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
  /* Last author close after first acceptance cannot erase a begun physical PDU. */
  init_batch(&s,&b[0]);enqueue_fragment_test(&s.channels[0],2047);retire_after_fragment=true;
  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&fragment_count==8&&s.tx_started);

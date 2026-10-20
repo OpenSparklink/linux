@@ -92,6 +92,11 @@ another immediate pass. Queue admission and real RX/NOCP notifications remain
 the only normal readiness sources.
 
 Only an actual data-credit reserve failure marks the internal CREDIT wait.
+An unsubmitted PDU keeps its channel's service turn across that wait: an
+empty-pool probe has not served a PDU. Otherwise a long channel can repeatedly
+win newly returned credit before the already selected short channel. A begun
+PB stream remains uninterrupted, and queued deadlines and author withdrawal
+are still checked before the next actual submission.
 Other EAGAIN results retain a finite 10 ms retry bounded by the operation's
 original deadline. USB success does not return credit, and an uncertain USB
 failure cannot be classified as an empty pool or refund debt. Runtime's separate

@@ -1051,7 +1051,11 @@ static int sl_transmit_batch(struct sl_connection_session *s, struct sl_tx_budge
 		 * event/deadline scheduling at a real credit wait or other retry. */
 		if (step.attempted && step.result == -EAGAIN) {
 			s->tx_blocked = true;
-			if (s->fragment_slot < 0)
+			/* No credit means no PDU was served. Retain this turn until
+			 * real pool progress; rotating on each empty-pool probe lets a
+			 * long peer repeatedly consume the next returned credit. */
+			if (s->fragment_slot < 0 &&
+			    step.wait != SPARKLINK_ACB_WAIT_CREDIT)
 				s->tx_next = (slot + 1) % SL_SESSION_CHANNELS;
 			break;
 		}
