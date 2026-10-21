@@ -454,7 +454,9 @@ struct sle_runtime_address_submit {
 /* Unpublished version-1 Managed connection observations. profile1 only.
  * Requires CAP_NET_ADMIN, original File's Managed lease and exact epoch/link.
  * kind1=RSSI,kind2=PHY;action1=admit,2=cancel same author/payload/id.
- * timeout_ms1..5000 covers queue+USB+reply;retry never renews it.
+ * deadline_monotonic_ns is the original same-kernel CLOCK_MONOTONIC expiry,
+ * including caller/admission waits. timeout_ms1..5000 bounds remaining time,
+ * not a new relative grant. Retry retains both; final USB checks exact ns.
  * Success Status alone is not a measurement;successful Complete must echo
  * the captured handle. Cancellation/release cannot erase physical debt.
  * No arbitrary opcode, mutation, new Host or raw Diagnostic takeover.
@@ -462,6 +464,7 @@ struct sle_runtime_address_submit {
 struct sle_link_query_submit {
     __u32 version, action;
     __aligned_u64 generation, lease_epoch, request_id, lifetime;
+    __aligned_u64 deadline_monotonic_ns;
     __u32 timeout_ms, seq;
     __u16 handle;
     __u8 role, address_type, address[6], kind, reserved[5];
@@ -479,6 +482,7 @@ struct sle_link_query_submit {
 struct sle_link_query_result {
     __u32 version, flags;
     __aligned_u64 generation, lease_epoch, request_id, lifetime;
+    __aligned_u64 deadline_monotonic_ns;
     __u32 seq, state;
     __s32 error;
     __u16 handle;

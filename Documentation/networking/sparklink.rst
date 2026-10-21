@@ -46,6 +46,9 @@ They cannot be obtained through a second Diagnostic lease or raw opcode path.
 
 Queue selection and the final atomic USB command ticket recheck the captured
 identity, lease and original deadline. Successful Status is acceptance only.
+The request carries the original CLOCK_MONOTONIC nanosecond expiry, not a
+relative timeout renewed after RPC scheduling or ioctl mutex waiting. The
+Host tick deadline is a wakeup/cleanup bound; it cannot extend authorization.
 A successful Complete must contain the full reply and matching handle. Release
 cancels pending authors without erasing the retained physical reply slot or
 returning uncertain credit. The existing command ledger and bounded queue own

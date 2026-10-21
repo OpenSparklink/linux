@@ -27,10 +27,12 @@ pub mod prelude {
  pub const EFAULT: Error = Error(-14);
 }
 pub mod bindings {
+ pub unsafe fn ktime_get()->i64 {unsafe {jiffies_64 as i64 * 1_000_000}}
  pub const EOPNOTSUPP: u32 = 95; pub const ESTALE: u32 = 116;
  pub const EMSGSIZE: u32 = 90; pub const ETIMEDOUT: u32 = 110; pub const ECANCELED: u32 = 125;
  pub static mut JIFFIES_64: u64 = 0; pub use JIFFIES_64 as jiffies_64;
 }
+// Same clock-domain dependency as the existing jiffies fixture.
 pub mod time { pub fn msecs_to_jiffies(ms: u32) -> u64 { u64::from(ms) } }
 #[allow(dead_code)] // Whole production dependency; unused recipe functions outside this admission fixture.
 #[path = "sle_command_plan.rs"] mod sle_command_plan;

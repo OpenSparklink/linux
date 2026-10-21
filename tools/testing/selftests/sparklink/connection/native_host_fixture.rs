@@ -32,6 +32,7 @@ pub mod time {pub fn msecs_to_jiffies(ms:u32)->u64{u64::from(ms)}}
 pub mod bindings {pub const EMSGSIZE:u32=90;pub const ETIMEDOUT:u32=110;
  pub const EACCES:u32=13;pub const EOPNOTSUPP:u32=95;pub const ENOTCONN:u32=107;pub const ESTALE:u32=116;pub const EPROTO:u32=71;pub const ECANCELED:u32=125;pub const EALREADY:u32=114;
  #[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;
+ pub unsafe fn ktime_get()->i64 {unsafe{jiffies_64 as i64 * 1000000}}
  pub unsafe fn ktime_get_boottime()->i64 {unsafe{jiffies_64 as i64 * 1000000}}
 }}
 fn error_from_errno(value:i32)->i32 {value}
@@ -62,7 +63,7 @@ fn host()->CommandHost {let mut operations=Operations::new();operations.initiali
 fn clock(now:u64){super::sle_security_relay::clock(now);unsafe{kernel::bindings::jiffies_64=now}}
 fn reference(handle:u16)->sle_connection_operation::ExpectedLink { sle_connection_operation::ExpectedLink { lifetime:1,handle,role:0,address_type:0,address:[1;6] } }
 fn query_scope()->sle_link_query::Scope { sle_link_query::Scope {
- link:reference(7),lease_epoch:1,kind:sle_link_query::Kind::Rssi } }
+ link:reference(7),lease_epoch:1,kind:sle_link_query::Kind::Rssi,deadline_monotonic_ns:100_000_000 } }
 fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants.activate(1,true));h}
 #[test] fn query_requires_exact_link_epoch_at_admission_and_selection() {
  clock(1);let mut h=query_host();let scope=query_scope();
@@ -105,7 +106,7 @@ fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants
 #[test] fn query_ledger_cancel_is_unique_while_real_host_consumes_late_reply() {
  clock(1);let mut h=query_host();let mut ledger=super::hardware_fault_pending::CmdPendingQueue::new();
  let seq=ledger.submit_with_timeout(0x180c,99).unwrap();ledger.assign_request(seq,42,5);
- ledger.assign_query(seq,query_scope()).unwrap();let deadline=ledger.find_by_seq(seq).unwrap().deadline;
+ ledger.assign_query(seq,query_scope(),100).unwrap();let deadline=ledger.find_by_seq(seq).unwrap().deadline;
  h.enqueue_link_query(0x180c,&[7,0],seq,deadline,query_scope()).unwrap();
  let r=h.next(|s|ledger.find_by_seq(s).is_some_and(|e|e.is_pending())).unwrap().unwrap();h.command_committed(r.cookie);
  h.revoke_connections();ledger.cancel_link_queries();ledger.cancel_link_queries();
@@ -116,6 +117,29 @@ fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants
  ledger.resolve_seq(done.seq,0,&[7,0,200]);
  let e=ledger.find_by_seq(seq).unwrap();assert_eq!(e.error,-125);assert_eq!(e.data_len,0);assert_eq!(e.result_status(),None);
  assert_eq!(ledger.total_resolved,1);assert!(!h.query_current(query_scope()));
+}
+#[test] fn query_original_nanosecond_deadline_cannot_be_renewed_by_coarse_wakeup() {
+ for submitted in [false,true] {
+  clock(1);let mut h=query_host();let scope=sle_link_query::Scope{deadline_monotonic_ns:1_999_999,..query_scope()};
+  assert_eq!(super::sle_security_relay_state::host_wake_deadline(1_000_000,scope.deadline_monotonic_ns,1,1000),Ok(3));
+  let mut ledger=super::hardware_fault_pending::CmdPendingQueue::new();
+  let seq=ledger.submit_with_timeout(0x180c,5000).unwrap();ledger.assign_request(seq,42,5);ledger.assign_query(seq,scope,3).unwrap();
+  h.enqueue_link_query(0x180c,&[7,0],seq,3,scope).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+  assert_eq!(h.validate_command_commit(r.cookie,0x180c),Ok(()));
+  if submitted {h.command_committed(r.cookie);}
+  clock(2);assert_eq!(ledger.expire_at(2),1);assert_eq!(ledger.find_by_seq(seq).unwrap().error,-110);
+  assert_eq!(ledger.next_deadline(),None);assert_eq!(h.next_deadline(),Some(3));
+  if submitted {
+   // Real already-started physical obligation; no synthetic refund on expiry.
+   assert_eq!(h.credits,0);
+   let _=h.receive(SleEvent::NativeCommandReply{opcode:0x180c,command_credits:1,status:0,complete:true,data:vec![7,0,200]});
+   h.transport_complete(r.cookie);let done=h.take_reply().unwrap();assert!(!ledger.resolve_seq(done.seq,0,&[7,0,200]));
+  } else {
+   assert_eq!(h.validate_command_commit(r.cookie,0x180c),Err(-110));
+   h.abort_unsubmitted(r.cookie,-110).unwrap();assert!(h.active.is_none());assert_eq!(h.credits,1);
+  }
+  assert_eq!(ledger.find_by_seq(seq).unwrap().error,-110);assert_eq!(ledger.total_timeouts,1);
+ }
 }
 fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_operation::Intent::Create{address_type:0,address:[1;6]},1,0x1401,&[1;27],100,None).unwrap()}
 #[test] fn stale_peer_reference_rejects_before_admission_without_mutation(){

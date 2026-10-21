@@ -163,6 +163,9 @@ impl CommandHost {
 
     pub(crate) fn enqueue_link_query(&mut self, opcode: u16, params: &[u8], seq: u32,
         deadline: u64, scope: super::sle_link_query::Scope) -> Result {
+        // Exact caller budget, including RPC/queue/admission waiting. Jiffies
+        // below are cleanup/wakeup only and cannot extend submit authority.
+        if scope.expired(unsafe { kernel::bindings::ktime_get() } as u64) { return Err(ETIMEDOUT); }
         if !self.query_current(scope) { return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32))); }
         let cookie = self.next_cookie;
         let next = cookie.checked_add(1).ok_or(EOVERFLOW)?;
@@ -597,7 +600,8 @@ impl CommandHost {
             // Disconnect at the queue front when an exact handle is available.
             if self.revoking && self.requests.first_recipe().is_some() && !self.links_clear_for_management() { return Ok(None); }
             let Some(request) = self.requests.pop() else { return Ok(None) };
-            if request.query.is_some_and(|scope| !self.query_current(scope)) { continue; }
+            if request.query.is_some_and(|scope| !self.query_current(scope)
+                || scope.expired(unsafe { kernel::bindings::ktime_get() } as u64)) { continue; }
             if let Some(relay)=&request.relay {
                 if self.validate_relay(relay).is_err() || now>=request.deadline {relay.withdraw();continue;}
             }
@@ -700,6 +704,9 @@ impl CommandHost {
         if let Some(error) = self.fault { return Err(error); }
         let active = self.active.as_ref().filter(|a| a.cookie == cookie && a.opcode == opcode).ok_or(EINVAL)?;
         if let Some(relay)=&active.relay {self.validate_relay(relay)?;}
+        if active.query.is_some_and(|scope| scope.expired(unsafe { kernel::bindings::ktime_get() } as u64)) {
+            return Err(ETIMEDOUT);
+        }
         if active.query.is_some_and(|scope| !self.query_current(scope)) {
             return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
         }

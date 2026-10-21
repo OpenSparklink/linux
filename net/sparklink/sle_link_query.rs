@@ -26,10 +26,12 @@ pub(crate) struct Scope {
     pub(crate) link: ExpectedLink,
     pub(crate) lease_epoch: u64,
     pub(crate) kind: Kind,
+    pub(crate) deadline_monotonic_ns: u64,
 }
 
 impl Scope {
-    pub(crate) fn valid(self) -> bool { self.link.valid() && self.lease_epoch != 0 }
+    pub(crate) fn valid(self) -> bool { self.link.valid() && self.lease_epoch != 0 && self.deadline_monotonic_ns != 0 }
+    pub(crate) fn expired(self, now_ns: u64) -> bool { now_ns >= self.deadline_monotonic_ns }
     /// Acceptance Status is not a sample. Error Status/Complete remains a
     /// controller error, without inventing a success body. Only a successful
     /// Complete must echo this captured handle and the full bounded layout.
@@ -49,13 +51,15 @@ impl Scope {
 mod tests {
     use super::*;
     fn scope(kind: Kind) -> Scope {
-        Scope { kind, lease_epoch: 7, link: ExpectedLink {
+        Scope { kind, lease_epoch: 7, deadline_monotonic_ns: 100_000_000, link: ExpectedLink {
             lifetime: 11, handle: 0x1234, role: 0, address_type: 0, address: [1;6] } }
     }
     #[test] fn typed_inputs_and_identity_are_finite() {
         for n in 0..=255 { assert_eq!(Kind::parse(n).is_some(), n == 1 || n == 2); }
         let s = scope(Kind::Rssi); assert!(s.valid());
         assert!(!Scope { lease_epoch: 0, ..s }.valid());
+        assert!(!Scope { deadline_monotonic_ns: 0, ..s }.valid());
+        assert!(!s.expired(99_999_999)); assert!(s.expired(100_000_000));
         assert!(!Scope { link: ExpectedLink { lifetime: 0, ..s.link }, ..s }.valid());
         assert_eq!(s.kind.provider_operation(),4); assert_eq!(Kind::Phy.provider_operation(),5);
     }

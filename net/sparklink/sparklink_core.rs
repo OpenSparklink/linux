@@ -1660,6 +1660,7 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     let kind = sle_link_query::Kind::parse(input.kind).ok_or(EINVAL)?;
     let scope = sle_link_query::Scope { kind, lease_epoch: input.lease_epoch,
+        deadline_monotonic_ns: input.deadline_monotonic_ns,
         link: sle_connection_operation::ExpectedLink { lifetime: input.lifetime, handle: input.handle,
             role: input.role, address_type: input.address_type, address: input.address } };
     if !scope.valid() || input.generation == 0 || input.request_id == 0 || input.seq != 0
@@ -1688,9 +1689,15 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
             if input.request_id <= *watermark { return Err(Error::from_errno(-(bindings::ESTALE as i32))); }
             if input.action == 2 { return Err(ENOENT); }
             let plan = state.controller.provider().prepare_link_query(scope)?;
+            let sampled_ns = unsafe { bindings::ktime_get() } as u64;
+            sle_security_relay_state::original_deadline(sampled_ns, scope.deadline_monotonic_ns, input.timeout_ms)
+                .map_err(|e| if e == sle_security_relay_state::Error::Expired {ETIMEDOUT} else {EINVAL})?;
+            let ticks_after = unsafe { bindings::jiffies_64 };
+            let wake = sle_security_relay_state::host_wake_deadline(sampled_ns, scope.deadline_monotonic_ns,
+                ticks_after, kernel::time::msecs_to_jiffies(1000) as u32).map_err(|_|EOVERFLOW)?;
             input.seq = state.cmd_pending.submit_with_timeout(plan.opcode, input.timeout_ms)?;
             state.cmd_pending.assign_request(input.seq, me.file_id, input.request_id);
-            if let Err(error) = state.cmd_pending.assign_query(input.seq, scope) {
+            if let Err(error) = state.cmd_pending.assign_query(input.seq, scope, wake) {
                 state.cmd_pending.rollback(input.seq); return Err(error);
             }
             let deadline = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?.deadline;
@@ -1729,6 +1736,7 @@ fn ioctl_link_query_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     output.version = 1; output.generation = owner.identity.generation;
     output.lease_epoch = scope.lease_epoch; output.request_id = entry.request_id;
     output.lifetime = scope.link.lifetime; output.handle = scope.link.handle;
+    output.deadline_monotonic_ns = scope.deadline_monotonic_ns;
     output.role = scope.link.role; output.address_type = scope.link.address_type;
     output.address = scope.link.address; output.kind = scope.kind as u8; output.seq = entry.seq;
     if owner.host.lock().query_current(scope) { output.flags |= 1; }

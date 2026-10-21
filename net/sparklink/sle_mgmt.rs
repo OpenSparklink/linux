@@ -236,7 +236,9 @@ impl CmdPendingQueue {
         }
         for entry in self.entries.iter_mut().flatten() {
             if entry.seq == seq && entry.is_pending() {
-                entry.resolve(status, data);
+                if entry.query.is_some_and(|q| q.expired(unsafe { kernel::bindings::ktime_get() } as u64)) {
+                    entry.timeout(); self.total_timeouts += 1;
+                } else { entry.resolve(status, data); }
                 self.pending_count = self.pending_count.saturating_sub(1);
                 self.total_resolved += 1;
                 return true;
@@ -274,8 +276,11 @@ impl CmdPendingQueue {
     /// Returns the number of entries that were timed out.
     pub(crate) fn expire_at(&mut self, now: u64) -> u32 {
         let mut expired = 0u32;
+        // One exact query clock sample; existing Host/metadata coordination
+        // continues to use the caller-supplied single jiffies instant.
+        let query_now = unsafe { kernel::bindings::ktime_get() } as u64;
         for entry in self.entries.iter_mut().flatten() {
-            if entry.is_pending() && entry.is_expired_at(now) {
+            if entry.is_pending() && (entry.is_expired_at(now) || entry.query.is_some_and(|q| q.expired(query_now))) {
                 entry.timeout();
                 self.pending_count = self.pending_count.saturating_sub(1);
                 self.total_resolved += 1;
@@ -298,10 +303,11 @@ impl CmdPendingQueue {
         }
     }
 
-    pub(crate) fn assign_query(&mut self, seq: u32, query: super::sle_link_query::Scope) -> Result {
+    pub(crate) fn assign_query(&mut self, seq: u32, query: super::sle_link_query::Scope, deadline: u64) -> Result {
         let entry = self.entries.iter_mut().flatten().find(|e| e.seq == seq && e.is_pending()).ok_or(EINVAL)?;
         if !query.valid() || entry.query.is_some() { return Err(EINVAL); }
         entry.query = Some(query);
+        entry.deadline = deadline; // coarse wakeup only; scope retains exact ns
         Ok(())
     }
 
