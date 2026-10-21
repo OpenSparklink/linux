@@ -972,10 +972,8 @@ impl CommandHost {
             .into_iter().flatten().min()
     }
 
-    pub(crate) fn timed_out(&mut self) -> bool {
+    pub(crate) fn timed_out_at(&mut self, now: u64) -> bool {
         if self.fault.is_some() { return false; }
-        // SAFETY: reading jiffies is safe in process/IRQ context.
-        let now = unsafe { kernel::bindings::jiffies_64 };
         self.requests.expire_relays(now);
         if let Some(cookie) = self.connections.expire(now) { self.requests.remove_cookie(cookie); }
         !self.connections.clear() && self.connections.next_deadline().is_none()

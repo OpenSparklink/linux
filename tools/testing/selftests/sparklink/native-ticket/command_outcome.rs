@@ -32,6 +32,7 @@ impl NativeCommandTransport {
 }
 
 unsafe fn sparklink_native_transport_validate_relay(_p:*mut core::ffi::c_void,_op:u16,_v:*const u8,_n:usize)->i32{unsafe{VALIDATION}}
+unsafe fn sparklink_native_transport_validate_runtime_address(_p:*mut core::ffi::c_void,_op:u16,_v:*const u8,_n:usize)->i32{unsafe{VALIDATION}}
 
 #[test] fn relay_refuses_legacy_before_any_validation_io() {unsafe {
  let owner=ControllerRuntime {identity:DeviceIdentity {id:42,generation:2},host:FixtureLock(std::sync::Mutex::new(host())),schedule_gate:FixtureLock(std::sync::Mutex::new(false)),transport_open:std::sync::atomic::AtomicBool::new(true)};

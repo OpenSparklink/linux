@@ -3,6 +3,8 @@ macro_rules! init {($($tokens:tt)*)=>{crate::hardware_fault_allocator::Stub::<Se
 #[allow(dead_code, reason="Actual complete pending module;allocator/event queue dependencies outside this worker subset")]
 #[path="hardware_fault_pending.rs"] mod hardware_fault_pending;
 #[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;
+#[path="sle_runtime_address.rs"] mod runtime_address;
+mod sle_uapi { pub struct SleAddr { pub b: [u8; 6] } }
 #[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 // SPDX-License-Identifier: GPL-2.0-only
 // Actual Host methods with clock, kernel errno, allocation and wire-event
@@ -53,7 +55,7 @@ pub(crate) enum SleEvent {
 // @@COMMAND_CALLBACK@@
 // @@COMMAND_OUTCOME@@
 fn host()->CommandHost {let mut operations=Operations::new();operations.initialized=true;CommandHost {requests:CmdRequestQueue::new(),links:sle_link_observation::LinkObservation::new(),
- connections:sle_connection_operation::Connections::new(),credits:1,credit_revision:0,active:None,reply:None,fault:None,hardware_error:None,next_cookie:1,
+ runtime_address:None,connections:sle_connection_operation::Connections::new(),credits:1,credit_revision:0,active:None,reply:None,fault:None,hardware_error:None,next_cookie:1,
  broadcast_cookie:0,scan_cookie:0,recipe:None,operations,advertising_set:sle_command_plan::AdvertisingSet::Unknown,selected_policy_domains:0,
  grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){super::sle_security_relay::clock(now);unsafe{kernel::bindings::jiffies_64=now}}
@@ -208,9 +210,9 @@ fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{k
  assert!(h.connection_result(43,1).is_none());
 }
 #[test] fn queued_expiry_is_local_but_accepted_expiry_faults_only_owner(){
- clock(1);let mut a=host();create(&mut a,1);clock(101);assert!(!a.timed_out());assert!(a.next(|_|true).unwrap().is_none());assert!(a.fault.is_none());
+ clock(1);let mut a=host();create(&mut a,1);clock(101);assert!(!a.timed_out_at(unsafe { kernel::bindings::jiffies_64 }));assert!(a.next(|_|true).unwrap().is_none());assert!(a.fault.is_none());
  clock(1);let mut a=host();let b=host();create(&mut a,1);let r=a.next(|_|true).unwrap().unwrap();a.transport_complete(r.cookie);a.receive(status(0x1401,0));a.take_reply();
- clock(101);assert!(a.timed_out());a.fail(ETIMEDOUT);up(&mut a,[1;6]);
+ clock(101);assert!(a.timed_out_at(unsafe { kernel::bindings::jiffies_64 }));a.fail(ETIMEDOUT);up(&mut a,[1;6]);
  assert_eq!(a.connection_result(42,1).unwrap().state,sle_connection_operation::State::Faulted);assert!(!a.links_clear_for_management());assert!(b.fault.is_none());
 }
 #[test] fn native_queries_and_discovery_still_require_complete_after_successful_status(){
@@ -299,7 +301,7 @@ fn cleanup_down(h:&mut CommandHost,handle:u16){h.observe_link(&sle_link_observat
  clock(1);let mut h=host();off(&mut h);create(&mut h,1);let wire=h.next(|_|true).unwrap().unwrap();
  h.receive(status(0x1401,0));h.transport_complete(wire.cookie);h.take_reply();h.revoke_connections();revoke(&mut h).unwrap();
  let deadline=h.revoke_deadline;for _ in 0..10 {assert_eq!(h.cleanup_candidate(),Ok(None));assert_eq!(h.revoke_deadline,deadline);assert!(h.next(|_|true).unwrap().is_none());}
- clock(101);assert!(h.timed_out());h.fail(-110);assert_eq!(h.revocation_result().unwrap(),Err(-110));assert!(!h.timed_out());
+ clock(101);assert!(h.timed_out_at(unsafe { kernel::bindings::jiffies_64 }));h.fail(-110);assert_eq!(h.revocation_result().unwrap(),Err(-110));assert!(!h.timed_out_at(unsafe { kernel::bindings::jiffies_64 }));
  let original=h.connection_result(42,1).unwrap();assert_eq!((original.state,original.error,original.fault_error),(sle_connection_operation::State::Cancelled,-125,-110));
 }
 
@@ -420,7 +422,7 @@ fn relay_host() -> (CommandHost,super::sle_security_relay::Command) {
  let q=h.next(|_|true).unwrap().unwrap();h.revoke_connections();assert_eq!(h.validate_command_commit(q.cookie,0x1812),Err(-13));
  assert_ne!(h.commit_relay(q.cookie,||panic!("revoked queued")),0);h.abort_unsubmitted(q.cookie,-13).unwrap();assert_eq!(h.credits,1);
  let(mut h,c)=relay_host();h.credits=0;h.enqueue_relay(0x1812,&[0,0,0x47,1,1,2],10,c.clone()).unwrap();clock(11);
- assert!(!h.timed_out());assert!(h.requests.is_empty());assert_eq!(h.credits,0);assert!(h.fault.is_none());
+ assert!(!h.timed_out_at(unsafe { kernel::bindings::jiffies_64 }));assert!(h.requests.is_empty());assert_eq!(h.credits,0);assert!(h.fault.is_none());
  assert_ne!(c.commit(||panic!("expired queued")),0);
 }
 #[test] fn actual_relay_revoke_retains_inflight_and_peer_remains_independent() {

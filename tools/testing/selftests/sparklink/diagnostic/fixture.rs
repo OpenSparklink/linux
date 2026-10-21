@@ -69,6 +69,13 @@ struct Owner {
     schedule_gate: TestMutex<bool>,
 }
 struct State { cmd_pending: CmdPendingQueue }
+impl Owner {
+    // This result/storage fixture has no transport or Host. Its admissions are
+    // unselected. Actual coupled Host expiry is compiled by the native runner.
+    fn expire_command_deadlines(&self, state: &mut State) {
+        state.cmd_pending.expire_at(unsafe { bindings::jiffies_64 });
+    }
+}
 struct RuntimeContext { owner: Option<Owner>, state: TestMutex<Option<State>> }
 impl RuntimeContext {
     fn lock(&self) -> Result<MutexGuard<'_, Option<State>>> { Ok(self.state.lock()) }

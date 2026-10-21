@@ -92,7 +92,7 @@ fn process_host_events(owner: &Arc<ControllerRuntime>, state: &mut ControllerSta
     // Admission deadlines include queue, transport and final Host processing.
     // A late Complete releases its real reservation but cannot revive a timed
     // out author result; queued expirations do not invent hardware failure.
-    state.cmd_pending.expire_stale();
+    owner.expire_command_deadlines(state);
     if let sle_dli::SleEvent::NativeCommandReply{opcode:0x0406,status:0,complete:true,data,..}=&reply.event {
         let mut host=owner.host.lock();
         if let Some(address)=host.verify_runtime_address(owner.identity.generation,reply.seq,data.as_slice()) {
@@ -125,8 +125,11 @@ fn process_host_events(owner: &Arc<ControllerRuntime>, state: &mut ControllerSta
     true
 }
 
-fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error: Error) {
-    let mut host = owner.host.lock();
+fn fail_host(owner: &ControllerRuntime, state: &mut ControllerState, error: Error) {
+    fail_host_locked(&mut owner.host.lock(), state, error);
+}
+
+fn fail_host_locked(host: &mut super::sle_host::CommandHost, state: &mut ControllerState, error: Error) {
     let seq = host.fail(error);
     let error = host.controller_status().2.unwrap_or(error);
     if let Some(seq) = seq {
@@ -139,6 +142,31 @@ fn fail_host(owner: &Arc<ControllerRuntime>, state: &mut ControllerState, error:
 
 
 impl ControllerRuntime {
+    /// The caller holds this Runtime's protocol mutex. Publish an expired
+    /// physical obligation's existing Host fault before exposing an author
+    /// timeout; result queries and workers must not advance separate ledgers.
+    /// No transport, scheduling, allocation, deadline renewal or credit refund.
+    pub(crate) fn expire_command_deadlines(&self, state: &mut ControllerState) {
+        let mut host = self.host.lock();
+        // One linearization instant for both ledgers. Re-reading the clock
+        // between Host and author expiry could straddle the original deadline.
+        // SAFETY: read-only kernel deadline clock under Runtime -> Host locks.
+        let now = unsafe { kernel::bindings::jiffies_64 };
+        let timed_out = host.timed_out_at(now);
+        if let Some(error) = host.controller_status().2.or(timed_out.then_some(ETIMEDOUT)) {
+            fail_host_locked(&mut host, state, error);
+        }
+        let expired = state.cmd_pending.expire_at(now);
+        drop(host);
+        if timed_out {
+            pr_warn!("sparklink: sle{} USB command Host timed out\n", self.identity.id);
+        }
+        if expired > 0 {
+            pr_warn!("sparklink: sle{}: {} pending commands timed out\n",
+                     self.identity.id, expired);
+        }
+    }
+
     pub(crate) fn start_workers(self: &Arc<Self>) {
         self.schedule_rx(msecs_to_jiffies(EVENT_PUMP_HEARTBEAT_MS));
     }
@@ -249,23 +277,7 @@ impl WorkItem<0> for ControllerRuntime {
                     if let Err(error) = progress_connection_cleanup(&this, runtime) {
                         fail_host(&this, runtime, error);
                     }
-                    if this.host.lock().timed_out()
-                    {
-                        fail_host(&this, runtime, ETIMEDOUT);
-                        pr_warn!(
-                            "sparklink: sle{} USB command Host timed out\n",
-                            this.identity.id
-                        );
-                    }
-                    let expired = runtime.cmd_pending.expire_stale();
-                    if expired > 0 {
-                        pr_warn!(
-                            "sparklink: sle{}: {} pending commands timed out\n",
-                            this.identity.id,
-                            expired
-                        );
-                    }
-
+                    this.expire_command_deadlines(runtime);
                 }
             }
             if drained == 0 || pumped >= 256 {

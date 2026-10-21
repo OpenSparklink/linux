@@ -62,6 +62,16 @@ impl Owner {fn schedule_rx(&self, delay: u32) {assert_eq!(delay,0); RX_WAKES.wit
 struct Controller(u32);
 impl Controller {fn validate_command(&self,opcode:u16,params:&[u8])->Result{if params == diagnostic_parameters(self.0,opcode)? {Ok(())}else{Err(Error(-95))}}}
 struct State {cmd_pending:CmdPendingQueue,controller:Controller}
+impl Owner {
+ fn expire_command_deadlines(&self,state:&mut State) {
+  // Only the queued-ledger adapter is modeled here. Expired physical slots
+  // and existing-fault/author composition must use the actual Host runner.
+  let now=unsafe{bindings::jiffies_64};let host=self.host.lock();
+  assert!(host.active.is_none()||state.cmd_pending.next_deadline().is_none_or(|d|d>now));
+  assert!(host.fault.is_none()||state.cmd_pending.pending()==0);
+  state.cmd_pending.expire_at(now);
+ }
+}
 struct RuntimeContext {owner:Option<Owner>,state:TestMutex<Option<State>>}
 impl RuntimeContext {fn lock(&self)->Result<MutexGuard<'_,Option<State>>>{Ok(self.state.lock())}}
 struct SparkLinkCtl {file_id:u64,target:TestMutex<Option<Target>>,diagnostic_request_id:TestMutex<u64>}

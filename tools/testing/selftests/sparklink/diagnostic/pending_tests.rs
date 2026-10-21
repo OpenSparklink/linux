@@ -3,6 +3,20 @@
 mod diagnostic_pending_tests {
     use super::*;
     #[test]
+    fn explicit_expiry_instant_does_not_resample_advancing_global_clock() {
+        let mut q=CmdPendingQueue::new();
+        let seq=q.submit_with_timeout(0x0405,500).unwrap();
+        let deadline=q.find_by_seq(seq).unwrap().deadline;
+        let old=unsafe{kernel::bindings::jiffies_64};
+        unsafe{kernel::bindings::jiffies_64=deadline+1};
+        assert_eq!(q.expire_at(deadline-1),0);
+        assert!(q.find_by_seq(seq).unwrap().is_pending());
+        assert_eq!(q.expire_at(deadline),1);
+        assert_eq!(q.expire_at(deadline+1),0);
+        unsafe{kernel::bindings::jiffies_64=old};
+        assert_eq!((q.total_timeouts,q.total_resolved,q.find_by_seq(seq).unwrap().error),(1,1,-110));
+    }
+    #[test]
     fn resolved_slot_retained_until_bounded_replacement() {
         let mut q = CmdPendingQueue::new();
         let seq = q.submit_with_timeout(0x0403, CMD_TIMEOUT_MS).unwrap(); q.assign_request(seq, 42, 0);
@@ -29,7 +43,7 @@ mod diagnostic_pending_tests {
     fn timeout_retained_and_rollback_has_no_result() {
         let mut q = CmdPendingQueue::new();
         let seq = q.submit_with_timeout(0x0403, 0).unwrap();
-        assert_eq!(q.expire_stale(), 1); assert_eq!(q.expire_stale(), 0);
+        assert_eq!(q.expire_at(unsafe { kernel::bindings::jiffies_64 }), 1); assert_eq!(q.expire_at(unsafe { kernel::bindings::jiffies_64 }), 0);
         let e = q.find_by_seq(seq).unwrap();
         assert_eq!((e.error, e.result_status(), e.data_len), (-110, None, 0));
         assert!(!q.resolve_seq(seq, 0, &[9]));
@@ -77,7 +91,7 @@ mod diagnostic_pending_tests {
         let original = q.find_by_seq(seq).unwrap().deadline;
         for _ in 0..8 { assert_eq!(q.next_deadline(), Some(original)); }
         assert_eq!((q.pending_count, q.total_resolved, q.total_timeouts), (1, 0, 0));
-        assert_eq!(q.expire_stale(), 1);
+        assert_eq!(q.expire_at(unsafe { kernel::bindings::jiffies_64 }), 1);
         assert_eq!(q.next_deadline(), None);
         assert_eq!((q.total_resolved, q.total_timeouts), (1, 1));
     }

@@ -17,12 +17,14 @@ from security_relay_fixture import write_fixture
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
-    executed=[]
+    executed=[];executed_names=[]
     def execute(binary):
         text=subprocess.check_output([str(binary),'--test-threads=1'],text=True)
         rows=re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;',text)
         assert len(rows)==1 and int(rows[0])>0,'complete default test harness result required'
-        executed.append(int(rows[0]));print(text)
+        names=re.findall(r'(?m)^test (\S+) \.\.\. ok$',text)
+        assert len(names)==int(rows[0]),'all successful case identities required'
+        executed.append(int(rows[0]));executed_names.append(names);print(text)
     inputs = {name: (net / name).read_bytes() for name in
               ['sle_mgmt.rs', 'sle_runtime_address.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs', 'sle_security_relay.rs', 'sle_security_relay_state.rs']}
     uapi = inputs['sle_uapi.rs'].decode()
@@ -74,8 +76,8 @@ def run(output):
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
         execute(tmp/'test')
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': sum(executed), 'executed_phase_tests': executed, 'result_tests': 14, 'admission_tests': 14, 'host_deadline_tests': 16, 'connection_dependency_tests': 14, 'link_dependency_tests': 6,
-              'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': sum(executed), 'executed_phase_tests': executed, 'executed_case_names': executed_names, 'result_tests': executed[0], 'admission_tests': executed[1], 'host_deadline_tests': executed[2], 'connection_dependency_tests': sum(n.startswith('sle_connection_operation::')for n in executed_names[2]), 'link_dependency_tests': sum(n.startswith('sle_link_observation::')for n in executed_names[2]),
+              'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures. Result fixture has no physical Host; admission expiry adapter rejects expired on-wire or fault/pending compositions. Coupled Runtime/Host expiry is tested separately with actual Host in run_native_connection_host, not by these queued-only adapters.',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},
               'relay_dependency_fixture_sha256': hashlib.sha256((here / 'security_relay_fixture.py').read_bytes()).hexdigest(),

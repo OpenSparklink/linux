@@ -1635,7 +1635,7 @@ fn ioctl_runtime_address_submit(context:&RuntimeContext,me:Pin<&SparkLinkCtl>,ar
         if input.action==2 {return Err(ENOENT);}
         if input.request_id<=*watermark {return Err(Error::from_errno(-(bindings::ESTALE as i32)));}
         let(opcode,params)=state.controller.provider().prepare_runtime_address(&input.address)?;
-        state.cmd_pending.expire_stale();
+        owner.expire_command_deadlines(state);
         input.seq=state.cmd_pending.submit_with_timeout(opcode,input.timeout_ms)?;
         state.cmd_pending.assign_request(input.seq,me.file_id,input.request_id);
         let deadline=state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?.deadline;
@@ -1672,7 +1672,7 @@ fn ioctl_diagnostic_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         let mut state = context.lock()?;
         let state = Option::as_mut(&mut *state).ok_or(ENODEV)?;
         state.controller.validate_command(input.opcode, params)?;
-        state.cmd_pending.expire_stale();
+        owner.expire_command_deadlines(state);
         if let Some(entry) = state.cmd_pending.find_request(me.file_id, input.request_id) {
             if entry.opcode != input.opcode || entry.timeout_ms != input.timeout_ms { return Err(EINVAL); }
             input.seq = entry.seq;
@@ -1721,7 +1721,7 @@ fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     owner.management.lock().authorize(me.file_id, sle_management::DIAGNOSTIC).map_err(management_error)?;
     let mut guard = context.lock()?;
     let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
-    state.cmd_pending.expire_stale();
+    owner.expire_command_deadlines(state);
     let entry = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;
     if entry.file_id != me.file_id { return Err(EPERM); }
     // SAFETY: only integer fields and byte arrays; all-zero is a valid baseline.

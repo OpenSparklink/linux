@@ -133,7 +133,11 @@ impl CmdPendingEntry {
 
     /// Check whether this entry's deadline has passed.
     pub(crate) fn is_expired(&self) -> bool {
-        Self::jiffies_now() >= self.deadline
+        self.is_expired_at(Self::jiffies_now())
+    }
+
+    pub(crate) fn is_expired_at(&self, now: u64) -> bool {
+        now >= self.deadline
     }
 }
 
@@ -261,13 +265,14 @@ impl CmdPendingQueue {
             .map(|entry| entry.deadline).min()
     }
 
-    /// Expire all entries whose deadline has passed.
+    /// Expire entries at one supplied kernel-clock instant. Runtime uses the
+    /// same instant for Host obligations; never re-sample between entries.
     ///
     /// Returns the number of entries that were timed out.
-    pub(crate) fn expire_stale(&mut self) -> u32 {
+    pub(crate) fn expire_at(&mut self, now: u64) -> u32 {
         let mut expired = 0u32;
         for entry in self.entries.iter_mut().flatten() {
-            if entry.is_pending() && entry.is_expired() {
+            if entry.is_pending() && entry.is_expired_at(now) {
                 entry.timeout();
                 self.pending_count = self.pending_count.saturating_sub(1);
                 self.total_resolved += 1;
