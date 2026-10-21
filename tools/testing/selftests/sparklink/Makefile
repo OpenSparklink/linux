@@ -32,12 +32,14 @@ TEST_PROGS += run_native_data.py run_native_ticket_driver.py run_session_dispatc
 TEST_PROGS += run_retired_transport.py
 TEST_PROGS += run_usb_firmware.py
 TEST_PROGS += run_usb_binding.py
+TEST_PROGS += run_ws73_runtime_rx.py
 TEST_PROGS += run_standard_provider.py
 TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
 TEST_PROGS += test_virtual_vm_verdict.py run_standard_events.py test_dli_parser_budget.py
 TEST_PROGS += run_raw_uapi_retirement.py
 TEST_FILES += native_runtime_probe.h vm_test_utils.py retired-raw-uapi
+TEST_FILES += ws73-runtime-rx
 TEST_FILES += dli_parser_budget.py retired_uapi_test.c retired_ioctl_cases.h retired_ioctl_numbers.h file_affinity_probe.h
 TEST_FILES += run_virtual_vm.py standard_event_fixture.rs retired-standard-events retired-registry-version
 
