@@ -1,3 +1,4 @@
+#[path="sle_runtime_address.rs"] mod runtime_address;
 // SPDX-License-Identifier: GPL-2.0-only
 // Actual Host deadline selection body, production queue/recipe dependencies.
 // Allocation, I/O and timers are not executed by this standalone fixture.
@@ -16,12 +17,12 @@ mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 use sle_command_plan::{DiscoveryIntent, RecipePart};
 use sle_command_queue::CmdRequestQueue;
 struct Active { deadline:u64, transport_done:bool }
-struct Host { links:sle_link_observation::LinkObservation, connections:sle_connection_operation::Connections, fault:Option<u8>, revoking:bool, revoke_done:u8, revoke_deadline:u64,
+struct Host { runtime_address:Option<runtime_address::Mutation>,links:sle_link_observation::LinkObservation, connections:sle_connection_operation::Connections, fault:Option<u8>, revoking:bool, revoke_done:u8, revoke_deadline:u64,
  active:Option<Active>, reply:Option<()>, requests:CmdRequestQueue }
 impl Host {
  // @@HOST_DEADLINE@@
 }
-fn host()->Host {Host{links:sle_link_observation::LinkObservation::new(),connections:sle_connection_operation::Connections::new(),fault:None,revoking:false,revoke_done:0,revoke_deadline:5000,
+fn host()->Host {Host{runtime_address:None,links:sle_link_observation::LinkObservation::new(),connections:sle_connection_operation::Connections::new(),fault:None,revoking:false,revoke_done:0,revoke_deadline:5000,
  active:None,reply:None,requests:CmdRequestQueue::new()}}
 #[test] fn empty_and_faulted_have_no_rearm_deadline(){
  let mut h=host();assert_eq!(h.next_deadline(),None);

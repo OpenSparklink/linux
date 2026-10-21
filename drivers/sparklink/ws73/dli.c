@@ -37,6 +37,41 @@ struct ws73_query {
 	int complete;
 };
 
+int ws73_dli_prepare_runtime_address(const unsigned char *address,
+		unsigned short *opcode, unsigned char *params, size_t capacity)
+{
+	int ret;
+
+	if (!opcode || !params || capacity < 6)
+		return -EINVAL;
+	ret = ws73_dli_validate_runtime_address(0x0405, address, 6);
+	if (ret)
+		return ret;
+	memcpy(params, address, 6);
+	*opcode = 0x0405;
+	return 6;
+}
+
+int ws73_dli_validate_runtime_address(unsigned int opcode,
+		const unsigned char *params, size_t size)
+{
+	size_t i;
+
+	if (opcode != 0x0405)
+		return -EOPNOTSUPP;
+	if (!params || size != 6)
+		return -EINVAL;
+	/* SDK110 E 4009b0 -> 40f322 rejects exactly the all-zero value.
+	 * Handler 40f40a copies six bytes to its volatile global only after
+	 * that check. No Wi-Fi/Bluetooth bit rules or official allocation
+	 * claims follow; the actual controller may still reject the command.
+	 */
+	for (i = 0; i < size; i++)
+		if (params[i])
+			return 0;
+	return -EINVAL;
+}
+
 static unsigned int dli_u16(const unsigned char *p)
 {
 	return (unsigned int)p[0] | (unsigned int)p[1] << 8;
@@ -170,6 +205,7 @@ int ws73_dli_validate_reply(const unsigned char *data, size_t size)
 	case 0x0c05:
 	case 0x1001:
 	case 0x1002:
+	case 0x0405: /* SDK110 volatile address setter: status only */
 		expected = 0;
 		break;
 	case 0x1812:

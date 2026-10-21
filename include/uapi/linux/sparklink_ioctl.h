@@ -430,6 +430,27 @@ struct sle_diagnostic_submit {
 };
 #define SL_IOCTL_DIAGNOSTIC_SUBMIT _IOWR(SL_MAGIC, 0xd1, struct sle_diagnostic_submit)
 
+/* Unpublished experimental volatile address setup. CAP_NET_ADMIN and the
+ * original File's exclusive Diagnostic lease;untouched Setup only,no links.
+ * One mutation per registration. Six bytes in driver order,not an official
+ * address allocation claim;no permanent storage operation is exposed.
+ * version1/flags0/reserved0,nonzero generation/request_id,seq0 on input.
+ * action1 admits;action2 withdraws original author with identical parameters.
+ * Same ID/payload retry returns its original seq/deadline,never resends.
+ * The existing Diagnostic result exposes the real setter Complete ONLY.
+ * A causally newer real 0406 query must verify the value before the original
+ * 1..5000ms deadline;until then metadata is invalid and Managed is refused.
+ * Closing/releasing unverified setup quarantines instead of claiming Free.
+ * This first version needs fresh initialization for a further address change.
+ */
+struct sle_runtime_address_submit {
+    __u32 version, flags;
+    __aligned_u64 generation, request_id;
+    __u32 timeout_ms, seq, action;
+    __u8 address[6], reserved[6];
+};
+#define SL_IOCTL_RUNTIME_ADDRESS_SUBMIT _IOWR(SL_MAGIC, 0xd7, struct sle_runtime_address_submit)
+
 
 /* Unpublished Native typed connection ABI. File-local nonzero request IDs
  * increase monotonically. Submit has no copyout; retry/query never repeats I/O.

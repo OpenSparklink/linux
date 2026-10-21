@@ -478,6 +478,10 @@ impl ControllerBackend {
         let Self::Native(provider) = self;
         provider
     }
+    pub(crate) fn provider_mut(&mut self) -> &mut super::sle_native::NativeController {
+        let Self::Native(provider)=self;
+        provider
+    }
 }
 
 // -- High-level convenience wrappers ----------------------------------------

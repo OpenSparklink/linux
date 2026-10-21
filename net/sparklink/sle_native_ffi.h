@@ -20,6 +20,7 @@ int sparklink_backend_pending_query_rust(u16 id, u64 generation, struct sparklin
 void sparklink_backend_cancel_rust(u16 id, u64 generation);
 void sparklink_native_unregister_rust(u16 id, u64 generation);
 int sparklink_native_health_rust(u16 id, u64 generation);
+int sparklink_native_current_address_rust(u16 id,u64 generation,u8 *address);
 void sparklink_native_snoop_rx_rust(u16 id, u64 generation, const u8 *data, size_t length);
 void sparklink_native_snoop_tx_rust(u16 id, u64 generation, u16 opcode, const u8 *params, size_t length, int status);
 int sparklink_native_receive_rust(u16 id, u64 generation, const u8 *data, size_t length);

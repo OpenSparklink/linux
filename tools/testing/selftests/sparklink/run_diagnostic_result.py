@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,8 +17,14 @@ from security_relay_fixture import write_fixture
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
+    executed=[]
+    def execute(binary):
+        text=subprocess.check_output([str(binary),'--test-threads=1'],text=True)
+        rows=re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;',text)
+        assert len(rows)==1 and int(rows[0])>0,'complete default test harness result required'
+        executed.append(int(rows[0]));print(text)
     inputs = {name: (net / name).read_bytes() for name in
-              ['sle_mgmt.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs', 'sle_security_relay.rs', 'sle_security_relay_state.rs']}
+              ['sle_mgmt.rs', 'sle_runtime_address.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs', 'sle_security_relay.rs', 'sle_security_relay_state.rs']}
     uapi = inputs['sle_uapi.rs'].decode()
     declaration = uapi[uapi.index('/// Owner-private bounded diagnostic result;'):
                        uapi.index('unsafe impl FromBytes for SleDiagnosticResult')]
@@ -33,7 +40,7 @@ def run(output):
         (tmp / 'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
-        subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
+        execute(tmp/'test')
     with tempfile.TemporaryDirectory(prefix='sparklink-diagnostic-admission-') as tmp:
         tmp = Path(tmp)
         write_fixture(here.parents[3], tmp)
@@ -54,20 +61,20 @@ def run(output):
         (tmp / 'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
-        subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
+        execute(tmp/'test')
     with tempfile.TemporaryDirectory(prefix='sparklink-host-deadline-') as tmp:
         tmp = Path(tmp)
         write_fixture(here.parents[3], tmp)
-        for name in ['sle_command_queue.rs', 'sle_command_plan.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']:
+        for name in ['sle_runtime_address.rs','sle_command_queue.rs', 'sle_command_plan.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']:
             (tmp / name).write_bytes(inputs[name])
         fixture = (here / 'diagnostic/host_deadline_fixture.rs').read_text()
         fixture = fixture.replace('// @@HOST_DEADLINE@@', function(inputs['sle_host.rs'].decode(), 'next_deadline')+'\n'+function(inputs['sle_host.rs'].decode(),'links_clear_for_management'))
         (tmp / 'fixture.rs').write_text(fixture)
         subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
                         '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
-        subprocess.run([str(tmp / 'test'), '--test-threads=1'], check=True)
+        execute(tmp/'test')
     assert all((net / n).read_bytes() == data for n, data in inputs.items())
-    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': 54, 'result_tests': 14, 'admission_tests': 14, 'host_deadline_tests': 6, 'connection_dependency_tests': 14, 'link_dependency_tests': 6,
+    record = {'status': 'DIAGNOSTIC_RESULT_BOUNDARY_PASS', 'rust_tests': sum(executed), 'executed_phase_tests': executed, 'result_tests': 14, 'admission_tests': 14, 'host_deadline_tests': 16, 'connection_dependency_tests': 14, 'link_dependency_tests': 6,
               'scope': 'actual pending/queue modules, submit/result handlers and Host enqueue/cancel bodies; clock/lease/lock/usercopy/allocation dependencies are fixtures',
               'live_vfs_acceptance': False, 'physical_acceptance': False,
               'sources': {n: hashlib.sha256(data).hexdigest() for n, data in inputs.items()},

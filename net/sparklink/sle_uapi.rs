@@ -530,6 +530,20 @@ impl_check_reserved!(SleDiagnosticSubmit, [reserved]);
 const _: () = assert!(core::mem::size_of::<SleDiagnosticSubmit>() == 40);
 pub(crate) const SL_IOCTL_DIAGNOSTIC_SUBMIT: u32 = _IOWR::<SleDiagnosticSubmit>(SL_MAGIC, 0xd1);
 
+#[repr(C,align(8))]
+#[derive(Copy,Clone)]
+pub(crate) struct SleRuntimeAddressSubmit {
+    pub version:u32,pub flags:u32,
+    pub generation:u64,pub request_id:u64,
+    pub timeout_ms:u32,pub seq:u32,pub action:u32,
+    pub address:[u8;6],pub reserved:[u8;6],
+}
+// SAFETY: integer/byte fields only,explicit alignment and all padding reserved.
+unsafe impl FromBytes for SleRuntimeAddressSubmit {}
+impl_check_reserved!(SleRuntimeAddressSubmit,[reserved]);
+const _:()=assert!(core::mem::size_of::<SleRuntimeAddressSubmit>()==48);
+pub(crate) const SL_IOCTL_RUNTIME_ADDRESS_SUBMIT:u32=_IOWR::<SleRuntimeAddressSubmit>(SL_MAGIC,0xd7);
+
 pub(crate) const SL_IOCTL_CONNECTION_SUBMIT: u32 = _IOW::<SleConnectionSubmit>(SL_MAGIC, 0x9c);
 pub(crate) const SL_IOCTL_CONNECTION_RESULT: u32 = _IOWR::<SleConnectionResult>(SL_MAGIC, 0x9d);
 #[repr(C)]

@@ -27,6 +27,15 @@ struct ws73_dli_result {
 int ws73_dli_validate_command(unsigned int opcode, const unsigned char *params,
 			      size_t size);
 
+/* Setup-only typed volatile address path. This does not expand the raw query
+ * whitelist or authorize storage writes. Core must retain the frozen ticket,
+ * original deadline and independent 0406 readback before using the identity.
+ */
+int ws73_dli_validate_runtime_address(unsigned int opcode,
+		const unsigned char *params, size_t size);
+int ws73_dli_prepare_runtime_address(const unsigned char *address,
+		unsigned short *opcode, unsigned char *params, size_t capacity);
+
 /* Validate one A2 management event slot, not an HCC aggregate. WS73 owns the
  * successful Complete return schemas (including 0C02's selected TX power).
  * Unknown opcode returns remain opaque; Status, credit-only and framing are

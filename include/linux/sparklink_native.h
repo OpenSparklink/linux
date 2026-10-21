@@ -105,6 +105,14 @@ struct sparklink_native_ops {
         const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity,
         u16 *echo_index);
     int (*validate_relay)(void *context, u16 opcode, const u8 *params, size_t size);
+	/* Optional setup-only volatile address command. The Host supplies a
+	 * frozen typed ticket; raw validate_command remains query-only. This
+	 * callback validates wire bytes only,never Ready or address ownership.
+	 */
+	int (*validate_runtime_address)(void *context, u16 opcode,
+		const u8 *params, size_t length);
+	int (*prepare_runtime_address)(void *context, const u8 *address,
+		u16 *opcode, u8 *params, size_t capacity);
 	int (*send_command)(void *context, u16 opcode, const u8 *params, size_t length);
 	/* Optional atomic command submission. Prepare outside Host locks, then
 	 * commit exactly once; wait/kill/join after commit returns. The core checks
@@ -132,6 +140,11 @@ void sparklink_native_unregister(u16 id, u64 generation);
  * or retired identity. Never admits I/O, supplies credits or publishes Ready.
  */
 int sparklink_native_health(u16 id, u64 generation);
+/* Exact process-context current address observation. Unverified mutation is
+ * -EAGAIN;retirement -ENODEV. No I/O,cache fallback,Ready or identity claim.
+ * Do not hold driver phase/transfer locks while calling into Runtime state.
+ */
+int sparklink_native_current_address(u16 id, u64 generation, u8 *address);
 /* Valid during the callback; the core copies data and never retains its pointer.
  * Returns 0 if accepted, -ENODEV for a retired owner, -EPROTO for bad framing.
  * The driver must validate its dialect's management return schema before

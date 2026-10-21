@@ -942,6 +942,18 @@ static int ws73_native_validate_relay(void *context, u16 opcode, const u8 *param
     return ws73_dli_relay_validate(opcode, params, size);
 }
 
+static int ws73_native_validate_runtime_address(void *context, u16 opcode,
+		const u8 *params, size_t length)
+{
+	return ws73_dli_validate_runtime_address(opcode, params, length);
+}
+
+static int ws73_native_prepare_runtime_address(void *context, const u8 *address,
+		u16 *opcode, u8 *params, size_t capacity)
+{
+	return ws73_dli_prepare_runtime_address(address, opcode, params, capacity);
+}
+
 struct ws73_acb_transfer {
 	struct completion done;
 	struct urb *urb;
@@ -1098,6 +1110,8 @@ static const struct sparklink_native_ops ws73_native_ops = {
     .validate_connection = ws73_native_validate_connection,
     .prepare_relay = ws73_native_prepare_relay,
     .validate_relay = ws73_native_validate_relay,
+	.validate_runtime_address = ws73_native_validate_runtime_address,
+	.prepare_runtime_address = ws73_native_prepare_runtime_address,
 	.send_command_ticketed = ws73_native_command,
 	.send_acb = ws73_native_acb,
 	.send_acb_fragment = ws73_native_acb_fragment,
@@ -1412,7 +1426,10 @@ static ssize_t controller_information_show(struct device *dev,
 					   struct device_attribute *attr, char *buf)
 {
 	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
-	ssize_t ret;
+	struct ws73_dli_info info;
+	unsigned int credits;
+	int id, ret;
+	u64 generation;
 
 	/* Recovery may rewrite metadata on this interface. Avoid blocking a
 	 * diagnostic reader through an entire BSLE transaction, and serialize
@@ -1424,13 +1441,25 @@ static ssize_t controller_information_show(struct device *dev,
 		mutex_unlock(&ws->phase_lock);
 		return -ENODATA;
 	}
-	ret = sysfs_emit(buf,
-			  "version=%5phN features=%10phN address=%pM acb=%u/%u icb=%u/%u bootstrap_credits=%u\n",
-			  ws->info.version, ws->info.features, ws->info.address,
-			  ws->info.acb_length, ws->info.acb_count,
-			  ws->info.icb_length, ws->info.icb_count, ws->command_credits);
+	info = ws->info;
+	credits = ws->command_credits;
+	id = ws->native_id;
+	generation = ws->native_generation;
 	mutex_unlock(&ws->phase_lock);
-	return ret;
+	/* Bootstrap metadata is not an alternative current address after a
+	 * typed runtime change. Drop driver locks before the Runtime mutex;
+	 * no retired/uncertain owner may fall back to the bootstrap cache.
+	 */
+	if (id < 0 || !generation)
+		return -EAGAIN;
+	ret = sparklink_native_current_address(id, generation, info.address);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf,
+			  "version=%5phN features=%10phN address=%pM acb=%u/%u icb=%u/%u bootstrap_credits=%u\n",
+			  info.version, info.features, info.address,
+			  info.acb_length, info.acb_count,
+			  info.icb_length, info.icb_count, credits);
 }
 static DEVICE_ATTR_RO(controller_information);
 

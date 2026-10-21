@@ -942,6 +942,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
         if *owner.schedule_gate.lock() { return Err(ENODEV); }
         {
             let mut host = owner.host.lock();
+            if !host.address_metadata_valid() {return Err(EIO);}
             if let Some(error) = host.controller_status().2 { return Err(error); }
             // Preserve sent/accepted author procedures and physical facts.
             // Managed cleanup will prepare real Disconnects in process context;
@@ -1062,6 +1063,7 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
         {
             let host = owner.host.lock();
             if !host.quiet() || !host.links_clear_for_management() { return Err(EBUSY); }
+            if request.mode==sle_management::MANAGED && !host.address_metadata_valid() {return Err(EAGAIN);}
         }
         request.lease = token;
         // No command has been admitted. EFAULT leaves ownership and counter
@@ -1078,6 +1080,7 @@ fn ioctl_management(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, cmd: u32, 
             if *stopping { return Err(ENODEV); }
             if let Some(error) = host.controller_status().2 { return Err(error); }
             if !host.quiet() || !host.links_clear_for_management() { return Err(EBUSY); }
+            if request.mode==sle_management::MANAGED && !host.address_metadata_valid() {return Err(EAGAIN);}
             if !host.grants.accepts(token) { return Err(EOVERFLOW); }
             host.resume_management()?;
             if !host.grants.activate(token, request.mode == sle_management::MANAGED) { return Err(EOVERFLOW); }
@@ -1133,9 +1136,13 @@ fn ioctl_controller_snapshot(
     out.dev_index = owner.identity.id;
     out.profile = owner.protocol_profile;
     out.bus = state.controller.info().bus as u8;
-    let (credits, native_ready, fault) = owner.host.lock().controller_status();
+    let host=owner.host.lock();
+    let (credits, native_ready, fault) = host.controller_status();
+    let address_valid=host.address_metadata_valid();
+    drop(host);
     out.command_credits = credits;
     state.controller.provider().fill_snapshot(&mut out);
+    if !address_valid {out.valid_fields=0;}
     out.flags = if native_ready { 1 } else { 2 };
     if let Some(error) = fault {
         out.flags = 4;
@@ -1596,6 +1603,53 @@ fn diagnostic_parameters(profile: u32, opcode: u16) -> Result<&'static [u8]> {
     }
 }
 
+/// Explicit volatile setup,with the existing command queue and result ledger.
+/// Neither raw command permission nor software-only metadata mutation follows.
+#[inline(never)]
+fn ioctl_runtime_address_submit(context:&RuntimeContext,me:Pin<&SparkLinkCtl>,arg:usize)->Result<isize> {
+    let mut input:SleRuntimeAddressSubmit=read_user_struct(arg)?;
+    if input.version!=1 {return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));}
+    if input.flags!=0 || input.reserved!=[0;6] || input.generation==0 || input.request_id==0 || input.seq!=0
+        || !(1..=sle_mgmt::CMD_TIMEOUT_MS).contains(&input.timeout_ms) || !matches!(input.action,1|2) {return Err(EINVAL);}
+    let owner=context.owner.as_ref().ok_or(ENODEV)?;
+    if me.target.lock().as_ref().map(|t|t.identity)!=Some(owner.identity) {return Err(EINVAL);}
+    if input.generation!=owner.identity.generation {return Err(ENODEV);}
+    if owner.protocol_profile!=1 {return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));}
+    if *owner.schedule_gate.lock() {return Err(ENODEV);}
+    let management=owner.management.lock();
+    management.authorize(me.file_id,sle_management::DIAGNOSTIC).map_err(management_error)?;
+    let mut watermark=me.diagnostic_request_id.lock();
+    let mut guard=context.lock()?;
+    let state=Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+    let existing=owner.host.lock().runtime_address_retry(input.generation,me.file_id,
+        input.request_id,input.timeout_ms,input.address)?;
+    if let Some(seq)=existing {
+        let entry=state.cmd_pending.find_by_seq(seq).ok_or(ENOENT)?;
+        if entry.file_id!=me.file_id {return Err(EPERM);}
+        input.seq=seq;
+        if input.action==2 {
+            state.cmd_pending.cancel_seq(seq);
+            owner.host.lock().withdraw_runtime_address(seq);
+        }
+    } else {
+        if input.action==2 {return Err(ENOENT);}
+        if input.request_id<=*watermark {return Err(Error::from_errno(-(bindings::ESTALE as i32)));}
+        let(opcode,params)=state.controller.provider().prepare_runtime_address(&input.address)?;
+        state.cmd_pending.expire_stale();
+        input.seq=state.cmd_pending.submit_with_timeout(opcode,input.timeout_ms)?;
+        state.cmd_pending.assign_request(input.seq,me.file_id,input.request_id);
+        let deadline=state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?.deadline;
+        if let Err(error)=owner.host.lock().enqueue_runtime_address(input.generation,me.file_id,input.request_id,
+            input.seq,input.timeout_ms,deadline,input.address,opcode,&params) {
+            state.cmd_pending.rollback(input.seq);return Err(error);
+        }
+        *watermark=input.request_id;
+    }
+    drop(guard);drop(watermark);drop(management);
+    owner.kick_commands();owner.schedule_rx(0);
+    write_user_struct(arg,&input)?;Ok(0)
+}
+
 /// Metadata-only admission: management mutex spans authorization/admission,
 /// never usercopy. No default controller, transport I/O or policy/test hook.
 #[inline(never)]
@@ -1836,6 +1890,9 @@ impl MiscDevice for SparkLinkCtl {
         }
         if cmd == SL_IOCTL_DIAGNOSTIC_SUBMIT {
             return ioctl_diagnostic_submit(context, me, arg);
+        }
+        if cmd==SL_IOCTL_RUNTIME_ADDRESS_SUBMIT {
+            return ioctl_runtime_address_submit(context,me,arg);
         }
         // Admission serialization lasts through dispatch. Workers do not take
         // this mutex under the protocol mutex; revocation completion is in Host.

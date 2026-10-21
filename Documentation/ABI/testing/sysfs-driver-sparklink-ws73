@@ -100,3 +100,22 @@ Description:
                 Normal operation and existing collectors do not read this
                 attribute automatically. A diagnostic failure does not create
                 protocol credit, controller failure or a successful recovery.
+
+What:           /sys/bus/usb/devices/<interface>/controller_information
+Date:           October 2026
+Contact:        OpenSparklink maintainers (https://github.com/OpenSparklink/linux/issues)
+Description:
+                Controller bootstrap version, features and buffer limits, plus
+                the current address observed by the exact Native Runtime
+                registration. bootstrap_credits is a bootstrap observation,
+                not current command credit. This read performs no USB I/O.
+
+                Following experimental volatile address setup, the address is
+                published only after a real matching DLI 0x0406 reply. Pending
+                verification returns EAGAIN; retired Runtime returns ENODEV;
+                latched Host errors propagate. No stale bootstrap-address
+                fallback is permitted. During bootstrap/recovery the usual
+                phase EAGAIN or metadata ENODATA may be returned.
+
+                These observations establish neither radio Ready, peer
+                delivery, persistence nor an officially allocated identity.

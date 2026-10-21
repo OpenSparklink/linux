@@ -16,6 +16,10 @@ int sparklink_native_transport_prepare_relay(struct sparklink_native_transport *
     u16 handle, u16 index, const u8 *payload, size_t size, u16 *opcode, u8 *params, size_t capacity, u16 *echo_index);
 int sparklink_native_transport_validate_relay(struct sparklink_native_transport *transport,
     u16 opcode, const u8 *params, size_t size);
+int sparklink_native_transport_validate_runtime_address(struct sparklink_native_transport *transport,
+    u16 opcode, const u8 *params, size_t size);
+int sparklink_native_transport_prepare_runtime_address(struct sparklink_native_transport *transport,
+    const u8 *address, u16 *opcode, u8 *params, size_t capacity);
 bool sparklink_native_transport_has_command_ticket(struct sparklink_native_transport *transport);
 int sparklink_native_transport_command_ticketed(struct sparklink_native_transport *transport,
     struct sparklink_native_command_ticket *ticket, u16 opcode, const u8 *params, size_t length);
@@ -33,6 +37,8 @@ static_assert(sizeof(struct sle_controller_event_query) == 360);
 static_assert(offsetof(struct sle_controller_event_query, event) == 24);
 
 static_assert(sizeof(struct sle_controller_snapshot) == 64);
+static_assert(sizeof(struct sle_runtime_address_submit) == 48);
+static_assert(offsetof(struct sle_runtime_address_submit,address) == 36);
 static_assert(sizeof(struct sle_connection_parameters) == 60);
 static_assert(sizeof(struct sparklink_connection_parameters) == 60);
 static_assert(sizeof(struct sle_connection_submit) == 128);
@@ -275,6 +281,22 @@ int sparklink_native_transport_command(struct sparklink_native_transport *transp
 	return transport->ops.send_command(transport->context, opcode, params, length);
 }
 
+int sparklink_native_transport_validate_runtime_address(struct sparklink_native_transport *transport,
+    u16 opcode, const u8 *params, size_t size)
+{
+    if (!transport->ops.validate_runtime_address)
+        return -EOPNOTSUPP;
+    return transport->ops.validate_runtime_address(transport->context, opcode, params, size);
+}
+
+int sparklink_native_transport_prepare_runtime_address(struct sparklink_native_transport *transport,
+    const u8 *address, u16 *opcode, u8 *params, size_t capacity)
+{
+    if (!transport->ops.prepare_runtime_address || !transport->ops.validate_runtime_address)
+        return -EOPNOTSUPP;
+    return transport->ops.prepare_runtime_address(transport->context, address, opcode, params, capacity);
+}
+
 bool sparklink_native_transport_has_command_ticket(struct sparklink_native_transport *transport)
 {
 	return transport->ops.send_command_ticketed != NULL;
@@ -318,6 +340,14 @@ int sparklink_native_health(u16 id, u64 generation)
 	return sparklink_native_health_rust(id, generation);
 }
 EXPORT_SYMBOL_GPL(sparklink_native_health);
+
+int sparklink_native_current_address(u16 id,u64 generation,u8 *address)
+{
+    if (!address)
+        return -EINVAL;
+    return sparklink_native_current_address_rust(id,generation,address);
+}
+EXPORT_SYMBOL_GPL(sparklink_native_current_address);
 
 int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
 				   struct sparklink_native_tx_ticket *ticket, u16 handle, u8 boundary, const u8 *data, size_t length)

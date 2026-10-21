@@ -93,6 +93,15 @@ fn process_host_events(owner: &Arc<ControllerRuntime>, state: &mut ControllerSta
     // A late Complete releases its real reservation but cannot revive a timed
     // out author result; queued expirations do not invent hardware failure.
     state.cmd_pending.expire_stale();
+    if let sle_dli::SleEvent::NativeCommandReply{opcode:0x0406,status:0,complete:true,data,..}=&reply.event {
+        let mut host=owner.host.lock();
+        if let Some(address)=host.verify_runtime_address(owner.identity.generation,reply.seq,data.as_slice()) {
+            // Same Runtime mutex and Host lock publish the verified value and
+            // its validity together;no I/O/allocation or daemon-made state.
+            state.controller.provider_mut().observe_runtime_address(address);
+            state.dev_info.addr=super::sle_uapi::SleAddr{b:address};
+        }
+    }
     match &reply.event {
         sle_dli::SleEvent::CommandComplete { status, data, .. } => {
             state

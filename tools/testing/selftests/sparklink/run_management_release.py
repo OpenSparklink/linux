@@ -17,7 +17,7 @@ from run_connection_tx import function
 def run(output):
     here = Path(__file__).resolve().parent
     net = here.parents[3] / 'net/sparklink'
-    names = ['sle_host.rs', 'sparklink_core.rs', 'sle_management.rs',
+    names = ['sle_host.rs', 'sparklink_core.rs', 'sle_management.rs', 'sle_runtime_address.rs',
              'sle_discovery_operation.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_dli.rs', 'sle_mgmt.rs', 'sle_link_observation.rs', 'sle_connection_operation.rs', 'sle_grant.rs','sle_security_relay.rs','sle_security_relay_state.rs']
     names += ['sle_security_relay.rs','sle_security_relay_state.rs']
     inputs = {n: (net/n).read_bytes() for n in names}
@@ -40,7 +40,7 @@ def run(output):
         depth += (acquire[end]=='{')-(acquire[end]=='}'); end += 1
     commit = acquire[start:end]
     methods = '\n'.join(function(inputs['sle_host.rs'].decode(), n) for n in
-                        ['validate_relay','admits_data','validate_connection_cleanup','revoke_connections','observe_link','links_clear_for_management','quiet', 'resume_management', 'policy_untouched', 'query_policy_untouched', 'policy_unsubmitted',
+                        ['address_metadata_valid','validate_relay','admits_data','validate_connection_cleanup','revoke_connections','observe_link','links_clear_for_management','quiet', 'resume_management', 'policy_untouched', 'query_policy_untouched', 'policy_unsubmitted',
                          'cancel_unsubmitted_policy', 'controller_status', 'discovery_radio',
                          'current_recipe', 'can_send', 'retained_revocation',
                          'retained_revocation_ready', 'next', 'cancel_recipe_progress', 'enqueue_recipe_until', 'enqueue_recipe',

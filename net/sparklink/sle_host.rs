@@ -13,6 +13,9 @@ use super::sle_discovery_operation::{Operations, Operation, State, AdmissionErro
 use super::sle_mgmt::{CmdRequest, CmdRequestQueue, CMD_TIMEOUT_MS};
 use super::sle_command_plan::{DiscoveryIntent, RecipePart, RecipeProgress, RecipeReply, RecipeTag};
 
+#[path = "sle_runtime_address.rs"]
+mod runtime_address;
+
 struct InFlight {
     opcode: u16,
     seq: u32,
@@ -50,6 +53,7 @@ pub(crate) struct CommandHost {
     // Reserved critical observation, never an authorization or Ready source.
     // First-fault code waits for the process worker even if the RX ring is full.
     hardware_error: Option<u8>,
+    runtime_address: Option<runtime_address::Mutation>,
     next_cookie: u64,
     broadcast_cookie: u64,
     scan_cookie: u64,
@@ -82,6 +86,7 @@ impl CommandHost {
                 reply: None,
                 fault: None,
                 hardware_error: None,
+                runtime_address: None,
             next_cookie: 1,
             broadcast_cookie: 0,
             scan_cookie: 0,
@@ -129,8 +134,8 @@ impl CommandHost {
         if let Some(relay)=&active.relay {relay.commit(submit)} else {submit()}
     }
 
-    /// Metadata-only diagnostic admission supplies the original absolute
-    /// deadline; queue wait does not grant a fresh full timeout on transmission.
+    /// Raw metadata queries and the separately gated typed address operation
+    /// share the existing command ledger. Queue wait never grants a new timeout.
     pub(crate) fn enqueue_diagnostic(&mut self, opcode: u16, params: &[u8], seq: u32, deadline: u64) -> Result {
         if let Some(error) = self.fault { return Err(error); }
         let cookie = self.next_cookie;
@@ -147,6 +152,48 @@ impl CommandHost {
         }
         // active/reply/credits/deadline remain untouched. Cancelling an on-wire
         // author waits for its real reply or a normal uncertain-outcome fault.
+    }
+
+    pub(crate) fn runtime_address_retry(&self, generation:u64, author:u64,
+        request_id:u64, timeout_ms:u32, address:[u8;6])->Result<Option<u32>> {
+        let Some(current)=&self.runtime_address else {return Ok(None);};
+        current.retry(generation,author,request_id,timeout_ms,address).map(Some).map_err(|e|match e {
+            runtime_address::Failure::Invalid=>EINVAL,
+            _=>EBUSY,
+        })
+    }
+
+    pub(crate) fn enqueue_runtime_address(&mut self,generation:u64,author:u64,
+        request_id:u64,seq:u32,timeout_ms:u32,deadline:u64,address:[u8;6],opcode:u16,params:&[u8])->Result {
+        if self.runtime_address.is_some() || !self.policy_untouched() || !self.links_clear_for_management() {
+            return Err(EBUSY);
+        }
+        let change=runtime_address::Mutation::new(generation,author,request_id,seq,
+            self.next_cookie,timeout_ms,deadline,address).map_err(|_|EINVAL)?;
+        self.enqueue_diagnostic(opcode,params,seq,deadline)?;
+        self.runtime_address=Some(change);
+        Ok(())
+    }
+
+    pub(crate) fn runtime_address_command(&self,generation:u64,cookie:u64)->bool {
+        self.runtime_address.as_ref().is_some_and(|a|a.generation==generation && a.cookie==cookie
+            && a.stage==runtime_address::Stage::Queued)
+    }
+    pub(crate) fn address_metadata_valid(&self)->bool {
+        self.runtime_address.as_ref().is_none_or(|a|!a.unverified())
+    }
+    pub(crate) fn withdraw_runtime_address(&mut self,seq:u32) {
+        if let Some(a)=self.runtime_address.as_mut().filter(|a|a.seq==seq && a.unverified()) {
+            a.withdraw();
+        }
+        self.cancel_diagnostic(seq); // Physical slot/credit/deadline retained.
+    }
+    pub(crate) fn verify_runtime_address(&mut self,generation:u64,seq:u32,data:&[u8])->Option<[u8;6]> {
+        let change=self.runtime_address.as_mut()?;
+        if change.stage!=runtime_address::Stage::SetComplete {return None;}
+        // SAFETY: same original per-operation clock,read under Host lock.
+        let now=unsafe {kernel::bindings::jiffies_64};
+        change.verify(generation,seq,now,data).ok()
     }
 
     fn cancel_recipe_progress(&mut self, intent: DiscoveryIntent) {
@@ -473,7 +520,7 @@ impl CommandHost {
     pub(crate) fn controller_status(&self) -> (u8, bool, Option<Error>) {
         (
             self.credits,
-            self.operations.initialized && self.fault.is_none(),
+            self.operations.initialized && self.fault.is_none() && self.address_metadata_valid(),
             self.fault,
         )
     }
@@ -787,6 +834,11 @@ impl CommandHost {
         if !self.active.as_ref().is_some_and(|active| active.transport_done) { return None; }
         let (event, received) = self.reply.take()?;
         let active = self.active.take()?;
+        if let Some(address)=self.runtime_address.as_mut().filter(|a|a.cookie==active.cookie) {
+            if let SleEvent::NativeCommandReply{complete,status,data,..}=&event {
+                address.setter_reply(active.cookie,*complete,*status,data.as_slice().len());
+            }
+        }
         let successful_complete = matches!(&event,
             SleEvent::NativeCommandReply { complete: true, status: 0, .. })
             || matches!(&event, SleEvent::CommandComplete { status: super::sle_dli::SleStatus::Success, .. });
@@ -915,7 +967,8 @@ impl CommandHost {
         let active = self.active.as_ref()
             .filter(|active| !active.transport_done || self.reply.is_none())
             .map(|active| active.deadline);
-        [revoke, active, self.requests.first_recipe_deadline(), self.requests.relay_deadline(), self.connections.next_deadline()]
+        [revoke, active, self.requests.first_recipe_deadline(), self.requests.relay_deadline(), self.connections.next_deadline(),
+            self.runtime_address.as_ref().and_then(|a|a.next_deadline())]
             .into_iter().flatten().min()
     }
 

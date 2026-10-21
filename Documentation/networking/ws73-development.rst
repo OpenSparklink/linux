@@ -1129,3 +1129,37 @@ New-QEMU validation reuses kernel97: 13 Runtime gates, 292 harness tests and
 QMP support RF rounds. Original physical isolation, native-host deployment,
 missing-device recovery and four-device matrix remain open; no new kernel or
 physical North Star completion is asserted.
+
+Experimental volatile address setup
+----------------------------------
+
+The unpublished ``SL_IOCTL_RUNTIME_ADDRESS_SUBMIT`` is separate from raw
+diagnostics, whose command whitelist remains read-only. It requires
+CAP_NET_ADMIN, the original File's exclusive Diagnostic lease, WS73 profile 1,
+and untouched Setup before any radio policy or connection. One mutation is
+allowed per registration; this interface provides no permanent storage write.
+It does not allocate an official address or authenticate silicon identity.
+
+The driver prepares six bytes in controller order for DLI 0x0405; the Host
+uses the existing command queue, command credit and atomic submission ticket.
+A real successful status-only Complete is necessary but insufficient: a later
+reserved DLI 0x0406 reply must match all six bytes before the setter's original
+1--5000 ms deadline. Metadata is invalid and Managed admission is refused
+until that observation is published under Runtime and Host locks. The sysfs
+controller address then reads this same current Runtime observation, dropping
+driver phase locks before entering Runtime. There is no bootstrap fallback for
+an uncertain or retired identity.
+
+Retrying the same author/request/payload returns the original sequence without
+resending or replacing its deadline. Withdrawal cancels author admission, not
+a physical command already submitted. Release/last close before verification
+quarantines the controller rather than declaring it Free. Further configuration
+requires the existing reinitialization lifecycle, with fresh identity; there
+is no live address or connection migration. Old own-address discovery recipes
+are rejected instead of reintroducing stale cached identity.
+
+The pure mutation selftest directly compiles ``sle_runtime_address.rs``;
+``ws73_dli_test`` exercises the production codec with synthetic I/O. Neither
+these tests nor a setter Complete establishes two-device discovery, connection,
+application delivery, persistence, cold startup or production address uniqueness.
+Those gates require separately identified VM artifacts and real observations.

@@ -10,6 +10,7 @@ TEST_GEN_PROGS += sle_channel_wire_test sle_channel_signal_test
 TEST_GEN_PROGS += sle_channel_state_test sle_channel_table_test
 TEST_GEN_PROGS_EXTENDED += ssap_removed_uapi_test sparklink_socket_type_test
 TEST_GEN_PROGS_EXTENDED += sparklink_host_plan_test sparklink_discovery_operation_test
+TEST_GEN_PROGS_EXTENDED += sparklink_runtime_address_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_open_test
 TEST_GEN_PROGS_EXTENDED += ws73_native_rpc_fault_test
 TEST_GEN_PROGS_EXTENDED += sparklink_event_copy_test
@@ -74,6 +75,9 @@ $(OUTPUT)/ws73_native_rpc_fault_test: ws73_native_rpc_fault_test.c ws73_native_o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $< $(LDLIBS) -pthread -o $@
 
 RUSTC ?= rustc
+$(OUTPUT)/sparklink_runtime_address_test: ../../../../net/sparklink/sle_runtime_address.rs
+	$(RUSTC) --edition=2021 -D warnings --test $< -o $@
+
 $(OUTPUT)/sparklink_host_plan_test: sparklink_host_plan_test.rs \
 	../../../../net/sparklink/sle_command_plan.rs \
 	../../../../net/sparklink/sle_command_queue.rs \

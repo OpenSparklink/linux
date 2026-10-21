@@ -1,3 +1,4 @@
+#[path="sle_runtime_address.rs"] mod runtime_address;
 #[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;
 #[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }
 // SPDX-License-Identifier: GPL-2.0-only
@@ -25,7 +26,7 @@ type Result<T=()>=std::result::Result<T,Error>;
 mod kernel {pub mod bindings {pub const ECANCELED:u32=125;pub const EACCES:u32=13;pub const EOPNOTSUPP:u32=95;pub const ESTALE:u32=116;#[allow(non_upper_case_globals)] pub static mut jiffies_64:u64=1;}}
 use kernel::bindings;
 fn error_from_errno(value:i32)->i32 {value}
-const ENODEV:i32=-19;const EBUSY:i32=-16;
+const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;
 const EINVAL:i32=-22;const ETIMEDOUT:i32=-110;const EOVERFLOW:i32=-75;
 trait Errno {fn to_errno(self)->i32;}
 impl Errno for i32 {fn to_errno(self)->i32{self}}
@@ -44,7 +45,7 @@ impl Lock {fn lock(&self)->RefMut<'_,Host>{self.0.borrow_mut()}}
 struct BoolLock(RefCell<bool>);
 impl BoolLock {fn lock(&self)->RefMut<'_,bool>{self.0.borrow_mut()}}
 struct Owner {host:Lock,schedule_gate:BoolLock}
-struct Host {connections:sle_connection_operation::Connections,links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,credit_revision:u64,active:Option<InFlight>,reply:Option<()>,
+struct Host {runtime_address:Option<runtime_address::Mutation>,connections:sle_connection_operation::Connections,links:sle_link_observation::LinkObservation,requests:CmdRequestQueue,credits:u8,credit_revision:u64,active:Option<InFlight>,reply:Option<()>,
  fault:Option<Error>,recipe:Option<(RecipeTag,RecipeProgress)>,broadcast_cookie:u64,scan_cookie:u64,
  advertising_set:sle_command_plan::AdvertisingSet,operations:Operations,selected_policy_domains:u8,grants:sle_grant::LeaseAuthority,data_revoked:bool,revoking:bool,next_cookie:u64,revoke_done:u8,revoke_cookies:[u64;2],revoke_deadline:u64,revoke_status:u8,revoke_opcode:u16,revoke_reply:bool}
 impl Host {
@@ -54,7 +55,7 @@ fn candidate(owner:&Owner,gate:&mut sle_management::Management,mode:u32)->Result
  // @@CORE_DECISION@@
  Err(-999) // actual controller preparation/cleanup would follow this point
 }
-fn host()->Host {Host{connections:sle_connection_operation::Connections::new(),links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,credit_revision:0,active:None,reply:None,
+fn host()->Host {Host{runtime_address:None,connections:sle_connection_operation::Connections::new(),links:sle_link_observation::LinkObservation::new(),requests:CmdRequestQueue::new(),credits:1,credit_revision:0,active:None,reply:None,
  fault:None,recipe:None,broadcast_cookie:0,scan_cookie:0,operations:Operations::new(),advertising_set:sle_command_plan::AdvertisingSet::Unknown,
  selected_policy_domains:0,grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,next_cookie:1,revoke_done:0,revoke_cookies:[0;2],revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 struct Caller {file_id:u64}
@@ -381,6 +382,20 @@ fn queued_policy()->Host {
  assert_eq!(h.active.as_ref().unwrap().deadline,1000);assert_eq!(h.credits,0);
  h.operations.initialized=true;assert!(!h.query_policy_untouched());
  h.operations.initialized=false;h.selected_policy_domains=1;assert!(!h.query_policy_untouched());
+}
+
+
+#[test] fn unverified_volatile_address_cannot_fast_release_or_claim_managed(){
+ let mut h=host();h.runtime_address=Some(runtime_address::Mutation::new(7,42,1,1,1,5000,5000,[1;6]).unwrap());
+ let(_,gate,result)=released(h,sle_management::DIAGNOSTIC);
+ assert_eq!(result,Err(EIO));assert_eq!(gate.state,sle_management::REVOKING);
+ let mut h=host();h.runtime_address=Some(runtime_address::Mutation::new(7,42,1,1,1,5000,5000,[1;6]).unwrap());
+ let owner=Owner{host:Lock(RefCell::new(h)),schedule_gate:BoolLock(RefCell::new(false))};
+ let mut gate=sle_management::Management::new();let token=gate.prepare(sle_management::MANAGED).unwrap();
+ assert_eq!(after_copyout_commit(&owner,&mut gate,token),Err(EAGAIN));
+ assert!(!gate.owns(42));
+ // Surrounding production revoke code quarantines the failed decision;this
+ // extraction does not claim callbacks,driver recovery or full VFS execution.
 }
 
 }

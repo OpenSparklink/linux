@@ -73,6 +73,10 @@ struct NativeConnectionRequest { operation: u32, handle: u32, reason: u32, param
 #[repr(C)]
 pub(crate) struct NativeConnectionPlan { pub operation: u32, pub opcode: u16, pub length: u16, pub params: [u8; 32] }
 extern "C" {
+    fn sparklink_native_transport_prepare_runtime_address(transport:*mut c_void,address:*const u8,
+        opcode:*mut u16,params:*mut u8,capacity:usize)->i32;
+    fn sparklink_native_transport_validate_runtime_address(transport:*mut c_void,opcode:u16,
+        params:*const u8,size:usize)->i32;
     fn sparklink_native_transport_prepare_relay(transport:*mut c_void, handle:u16, index:u16,
         payload:*const u8, size:usize, opcode:*mut u16, params:*mut u8, capacity:usize, echo_index:*mut u16)->i32;
     fn sparklink_native_transport_validate_relay(transport:*mut c_void, opcode:u16, params:*const u8, size:usize)->i32;
@@ -147,6 +151,24 @@ impl Drop for NativeCommandTransport {
 
 impl NativeController {
     pub(crate) fn profile(&self) -> u32 { self.metadata.profile }
+    pub(crate) fn prepare_runtime_address(&self,address:&[u8;6])->Result<(u16,[u8;6])> {
+        if !unsafe {sparklink_native_transport_has_command_ticket(self.transport)} {
+            return Err(Error::from_errno(UNSUPPORTED));
+        }
+        let mut opcode=0;let mut params=[0;6];
+        // SAFETY: retained driver,live borrowed input and exact initialized outputs;
+        // preparation is side-effect free. Only the driver's dialect builds bytes.
+        let length=unsafe {sparklink_native_transport_prepare_runtime_address(self.transport,
+            address.as_ptr(),&mut opcode,params.as_mut_ptr(),params.len())};
+        if length<0 {return Err(Error::from_errno(length));}
+        if length!=6 || opcode==0 {return Err(Error::from_errno(PROTOCOL_ERROR));}
+        Self::result(unsafe {sparklink_native_transport_validate_runtime_address(self.transport,
+            opcode,params.as_ptr(),params.len())})?;
+        Ok((opcode,params))
+    }
+    /// Caller holds Runtime state and Host;source is the reserved real readback.
+    /// This copies an observation,not a software-only setter or storage write.
+    pub(crate) fn observe_runtime_address(&mut self,address:[u8;6]) {self.metadata.address=address;}
     pub(crate) fn data_limits(&self) -> (u16, u8) {
         // SAFETY: retained immutable copied driver operations; no I/O.
         if unsafe { sparklink_native_transport_has_acb(self.transport) } {
@@ -173,6 +195,14 @@ impl NativeController {
         out.icb_count = self.metadata.icb_count;
     }
     pub(crate) fn prepare_discovery(&self, request: &SleDiscoverySubmit) -> Result<KBox<NativeDiscoveryPlan>> {
+        // A manager may have observed Setup before a separate exclusive
+        // volatile-address lease. Never configure an old public own address
+        // from that cached snapshot after management is acquired again.
+        if self.metadata.profile==1 && matches!(request.operation,1|5)
+            && request.advertising.own_address_type==0
+            && request.advertising.own_address!=self.metadata.address {
+            return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+        }
         let mut plan = KBox::init(init!(NativeDiscoveryPlan {
             operation: 0, count: 0, power_step: 0,
             // SAFETY: repr(C) integers/bytes accept an all-zero value.
@@ -286,7 +316,13 @@ impl NativeCommandTransport {
         opcode: u16, params: &[u8], recipe: Option<RecipeTag>, connection: Option<u32>, relay:bool) -> Result {
         self.never_submitted.set(true); // validation performs no I/O
         if connection.is_some() && recipe.is_some() || relay && (connection.is_some() || recipe.is_some()) { return Err(EINVAL); }
-        if relay {
+        let runtime_address = { owner.host.lock().runtime_address_command(owner.identity.generation,cookie) };
+        if runtime_address {
+            if relay || connection.is_some() || recipe.is_some()
+                || !unsafe {sparklink_native_transport_has_command_ticket(self.transport)} {return Err(EINVAL);}
+            NativeController::result(unsafe {sparklink_native_transport_validate_runtime_address(
+                self.transport,opcode,params.as_ptr(),params.len())})?;
+        } else if relay {
             // Relay ledger/debt requires the final atomic ticket, never legacy
             // unguarded send even if a provider implements dialect callbacks.
             if !unsafe {sparklink_native_transport_has_command_ticket(self.transport)} {return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));}
@@ -571,6 +607,25 @@ pub(crate) extern "C" fn sparklink_native_health_rust(id: u16, generation: u64) 
     } else {
         1
     }
+}
+
+#[no_mangle]
+pub(crate) unsafe extern "C" fn sparklink_native_current_address_rust(id:u16,generation:u64,address:*mut u8)->i32 {
+    let result=(||->Result {
+        if address.is_null() {return Err(EINVAL);}
+        let owner=super::sle_ingress::ingress_owner(DeviceIdentity{id,generation}).ok_or(ENODEV)?;
+        let guard=owner.state.lock();
+        let state=guard.as_ref().ok_or(ENODEV)?;
+        let host=owner.host.lock();
+        if *owner.schedule_gate.lock() {return Err(ENODEV);}
+        if let Some(error)=host.controller_status().2 {return Err(error);}
+        if !host.address_metadata_valid() {return Err(EAGAIN);}
+        let value=state.controller.info().addr;
+        // SAFETY: internal caller provides six live bytes;copied only on success.
+        unsafe {core::ptr::copy_nonoverlapping(value.as_ptr(),address,6)};
+        Ok(())
+    })();
+    NativeController::result_to_errno(result)
 }
 
 /// Callback receives a complete standard event packet or WS73 HCC slot;

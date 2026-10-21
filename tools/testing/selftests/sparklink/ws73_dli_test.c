@@ -216,6 +216,47 @@ static void init_fake(struct fake *f, enum fault fault, unsigned int owner)
 	};
 }
 
+static void runtime_address_tests(void)
+{
+    unsigned char address[6] = {0xa6, 0x7b, 0x73, 0x10, 0xe0, 1};
+    unsigned char params[8], event[10] = {0xa2, 2, 0, 4, 0, 5, 4, 1, 0, 0};
+    unsigned short opcode;
+    unsigned int i, n;
+
+    CHECK(ws73_dli_validate_command(0x0405, address, 6) == -EOPNOTSUPP);
+    CHECK(ws73_dli_validate_runtime_address(0x0405, address, 6) == 0);
+    CHECK(ws73_dli_validate_runtime_address(0x0408, address, 6) == -EOPNOTSUPP);
+    CHECK(ws73_dli_validate_runtime_address(0x0405, NULL, 6) == -EINVAL);
+    for (n = 0; n <= 8; n++) {
+        if (n != 6)
+            CHECK(ws73_dli_validate_runtime_address(0x0405, address, n) == -EINVAL);
+    }
+    memset(address, 0, sizeof(address));
+    CHECK(ws73_dli_validate_runtime_address(0x0405, address, 6) == -EINVAL);
+    for (i = 0; i < 6; i++) {
+        address[i] = 1;
+        CHECK(ws73_dli_validate_runtime_address(0x0405, address, 6) == 0);
+        address[i] = 0;
+    }
+    memset(params, 0xcc, sizeof(params)); opcode = 0xcccc;
+    CHECK(ws73_dli_prepare_runtime_address(address, &opcode, params, sizeof(params)) == -EINVAL);
+    CHECK(opcode == 0xcccc);
+    for (i = 0; i < sizeof(params); i++) CHECK(params[i] == 0xcc);
+    address[5] = 2;
+    CHECK(ws73_dli_prepare_runtime_address(address, &opcode, params, 5) == -EINVAL);
+    CHECK(opcode == 0xcccc);
+    CHECK(ws73_dli_prepare_runtime_address(address, NULL, params, 8) == -EINVAL);
+    CHECK(ws73_dli_prepare_runtime_address(address, &opcode, NULL, 8) == -EINVAL);
+    CHECK(ws73_dli_prepare_runtime_address(address, &opcode, params, 8) == 6);
+    CHECK(opcode == 0x0405 && !memcmp(params, address, 6));
+    CHECK(params[6] == 0xcc && params[7] == 0xcc);
+    CHECK(ws73_dli_validate_reply(event, 9) == 0);
+    event[3] = 5;
+    CHECK(ws73_dli_validate_reply(event, 10) == -EPROTO);
+    event[8] = 15; /* Actual rejection stays a rejection,not synthetic success. */
+    CHECK(ws73_dli_validate_reply(event, 10) == 0);
+}
+
 static void command_tests(void)
 {
 	unsigned char tx[328], params[255];
@@ -572,6 +613,7 @@ int main(void)
  installation_intent_tests();
 	relay_index_tests();
 	reply_tests();
+	runtime_address_tests();
 	command_tests();
 	query_tests();
 	printf("WS73_NATIVE_DLI_TEST: %s (%u checks, %u failures; synthetic IO only)\n",
