@@ -1665,6 +1665,7 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if !scope.valid() || input.generation == 0 || input.request_id == 0 || input.seq != 0
         || !(1..=sle_mgmt::CMD_TIMEOUT_MS).contains(&input.timeout_ms) || !matches!(input.action, 1 | 2) { return Err(EINVAL); }
     let owner = discovery_owner(context, me)?;
+    if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if input.generation != owner.identity.generation { return Err(ENODEV); }
     if *owner.schedule_gate.lock() { return Err(ENODEV); }
     let management = owner.management.lock();
@@ -1713,6 +1714,7 @@ fn ioctl_link_query_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if input.flags != 0 || input.generation == 0 || (input.seq == 0 && input.request_id == 0) { return Err(EINVAL); }
     let owner = discovery_owner(context, me)?;
+    if owner.protocol_profile != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if input.generation != owner.identity.generation || *owner.schedule_gate.lock() { return Err(ENODEV); }
     let mut guard = context.lock()?;
     let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
