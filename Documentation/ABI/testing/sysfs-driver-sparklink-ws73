@@ -1,3 +1,67 @@
+What:           /sys/bus/usb/devices/.../chip_information
+Date:           October 2026
+Contact:        OpenSparklink <https://github.com/OpenSparklink/linux/issues>
+Description:
+                Read-only WS73 firmware-reported model and bus, obtained with
+                HCC platform GET_CHIP_TYPE (request 16, Complete 10). Example:
+                source=HCC_GET_CHIP_TYPE model=WS73E model_id=2 bus=USB bus_id=0
+
+                SDK model IDs: U=0, S=1, E=2. Unknown models, failed status,
+                invalid lengths and a non-USB bus reject bootstrap. No model
+                is inferred from VID/PID, a physical port, or a firmware name.
+                The original two-second query deadline is not renewed by
+                unrelated input. Each query write receives only its remaining
+                original USB timeout; expiration prevents subsequent writes
+                and notification reads. This query precedes Runtime registration;
+                it does not consume DLI command or controller data credits.
+
+                Reading during a bootstrap/recovery transaction returns
+                EAGAIN. Missing/invalidated controller metadata returns
+                ENODATA. The snapshot is serialized with the per-device phase
+                lock; an earlier generation's observation is not published
+                after invalidation. The attribute does not grant Ready.
+
+                This is a firmware report, not silicon, board calibration or
+                executing-firmware attestation. HCC is unavailable on the
+                two-endpoint ROM download interface. It cannot select the
+                first cold-boot firmware before that firmware runs. Boot
+                deployment must supply explicit matching inputs until a
+                separately verified ROM identification mechanism exists.
+
+What:           /sys/bus/usb/devices/.../sle_address_source
+Date:           October 2026
+Contact:        OpenSparklink <https://github.com/OpenSparklink/linux/issues>
+Description:
+                Read-only bootstrap observation of the SDK SLE address eFuse
+                field, using HCC READ_EFUSE request 11, Complete 5, fixed field
+                ID 125 and fixed six-byte length. No arbitrary field, register,
+                eFuse write, address configuration or flash access is exposed.
+
+                A completed successful read reports:
+                source=HCC_READ_EFUSE id=125 response=1 error=0 status=00000000 length=6 bytes=<12 hex digits>
+
+                Firmware failure retains its status and reported length but
+                withholds the output bytes (bytes=unavailable). An unavailable
+                response reports response=0, error=<negative errno>,
+                status=unknown, length=0 and bytes=unknown. This diagnostic has
+                one original two-second deadline including TX, unrelated RX
+                and notification handling, before Native registration/DLI.
+                Timeout is optional diagnostic unavailability; malformed
+                related replies and transport errors fail bootstrap. It does
+                not consume DLI command or controller data credit.
+
+                Read observations use the same phase lock and metadata
+                publication contract as chip_information: EAGAIN during a
+                transaction, ENODATA without valid current metadata. They are
+                not inherited from an earlier bootstrap/interface generation.
+
+                Zero bytes are observable data, not proof of an assigned or
+                valid identifier. Neither a firmware success status nor this
+                attribute establishes silicon identity, address uniqueness,
+                the firmware's initialization branch or secure attestation.
+                The observation does not change the controller address, grant
+                Ready, or authorize any connection or security operation.
+
 What:           /sys/bus/usb/devices/<interface>/hcc_memory_observation
 Date:           October 2026
 Contact:        OpenSparklink maintainers (https://github.com/OpenSparklink/linux/issues)
