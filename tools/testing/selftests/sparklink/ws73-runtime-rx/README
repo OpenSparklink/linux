@@ -42,3 +42,21 @@ The runtime driver already has one bulk RX URB and one notification interrupt
 URB, started after bootstrap. This test does not add another receiver, alter
 RX size/count or justify a performance change. Actual VM/device regressions,
 hardware failure RCA and nonmanual recovery remain separate requirements.
+
+HCC memory observation query
+----------------------------
+
+`python3 run_ws73_hcc_memory.py` extracts the actual driver query and the USB
+core usb_control_msg_recv body. It checks preconditions, finite fixed read,
+all short replies, an oversized reply, allocation/USB failures and observed
+stop/identity changes without overwriting an output on error. Five compiled
+assertion mutations exercise the verifier. Use --output and --artifacts to
+retain exact C/ELFs/stderr; a compiler/detector/timeout error is not a rejected
+behavioral counterexample. The output is invalidated before execution.
+
+The raw USB, allocation, mutex, access ordering, clock and simulated state
+changes remain single-thread fixtures. This does not establish real sysfs
+permissions, firmware support/counter meaning, callback/ref drain or concurrent
+unbinding. In particular a complete zero word is only a raw response, never
+DLI credit or proof of an empty device memory pool. Those properties require
+separate VM/device evidence on an exact artifact.

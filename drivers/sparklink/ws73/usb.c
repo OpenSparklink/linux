@@ -1453,6 +1453,90 @@ static ssize_t chip_information_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(chip_information);
 
+struct ws73_hcc_memory_observation {
+	u64 generation;
+	u64 start_ns;
+	u64 end_ns;
+	u32 raw_le32;
+	int id;
+};
+
+/* SDK USB class/interface IN request 5 observes a high-priority-memory word.
+ * It is not DLI credit. A complete response alone does not establish the
+ * running firmware's counter semantics, including the meaning of zero.
+ *
+ * Only the explicit root-only attribute below calls this function. The
+ * driver's dev_groups are removed/drained before disconnect drops the probe
+ * reference. phase_lock excludes bootstrap/recovery identity replacement;
+ * asynchronous failure/stop still needs the post-query checks below.
+ */
+static int ws73_hcc_memory_query(struct ws73_usb *ws,
+			       struct ws73_hcc_memory_observation *out)
+{
+	struct ws73_hcc_memory_observation candidate;
+	u8 reply[4];
+	int ret;
+
+	if (!mutex_trylock(&ws->phase_lock))
+		return -EAGAIN;
+	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken)) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (!ws->runtime_transport) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+	if (!smp_load_acquire(&ws->metadata_valid) || ws->native_id < 0 ||
+	    !ws->native_generation ||
+	    !READ_ONCE(ws->streaming)) {
+		ret = -ENODATA;
+		goto unlock;
+	}
+	candidate.id = ws->native_id;
+	candidate.generation = ws->native_generation;
+	candidate.start_ns = ktime_get_ns();
+	/* Probe admits interface 0 only. This fixed request has no caller-chosen
+	 * address, request code or write operation. The USB helper allocates a
+	 * DMA-safe buffer and rejects every non-exact response length.
+	 */
+	ret = usb_control_msg_recv(ws->udev, 0, 5,
+				   USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+				   0, 0, reply, sizeof(reply), 250, GFP_KERNEL);
+	candidate.end_ns = ktime_get_ns();
+	if (ret)
+		goto unlock;
+	if (READ_ONCE(ws->stopping) || READ_ONCE(ws->broken) ||
+	    !READ_ONCE(ws->streaming) || !smp_load_acquire(&ws->metadata_valid) ||
+	    ws->native_id != candidate.id ||
+	    ws->native_generation != candidate.generation) {
+		ret = -ESTALE;
+		goto unlock;
+	}
+	candidate.raw_le32 = get_unaligned_le32(reply);
+	*out = candidate;
+unlock:
+	mutex_unlock(&ws->phase_lock);
+	return ret;
+}
+
+static ssize_t hcc_memory_observation_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	struct ws73_hcc_memory_observation observation;
+	int ret;
+
+	ret = ws73_hcc_memory_query(ws, &observation);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf,
+		"source=SDK_USB_CLASS_5 id=%d generation=%llu raw_le32=%u start_ns=%llu end_ns=%llu semantics_verified=0\n",
+		observation.id, observation.generation, observation.raw_le32,
+		observation.start_ns, observation.end_ns);
+}
+static DEVICE_ATTR(hcc_memory_observation, 0400, hcc_memory_observation_show, NULL);
+
 static ssize_t sle_address_source_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
@@ -1522,6 +1606,7 @@ static struct attribute *ws73_attrs[] = {
 	&dev_attr_native_runtime.attr,
 	&dev_attr_controller_information.attr,
 	&dev_attr_chip_information.attr,
+	&dev_attr_hcc_memory_observation.attr,
 	&dev_attr_sle_address_source.attr,
 	NULL,
 };

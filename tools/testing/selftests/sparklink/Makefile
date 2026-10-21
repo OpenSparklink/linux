@@ -33,6 +33,7 @@ TEST_PROGS += run_retired_transport.py
 TEST_PROGS += run_usb_firmware.py
 TEST_PROGS += run_usb_binding.py
 TEST_PROGS += run_ws73_runtime_rx.py
+TEST_PROGS += run_ws73_hcc_memory.py
 TEST_PROGS += run_standard_provider.py
 TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
