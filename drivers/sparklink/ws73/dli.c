@@ -187,6 +187,12 @@ int ws73_dli_validate_reply(const unsigned char *data, size_t size)
 	if (event == 1 || data[8])
 		return 0;
 	switch (opcode) {
+	case 0x180c: /* Read RSSI: echoed handle LE16 and signed RSSI byte */
+		expected = 3;
+		break;
+	case 0x1805: /* Read PHY: handle LE16 and eight wire fields */
+		expected = 10;
+		break;
 	case 0x0402:
 	case 0x0406:
 		expected = 6;

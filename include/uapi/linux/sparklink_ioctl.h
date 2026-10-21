@@ -451,6 +451,44 @@ struct sle_runtime_address_submit {
 };
 #define SL_IOCTL_RUNTIME_ADDRESS_SUBMIT _IOWR(SL_MAGIC, 0xd7, struct sle_runtime_address_submit)
 
+/* Unpublished version-1 Managed connection observations. profile1 only.
+ * Requires CAP_NET_ADMIN, original File's Managed lease and exact epoch/link.
+ * kind1=RSSI,kind2=PHY;action1=admit,2=cancel same author/payload/id.
+ * timeout_ms1..5000 covers queue+USB+reply;retry never renews it.
+ * Success Status alone is not a measurement;successful Complete must echo
+ * the captured handle. Cancellation/release cannot erase physical debt.
+ * No arbitrary opcode, mutation, new Host or raw Diagnostic takeover.
+ */
+struct sle_link_query_submit {
+    __u32 version, action;
+    __aligned_u64 generation, lease_epoch, request_id, lifetime;
+    __u32 timeout_ms, seq;
+    __u16 handle;
+    __u8 role, address_type, address[6], kind, reserved[5];
+};
+/* Input version1/flags0/generation and seq or original request_id;other
+ * fields output. Same-File nonconsuming history remains readable following
+ * lease release;eviction returns ENOENT,retirement ENODEV. Zero reserved.
+ * state1=pending,2=controller success,3=controller/local error.
+ * flags:1=current link+lease identity NOW (not sample freshness),
+ * 2=value available,4=controller status valid. Local error is negative errno.
+ * data is successful Complete body only:handle LE16 then RSSI signed byte
+ * (127 invalid),or eight PHY wire bytes (SDK dialect interpretation separate).
+ * Observations are neither Ready/security qualification nor RF/peer delivery.
+ */
+struct sle_link_query_result {
+    __u32 version, flags;
+    __aligned_u64 generation, lease_epoch, request_id, lifetime;
+    __u32 seq, state;
+    __s32 error;
+    __u16 handle;
+    __u8 kind, status, role, address_type, address[6];
+    __u16 data_len;
+    __u8 reserved[4], data[10];
+};
+#define SL_IOCTL_LINK_QUERY_SUBMIT _IOWR(SL_MAGIC, 0xd8, struct sle_link_query_submit)
+#define SL_IOCTL_LINK_QUERY_RESULT _IOWR(SL_MAGIC, 0xd9, struct sle_link_query_result)
+
 
 /* Unpublished Native typed connection ABI. File-local nonzero request IDs
  * increase monotonically. Submit has no copyout; retry/query never repeats I/O.

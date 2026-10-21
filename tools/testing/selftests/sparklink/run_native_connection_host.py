@@ -9,7 +9,7 @@ from run_connection_tx import function
 def run(output=None):
     here=Path(__file__).resolve().parent;net=here.parents[3]/'net/sparklink'
     names=['sle_host.rs','sle_command_queue.rs','sle_command_plan.rs','sle_discovery_operation.rs','sle_connection_operation.rs','sle_link_observation.rs','sle_mgmt.rs','sle_dli.rs','sle_workers.rs','sle_grant.rs','sle_native.rs']
-    names += ['sle_security_relay.rs','sle_security_relay_state.rs','sle_ingress.rs','sle_runtime_address.rs']
+    names += ['sle_security_relay.rs','sle_security_relay_state.rs','sle_ingress.rs','sle_runtime_address.rs','sle_link_query.rs']
     inputs={n:(net/n).read_bytes() for n in names}
     source=inputs['sle_host.rs'].decode();source=source[source.index('struct InFlight {'):]
     constructor=function(source,'new_boxed');source=source.replace(constructor,'')

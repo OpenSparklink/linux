@@ -47,5 +47,22 @@ int main(void)
     assert(ws73_connection_disconnect(out,32,7,256)==-EINVAL);
     assert(ws73_connection_validate(3,0x1402,NULL,0)==-EOPNOTSUPP); // cancel not qualified on v111
     assert(ws73_connection_validate(1,0x1401,NULL,27)==-EINVAL);
+    for (unsigned int operation = 4; operation <= 5; operation++) {
+        struct sparklink_connection_request q = {.operation=operation, .handle=0xabcd};
+        assert(ws73_connection_prepare(&q,&plan)==0);
+        assert(plan.operation==operation && plan.opcode==(operation==4?0x180c:0x1805) && plan.length==2);
+        assert(plan.params[0]==0xcd && plan.params[1]==0xab);
+        assert(ws73_connection_validate(operation,plan.opcode,plan.params,2)==0);
+        assert(ws73_connection_validate(operation,plan.opcode,plan.params,1)==-EINVAL);
+        assert(ws73_connection_validate(operation,plan.opcode,plan.params,3)==-EINVAL);
+        assert(ws73_connection_validate(operation,plan.opcode^1,plan.params,2)==-EINVAL);
+        assert(ws73_connection_validate(operation,plan.opcode,NULL,2)==-EINVAL);
+        unchanged=plan;q.reason=1;
+        assert(ws73_connection_prepare(&q,&plan)==-EINVAL && !memcmp(&plan,&unchanged,sizeof(plan)));
+        q.reason=0;q.parameters.frame=1;
+        assert(ws73_connection_prepare(&q,&plan)==-EINVAL && !memcmp(&plan,&unchanged,sizeof(plan)));
+        q.parameters.frame=0;q.handle=65536;
+        assert(ws73_connection_prepare(&q,&plan)==-EINVAL && !memcmp(&plan,&unchanged,sizeof(plan)));
+    }
     puts("WS73_CONNECTION_PRODUCTION_CODEC: PASS; not running kernel or RF");return 0;
 }

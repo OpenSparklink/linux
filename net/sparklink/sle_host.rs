@@ -24,6 +24,7 @@ struct InFlight {
     recipe: Option<RecipeTag>,
     connection: Option<u32>,
     relay: Option<super::sle_security_relay::Command>,
+    query: Option<super::sle_link_query::Scope>,
     connection_reference: Option<super::sle_connection_operation::ExpectedLink>,
     transport_done: bool,
     transport_submitted: bool,
@@ -152,6 +153,26 @@ impl CommandHost {
         }
         // active/reply/credits/deadline remain untouched. Cancelling an on-wire
         // author waits for its real reply or a normal uncertain-outcome fault.
+    }
+
+    pub(crate) fn query_current(&self, scope: super::sle_link_query::Scope) -> bool {
+        scope.valid() && self.admits_data() && self.grants.permits(scope.lease_epoch)
+            && self.link_snapshot().1 && self.links.matches(scope.link.lifetime, scope.link.handle,
+                scope.link.role, scope.link.address_type, scope.link.address)
+    }
+
+    pub(crate) fn enqueue_link_query(&mut self, opcode: u16, params: &[u8], seq: u32,
+        deadline: u64, scope: super::sle_link_query::Scope) -> Result {
+        if !self.query_current(scope) { return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32))); }
+        let cookie = self.next_cookie;
+        let next = cookie.checked_add(1).ok_or(EOVERFLOW)?;
+        self.requests.push_query(opcode, params, seq, cookie, deadline, scope).map_err(Error::from)?;
+        self.next_cookie = next;
+        Ok(())
+    }
+
+    pub(crate) fn link_query_command(&self, cookie: u64) -> Option<super::sle_link_query::Scope> {
+        self.active.as_ref().filter(|a| a.cookie == cookie).and_then(|a| a.query)
     }
 
     pub(crate) fn runtime_address_retry(&self, generation:u64, author:u64,
@@ -346,6 +367,7 @@ impl CommandHost {
         // Actual submit takes this same lock. Already queued URBs retain debt.
         self.grants.revoke();
         self.data_revoked = true;
+        if let Some(active) = self.active.as_mut().filter(|a| a.query.is_some()) { active.withdrawn = true; }
         self.requests.expire_relays(u64::MAX);
         if let Some(relay)=self.active.as_ref().and_then(|a|a.relay.as_ref()) {relay.withdraw();}
         if let Some(cookie) = self.connections.revoke() { self.requests.remove_cookie(cookie); }
@@ -575,6 +597,7 @@ impl CommandHost {
             // Disconnect at the queue front when an exact handle is available.
             if self.revoking && self.requests.first_recipe().is_some() && !self.links_clear_for_management() { return Ok(None); }
             let Some(request) = self.requests.pop() else { return Ok(None) };
+            if request.query.is_some_and(|scope| !self.query_current(scope)) { continue; }
             if let Some(relay)=&request.relay {
                 if self.validate_relay(relay).is_err() || now>=request.deadline {relay.withdraw();continue;}
             }
@@ -659,6 +682,7 @@ impl CommandHost {
             recipe: request.recipe,
             connection: request.connection,
             relay: request.relay.clone(),
+            query: request.query,
             connection_reference: self.connections.reference(request.cookie),
             transport_done: false,
             transport_submitted: false,
@@ -676,6 +700,9 @@ impl CommandHost {
         if let Some(error) = self.fault { return Err(error); }
         let active = self.active.as_ref().filter(|a| a.cookie == cookie && a.opcode == opcode).ok_or(EINVAL)?;
         if let Some(relay)=&active.relay {self.validate_relay(relay)?;}
+        if active.query.is_some_and(|scope| !self.query_current(scope)) {
+            return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));
+        }
         if active.transport_submitted { return Err(Error::from_errno(-(kernel::bindings::EALREADY as i32))); }
         // SAFETY: read-only clock under this owner's IRQ-safe Host lock.
         if unsafe { kernel::bindings::jiffies_64 } >= active.deadline { return Err(ETIMEDOUT); }
@@ -778,6 +805,12 @@ impl CommandHost {
                 *opcode as u16
             }
             SleEvent::NativeCommandReply { opcode, command_credits, status, complete, data } => {
+                if self.active.as_ref().is_some_and(|active| active.opcode == *opcode
+                    && active.query.is_some_and(|scope| !scope.reply_matches(*complete, *status, data.as_slice()))) {
+                    // Foreign/malformed successful query echoes do not release
+                    // the captured slot or replenish command credit.
+                    return Some(event);
+                }
                 if self.active.as_ref().is_some_and(|active| active.opcode == *opcode
                     && active.relay.as_ref().is_some_and(|relay| !relay.reply_matches(*complete, *status, data))) {
                     // A foreign/malformed successful echo cannot release the

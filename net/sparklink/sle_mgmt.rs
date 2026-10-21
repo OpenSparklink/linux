@@ -33,6 +33,8 @@ pub(crate) struct CmdPendingEntry {
     pub(crate) file_id: u64,
     pub(crate) request_id: u64,
     pub(crate) timeout_ms: u32,
+    /// Immutable typed Managed query scope; None for metadata/address work.
+    pub(crate) query: Option<super::sle_link_query::Scope>,
     /// Monotonically increasing sequence number (for dedup).
     pub(crate) seq: u32,
     /// Resolution status.
@@ -64,6 +66,7 @@ impl CmdPendingEntry {
             file_id: 0,
             request_id: 0,
             timeout_ms,
+            query: None,
             seq,
             status: AtomicU32::new(CMD_STATUS_PENDING),
             data: [0u8; CMD_DATA_MAX],
@@ -292,6 +295,24 @@ impl CmdPendingQueue {
         if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.seq == seq) {
             entry.file_id = file_id;
             entry.request_id = request_id;
+        }
+    }
+
+    pub(crate) fn assign_query(&mut self, seq: u32, query: super::sle_link_query::Scope) -> Result {
+        let entry = self.entries.iter_mut().flatten().find(|e| e.seq == seq && e.is_pending()).ok_or(EINVAL)?;
+        if !query.valid() || entry.query.is_some() { return Err(EINVAL); }
+        entry.query = Some(query);
+        Ok(())
+    }
+
+    /// Revoke only the authors. Host retains active physical slots and debt.
+    pub(crate) fn cancel_link_queries(&mut self) {
+        for entry in self.entries.iter_mut().flatten().filter(|e| e.query.is_some() && e.is_pending()) {
+            entry.error = -(kernel::bindings::ECANCELED as i32);
+            entry.data.fill(0); entry.data_len = 0;
+            entry.status.store(CMD_RESOLVED_BIT | 0x200, Ordering::Release);
+            self.pending_count = self.pending_count.saturating_sub(1);
+            self.total_resolved += 1;
         }
     }
 

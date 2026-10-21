@@ -66,6 +66,8 @@ int ws73_connection_validate(unsigned int operation, unsigned int opcode,
 {
     if (size && !p)
         return -EINVAL;
+    if (operation == 4 || operation == 5)
+        return opcode == (operation == 4 ? 0x180c : 0x1805) && size == 2 ? 0 : -EINVAL;
     if (operation == 2)
         return opcode == 0x1403 && size == 3 ? 0 : -EINVAL;
     if (operation != 1)
@@ -104,6 +106,15 @@ int ws73_connection_prepare(const struct sparklink_connection_request *request,
             return -EINVAL;
         candidate.opcode = 0x1403;
         size = ws73_connection_disconnect(candidate.params, sizeof(candidate.params), request->handle, request->reason);
+    } else if (request->operation == 4 || request->operation == 5) {
+        /* Private provider recipe selectors, not public ConnectionSubmit.
+         * No policy mutation; handle bytes are LE16 in this SDK dialect. */
+        if (request->handle > 65535 || request->reason ||
+            memcmp(&request->parameters, &(struct sparklink_connection_parameters){0}, sizeof(request->parameters)))
+            return -EINVAL;
+        candidate.opcode = request->operation == 4 ? 0x180c : 0x1805;
+        put16(candidate.params, request->handle);
+        size = 2;
     } else {
         return -EOPNOTSUPP;
     }

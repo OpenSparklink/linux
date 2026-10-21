@@ -593,6 +593,28 @@ static void relay_index_tests(void)
 	CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, sizeof(normalized)) == 0);
 }
 
+static void connected_query_reply_tests(void)
+{
+	unsigned char wire[20] = {0xa2,2,0,0,0,0,0,1,0};
+	const unsigned int opcodes[2] = {0x180c,0x1805};
+	const unsigned int lengths[2] = {3,10};
+	for (unsigned int i=0;i<2;i++) {
+		unsigned int opcode=opcodes[i], length=lengths[i];
+		put16(wire+5,opcode);put16(wire+3,4+length);wire[8]=0;
+		CHECK(ws73_dli_validate_reply(wire,9+length)==0);
+		put16(wire+3,3+length);
+		CHECK(ws73_dli_validate_reply(wire,8+length)==-EPROTO);
+		put16(wire+3,5+length);
+		CHECK(ws73_dli_validate_reply(wire,10+length)==-EPROTO);
+		wire[8]=0x0c;put16(wire+3,4);
+		CHECK(ws73_dli_validate_reply(wire,9)==0); /* real error, no sample */
+		wire[8]=0;wire[1]=1;
+		CHECK(ws73_dli_validate_reply(wire,9)==0); /* accepted Status, not Complete */
+		wire[1]=2;
+		CHECK(ws73_dli_validate_command(opcode,NULL,0)==-EOPNOTSUPP);
+	}
+}
+
 int main(void)
 {
 	/* SDK ignores SLE RX sub_type; all 16 still pass the full query
@@ -613,6 +635,7 @@ int main(void)
  installation_intent_tests();
 	relay_index_tests();
 	reply_tests();
+	connected_query_reply_tests();
 	runtime_address_tests();
 	command_tests();
 	query_tests();

@@ -26,7 +26,7 @@ def run(output):
         assert len(names)==int(rows[0]),'all successful case identities required'
         executed.append(int(rows[0]));executed_names.append(names);print(text)
     inputs = {name: (net / name).read_bytes() for name in
-              ['sle_mgmt.rs', 'sle_runtime_address.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs', 'sle_security_relay.rs', 'sle_security_relay_state.rs']}
+              ['sle_mgmt.rs', 'sle_runtime_address.rs', 'sle_link_query.rs', 'sle_uapi.rs', 'sparklink_core.rs', 'sle_host.rs', 'sle_command_queue.rs', 'sle_command_plan.rs', 'sle_workers.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs', 'sle_security_relay.rs', 'sle_security_relay_state.rs']}
     uapi = inputs['sle_uapi.rs'].decode()
     declaration = uapi[uapi.index('/// Owner-private bounded diagnostic result;'):
                        uapi.index('unsafe impl FromBytes for SleDiagnosticResult')]
@@ -34,6 +34,8 @@ def run(output):
     handler = function(inputs['sparklink_core.rs'].decode(), 'ioctl_diagnostic_result')
     with tempfile.TemporaryDirectory(prefix='sparklink-diagnostic-result-') as tmp:
         tmp = Path(tmp)
+        for dependency in ["sle_link_query.rs", "sle_connection_operation.rs"]:
+            (tmp / dependency).write_bytes(inputs[dependency])
         (tmp / 'sle_mgmt.rs').write_bytes(inputs['sle_mgmt.rs'] + b'\n' +
                                         (here / 'diagnostic/pending_tests.rs').read_bytes())
         fixture = (here / 'diagnostic/fixture.rs').read_text()
@@ -45,6 +47,8 @@ def run(output):
         execute(tmp/'test')
     with tempfile.TemporaryDirectory(prefix='sparklink-diagnostic-admission-') as tmp:
         tmp = Path(tmp)
+        for dependency in ["sle_link_query.rs", "sle_connection_operation.rs"]:
+            (tmp / dependency).write_bytes(inputs[dependency])
         write_fixture(here.parents[3], tmp)
         for name in ['sle_mgmt.rs', 'sle_command_queue.rs', 'sle_command_plan.rs']:
             (tmp / name).write_bytes(inputs[name])
@@ -66,6 +70,8 @@ def run(output):
         execute(tmp/'test')
     with tempfile.TemporaryDirectory(prefix='sparklink-host-deadline-') as tmp:
         tmp = Path(tmp)
+        for dependency in ["sle_link_query.rs", "sle_connection_operation.rs"]:
+            (tmp / dependency).write_bytes(inputs[dependency])
         write_fixture(here.parents[3], tmp)
         for name in ['sle_runtime_address.rs','sle_command_queue.rs', 'sle_command_plan.rs', 'sle_connection_operation.rs', 'sle_link_observation.rs']:
             (tmp / name).write_bytes(inputs[name])

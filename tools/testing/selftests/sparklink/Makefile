@@ -81,6 +81,8 @@ $(OUTPUT)/sparklink_runtime_address_test: ../../../../net/sparklink/sle_runtime_
 $(OUTPUT)/sparklink_host_plan_test: sparklink_host_plan_test.rs \
 	../../../../net/sparklink/sle_command_plan.rs \
 	../../../../net/sparklink/sle_command_queue.rs \
+	../../../../net/sparklink/sle_link_query.rs \
+	../../../../net/sparklink/sle_connection_operation.rs \
 	../../../../net/sparklink/sle_security_relay.rs \
 	../../../../net/sparklink/sle_security_relay_state.rs \
 	run_host_plan.py security_relay_fixture.py

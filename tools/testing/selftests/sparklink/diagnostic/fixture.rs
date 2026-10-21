@@ -1,3 +1,7 @@
+#[allow(dead_code, reason="Actual query dependency;metadata fixture does not exercise Managed reads")]
+#[path="sle_link_query.rs"] mod sle_link_query;
+#[allow(dead_code, reason="Actual query identity dependency;not live connection acceptance")]
+#[path="sle_connection_operation.rs"] mod sle_connection_operation;
 // SPDX-License-Identifier: GPL-2.0-only
 // Verbatim pending module and ioctl handler; clock, allocation, locks,
 // lease and usercopy dependencies are fixtures, not live VFS qualification.

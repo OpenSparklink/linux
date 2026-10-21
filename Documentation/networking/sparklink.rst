@@ -14,8 +14,10 @@ Ownership and authoritative documents
 The target separates device drivers and per-controller Native Host Runtime
 from userspace policy, SSAP and Profiles. Kernel mechanisms own generation,
 connection lifetime, CMTC/DTAP, bounded credit accounting and channel sockets.
-The userspace SSAP Engine remains work in progress; old in-kernel SSAP service
-logic was removed, not replaced by a qualified userspace Engine.
+The userspace SSAP Engine uses the shared channel path; old in-kernel SSAP
+service logic was removed. Consult the qualification entry for the exact
+implemented, offline-tested and real-device scopes; a source module is not
+a claim of complete SSAP, security or Profile qualification.
 
 The following user repository documents are the single authoritative entries:
 
@@ -31,6 +33,32 @@ ControllerEvent queries. Channel sockets provide the current basic business
 data path. Snoop is an independent privileged observation path. Legacy read(2)
 event delivery, EVENT_COUNT/EVENT_STATS and raw DLI polling were removed.
 Do not infer support from remaining legacy ioctl or Generic Netlink declarations.
+
+Managed connection observations
+===============================
+
+The unpublished LINK_QUERY_SUBMIT/RESULT operations provide typed ReadRSSI and
+ReadPHY for Native profile 1. The original File must hold the Managed lease;
+submission captures its epoch and full connection lifetime, handle, role and
+peer identity. Both operations require CAP_NET_ADMIN. Results are nonconsuming
+author history and remain readable after lease release on the same live Runtime.
+They cannot be obtained through a second Diagnostic lease or raw opcode path.
+
+Queue selection and the final atomic USB command ticket recheck the captured
+identity, lease and original deadline. Successful Status is acceptance only.
+A successful Complete must contain the full reply and matching handle. Release
+cancels pending authors without erasing the retained physical reply slot or
+returning uncertain credit. The existing command ledger and bounded queue own
+all results, not a new connection procedure or Host.
+
+Result flags distinguish current identity at the locked snapshot, available
+value, and genuine controller status. Current identity is not sample freshness
+or permission to submit later. RSSI 127 is invalid. PHY carries eight wire fields;
+SDK dialect interpretation, actual firmware acceptance and RF behavior need
+separate evidence. Command completion is not peer application delivery.
+The wire reply has no generation/lifetime token: correct controller reply
+ordering and the existing quarantine/reinitialization barriers remain explicit
+hardware assumptions, not proven by handle equality or pure-source tests.
 
 The basic channel capability exchange keeps the SDU MTU and the complete DTAP
 PDU MPS separate. The current Native implementation advertises MTU 2042 and

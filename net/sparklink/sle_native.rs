@@ -258,6 +258,22 @@ impl NativeController {
         Ok((opcode,params,size as usize,echo_index))
     }
 
+    pub(crate) fn prepare_link_query(&self, scope: super::sle_link_query::Scope) -> Result<NativeConnectionPlan> {
+        if !scope.valid() { return Err(EINVAL); }
+        let operation = scope.kind.provider_operation();
+        let input = NativeConnectionRequest { operation, handle: u32::from(scope.link.handle), reason: 0,
+            // SAFETY: integer/byte-only parameters; query recipes require zero.
+            parameters: unsafe { core::mem::zeroed() } };
+        let mut plan = NativeConnectionPlan { operation: 0, opcode: 0, length: 0, params: [0;32] };
+        // SAFETY: retained provider, synchronous side-effect-free preparation;
+        // the private recipe tag is not the public connection procedure ABI.
+        Self::result(unsafe { sparklink_native_transport_prepare_connection(self.transport, &input, &mut plan) })?;
+        if plan.operation != operation || plan.opcode == 0 || plan.length as usize > plan.params.len() { return Err(EINVAL); }
+        Self::result(unsafe { sparklink_native_transport_validate_connection(self.transport,
+            operation, plan.opcode, plan.params.as_ptr(), plan.length as usize) })?;
+        Ok(plan)
+    }
+
     pub(crate) fn validate_command(&self, opcode: u16, params: &[u8]) -> Result {
         // SAFETY: this Backend retains the driver/context. Validation neither
         // performs I/O nor changes transaction/credit state; the driver owns
@@ -317,7 +333,17 @@ impl NativeCommandTransport {
         self.never_submitted.set(true); // validation performs no I/O
         if connection.is_some() && recipe.is_some() || relay && (connection.is_some() || recipe.is_some()) { return Err(EINVAL); }
         let runtime_address = { owner.host.lock().runtime_address_command(owner.identity.generation,cookie) };
-        if runtime_address {
+        let query = { owner.host.lock().link_query_command(cookie) };
+        if let Some(scope) = query {
+            if runtime_address || relay || connection.is_some() || recipe.is_some() { return Err(EINVAL); }
+            if !unsafe { sparklink_native_transport_has_command_ticket(self.transport) } {
+                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+            }
+            // Final identity/lease/deadline validation occurs under the existing
+            // Host -> scheduling-gate atomic submission ticket, not here alone.
+            NativeController::result(unsafe { sparklink_native_transport_validate_connection(self.transport,
+                scope.kind.provider_operation(), opcode, params.as_ptr(), params.len()) })?;
+        } else if runtime_address {
             if relay || connection.is_some() || recipe.is_some()
                 || !unsafe {sparklink_native_transport_has_command_ticket(self.transport)} {return Err(EINVAL);}
             NativeController::result(unsafe {sparklink_native_transport_validate_runtime_address(
