@@ -597,7 +597,7 @@ static void managed_link_reply_tests(void)
 {
 	unsigned char wire[20] = {0xa2,2,0,0,0,0,0,1,0};
 	const unsigned int opcodes[3] = {0x180c,0x1805,0x1804};
-	const unsigned int lengths[3] = {3,10,0};
+	const unsigned int lengths[3] = {3,10,2};
 	for (unsigned int i=0;i<3;i++) {
 		unsigned int opcode=opcodes[i], length=lengths[i];
 		put16(wire+5,opcode);put16(wire+3,4+length);wire[8]=0;

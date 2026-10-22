@@ -86,12 +86,12 @@ fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants
  let r=h.next(|_|true).unwrap().unwrap();h.command_committed(r.cookie);
  assert!(h.receive(status(0x1804,0)).is_some());assert!(h.reply.is_none());assert!(h.active.is_some());
  h.cancel_diagnostic(91);assert_eq!(h.next_deadline(),Some(100));
- assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x1804,command_credits:1,status:0,complete:true,data:vec![]}).is_none());
+ assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x1804,command_credits:1,status:0,complete:true,data:vec![7,0]}).is_none());
  assert!(h.take_reply().is_none());assert!(h.active.is_some());
  assert!(h.transport_complete(r.cookie));let reply=h.take_reply().unwrap();
  assert_eq!(reply.seq,91);
- assert!(matches!(reply.event,SleEvent::NativeCommandReply{opcode:0x1804,status:0,complete:true,ref data,..} if data.is_empty()));
- assert!(!scope.value_available(&[]));assert_eq!(scope.argument,1526);assert!(h.active.is_none());
+ assert!(matches!(reply.event,SleEvent::NativeCommandReply{opcode:0x1804,status:0,complete:true,ref data,..} if data == &[7,0]));
+ assert!(!scope.value_available(&[7,0]));assert_eq!(scope.argument,1526);assert!(h.active.is_none());
 }
 #[test] fn query_requires_exact_link_epoch_at_admission_and_selection() {
  clock(1);let mut h=query_host();let scope=query_scope();
@@ -102,6 +102,19 @@ fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants
  h.enqueue_link_command(0x180c,&[7,0],91,100,scope).unwrap();down(&mut h);up(&mut h,[1;6]);
  assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.credits,1);
  assert!(!h.link_command_current(scope)); // same handle/address, new lifetime
+}
+#[test] fn payload_complete_refuses_empty_wrong_handle_and_trailing_bytes() {
+ for data in [vec![],vec![7],vec![8,0],vec![7,0,0]] {
+  clock(1);let mut h=query_host();
+  let scope=sle_link_command::Scope{kind:sle_link_command::Kind::PayloadPreference,argument:1526,..query_scope()};
+  h.enqueue_link_command(0x1804,&[7,0,0xf6,5],91,100,scope).unwrap();
+  let r=h.next(|_|true).unwrap().unwrap();h.command_committed(r.cookie);h.transport_complete(r.cookie);
+  assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x1804,command_credits:1,status:0,complete:true,data}).is_some());
+  // Host refuses a foreign echo without erasing the real physical slot;
+  // malformed lengths are additionally rejected by the earlier C decoder.
+  assert!(h.take_reply().is_none());assert!(h.active.is_some());
+  assert_eq!(h.credits,0);assert_eq!(h.next_deadline(),Some(100));
+ }
 }
 #[test] fn query_last_commit_rechecks_down_reuse_and_revoke_without_erasing_wire_slot() {
  for revoke in [true,false] {

@@ -212,8 +212,10 @@ int ws73_dli_validate_reply(const unsigned char *data, size_t size)
 	case 0x1001:
 	case 0x1002:
 	case 0x0405: /* SDK110 volatile address setter: status only */
-	case 0x1804: /* SDK110 link payload preference: status, not effective MTU */
 		expected = 0;
+		break;
+	case 0x1804: /* SDK110 E success echoes handle LE16, not effective MTU */
+		expected = 2;
 		break;
 	case 0x1812:
 		/* SDK111 real capture: success echoes handle LE16 and SMP index

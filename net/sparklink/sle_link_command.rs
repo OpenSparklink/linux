@@ -17,7 +17,7 @@ impl Kind {
         match self { Self::Rssi => 4, Self::Phy => 5, Self::PayloadPreference => 6 }
     }
     pub(crate) fn reply_len(self) -> usize {
-        match self { Self::Rssi => 3, Self::Phy => 10, Self::PayloadPreference => 0 }
+        match self { Self::Rssi => 3, Self::Phy => 10, Self::PayloadPreference => 2 }
     }
 }
 
@@ -44,10 +44,8 @@ impl Scope {
     pub(crate) fn reply_matches(self, complete: bool, status: u8, data: &[u8]) -> bool {
         if !self.valid() { return false; }
         if !complete || status != 0 { return true; }
-        // SDK110 status-only completion. There is no echoed handle/value or
-        // generation on wire; Host matches the retained physical command.
-        // Acknowledgment does not publish an effective payload/MTU change.
-        if self.kind == Kind::PayloadPreference { return data.is_empty(); }
+        // SDK110 E Complete echoes handle LE16, not the requested octets or
+        // generation. This is not an effective payload/MTU observation.
         data.len() == self.kind.reply_len()
             && u16::from_le_bytes([data[0], data[1]]) == self.link.handle
     }
@@ -98,9 +96,11 @@ mod tests {
         assert!(!base.valid());
         for n in 1..=u16::MAX {
             let s = Scope { argument: n, ..base };
-            assert!(s.valid()); assert!(s.reply_matches(true, 0, &[]));
-            assert!(!s.value_available(&[]));
-            assert!(!s.reply_matches(true, 0, &[0x34,0x12]));
+            assert!(s.valid()); assert!(s.reply_matches(true, 0, &[0x34,0x12]));
+            assert!(!s.value_available(&[0x34,0x12]));
+            for data in [&[][..], &[0x34][..], &[0x35,0x12][..], &[0x34,0x12,0][..]] {
+                assert!(!s.reply_matches(true, 0, data));
+            }
             assert!(!Scope { kind: Kind::Rssi, ..s }.valid());
             assert_eq!(s.kind.provider_operation(), 6);
         }
