@@ -593,12 +593,12 @@ static void relay_index_tests(void)
 	CHECK(ws73_dli_relay_normalize_rx(wire, 11, normalized, sizeof(normalized)) == 0);
 }
 
-static void connected_query_reply_tests(void)
+static void managed_link_reply_tests(void)
 {
 	unsigned char wire[20] = {0xa2,2,0,0,0,0,0,1,0};
-	const unsigned int opcodes[2] = {0x180c,0x1805};
-	const unsigned int lengths[2] = {3,10};
-	for (unsigned int i=0;i<2;i++) {
+	const unsigned int opcodes[3] = {0x180c,0x1805,0x1804};
+	const unsigned int lengths[3] = {3,10,0};
+	for (unsigned int i=0;i<3;i++) {
 		unsigned int opcode=opcodes[i], length=lengths[i];
 		put16(wire+5,opcode);put16(wire+3,4+length);wire[8]=0;
 		CHECK(ws73_dli_validate_reply(wire,9+length)==0);
@@ -635,7 +635,7 @@ int main(void)
  installation_intent_tests();
 	relay_index_tests();
 	reply_tests();
-	connected_query_reply_tests();
+	managed_link_reply_tests();
 	runtime_address_tests();
 	command_tests();
 	query_tests();
