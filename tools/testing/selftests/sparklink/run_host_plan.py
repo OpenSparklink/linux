@@ -16,7 +16,7 @@ def run(binary=None, output=None):
     here = Path(__file__).resolve().parent
     root = here.parents[3]
     names = ['sle_command_plan.rs', 'sle_command_queue.rs',
-             'sle_security_relay.rs', 'sle_security_relay_state.rs', 'sle_link_query.rs', 'sle_connection_operation.rs']
+             'sle_security_relay.rs', 'sle_security_relay_state.rs', 'sle_link_command.rs', 'sle_connection_operation.rs']
     sources = {n: (root / 'net/sparklink' / n).read_bytes() for n in names}
     with tempfile.TemporaryDirectory(prefix='sparklink-host-plan-') as directory:
         tmp = Path(directory)
@@ -28,7 +28,7 @@ def run(binary=None, output=None):
         # Partial-source fixture only: unrelated relay methods are covered by
         # the production Host/relay runners, not the recipe tests below.
         source = source.replace('mod sle_command_queue;', '#[allow(dead_code)] mod sle_command_queue;')
-        prefix = ('#[allow(dead_code)] #[path="sle_link_query.rs"] mod sle_link_query;\n'
+        prefix = ('#[allow(dead_code)] #[path="sle_link_command.rs"] mod sle_link_command;\n'
                   '#[allow(dead_code)] #[path="sle_connection_operation.rs"] mod sle_connection_operation;\n'
                   '#[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;\n'
                   '#[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }\n')

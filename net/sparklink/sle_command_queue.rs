@@ -13,7 +13,7 @@ pub(crate) struct CmdRequest {
     pub(crate) recipe: Option<RecipeTag>,
     pub(crate) connection: Option<u32>,
     pub(crate) relay: Option<super::sle_security_relay::Command>,
-    pub(crate) query: Option<super::sle_link_query::Scope>,
+    pub(crate) link_command: Option<super::sle_link_command::Scope>,
     pub(crate) deadline: u64,
     pub(crate) opcode: u16,
     pub(crate) params: [u8; RECIPE_PARAMS_MAX],
@@ -80,7 +80,7 @@ impl CmdRequestQueue {
             recipe,
             connection: None,
             relay: None,
-            query: None,
+            link_command: None,
             deadline,
             opcode,
             params: [0; RECIPE_PARAMS_MAX],
@@ -93,12 +93,12 @@ impl CmdRequestQueue {
         Ok(())
     }
 
-    pub(crate) fn push_query(&mut self, opcode: u16, params: &[u8], seq: u32, cookie: u64,
-        deadline: u64, query: super::sle_link_query::Scope) -> Result<(), QueueError> {
+    pub(crate) fn push_link_command(&mut self, opcode: u16, params: &[u8], seq: u32, cookie: u64,
+        deadline: u64, query: super::sle_link_command::Scope) -> Result<(), QueueError> {
         if seq == 0 || cookie == 0 || !query.valid() { return Err(QueueError::Invalid); }
         self.push_tagged(opcode, params, seq, cookie, None, deadline)?;
         let index = (self.tail + CMD_REQ_QUEUE_DEPTH - 1) % CMD_REQ_QUEUE_DEPTH;
-        if let Some(request) = self.entries[index].as_mut() { request.query = Some(query); }
+        if let Some(request) = self.entries[index].as_mut() { request.link_command = Some(query); }
         Ok(())
     }
 

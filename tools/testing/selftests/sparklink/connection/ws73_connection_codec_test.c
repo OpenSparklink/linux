@@ -64,5 +64,24 @@ int main(void)
         q.parameters.frame=0;q.handle=65536;
         assert(ws73_connection_prepare(&q,&plan)==-EINVAL && !memcmp(&plan,&unchanged,sizeof(plan)));
     }
+    const unsigned int octets[] = {1,254,1526,65535};
+    for (unsigned int n=0;n<4;n++) {
+        struct sparklink_connection_request q = {.operation=6,.handle=0xabcd,.payload_octets=octets[n]};
+        assert(ws73_connection_prepare(&q,&plan)==0);
+        assert(plan.operation==6 && plan.opcode==0x1804 && plan.length==4);
+        assert(plan.params[0]==0xcd && plan.params[1]==0xab);
+        assert(plan.params[2]==(octets[n]&255) && plan.params[3]==(octets[n]>>8));
+        for (unsigned int size=0;size<=32;size++)
+            assert(ws73_connection_validate(6,0x1804,plan.params,size)==(size==4?0:-EINVAL));
+        assert(ws73_connection_validate(6,0x1804,NULL,4)==-EINVAL);
+        assert(ws73_connection_validate(6,0x1805,plan.params,4)==-EINVAL);
+        unchanged=plan;
+        for (unsigned int bad=0;bad<6;bad++) {
+            struct sparklink_connection_request r=q;
+            switch(bad) { case 0:r.payload_octets=0;break;case 1:r.payload_octets=65536;break;
+            case 2:r.reason=1;break;case 3:r.parameters.frame=1;break;case 4:r.handle=65536;break;default:r.operation=4; }
+            assert(ws73_connection_prepare(&r,&plan)==-EINVAL && !memcmp(&plan,&unchanged,sizeof(plan)));
+        }
+    }
     puts("WS73_CONNECTION_PRODUCTION_CODEC: PASS; not running kernel or RF");return 0;
 }

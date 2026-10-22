@@ -1,5 +1,5 @@
 #[allow(dead_code, reason="Actual query dependency;release fixture does not exercise read observations")]
-#[path="sle_link_query.rs"] mod sle_link_query;
+#[path="sle_link_command.rs"] mod sle_link_command;
 #[path="sle_runtime_address.rs"] mod runtime_address;
 #[allow(dead_code)] #[path="sle_security_relay_state.rs"] mod sle_security_relay_state;
 #[allow(dead_code)] mod sle_security_relay { include!("relay_owner_fixture.rs"); }
@@ -99,7 +99,7 @@ fn after_copyout_commit(owner:&Owner,gate:&mut sle_management::Management,token:
   else {assert_eq!(result,Err(-16));assert!(h.revoking);assert_eq!(h.selected_policy_domains,3);assert_eq!(gate.state,sle_management::FREE);}
  }
 }
-fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,deadline:1000,recipe:None,connection:None,relay:None,query:None,connection_reference:None,transport_done:false,transport_submitted:false,withdrawn:false,credit_revision:0,advertising_params:None,advertising_was_absent:false}}
+fn active()->InFlight {InFlight{opcode:0x0406,seq:1,cookie:1,deadline:1000,recipe:None,connection:None,relay:None,link_command:None,connection_reference:None,transport_done:false,transport_submitted:false,withdrawn:false,credit_revision:0,advertising_params:None,advertising_was_absent:false}}
 fn recipe()->(RecipeTag,RecipeProgress) {(RecipeTag{cookie:1,step:0,count:2,intent:DiscoveryIntent::AdvertisingStandby,recreate:false},RecipeProgress::new(2).unwrap())}
 fn operation()->Operation {Operation{request_id:1,cookie:1,
  intent:sle_command_plan::DiscoveryIntent::AdvertisingStandby,state:State::Cancelled,

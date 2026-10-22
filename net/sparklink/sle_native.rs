@@ -69,7 +69,7 @@ pub(crate) struct NativeDiscoveryPlan {
 const _: () = assert!(core::mem::size_of::<NativeDiscoveryPlan>() == 1052);
 
 #[repr(C)]
-struct NativeConnectionRequest { operation: u32, handle: u32, reason: u32, parameters: SleConnectionParameters }
+struct NativeConnectionRequest { operation: u32, handle: u32, reason: u32, payload_octets: u32, parameters: SleConnectionParameters }
 #[repr(C)]
 pub(crate) struct NativeConnectionPlan { pub operation: u32, pub opcode: u16, pub length: u16, pub params: [u8; 32] }
 extern "C" {
@@ -235,7 +235,7 @@ impl NativeController {
 
     pub(crate) fn prepare_connection(&self, request: &SleConnectionSubmit) -> Result<NativeConnectionPlan> {
         let input = NativeConnectionRequest { operation: request.operation, handle: request.handle,
-            reason: request.reason, parameters: request.parameters };
+            reason: request.reason, payload_octets: 0, parameters: request.parameters };
         let mut plan = NativeConnectionPlan { operation: 0, opcode: 0, length: 0, params: [0; 32] };
         // SAFETY: retained transport; disjoint immutable input/output live for
         // this side-effect-free call; no pointer is retained by the driver.
@@ -258,10 +258,11 @@ impl NativeController {
         Ok((opcode,params,size as usize,echo_index))
     }
 
-    pub(crate) fn prepare_link_query(&self, scope: super::sle_link_query::Scope) -> Result<NativeConnectionPlan> {
+    pub(crate) fn prepare_link_command(&self, scope: super::sle_link_command::Scope) -> Result<NativeConnectionPlan> {
         if !scope.valid() { return Err(EINVAL); }
         let operation = scope.kind.provider_operation();
         let input = NativeConnectionRequest { operation, handle: u32::from(scope.link.handle), reason: 0,
+            payload_octets: u32::from(scope.argument),
             // SAFETY: integer/byte-only parameters; query recipes require zero.
             parameters: unsafe { core::mem::zeroed() } };
         let mut plan = NativeConnectionPlan { operation: 0, opcode: 0, length: 0, params: [0;32] };
@@ -333,7 +334,7 @@ impl NativeCommandTransport {
         self.never_submitted.set(true); // validation performs no I/O
         if connection.is_some() && recipe.is_some() || relay && (connection.is_some() || recipe.is_some()) { return Err(EINVAL); }
         let runtime_address = { owner.host.lock().runtime_address_command(owner.identity.generation,cookie) };
-        let query = { owner.host.lock().link_query_command(cookie) };
+        let query = { owner.host.lock().link_command_scope(cookie) };
         if let Some(scope) = query {
             if runtime_address || relay || connection.is_some() || recipe.is_some() { return Err(EINVAL); }
             if !unsafe { sparklink_native_transport_has_command_ticket(self.transport) } {

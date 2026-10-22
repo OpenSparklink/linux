@@ -68,6 +68,8 @@ int ws73_connection_validate(unsigned int operation, unsigned int opcode,
         return -EINVAL;
     if (operation == 4 || operation == 5)
         return opcode == (operation == 4 ? 0x180c : 0x1805) && size == 2 ? 0 : -EINVAL;
+    if (operation == 6)
+        return opcode == 0x1804 && size == 4 && conn_get16(p + 2) ? 0 : -EINVAL;
     if (operation == 2)
         return opcode == 0x1403 && size == 3 ? 0 : -EINVAL;
     if (operation != 1)
@@ -95,6 +97,8 @@ int ws73_connection_prepare(const struct sparklink_connection_request *request,
 
     if (!request || !out)
         return -EINVAL;
+    if (request->operation != 6 && request->payload_octets)
+        return -EINVAL;
     candidate.operation = request->operation;
     if (request->operation == 1) {
         if (request->handle || request->reason)
@@ -106,15 +110,22 @@ int ws73_connection_prepare(const struct sparklink_connection_request *request,
             return -EINVAL;
         candidate.opcode = 0x1403;
         size = ws73_connection_disconnect(candidate.params, sizeof(candidate.params), request->handle, request->reason);
-    } else if (request->operation == 4 || request->operation == 5) {
-        /* Private provider recipe selectors, not public ConnectionSubmit.
-         * No policy mutation; handle bytes are LE16 in this SDK dialect. */
+    } else if (request->operation == 4 || request->operation == 5 || request->operation == 6) {
+        /* Private typed recipes, not public ConnectionSubmit. Preferences
+         * do not modify Host MTU/credit or imply the link budget took effect. */
         if (request->handle > 65535 || request->reason ||
             memcmp(&request->parameters, &(struct sparklink_connection_parameters){0}, sizeof(request->parameters)))
+            return -EINVAL;
+        if (request->operation == 6 && (!request->payload_octets || request->payload_octets > 65535))
             return -EINVAL;
         candidate.opcode = request->operation == 4 ? 0x180c : 0x1805;
         put16(candidate.params, request->handle);
         size = 2;
+        if (request->operation == 6) {
+            candidate.opcode = 0x1804;
+            put16(candidate.params + 2, request->payload_octets);
+            size = 4;
+        }
     } else {
         return -EOPNOTSUPP;
     }

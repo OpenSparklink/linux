@@ -107,7 +107,7 @@ def assess(console, code, radio=False, production_policy=False, kernel_authoriza
     if kernel_authorization:
         matrix = re.findall(r'^KERNEL_AUTHORIZATION: (.*)$', console, re.M)
         protected_count, observe_count = kernel_authorization_counts()
-        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected={protected_count} denied={protected_count} observe={observe_count} retired_enotty=101 configfs_absent=5 genl_denied=5 unknown=ENOTTY'
+        expected = [f'uid={uid} gid={gid} caps=0 inherited_fd=1 protected={protected_count} denied={protected_count} observe={observe_count} retired_enotty=103 configfs_absent=5 genl_denied=5 unknown=ENOTTY'
                     for uid, gid in [(1001,1001), (1000,1002), (0,0)]]
         if matrix != expected or re.findall(r'^KERNEL_AUTHORIZATION_STATE: (.*)$', console, re.M) != ['unchanged=1 native_admission=0 retired_mutations_absent=1']:
             errors.append('kernel authorization matrix missing, duplicated or incomplete')

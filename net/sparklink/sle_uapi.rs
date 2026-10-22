@@ -546,32 +546,32 @@ pub(crate) const SL_IOCTL_RUNTIME_ADDRESS_SUBMIT:u32=_IOWR::<SleRuntimeAddressSu
 
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
-pub(crate) struct SleLinkQuerySubmit {
+pub(crate) struct SleLinkCommandSubmit {
     pub version: u32, pub action: u32,
     pub generation: u64, pub lease_epoch: u64, pub request_id: u64, pub lifetime: u64,
     pub deadline_monotonic_ns: u64,
     pub timeout_ms: u32, pub seq: u32,
-    pub handle: u16, pub role: u8, pub address_type: u8, pub address: [u8;6], pub kind: u8, pub reserved: [u8;5],
+    pub handle: u16, pub role: u8, pub address_type: u8, pub address: [u8;6], pub kind: u8, pub reserved: u8, pub argument: u16, pub reserved_tail: u16,
 }
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
-pub(crate) struct SleLinkQueryResult {
+pub(crate) struct SleLinkCommandResult {
     pub version: u32, pub flags: u32,
     pub generation: u64, pub lease_epoch: u64, pub request_id: u64, pub lifetime: u64,
     pub deadline_monotonic_ns: u64,
     pub seq: u32, pub state: u32, pub error: i32,
     pub handle: u16, pub kind: u8, pub status: u8, pub role: u8, pub address_type: u8, pub address: [u8;6],
-    pub data_len: u16, pub reserved: [u8;4], pub data: [u8;10],
+    pub data_len: u16, pub argument: u16, pub reserved: [u8;2], pub data: [u8;10],
 }
 // SAFETY: integer/byte-only repr(C); alignment/padding explicitly represented.
-unsafe impl FromBytes for SleLinkQuerySubmit {}
-unsafe impl FromBytes for SleLinkQueryResult {}
-impl_check_reserved!(SleLinkQuerySubmit, [reserved]);
-impl_check_reserved!(SleLinkQueryResult, [reserved]);
-const _: () = assert!(core::mem::size_of::<SleLinkQuerySubmit>() == 72);
-const _: () = assert!(core::mem::size_of::<SleLinkQueryResult>() == 88);
-pub(crate) const SL_IOCTL_LINK_QUERY_SUBMIT: u32 = _IOWR::<SleLinkQuerySubmit>(SL_MAGIC,0xd8);
-pub(crate) const SL_IOCTL_LINK_QUERY_RESULT: u32 = _IOWR::<SleLinkQueryResult>(SL_MAGIC,0xd9);
+unsafe impl FromBytes for SleLinkCommandSubmit {}
+unsafe impl FromBytes for SleLinkCommandResult {}
+impl_check_reserved!(SleLinkCommandSubmit, [reserved, reserved_tail]);
+impl_check_reserved!(SleLinkCommandResult, [reserved]);
+const _: () = assert!(core::mem::size_of::<SleLinkCommandSubmit>() == 72);
+const _: () = assert!(core::mem::size_of::<SleLinkCommandResult>() == 88);
+pub(crate) const SL_IOCTL_LINK_COMMAND_SUBMIT: u32 = _IOWR::<SleLinkCommandSubmit>(SL_MAGIC,0xda);
+pub(crate) const SL_IOCTL_LINK_COMMAND_RESULT: u32 = _IOWR::<SleLinkCommandResult>(SL_MAGIC,0xdb);
 
 pub(crate) const SL_IOCTL_CONNECTION_SUBMIT: u32 = _IOW::<SleConnectionSubmit>(SL_MAGIC, 0x9c);
 pub(crate) const SL_IOCTL_CONNECTION_RESULT: u32 = _IOWR::<SleConnectionResult>(SL_MAGIC, 0x9d);

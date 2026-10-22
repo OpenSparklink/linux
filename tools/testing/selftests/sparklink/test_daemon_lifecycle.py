@@ -183,7 +183,7 @@ class KernelAuthorizationVerdict(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.protected_count, cls.observe_count = kernel_authorization_counts()
-        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected={cls.protected_count} denied={cls.protected_count} observe={cls.observe_count} retired_enotty=101 configfs_absent=5 genl_denied=5 unknown=ENOTTY\n'
+        cls.matrix = ''.join(f'KERNEL_AUTHORIZATION: uid={uid} gid={gid} caps=0 inherited_fd=1 protected={cls.protected_count} denied={cls.protected_count} observe={cls.observe_count} retired_enotty=103 configfs_absent=5 genl_denied=5 unknown=ENOTTY\n'
                              for uid,gid in [(1001,1001),(1000,1002),(0,0)])
         cls.state = 'KERNEL_AUTHORIZATION_STATE: unchanged=1 native_admission=0 retired_mutations_absent=1\n'
         cls.good = GOOD + cls.matrix + cls.state
@@ -202,8 +202,8 @@ class KernelAuthorizationVerdict(unittest.TestCase):
         self.assertTrue(assess(stale, 0, kernel_authorization=True))
 
     def test_missing_fd_inheritance(self): self.assertTrue(assess(self.good.replace('inherited_fd=1','inherited_fd=0',1),0,kernel_authorization=True))
-    def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('retired_enotty=101 configfs_absent=5','retired_enotty=101 configfs_absent=4',1),0,kernel_authorization=True))
-    def test_retired_commands_missing(self): self.assertTrue(assess(self.good.replace('retired_enotty=101','retired_enotty=100',1),0,kernel_authorization=True))
+    def test_configfs_bypass(self): self.assertTrue(assess(self.good.replace('retired_enotty=103 configfs_absent=5','retired_enotty=103 configfs_absent=4',1),0,kernel_authorization=True))
+    def test_retired_commands_missing(self): self.assertTrue(assess(self.good.replace('retired_enotty=103','retired_enotty=102',1),0,kernel_authorization=True))
     def test_genl_bypass(self): self.assertTrue(assess(self.good.replace('genl_denied=5','genl_denied=4',1),0,kernel_authorization=True))
     def test_changed_state(self): self.assertTrue(assess(self.good.replace('unchanged=1','unchanged=0'),0,kernel_authorization=True))
     def test_observer_changed_power(self): self.assertTrue(assess(self.good.replace('retired_mutations_absent=1','retired_mutations_absent=0'),0,kernel_authorization=True))

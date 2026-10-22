@@ -11,16 +11,16 @@ The Rust source is compiled with -D warnings. C boundaries require
 ASan/UBSan/LeakSanitizer; a restricted ptrace environment may prevent LSan
 execution and must be corrected, not recorded as a passing/skipped gate.
 
-Optional query-recipe CBMC check (no device access):
+Optional typed link-recipe CBMC check (no device access):
 
   python3 tools/testing/selftests/sparklink/run_link_query_cbmc.py --output NEW_DIRECTORY
 
 This compiles the actual production connection.c separately from
-connection/link_query_cbmc.c, checking private query selectors4/5, arbitrary
+connection/link_query_cbmc.c, checking private typed link selectors4/5/6, arbitrary
 32-bit request fields, 64-bit lengths, valid objects/NULL, output guards,
 failure atomicity, exact LE16 and recipe/validator agreement. Unwind64 has
-unwinding assertions. The runner requires all ten named properties and all
-generated safety properties, and two deliberately wrong private source copies
+unwinding assertions. The runner requires all eleven named properties and all
+generated safety properties, and three deliberately wrong private source copies
 must produce the expected counterexamples. Missing/unsupported/timeout/warning
 or incomplete results remain UNPROVED. No production source is modified.
 

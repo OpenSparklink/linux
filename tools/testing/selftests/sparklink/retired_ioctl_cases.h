@@ -3,6 +3,8 @@
 #define SPARKLINK_TEST_RETIRED_IOCTL_CASES_H
 #include "retired_ioctl_numbers.h"
 static const unsigned int sl_test_retired_commands[] = {
+    SL_TEST_RETIRED_LINK_QUERY_SUBMIT,
+    SL_TEST_RETIRED_LINK_QUERY_RESULT,
     SL_TEST_RETIRED_AFH_CLASSIFY,
     SL_TEST_RETIRED_AFH_GET_MAP,
     SL_TEST_RETIRED_AFH_HOP_NEXT,

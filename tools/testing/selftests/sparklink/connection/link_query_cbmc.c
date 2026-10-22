@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Actual production connection.c is a separate translation unit. No driver,
  * ledger, lock, allocator, clock, USB, firmware or Host stub is supplied here.
- * Scope: internal query selectors 4/5 only, arbitrary 32-bit fields, valid
+ * Scope: typed link selectors 4/5/6, arbitrary 32-bit fields, valid
  * allocated objects or NULL. Not an arbitrary-invalid-FFI-pointer proof.
  */
 #include <assert.h>
@@ -17,16 +17,18 @@ int main(void)
 		struct sparklink_connection_plan plan;
 		unsigned char suffix[8];
 	} output, before;
-	_Bool phy, null_request, null_output;
+	_Bool phy, payload, null_request, null_output;
 	__CPROVER_havoc_object(&request);
 	__CPROVER_havoc_object(&output);
 	__CPROVER_havoc_object(&phy);
+	__CPROVER_havoc_object(&payload);
 	__CPROVER_havoc_object(&null_request);
 	__CPROVER_havoc_object(&null_output);
-	request.operation = phy ? 5 : 4;
+	request.operation = payload ? 6 : phy ? 5 : 4;
 	before = output;
 	const struct sparklink_connection_parameters zero = {0};
 	int valid = request.handle <= 65535 && request.reason == 0 &&
+		    (payload ? request.payload_octets > 0 && request.payload_octets <= 65535 : request.payload_octets == 0) &&
 		    !memcmp(&request.parameters, &zero, sizeof(zero));
 	int result = ws73_connection_prepare(null_request ? NULL : &request,
 					    null_output ? NULL : &output.plan);
@@ -39,11 +41,13 @@ int main(void)
 	} else {
 		__CPROVER_assert(result == 0, "LQI_valid_accepted");
 		__CPROVER_assert(output.plan.operation == request.operation &&
-				 output.plan.opcode == (phy ? 0x1805 : 0x180c) &&
-				 output.plan.length == 2, "LQI_typed_recipe");
+				 output.plan.opcode == (payload ? 0x1804 : phy ? 0x1805 : 0x180c) &&
+				 output.plan.length == (payload ? 4 : 2), "LQI_typed_recipe");
 		__CPROVER_assert(output.plan.params[0] == (request.handle & 255) &&
 				 output.plan.params[1] == (request.handle >> 8), "LQI_LE16_handle");
-		for (unsigned int n = 2; n < sizeof(output.plan.params); n++)
+		__CPROVER_assert(!payload || (output.plan.params[2] == (request.payload_octets & 255) &&
+			 output.plan.params[3] == (request.payload_octets >> 8)), "LQI_LE16_payload");
+		for (unsigned int n = payload ? 4 : 2; n < sizeof(output.plan.params); n++)
 			__CPROVER_assert(output.plan.params[n] == 0, "LQI_unused_bytes_zero");
 		__CPROVER_assert(ws73_connection_validate(output.plan.operation,
 			 output.plan.opcode, output.plan.params, output.plan.length) == 0, "LQI_plan_validates");
@@ -58,7 +62,8 @@ int main(void)
 	__CPROVER_havoc_object(params);
 	int checked = ws73_connection_validate(request.operation, opcode,
 					  null_params ? NULL : params, size);
-	__CPROVER_assert(checked == (!null_params && size == 2 &&
-		 opcode == (phy ? 0x1805 : 0x180c) ? 0 : -EINVAL), "LQI_validator_shape");
+	__CPROVER_assert(checked == (!null_params && size == (payload ? 4 : 2) &&
+		 opcode == (payload ? 0x1804 : phy ? 0x1805 : 0x180c) &&
+		 (!payload || params[2] || params[3]) ? 0 : -EINVAL), "LQI_validator_shape");
 	return 0;
 }

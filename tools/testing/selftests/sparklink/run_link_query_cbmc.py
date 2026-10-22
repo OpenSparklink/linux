@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Actual WS73 query recipe/validator; bounded proof with source mutants.
+"""Actual WS73 typed link recipe/validator; bounded proof with source mutants.
 
 Optional CBMC invocation, never a driver, concurrent lifecycle or RF test.
 The default selftest tests this verdict parser without needing CBMC.
@@ -16,7 +16,7 @@ import time
 PROPERTIES = {
     'LQI_u32_model', 'LQI_output_guards', 'LQI_invalid_rejected',
     'LQI_failure_atomic', 'LQI_valid_accepted', 'LQI_typed_recipe',
-    'LQI_LE16_handle', 'LQI_unused_bytes_zero', 'LQI_plan_validates',
+    'LQI_LE16_handle', 'LQI_LE16_payload', 'LQI_unused_bytes_zero', 'LQI_plan_validates',
     'LQI_validator_shape',
 }
 
@@ -69,7 +69,7 @@ def run(output, timeout):
         assumptions=['Valid allocated C objects or NULL; arbitrary-invalid caller pointers excluded.',
                      'Sequential actual prepare/validate functions, 64-bit little-endian C target.',
                      'CBMC C frontend, SAT solver and C integer/object model are trusted.'],
-        bounds=['Selectors4/5 only; arbitrary32bit request fields and all parameter bytes.',
+        bounds=['Selectors4/5/6; arbitrary32bit request fields and all parameter bytes.',
                 'Validator arbitrary32bit opcode/64bit length and32byte buffer or NULL.',
                 'Unwind64 with unwinding assertions; intentional unsigned LE16 narrowing checked by exact bytes.'],
         properties=sorted(PROPERTIES),
@@ -87,6 +87,9 @@ def run(output, timeout):
         (include/'sparklink_connection.h').symlink_to(paths[2])
         original = production.read_text()
         cases = [('production', None, None, None),
+                 ('big-endian-payload', '            put16(candidate.params + 2, request->payload_octets);',
+                  '            candidate.params[2] = request->payload_octets >> 8; candidate.params[3] = request->payload_octets;',
+                  'LQI_LE16_payload'),
                  ('big-endian-handle', '        put16(candidate.params, request->handle);',
                   '        candidate.params[0] = request->handle >> 8; candidate.params[1] = request->handle;',
                   'LQI_LE16_handle'),
@@ -123,7 +126,7 @@ def run(output, timeout):
         if sources != {str(p.relative_to(root)): sha(p) for p in paths}:
             raise ValueError('production or proof source changed while running')
         if all(r['audited'] for r in report['cases']):
-            report['status'] = 'PRODUCTION_QUERY_RECIPE_BOUNDED_PASS'
+            report['status'] = 'PRODUCTION_LINK_COMMAND_RECIPE_BOUNDED_PASS'
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report.update(status='UNPROVED', error=str(error))
     if report['status'] == 'RUNNING_UNPROVED':
@@ -133,7 +136,7 @@ def run(output, timeout):
     temporary.write_text(json.dumps(report, indent=2)+'\n')
     temporary.replace(result_path)
     print(report['status'])
-    return report['status'] == 'PRODUCTION_QUERY_RECIPE_BOUNDED_PASS'
+    return report['status'] == 'PRODUCTION_LINK_COMMAND_RECIPE_BOUNDED_PASS'
 
 
 if __name__ == '__main__':

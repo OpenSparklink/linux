@@ -34,7 +34,7 @@ pub(crate) struct CmdPendingEntry {
     pub(crate) request_id: u64,
     pub(crate) timeout_ms: u32,
     /// Immutable typed Managed query scope; None for metadata/address work.
-    pub(crate) query: Option<super::sle_link_query::Scope>,
+    pub(crate) link_command: Option<super::sle_link_command::Scope>,
     /// Monotonically increasing sequence number (for dedup).
     pub(crate) seq: u32,
     /// Resolution status.
@@ -66,7 +66,7 @@ impl CmdPendingEntry {
             file_id: 0,
             request_id: 0,
             timeout_ms,
-            query: None,
+            link_command: None,
             seq,
             status: AtomicU32::new(CMD_STATUS_PENDING),
             data: [0u8; CMD_DATA_MAX],
@@ -236,7 +236,7 @@ impl CmdPendingQueue {
         }
         for entry in self.entries.iter_mut().flatten() {
             if entry.seq == seq && entry.is_pending() {
-                if entry.query.is_some_and(|q| q.expired(unsafe { kernel::bindings::ktime_get() } as u64)) {
+                if entry.link_command.is_some_and(|q| q.expired(unsafe { kernel::bindings::ktime_get() } as u64)) {
                     entry.timeout(); self.total_timeouts += 1;
                 } else { entry.resolve(status, data); }
                 self.pending_count = self.pending_count.saturating_sub(1);
@@ -280,7 +280,7 @@ impl CmdPendingQueue {
         // continues to use the caller-supplied single jiffies instant.
         let query_now = unsafe { kernel::bindings::ktime_get() } as u64;
         for entry in self.entries.iter_mut().flatten() {
-            if entry.is_pending() && (entry.is_expired_at(now) || entry.query.is_some_and(|q| q.expired(query_now))) {
+            if entry.is_pending() && (entry.is_expired_at(now) || entry.link_command.is_some_and(|q| q.expired(query_now))) {
                 entry.timeout();
                 self.pending_count = self.pending_count.saturating_sub(1);
                 self.total_resolved += 1;
@@ -303,17 +303,17 @@ impl CmdPendingQueue {
         }
     }
 
-    pub(crate) fn assign_query(&mut self, seq: u32, query: super::sle_link_query::Scope, deadline: u64) -> Result {
+    pub(crate) fn assign_link_command(&mut self, seq: u32, query: super::sle_link_command::Scope, deadline: u64) -> Result {
         let entry = self.entries.iter_mut().flatten().find(|e| e.seq == seq && e.is_pending()).ok_or(EINVAL)?;
-        if !query.valid() || entry.query.is_some() { return Err(EINVAL); }
-        entry.query = Some(query);
+        if !query.valid() || entry.link_command.is_some() { return Err(EINVAL); }
+        entry.link_command = Some(query);
         entry.deadline = deadline; // coarse wakeup only; scope retains exact ns
         Ok(())
     }
 
     /// Revoke only the authors. Host retains active physical slots and debt.
-    pub(crate) fn cancel_link_queries(&mut self) {
-        for entry in self.entries.iter_mut().flatten().filter(|e| e.query.is_some() && e.is_pending()) {
+    pub(crate) fn cancel_link_commands(&mut self) {
+        for entry in self.entries.iter_mut().flatten().filter(|e| e.link_command.is_some() && e.is_pending()) {
             entry.error = -(kernel::bindings::ECANCELED as i32);
             entry.data.fill(0); entry.data_len = 0;
             entry.status.store(CMD_RESOLVED_BIT | 0x200, Ordering::Release);

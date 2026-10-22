@@ -1,4 +1,4 @@
-#[path="sle_link_query.rs"] mod sle_link_query;
+#[path="sle_link_command.rs"] mod sle_link_command;
 mod hardware_fault_allocator {pub trait Init<T>{}pub struct Stub<T>(pub std::marker::PhantomData<T>);impl<T> Init<T> for Stub<T>{}}
 macro_rules! init {($($tokens:tt)*)=>{crate::hardware_fault_allocator::Stub::<Self>(std::marker::PhantomData)};}
 #[allow(dead_code, reason="Actual complete pending module;allocator/event queue dependencies outside this worker subset")]
@@ -62,22 +62,50 @@ fn host()->CommandHost {let mut operations=Operations::new();operations.initiali
  grants:sle_grant::LeaseAuthority::new(),data_revoked:false,revoking:false,revoke_cookies:[0;2],revoke_done:0,revoke_deadline:0,revoke_status:0,revoke_opcode:0,revoke_reply:false}}
 fn clock(now:u64){super::sle_security_relay::clock(now);unsafe{kernel::bindings::jiffies_64=now}}
 fn reference(handle:u16)->sle_connection_operation::ExpectedLink { sle_connection_operation::ExpectedLink { lifetime:1,handle,role:0,address_type:0,address:[1;6] } }
-fn query_scope()->sle_link_query::Scope { sle_link_query::Scope {
- link:reference(7),lease_epoch:1,kind:sle_link_query::Kind::Rssi,deadline_monotonic_ns:100_000_000 } }
+fn query_scope()->sle_link_command::Scope { sle_link_command::Scope {
+ link:reference(7),argument:0,lease_epoch:1,kind:sle_link_command::Kind::Rssi,deadline_monotonic_ns:100_000_000 } }
 fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants.activate(1,true));h}
+#[test] fn payload_preference_rechecks_cancel_revoke_down_and_original_deadline() {
+ for event in 0..4 {
+  clock(1);let mut h=query_host();
+  let scope=sle_link_command::Scope{kind:sle_link_command::Kind::PayloadPreference,argument:1526,..query_scope()};
+  h.enqueue_link_command(0x1804,&[7,0,0xf6,5],91,100,scope).unwrap();
+  let r=h.next(|_|true).unwrap().unwrap();assert_eq!(h.validate_command_commit(r.cookie,0x1804),Ok(()));
+  let expected=match event {
+   0=>{h.cancel_diagnostic(91);-125},1=>{h.revoke_connections();-116},
+   2=>{down(&mut h);up(&mut h,[1;6]);-116},_=>{clock(100_000_000);-110},
+  };
+  assert_eq!(h.validate_command_commit(r.cookie,0x1804),Err(expected));
+  assert!(h.active.is_some());assert_eq!(h.credits,0);assert_eq!(h.next_deadline(),Some(100));
+ }
+}
+#[test] fn payload_complete_needs_physical_out_and_does_not_publish_effective_budget() {
+ clock(1);let mut h=query_host();
+ let scope=sle_link_command::Scope{kind:sle_link_command::Kind::PayloadPreference,argument:1526,..query_scope()};
+ h.enqueue_link_command(0x1804,&[7,0,0xf6,5],91,100,scope).unwrap();
+ let r=h.next(|_|true).unwrap().unwrap();h.command_committed(r.cookie);
+ assert!(h.receive(status(0x1804,0)).is_some());assert!(h.reply.is_none());assert!(h.active.is_some());
+ h.cancel_diagnostic(91);assert_eq!(h.next_deadline(),Some(100));
+ assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x1804,command_credits:1,status:0,complete:true,data:vec![]}).is_none());
+ assert!(h.take_reply().is_none());assert!(h.active.is_some());
+ assert!(h.transport_complete(r.cookie));let reply=h.take_reply().unwrap();
+ assert_eq!(reply.seq,91);
+ assert!(matches!(reply.event,SleEvent::NativeCommandReply{opcode:0x1804,status:0,complete:true,ref data,..} if data.is_empty()));
+ assert!(!scope.value_available(&[]));assert_eq!(scope.argument,1526);assert!(h.active.is_none());
+}
 #[test] fn query_requires_exact_link_epoch_at_admission_and_selection() {
  clock(1);let mut h=query_host();let scope=query_scope();
- for bad in [sle_link_query::Scope{lease_epoch:2,..scope},sle_link_query::Scope{link:sle_connection_operation::ExpectedLink{lifetime:2,..scope.link},..scope}] {
-  assert_eq!(h.enqueue_link_query(0x180c,&[7,0],91,100,bad),Err(-116));
+ for bad in [sle_link_command::Scope{lease_epoch:2,..scope},sle_link_command::Scope{link:sle_connection_operation::ExpectedLink{lifetime:2,..scope.link},..scope}] {
+  assert_eq!(h.enqueue_link_command(0x180c,&[7,0],91,100,bad),Err(-116));
   assert!(h.requests.is_empty());assert_eq!(h.credits,1);
  }
- h.enqueue_link_query(0x180c,&[7,0],91,100,scope).unwrap();down(&mut h);up(&mut h,[1;6]);
+ h.enqueue_link_command(0x180c,&[7,0],91,100,scope).unwrap();down(&mut h);up(&mut h,[1;6]);
  assert!(h.next(|_|true).unwrap().is_none());assert_eq!(h.credits,1);
- assert!(!h.query_current(scope)); // same handle/address, new lifetime
+ assert!(!h.link_command_current(scope)); // same handle/address, new lifetime
 }
 #[test] fn query_last_commit_rechecks_down_reuse_and_revoke_without_erasing_wire_slot() {
  for revoke in [true,false] {
-  clock(1);let mut h=query_host();h.enqueue_link_query(0x180c,&[7,0],91,100,query_scope()).unwrap();
+  clock(1);let mut h=query_host();h.enqueue_link_command(0x180c,&[7,0],91,100,query_scope()).unwrap();
   let r=h.next(|_|true).unwrap().unwrap();assert_eq!(h.validate_command_commit(r.cookie,0x180c),Ok(()));
   if revoke {h.revoke_connections();}else{down(&mut h);up(&mut h,[1;6]);}
   assert_eq!(h.validate_command_commit(r.cookie,0x180c),Err(-116));
@@ -85,7 +113,7 @@ fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants
  }
 }
 #[test] fn query_status_foreign_echo_and_out_complete_obligations_are_distinct() {
- clock(1);let mut h=query_host();h.enqueue_link_query(0x180c,&[7,0],91,100,query_scope()).unwrap();
+ clock(1);let mut h=query_host();h.enqueue_link_command(0x180c,&[7,0],91,100,query_scope()).unwrap();
  let r=h.next(|_|true).unwrap().unwrap();h.command_committed(r.cookie);
  assert!(h.receive(status(0x180c,0)).is_some());assert!(h.reply.is_none());assert!(h.active.is_some());
  h.credits=0;let revision=h.credit_revision;
@@ -96,35 +124,35 @@ fn query_host()->CommandHost {let mut h=host();up(&mut h,[1;6]);assert!(h.grants
  assert!(h.active.is_none());assert!(!query_scope().value_available(&[7,0,127]));
 }
 #[test] fn query_cancelled_author_keeps_original_reply_credit_and_deadline() {
- clock(1);let mut h=query_host();h.enqueue_link_query(0x180c,&[7,0],91,100,query_scope()).unwrap();
+ clock(1);let mut h=query_host();h.enqueue_link_command(0x180c,&[7,0],91,100,query_scope()).unwrap();
  let r=h.next(|_|true).unwrap().unwrap();h.command_committed(r.cookie);h.cancel_diagnostic(91);
  assert_eq!(h.credits,0);assert_eq!(h.next_deadline(),Some(100));assert!(h.active.as_ref().unwrap().withdrawn);
  assert!(h.receive(SleEvent::NativeCommandReply{opcode:0x180c,command_credits:1,status:0,complete:true,data:vec![7,0,200]}).is_none());
  assert!(h.transport_complete(r.cookie));assert_eq!(h.take_reply().unwrap().seq,91);
- assert_eq!(h.credits,1);assert!(!h.query_current(sle_link_query::Scope{lease_epoch:2,..query_scope()}));
+ assert_eq!(h.credits,1);assert!(!h.link_command_current(sle_link_command::Scope{lease_epoch:2,..query_scope()}));
 }
 #[test] fn query_ledger_cancel_is_unique_while_real_host_consumes_late_reply() {
  clock(1);let mut h=query_host();let mut ledger=super::hardware_fault_pending::CmdPendingQueue::new();
  let seq=ledger.submit_with_timeout(0x180c,99).unwrap();ledger.assign_request(seq,42,5);
- ledger.assign_query(seq,query_scope(),100).unwrap();let deadline=ledger.find_by_seq(seq).unwrap().deadline;
- h.enqueue_link_query(0x180c,&[7,0],seq,deadline,query_scope()).unwrap();
+ ledger.assign_link_command(seq,query_scope(),100).unwrap();let deadline=ledger.find_by_seq(seq).unwrap().deadline;
+ h.enqueue_link_command(0x180c,&[7,0],seq,deadline,query_scope()).unwrap();
  let r=h.next(|s|ledger.find_by_seq(s).is_some_and(|e|e.is_pending())).unwrap().unwrap();h.command_committed(r.cookie);
- h.revoke_connections();ledger.cancel_link_queries();ledger.cancel_link_queries();
+ h.revoke_connections();ledger.cancel_link_commands();ledger.cancel_link_commands();
  assert_eq!(ledger.pending(),0);assert_eq!(ledger.find_by_seq(seq).unwrap().error,-125);
  assert!(h.active.is_some());assert_eq!(h.credits,0);
  let _=h.receive(SleEvent::NativeCommandReply{opcode:0x180c,command_credits:1,status:0,complete:true,data:vec![7,0,200]});
  h.transport_complete(r.cookie);let done=h.take_reply().unwrap();
  ledger.resolve_seq(done.seq,0,&[7,0,200]);
  let e=ledger.find_by_seq(seq).unwrap();assert_eq!(e.error,-125);assert_eq!(e.data_len,0);assert_eq!(e.result_status(),None);
- assert_eq!(ledger.total_resolved,1);assert!(!h.query_current(query_scope()));
+ assert_eq!(ledger.total_resolved,1);assert!(!h.link_command_current(query_scope()));
 }
 #[test] fn query_original_nanosecond_deadline_cannot_be_renewed_by_coarse_wakeup() {
  for submitted in [false,true] {
-  clock(1);let mut h=query_host();let scope=sle_link_query::Scope{deadline_monotonic_ns:1_999_999,..query_scope()};
+  clock(1);let mut h=query_host();let scope=sle_link_command::Scope{deadline_monotonic_ns:1_999_999,..query_scope()};
   assert_eq!(super::sle_security_relay_state::host_wake_deadline(1_000_000,scope.deadline_monotonic_ns,1,1000),Ok(3));
   let mut ledger=super::hardware_fault_pending::CmdPendingQueue::new();
-  let seq=ledger.submit_with_timeout(0x180c,5000).unwrap();ledger.assign_request(seq,42,5);ledger.assign_query(seq,scope,3).unwrap();
-  h.enqueue_link_query(0x180c,&[7,0],seq,3,scope).unwrap();let r=h.next(|_|true).unwrap().unwrap();
+  let seq=ledger.submit_with_timeout(0x180c,5000).unwrap();ledger.assign_request(seq,42,5);ledger.assign_link_command(seq,scope,3).unwrap();
+  h.enqueue_link_command(0x180c,&[7,0],seq,3,scope).unwrap();let r=h.next(|_|true).unwrap().unwrap();
   assert_eq!(h.validate_command_commit(r.cookie,0x180c),Ok(()));
   if submitted {h.command_committed(r.cookie);}
   clock(2);assert_eq!(ledger.expire_at(2),1);assert_eq!(ledger.find_by_seq(seq).unwrap().error,-110);

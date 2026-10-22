@@ -12,6 +12,7 @@ struct sparklink_connection_parameters {
 };
 struct sparklink_connection_request {
     unsigned int operation, handle, reason;
+    unsigned int payload_octets; /* Private operation6 only; not SSAP/DTAP MTU. */
     struct sparklink_connection_parameters parameters;
 };
 struct sparklink_connection_plan {

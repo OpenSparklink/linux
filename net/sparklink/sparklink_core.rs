@@ -22,7 +22,7 @@ mod sle_configfs;
 mod sle_command_plan;
 mod sle_discovery_operation;
 mod sle_connection_operation;
-mod sle_link_query;
+mod sle_link_command;
 mod sle_command_queue;
 mod sle_controller_event;
 mod sle_dev;
@@ -940,7 +940,7 @@ fn revoke_management(owner: &Arc<ControllerRuntime>, gate: &mut sle_management::
     let result = (|| -> Result {
         let mut state = owner.state.lock();
         let state = Option::as_mut(&mut *state).ok_or(ENODEV)?;
-        state.cmd_pending.cancel_link_queries();
+        state.cmd_pending.cancel_link_commands();
         if *owner.schedule_gate.lock() { return Err(ENODEV); }
         {
             let mut host = owner.host.lock();
@@ -1652,14 +1652,14 @@ fn ioctl_runtime_address_submit(context:&RuntimeContext,me:Pin<&SparkLinkCtl>,ar
     write_user_struct(arg,&input)?;Ok(0)
 }
 
-/// Managed read-only link observations share the original author ledger and
+/// Typed Managed link commands share the original author ledger and
 /// physical Host. The scope is immutable; no query actor or Ready cache.
 #[inline(never)]
-fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
-    let mut input: SleLinkQuerySubmit = read_user_struct(arg)?;
+fn ioctl_link_command_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let mut input: SleLinkCommandSubmit = read_user_struct(arg)?;
     if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
-    let kind = sle_link_query::Kind::parse(input.kind).ok_or(EINVAL)?;
-    let scope = sle_link_query::Scope { kind, lease_epoch: input.lease_epoch,
+    let kind = sle_link_command::Kind::parse(input.kind).ok_or(EINVAL)?;
+    let scope = sle_link_command::Scope { kind, argument: input.argument, lease_epoch: input.lease_epoch,
         deadline_monotonic_ns: input.deadline_monotonic_ns,
         link: sle_connection_operation::ExpectedLink { lifetime: input.lifetime, handle: input.handle,
             role: input.role, address_type: input.address_type, address: input.address } };
@@ -1679,7 +1679,7 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
         owner.expire_command_deadlines(state);
         if let Some(entry) = state.cmd_pending.find_request(me.file_id, input.request_id) {
-            if entry.query != Some(scope) || entry.timeout_ms != input.timeout_ms { return Err(EINVAL); }
+            if entry.link_command != Some(scope) || entry.timeout_ms != input.timeout_ms { return Err(EINVAL); }
             input.seq = entry.seq;
             if input.action == 2 {
                 state.cmd_pending.cancel_seq(input.seq);
@@ -1688,7 +1688,7 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         } else {
             if input.request_id <= *watermark { return Err(Error::from_errno(-(bindings::ESTALE as i32))); }
             if input.action == 2 { return Err(ENOENT); }
-            let plan = state.controller.provider().prepare_link_query(scope)?;
+            let plan = state.controller.provider().prepare_link_command(scope)?;
             let sampled_ns = unsafe { bindings::ktime_get() } as u64;
             sle_security_relay_state::original_deadline(sampled_ns, scope.deadline_monotonic_ns, input.timeout_ms)
                 .map_err(|e| if e == sle_security_relay_state::Error::Expired {ETIMEDOUT} else {EINVAL})?;
@@ -1697,11 +1697,11 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
                 ticks_after, kernel::time::msecs_to_jiffies(1000) as u32).map_err(|_|EOVERFLOW)?;
             input.seq = state.cmd_pending.submit_with_timeout(plan.opcode, input.timeout_ms)?;
             state.cmd_pending.assign_request(input.seq, me.file_id, input.request_id);
-            if let Err(error) = state.cmd_pending.assign_query(input.seq, scope, wake) {
+            if let Err(error) = state.cmd_pending.assign_link_command(input.seq, scope, wake) {
                 state.cmd_pending.rollback(input.seq); return Err(error);
             }
             let deadline = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?.deadline;
-            if let Err(error) = owner.host.lock().enqueue_link_query(plan.opcode, &plan.params[..plan.length as usize], input.seq, deadline, scope) {
+            if let Err(error) = owner.host.lock().enqueue_link_command(plan.opcode, &plan.params[..plan.length as usize], input.seq, deadline, scope) {
                 state.cmd_pending.rollback(input.seq); return Err(error);
             }
             *watermark = input.request_id;
@@ -1716,8 +1716,8 @@ fn ioctl_link_query_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
 }
 
 #[inline(never)]
-fn ioctl_link_query_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
-    let input: SleLinkQueryResult = read_user_struct(arg)?;
+fn ioctl_link_command_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg: usize) -> Result<isize> {
+    let input: SleLinkCommandResult = read_user_struct(arg)?;
     if input.version != 1 { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     if input.flags != 0 || input.generation == 0 || (input.seq == 0 && input.request_id == 0) { return Err(EINVAL); }
     let owner = discovery_owner(context, me)?;
@@ -1730,16 +1730,16 @@ fn ioctl_link_query_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         else { state.cmd_pending.find_request(me.file_id, input.request_id) }.ok_or(ENOENT)?;
     if entry.file_id != me.file_id { return Err(EPERM); }
     if input.request_id != 0 && input.request_id != entry.request_id { return Err(ENOENT); }
-    let scope = entry.query.ok_or(Error::from_errno(-(bindings::EOPNOTSUPP as i32)))?;
+    let scope = entry.link_command.ok_or(Error::from_errno(-(bindings::EOPNOTSUPP as i32)))?;
     // SAFETY: integer/byte-only repr(C), with all padding represented.
-    let mut output: SleLinkQueryResult = unsafe { core::mem::zeroed() };
+    let mut output: SleLinkCommandResult = unsafe { core::mem::zeroed() };
     output.version = 1; output.generation = owner.identity.generation;
     output.lease_epoch = scope.lease_epoch; output.request_id = entry.request_id;
     output.lifetime = scope.link.lifetime; output.handle = scope.link.handle;
     output.deadline_monotonic_ns = scope.deadline_monotonic_ns;
     output.role = scope.link.role; output.address_type = scope.link.address_type;
-    output.address = scope.link.address; output.kind = scope.kind as u8; output.seq = entry.seq;
-    if owner.host.lock().query_current(scope) { output.flags |= 1; }
+    output.address = scope.link.address; output.kind = scope.kind as u8; output.argument = scope.argument; output.seq = entry.seq;
+    if owner.host.lock().link_command_current(scope) { output.flags |= 1; }
     if entry.is_pending() { output.state = 1; }
     else if let Some(status) = entry.result_status() {
         output.status = status; output.flags |= 4;
@@ -1780,7 +1780,7 @@ fn ioctl_diagnostic_submit(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
         state.controller.validate_command(input.opcode, params)?;
         owner.expire_command_deadlines(state);
         if let Some(entry) = state.cmd_pending.find_request(me.file_id, input.request_id) {
-            if entry.query.is_some() || entry.opcode != input.opcode || entry.timeout_ms != input.timeout_ms { return Err(EINVAL); }
+            if entry.link_command.is_some() || entry.opcode != input.opcode || entry.timeout_ms != input.timeout_ms { return Err(EINVAL); }
             input.seq = entry.seq;
             if input.action == 2 {
                 state.cmd_pending.cancel_seq(input.seq);
@@ -1830,7 +1830,7 @@ fn ioctl_diagnostic_result(context: &RuntimeContext, me: Pin<&SparkLinkCtl>, arg
     owner.expire_command_deadlines(state);
     let entry = state.cmd_pending.find_by_seq(input.seq).ok_or(ENOENT)?;
     if entry.file_id != me.file_id { return Err(EPERM); }
-    if entry.query.is_some() { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
+    if entry.link_command.is_some() { return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))); }
     // SAFETY: only integer fields and byte arrays; all-zero is a valid baseline.
     let mut output: SleDiagnosticResult = unsafe { core::mem::zeroed() };
     output.version = 1; output.generation = owner.identity.generation;
@@ -2001,8 +2001,8 @@ impl MiscDevice for SparkLinkCtl {
         if cmd==SL_IOCTL_RUNTIME_ADDRESS_SUBMIT {
             return ioctl_runtime_address_submit(context,me,arg);
         }
-        if cmd == SL_IOCTL_LINK_QUERY_SUBMIT { return ioctl_link_query_submit(context, me, arg); }
-        if cmd == SL_IOCTL_LINK_QUERY_RESULT { return ioctl_link_query_result(context, me, arg); }
+        if cmd == SL_IOCTL_LINK_COMMAND_SUBMIT { return ioctl_link_command_submit(context, me, arg); }
+        if cmd == SL_IOCTL_LINK_COMMAND_RESULT { return ioctl_link_command_result(context, me, arg); }
         // Admission serialization lasts through dispatch. Workers do not take
         // this mutex under the protocol mutex; revocation completion is in Host.
         let mut management_guard = if access == sle_authorization::Access::Protected && !registry_operation {

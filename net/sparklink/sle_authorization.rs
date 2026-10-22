@@ -9,7 +9,7 @@ pub(crate) enum Access { Observe, Affinity, Protected, PrivilegedObserve }
 
 pub(crate) fn classify(cmd: u32) -> Result<Access> {
     match cmd {
-        SL_IOCTL_SNOOP_GET | SL_IOCTL_DIAGNOSTIC_RESULT | SL_IOCTL_LINK_QUERY_RESULT => Ok(Access::PrivilegedObserve),
+        SL_IOCTL_SNOOP_GET | SL_IOCTL_DIAGNOSTIC_RESULT | SL_IOCTL_LINK_COMMAND_RESULT => Ok(Access::PrivilegedObserve),
         SL_IOCTL_DEV_GET_ACTIVE
         | SL_IOCTL_DEV_SELECT => Ok(Access::Affinity),
         SL_IOCTL_MANAGEMENT_QUERY
@@ -32,7 +32,7 @@ pub(crate) fn classify(cmd: u32) -> Result<Access> {
         | SL_IOCTL_SECURITY_NEGOTIATION_CANCEL
         | SL_IOCTL_DIAGNOSTIC_SUBMIT
         | SL_IOCTL_RUNTIME_ADDRESS_SUBMIT
-        | SL_IOCTL_LINK_QUERY_SUBMIT
+        | SL_IOCTL_LINK_COMMAND_SUBMIT
         | SL_IOCTL_MANAGEMENT_ACQUIRE
         | SL_IOCTL_MANAGEMENT_RELEASE
         | SL_IOCTL_CONNECTION_SUBMIT

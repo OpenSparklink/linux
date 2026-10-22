@@ -451,23 +451,27 @@ struct sle_runtime_address_submit {
 };
 #define SL_IOCTL_RUNTIME_ADDRESS_SUBMIT _IOWR(SL_MAGIC, 0xd7, struct sle_runtime_address_submit)
 
-/* Unpublished version-1 Managed connection observations. profile1 only.
+/* Unpublished version-1 typed Managed link commands. profile1 only.
  * Requires CAP_NET_ADMIN, original File's Managed lease and exact epoch/link.
- * kind1=RSSI,kind2=PHY;action1=admit,2=cancel same author/payload/id.
+ * kind1=RSSI,kind2=PHY,kind3=payload preference; action1=admit,2=cancel same author/payload/id.
+ * argument=0 for queries; kind3 uses nonzero LE16 payload preference.
+ * No effective packet budget,MTU,Ready or security state is changed by an ack.
  * deadline_monotonic_ns is the original same-kernel CLOCK_MONOTONIC expiry,
  * including caller/admission waits. timeout_ms1..5000 bounds remaining time,
  * not a new relative grant. Retry retains both; final USB checks exact ns.
  * Success Status alone is not a measurement;successful Complete must echo
- * the captured handle. Cancellation/release cannot erase physical debt.
- * No arbitrary opcode, mutation, new Host or raw Diagnostic takeover.
+ * the captured handle for queries;kind3 requires status-only Complete. Cancellation/release cannot erase physical debt.
+ * No arbitrary opcode, new Host or raw Diagnostic takeover.
+ * Old query-only ioctl numbers0xd8/0xd9 are retired and must not be reused.
  */
-struct sle_link_query_submit {
+struct sle_link_command_submit {
     __u32 version, action;
     __aligned_u64 generation, lease_epoch, request_id, lifetime;
     __aligned_u64 deadline_monotonic_ns;
     __u32 timeout_ms, seq;
     __u16 handle;
-    __u8 role, address_type, address[6], kind, reserved[5];
+    __u8 role, address_type, address[6], kind, reserved;
+    __u16 argument, reserved_tail;
 };
 /* Input version1/flags0/generation and seq or original request_id;other
  * fields output. Same-File nonconsuming history remains readable following
@@ -477,9 +481,11 @@ struct sle_link_query_submit {
  * 2=value available,4=controller status valid. Local error is negative errno.
  * data is successful Complete body only:handle LE16 then RSSI signed byte
  * (127 invalid),or eight PHY wire bytes (SDK dialect interpretation separate).
- * Observations are neither Ready/security qualification nor RF/peer delivery.
+ * kind3 success carries no data and never sets value-available. argument echoes
+ * the original preference,not an effective/negotiated value. Results are neither
+ * Ready/security qualification nor RF/peer delivery.
  */
-struct sle_link_query_result {
+struct sle_link_command_result {
     __u32 version, flags;
     __aligned_u64 generation, lease_epoch, request_id, lifetime;
     __aligned_u64 deadline_monotonic_ns;
@@ -488,10 +494,11 @@ struct sle_link_query_result {
     __u16 handle;
     __u8 kind, status, role, address_type, address[6];
     __u16 data_len;
-    __u8 reserved[4], data[10];
+    __u16 argument;
+    __u8 reserved[2], data[10];
 };
-#define SL_IOCTL_LINK_QUERY_SUBMIT _IOWR(SL_MAGIC, 0xd8, struct sle_link_query_submit)
-#define SL_IOCTL_LINK_QUERY_RESULT _IOWR(SL_MAGIC, 0xd9, struct sle_link_query_result)
+#define SL_IOCTL_LINK_COMMAND_SUBMIT _IOWR(SL_MAGIC, 0xda, struct sle_link_command_submit)
+#define SL_IOCTL_LINK_COMMAND_RESULT _IOWR(SL_MAGIC, 0xdb, struct sle_link_command_result)
 
 
 /* Unpublished Native typed connection ABI. File-local nonzero request IDs

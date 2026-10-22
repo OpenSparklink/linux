@@ -34,8 +34,8 @@ static const unsigned long protected[] = {
     SL_IOCTL_CONNECTION_SECURITY,
     SL_IOCTL_DIAGNOSTIC_SUBMIT,
     SL_IOCTL_RUNTIME_ADDRESS_SUBMIT,
-    SL_IOCTL_LINK_QUERY_SUBMIT,
-    SL_IOCTL_LINK_QUERY_RESULT,
+    SL_IOCTL_LINK_COMMAND_SUBMIT,
+    SL_IOCTL_LINK_COMMAND_RESULT,
     SL_IOCTL_MANAGEMENT_ACQUIRE,
     SL_IOCTL_MANAGEMENT_RELEASE,
     SL_IOCTL_CONNECTION_SUBMIT,
@@ -189,8 +189,8 @@ static int child(int fd, uid_t uid, gid_t gid, int id, __u64 generation)
 			return failure("retired configfs mutation reappeared");
 	}
 	if (genl_denied()) return 1;
-	printf("KERNEL_AUTHORIZATION: uid=%u gid=%u caps=0 inherited_fd=1 protected=%zu denied=%zu observe=%zu retired_enotty=101 configfs_absent=5 genl_denied=5 unknown=ENOTTY\n",
-	       uid, gid, COUNT(protected), COUNT(protected), COUNT(observe));
+	printf("KERNEL_AUTHORIZATION: uid=%u gid=%u caps=0 inherited_fd=1 protected=%zu denied=%zu observe=%zu retired_enotty=%zu configfs_absent=5 genl_denied=5 unknown=ENOTTY\n",
+	       uid, gid, COUNT(protected), COUNT(protected), COUNT(observe), COUNT(retired) + COUNT(sl_test_retired_commands));
 	fflush(stdout);
 	return 0;
 }

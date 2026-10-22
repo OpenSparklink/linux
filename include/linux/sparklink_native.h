@@ -91,7 +91,8 @@ struct sparklink_native_ops {
 		unsigned int step, unsigned int count, u16 opcode,
 		const u8 *params, size_t length);
     /* Optional paired callbacks. Missing callbacks reject typed connection.
-     * Private recipes: 1 Create, 2 Disconnect, 4 ReadRSSI, 5 ReadPHY.
+     * Private recipes: 1 Create, 2 Disconnect, 4 ReadRSSI, 5 ReadPHY,
+     * 6 SetPayloadPreference (payload_octets LE16, real status-only Complete).
      * These are not public ConnectionSubmit operation numbers (3 is cancel).
      * The internal tag never grants raw DLI mutation or query permission. */
     int (*prepare_connection)(void *context,

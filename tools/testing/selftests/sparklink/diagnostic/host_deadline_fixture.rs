@@ -1,5 +1,5 @@
 #[allow(dead_code, reason="Actual query dependency;metadata fixture does not exercise Managed reads")]
-#[path="sle_link_query.rs"] mod sle_link_query;
+#[path="sle_link_command.rs"] mod sle_link_command;
 #[path="sle_runtime_address.rs"] mod runtime_address;
 // SPDX-License-Identifier: GPL-2.0-only
 // Actual Host deadline selection body, production queue/recipe dependencies.
