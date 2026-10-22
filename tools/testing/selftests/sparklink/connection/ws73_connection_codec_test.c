@@ -3,10 +3,14 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 #include "connection.h"
 int main(void)
 {
+    assert(sizeof(struct sparklink_connection_request)==76);
+    assert(offsetof(struct sparklink_connection_request,payload_octets)==12);
+    assert(offsetof(struct sparklink_connection_request,parameters)==16);
     struct sparklink_connection_parameters p = {.peer_address={0,1,9,0x32,0x54,0xf9},
         .gt_negotiate=1,.frame=1,.scan_interval=32,.scan_window=32,
         .interval_min=12,.interval_max=12,.supervision_timeout=508};

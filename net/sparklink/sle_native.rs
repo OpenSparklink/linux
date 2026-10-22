@@ -70,6 +70,10 @@ const _: () = assert!(core::mem::size_of::<NativeDiscoveryPlan>() == 1052);
 
 #[repr(C)]
 struct NativeConnectionRequest { operation: u32, handle: u32, reason: u32, payload_octets: u32, parameters: SleConnectionParameters }
+const _: () = assert!(core::mem::size_of::<NativeConnectionRequest>() == 76);
+const _: () = assert!(core::mem::align_of::<NativeConnectionRequest>() == 4);
+const _: () = assert!(core::mem::offset_of!(NativeConnectionRequest, payload_octets) == 12);
+const _: () = assert!(core::mem::offset_of!(NativeConnectionRequest, parameters) == 16);
 #[repr(C)]
 pub(crate) struct NativeConnectionPlan { pub operation: u32, pub opcode: u16, pub length: u16, pub params: [u8; 32] }
 extern "C" {
