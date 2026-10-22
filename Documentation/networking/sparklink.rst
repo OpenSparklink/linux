@@ -116,18 +116,32 @@ The unique worker now selects the earliest original negotiation, dynamic
 channel, queued/begun PDU or pending control-response deadline. An idle open
 Session does not queue maintenance work. A pass drains at most 16 RX PDUs. TX
 uses an eight-attempt, 4096-byte, two-millisecond admission quantum and rotates
-the six channel slots at PDU boundaries; a begun PB sequence retains the physical
-connection. The time budget limits the next attempt, not the duration of an
+at PDU boundaries. Fixed CUTC/SMTC and dynamic channels have independent
+round-robin cursors. At most two completed fixed-channel PDUs precede a ready
+dynamic PDU; an empty class never prevents progress of the other. This bounded
+software priority does not change the DLI priority bit, physical packet credit
+or access permissions. A begun PB sequence retains the physical connection.
+The time budget limits the next attempt, not the duration of an
 already started synchronous transport call. Residual runnable progress requests
 another immediate pass. Queue admission and real RX/NOCP notifications remain
 the only normal readiness sources.
 
 Only an actual data-credit reserve failure marks the internal CREDIT wait.
-An unsubmitted PDU keeps its channel's service turn across that wait: an
-empty-pool probe has not served a PDU. Otherwise a long channel can repeatedly
-win newly returned credit before the already selected short channel. A begun
+An unsubmitted PDU keeps its class's round-robin turn across that wait: an
+empty-pool probe has not served a PDU or spent completed-PDU quota. The other
+class can take its bounded priority turn; peers in the same class cannot
+repeatedly rotate past the selected channel on an empty-pool probe. A begun
 PB stream remains uninterrupted, and queued deadlines and author withdrawal
 are still checked before the next actual submission.
+
+The direct production policy helper is checked by
+``tools/testing/selftests/sparklink/run_tx_policy.py --output NEW_DIRECTORY``.
+Its bounded progress property assumes constant queue eligibility and actual
+completion of each selected PDU. It is not a time bound, credit-truth,
+concurrency, implementation refinement or hardware proof. The existing
+``run_session_dispatch.py`` tests the actual selector and batch with explicit
+kernel/Runtime/USB dependencies; ``--artifact-dir NEW_DIRECTORY`` retains and
+executes its sanitized fixture ELF. Actual device qualification remains separate.
 Other EAGAIN results retain a finite 10 ms retry bounded by the operation's
 original deadline. USB success does not return credit, and an uncertain USB
 failure cannot be classified as an empty pool or refund debt. Runtime's separate

@@ -19,6 +19,7 @@ static unsigned long jiffies = 42;
 #include "sle_channel_state.h"
 #include "sle_channel_grant.h"
 #include "sle_channel_table.h"
+#include "sle_tx_policy.h"
 #include "sle_dynamic_state.h"
 #include "sle_fragment_cursor.h"
 #include "sparklink_socket.h"
@@ -915,7 +916,7 @@ static void batch_worker_tests(void){
  s.tx_budget_exhausted=false;q=sl_tx_budget_begin(fixture_now_ns);
  assert(!sl_transmit_batch(&s,&q));assert(q.packets==2&&fragment_count==10&&!s.tx_inflight&&!allocations);
  assert(fragment_pb[0]==1&&fragment_pb[8]==3&&fragment_pb[9]==0);
- assert(original==5042&&s.tx_next==2); /* only complete-PDU boundaries rotate */
+ assert(original==5042&&s.tx_policy.fixed_next==2); /* only complete-PDU boundaries rotate */
  /* Byte budget is independent of packet credit, including large other backends. */
  init_batch(&s,&b[0]);s.acb_maximum=2047;
  for(unsigned int i=0;i<3;i++)enqueue_fragment_test(&s.channels[0],2047);
@@ -948,7 +949,7 @@ static void batch_worker_tests(void){
  init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);packet_budget=0;
  enqueue_fragment_test(&s.channels[0],255);enqueue_fragment_test(&s.channels[1],4);
  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
- assert(q.packets==1&&fragment_count==0&&!s.tx_inflight&&s.tx_next==0);
+ assert(q.packets==1&&fragment_count==0&&!s.tx_inflight&&s.tx_policy.fixed_next==0);
  assert(!s.work_retry&&!s.work_progress&&!s.tx_budget_exhausted);
  plan=sl_next_schedule(&s);assert(plan.pending&&plan.delay==5000);
  packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
@@ -960,27 +961,27 @@ static void batch_worker_tests(void){
   * fills the pool, then a selected short PDU waits. Repeated empty-pool work
   * must not move its turn to another queued long PDU. Budget restoration here
   * is an explicit Runtime/USB dependency, not a fabricated production NOCP. */
- init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);s.tx_next=1;
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);s.tx_policy.fixed_next=1;
  enqueue_fragment_test(&s.channels[0],66);
  enqueue_fragment_test(&s.channels[1],255);enqueue_fragment_test(&s.channels[1],255);
  packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
- assert(fragment_count==2&&fragment_pb[0]==1&&fragment_pb[1]==3&&s.tx_next==0&&s.tx_blocked);
+ assert(fragment_count==2&&fragment_pb[0]==1&&fragment_pb[1]==3&&s.tx_policy.fixed_next==0&&s.tx_blocked);
  unsigned long short_deadline=((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline;
  for(unsigned int empty=0;empty<3;empty++){
   q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
-  assert(q.packets==1&&s.tx_next==0&&fragment_count==2&&!s.tx_inflight&&s.channels[0].tx.qlen==1);
+  assert(q.packets==1&&s.tx_policy.fixed_next==0&&fragment_count==2&&!s.tx_inflight&&s.channels[0].tx.qlen==1);
   assert(((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline==short_deadline);
  }
  packet_budget=1;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
  assert(fragment_count==3&&fragment_pb[2]==0&&fragment_size[2]==66&&!s.channels[0].tx.qlen);
- assert(s.channels[1].tx.qlen==1&&s.tx_next==1&&!s.tx_inflight);
+ assert(s.channels[1].tx.qlen==1&&s.tx_policy.fixed_next==1&&!s.tx_inflight);
  packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
  /* Retaining a credit turn neither refreshes its deadline nor blocks peers
   * after the selected queued author expires. */
  init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);packet_budget=0;
  enqueue_fragment_test(&s.channels[0],66);enqueue_fragment_test(&s.channels[1],255);
  ((struct sl_fragment_cursor *)s.channels[0].tx.head->cb)->deadline=50;
- q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&s.tx_next==0);
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&s.tx_policy.fixed_next==0);
  jiffies=50;packet_budget=2;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
  assert(b[0].sk.sk_err==ETIMEDOUT&&!sl_binding_live(s.channels[0].binding));
  assert(sl_binding_live(s.channels[1].binding)&&fragment_count==2&&fragment_pb[0]==1&&fragment_pb[1]==3&&!allocations);
@@ -989,7 +990,7 @@ static void batch_worker_tests(void){
  init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);fragment_failure=-EAGAIN;
  enqueue_fragment_test(&s.channels[0],66);enqueue_fragment_test(&s.channels[1],66);
  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
- assert(s.tx_next==1&&s.work_retry&&fragment_count==0);
+ assert(s.tx_policy.fixed_next==1&&s.work_retry&&fragment_count==0);
  fragment_failure=0;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
  /* Last author close after first acceptance cannot erase a begun physical PDU. */
  init_batch(&s,&b[0]);enqueue_fragment_test(&s.channels[0],2047);retire_after_fragment=true;
@@ -1024,6 +1025,62 @@ static void batch_worker_tests(void){
 }
 /* Kernel/crypto/Host are visible dependencies. Exercise the actual C Grant,
  * publication, syscall authorization, route and final USB-consent functions. */
+static void normal_batch_channel(struct sl_connection_session *s,struct sl_socket_binding *b,unsigned int slot){
+ assert(slot>=SL_FIXED_CHANNELS&&slot<SL_SESSION_CHANNELS);
+ *b=(struct sl_socket_binding){.sk={.refs=1,.sk_rcvbuf=100000,
+  .sk_data_ready=data_ready,.sk_error_report=data_ready,.sk_state_change=data_ready},.channel_slot=slot};
+ struct sl_basic_channel *c=&s->channels[slot];
+ c->sk=&b->sk;c->local_tcid=c->remote_tcid=32+slot;c->mtu=2042;c->mps=2047;
+ c->dynamic=true;c->negotiation.phase=SL_DYN_OPEN;
+ assert(sl_binding_attach(&c->binding));init_grant(s,&b->sk,SL_GRANT_TX|SL_GRANT_RX);
+}
+static void priority_worker_tests(void){
+ struct sl_connection_session s;struct sl_socket_binding b[SL_SESSION_CHANNELS]={0};
+ struct sl_tx_budget q;unsigned int before,accepted[64],count;
+ init_batch(&s,&b[0]);second_batch_channel(&s,&b[1]);
+ for(unsigned int slot=2;slot<SL_SESSION_CHANNELS;slot++)normal_batch_channel(&s,&b[slot],slot);
+ for(unsigned int slot=0;slot<SL_SESSION_CHANNELS;slot++)
+  for(unsigned int n=0;n<4;n++)enqueue_fragment_test(&s.channels[slot],16);
+ before=observed_count;
+ for(unsigned int round=0;round<4;round++){
+  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ }
+ count=0;
+ for(unsigned int i=before;i<observed_count;i++)
+  if(observed_tx[i].stage==2){assert(!observed_tx[i].result);accepted[count++]=observed_tx[i].slot;}
+ const unsigned int expected[]={0,1,2,0,1,3,0,1,4,0,1,5,2,3,4,5,2,3,4,5,2,3,4,5};
+ assert(count==sizeof(expected)/sizeof(expected[0]));
+ for(unsigned int i=0;i<count;i++)assert(accepted[i]==expected[i]);
+ assert(!allocations&&!s.tx_inflight&&!s.tx_policy.fixed_run);
+ /* Credit refusal cannot spend the dynamic turn owed after two fixed PDUs.
+  * Restoring packet_budget is the visible transport dependency, not NOCP. */
+ init_batch(&s,&b[0]);normal_batch_channel(&s,&b[2],2);s.tx_policy.fixed_run=2;
+ enqueue_fragment_test(&s.channels[0],16);enqueue_fragment_test(&s.channels[2],16);packet_budget=0;
+ unsigned long original=((struct sl_fragment_cursor *)s.channels[2].tx.head->cb)->deadline;
+ for(unsigned int n=0;n<3;n++){
+  q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+  assert(s.tx_blocked&&!fragment_count&&s.tx_policy.fixed_run==2&&s.tx_policy.normal_next==2);
+  assert(((struct sl_fragment_cursor *)s.channels[2].tx.head->cb)->deadline==original);
+ }
+ packet_budget=1;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==1&&!s.channels[2].tx.qlen&&s.channels[0].tx.qlen==1&&!s.tx_policy.fixed_run);
+ packet_budget=1;q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q)&&!allocations);
+ /* Fixed traffic arriving after a normal first PB cannot interleave it. */
+ init_batch(&s,&b[0]);normal_batch_channel(&s,&b[2],2);
+ enqueue_fragment_test(&s.channels[2],255);packet_budget=1;
+ assert(!one_transmit(&s,&s.channels[2])&&s.tx_started&&s.fragment_slot==2);
+ enqueue_fragment_test(&s.channels[0],16);packet_budget=2;before=observed_count;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==3&&fragment_pb[0]==1&&fragment_pb[1]==3&&fragment_pb[2]==0);
+ count=0;for(unsigned int i=before;i<observed_count;i++)if(observed_tx[i].stage==2)accepted[count++]=observed_tx[i].slot;
+ assert(count==2&&accepted[0]==2&&accepted[1]==0&&!allocations&&!s.tx_inflight);
+ /* Retired fixed authors confer neither priority nor a phantom completion. */
+ init_batch(&s,&b[0]);normal_batch_channel(&s,&b[2],2);
+ enqueue_fragment_test(&s.channels[0],16);enqueue_fragment_test(&s.channels[2],16);
+ sl_fail_channel(&s,&s.channels[0],-ECONNRESET);packet_budget=1;
+ q=sl_tx_budget_begin(fixture_now_ns);assert(!sl_transmit_batch(&s,&q));
+ assert(fragment_count==1&&!allocations&&!s.tx_policy.fixed_run&&b[0].sk.sk_err==ECONNRESET);
+}
 static void protected_grant_tests(void) {
  struct sl_connection_session s;
  struct sl_socket_binding b={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready,.sk_error_report=data_ready,.sk_state_change=data_ready}};
@@ -1201,7 +1258,7 @@ int main(void){
  route(&s,SL_CHANNEL_CUTC,241,"after detach");assert(s.channels[0].rx.qlen==SL_CHANNEL_RX&&s.channels[0].rx_dropped==2);
  while(s.channels[0].rx.head){struct sk_buff *skb=s.channels[0].rx.head;s.channels[0].rx.head=skb->next;kfree_skb(skb);}
  while(s.channels[0].tx.head){struct sk_buff *skb=s.channels[0].tx.head;s.channels[0].tx.head=skb->next;kfree_skb(skb);}assert(allocations==0);
- queued_discard_tests();batch_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();message_security_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
+ queued_discard_tests();batch_worker_tests();priority_worker_tests();scheduling_tests();blocked_original_deadlines_tests();receive_tests();message_security_tests();direction_tests();publication_tests();two_channel_tests();capability_tests();fragment_worker_tests();tx_status_tests();dynamic_publication_tests();dynamic_protocol_tests();dynamic_worker_tests();
 	session_status_tests();
  protected_grant_tests();
  puts("ACTUAL_SESSION_ROUTE_SUBMIT_PASS; explicit kernel dependencies, no RF");return 0;

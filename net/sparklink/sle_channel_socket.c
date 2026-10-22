@@ -31,6 +31,7 @@
 #include "sle_security_relay.h"
 #include "sle_session_schedule.h"
 #include "sle_tx_budget.h"
+#include "sle_tx_policy.h"
 #define CREATE_TRACE_POINTS
 #include <trace/events/sparklink.h>
 
@@ -92,7 +93,7 @@ struct sl_connection_session {
 	bool tx_blocked; /* last data attempt could not progress; worker-only */
 	u64 service_sequence, tx_sequence; /* worker-only observer IDs, not authority */
 	u64 admission_sequence; /* Session lock; trace-only, never authorization */
-	unsigned int tx_next; /* serialized worker-only round-robin start */
+	struct sl_tx_policy tx_policy; /* serialized worker-only class turns */
 	u16 acb_maximum; /* controller packet size, distinct from DTAP MTU */
 	int fragment_slot; /* sole operation slot; Session lock protects ownership */
 	struct sk_buff *tx_inflight; /* Session-owned, never in an fd queue */
@@ -1090,12 +1091,40 @@ static int sl_transmit_channel(struct sl_connection_session *s, struct sl_basic_
 	sl_wake(s);
 	return ret == -EAGAIN ? 0 : ret;
 }
+/* Snapshot runnable queues under the existing Session -> queue lock order.
+ * Selection is only a hint; actual submit rechecks all physical authority.
+ */
+static int sl_tx_select(struct sl_connection_session *s)
+{
+	unsigned long flags;
+	unsigned int i, ready = 0;
+	int slot;
+
+	spin_lock_irqsave(&s->lock, flags);
+	if (s->fragment_slot >= 0) {
+		slot = s->fragment_slot;
+	} else {
+		for (i = 0; i < SL_SESSION_CHANNELS; i++) {
+			struct sl_basic_channel *c = &s->channels[i];
+
+			if (!sl_binding_live(c->binding) || c->binding.busy ||
+			    !sl_permits(s, c, SL_GRANT_TX))
+				continue;
+			spin_lock(&c->tx.lock);
+			if (skb_peek(&c->tx))
+				ready |= 1U << i;
+			spin_unlock(&c->tx.lock);
+		}
+		slot = sl_tx_policy_choose(&s->tx_policy, ready);
+	}
+	spin_unlock_irqrestore(&s->lock, flags);
+	return slot;
+}
 /* At most six empty visits between budgeted attempts. A begun PB stream
- * retains the physical connection until its PDU ends, then rotate channels.
+ * retains the physical connection until its PDU ends, then advance its class.
  * This loop owns no new references and never creates or refunds credit. */
 static int sl_transmit_batch(struct sl_connection_session *s, struct sl_tx_budget *budget)
 {
-	unsigned long flags;
 	unsigned int i, idle = 0;
 	int slot, ret;
 	struct sl_tx_step step;
@@ -1104,9 +1133,9 @@ static int sl_transmit_batch(struct sl_connection_session *s, struct sl_tx_budge
 	for (i = 0; i < SL_SESSION_CHANNELS; i++)
 		sl_expire_queued_channel(s, &s->channels[i]);
 	while (sl_channel_active(sl_snapshot(s))) {
-		spin_lock_irqsave(&s->lock, flags);
-		slot = s->fragment_slot >= 0 ? s->fragment_slot : s->tx_next;
-		spin_unlock_irqrestore(&s->lock, flags);
+		slot = sl_tx_select(s);
+		if (slot < 0)
+			break;
 		ret = sl_transmit_channel(s, &s->channels[slot], budget, &step);
 		if (ret || budget->stop != SL_TX_BUDGET_NONE)
 			return ret;
@@ -1119,11 +1148,11 @@ static int sl_transmit_batch(struct sl_connection_session *s, struct sl_tx_budge
 			 * long peer repeatedly consume the next returned credit. */
 			if (s->fragment_slot < 0 &&
 			    step.wait != SPARKLINK_ACB_WAIT_CREDIT)
-				s->tx_next = (slot + 1) % SL_SESSION_CHANNELS;
+				sl_tx_policy_yield(&s->tx_policy, slot);
 			break;
 		}
-		if (s->fragment_slot < 0)
-			s->tx_next = (slot + 1) % SL_SESSION_CHANNELS;
+		if (step.submitted && s->fragment_slot < 0)
+			sl_tx_policy_complete(&s->tx_policy, slot);
 		if (step.submitted)
 			idle = 0;
 		else if (++idle == SL_SESSION_CHANNELS)
