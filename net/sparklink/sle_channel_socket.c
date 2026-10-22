@@ -1855,25 +1855,29 @@ static int sl_admit(void *context, u64 security_revision)
 	int ret;
 
 	spin_lock_irqsave(&s->lock, flags);
-	if (sl_binding_live(c->binding) && sl_dynamic_status(c))
+	/* Session failure can precede Binding retirement. Match the early
+	 * access/prepare terminal state before inspecting a cached deadline.
+	 */
+	if (!sl_channel_active(s->progress) || !sl_binding_live(c->binding)) {
+		ret = -ENOTCONN;
+	} else if (sl_dynamic_status(c)) {
 		ret = sl_dynamic_status(c);
-	else if (sl_binding_live(c->binding) &&
-		 (!sl_permits(s, c, SL_GRANT_TX) ||
-		  sl_security_check(s, c, security_revision)))
+	} else if (!sl_permits(s, c, SL_GRANT_TX) ||
+		   sl_security_check(s, c, security_revision)) {
 		ret = -EACCES;
-	else if ((ret = sl_constraint_check(s, c, &admission->constraint,
-					    security_revision))) {
+	} else {
 		/* Preserve explicit original-deadline and malformed bounds errors. */
-	} else if (s->progress.phase != SL_CH_OPEN ||
-		   !sl_binding_live(c->binding))
-		ret = sl_channel_active(s->progress) &&
-				      sl_binding_live(c->binding) ?
-			      -EAGAIN :
-			      -ENOTCONN;
-	else if (length > c->mtu ||
-		 length > sl_channel_payload_limit(s->progress, c->remote_tcid))
+		ret = sl_constraint_check(s, c, &admission->constraint,
+					  security_revision);
+	}
+	if (ret)
+		goto unlock;
+	if (s->progress.phase != SL_CH_OPEN) {
+		ret = -EAGAIN;
+	} else if (length > c->mtu ||
+		   length > sl_channel_payload_limit(s->progress, c->remote_tcid)) {
 		ret = -EMSGSIZE;
-	else {
+	} else {
 		spin_lock(&c->tx.lock);
 		if (!sl_binding_space(c->binding, c->tx.qlen, SL_CHANNEL_TX))
 			ret = -EAGAIN;
@@ -1913,6 +1917,7 @@ static int sl_admit(void *context, u64 security_revision)
 		}
 		spin_unlock(&c->tx.lock);
 	}
+unlock:
 	spin_unlock_irqrestore(&s->lock, flags);
 	return ret;
 }
@@ -1926,7 +1931,8 @@ static int sl_tx_access(void *context, u64 security_revision)
 	unsigned long flags;
 	int ret;
 	spin_lock_irqsave(&s->lock, flags);
-	ret = !sl_binding_live(c->binding) ? -ENOTCONN :
+	ret = !sl_channel_active(s->progress) || !sl_binding_live(c->binding) ?
+				     -ENOTCONN :
 	      sl_dynamic_status(c)	   ? sl_dynamic_status(c) :
 	      (!sl_permits(s, c, SL_GRANT_TX) ||
 	       sl_security_check(s, c, security_revision)) ?

@@ -95,6 +95,22 @@ Managed revocation and physical disconnect retain their existing failure
 semantics and cannot renew an old fd. Reliable/security-protected modes and
 blocking channel setup are explicitly unsupported.
 
+Constrained channel send state
+==============================
+
+Runtime identity and Grant authority are checked before the Session callbacks.
+Under the Session lock, both early TX access and final queue admission reject
+an inactive Session or retired Binding with ENOTCONN before inspecting a cached
+send constraint. Session failure does not require immediate Binding retirement.
+An expired constraint on an otherwise active, authorized binding still returns
+ETIMEDOUT; neither a retry nor a failed-state check renews its original deadline.
+Malformed ancillary records retain their parser errors.
+
+Final admission rechecks this state before transferring the skb to the bounded
+queue. Rejection neither transfers ownership nor changes queued data, physical
+debt or completion accounting. These checks do not prove USB drain, hardware
+completion accuracy, handle reuse safety or peer application delivery.
+
 Session event wakeup staging
 ===========================
 

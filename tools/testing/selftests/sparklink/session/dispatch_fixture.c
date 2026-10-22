@@ -1197,6 +1197,44 @@ static void send_constraint_tests(void) {
  assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-EACCES);
  fixture_security_revision=1;fixture_security_level=0;
 }
+/* A failed physical Session need not retire its SocketBinding immediately.
+ * Cached intent expiry must not hide that common send/prepare terminal state.
+ * These are actual early/final production callbacks; locks, clock, allocator
+ * and Host authorization remain the explicit dependencies above. */
+static void inactive_intent_admission_tests(void) {
+ for(unsigned terminal=0;terminal<2;terminal++)for(unsigned retired=0;retired<2;retired++)for(unsigned expired=0;expired<2;expired++) {
+  struct sl_connection_session s;struct sl_socket_binding b={0};init_batch(&s,&b);
+  fixture_security_revision=2;fixture_security_level=1;
+  struct sl_admission a={.session=&s,.channel=&s.channels[0],.constraint=intent_for(&s,&s.channels[0],1,2),.length=4};
+  if(expired)a.constraint.deadline_monotonic_ns=fixture_now_ns;
+  if(terminal)sl_channel_close(&s.progress);else sl_channel_fail(&s.progress);
+  if(retired)sl_binding_retire(&s.channels[0].binding);
+  struct sl_channel_progress progress=s.progress;struct sl_binding_progress binding=s.channels[0].binding;
+  struct sparklink_send_constraint original=a.constraint;unsigned before=fragment_count,queues=observed_queue[0];
+  assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-ENOTCONN);
+  a.skb=alloc_skb(4,0);skb_put(a.skb,4);struct sk_buff *owned=a.skb;
+  assert(sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a)==-ENOTCONN);
+  assert(a.skb==owned&&!s.channels[0].tx.qlen&&fragment_count==before&&observed_queue[0]==queues);
+  assert(!memcmp(&a.constraint,&original,sizeof(original))&&!memcmp(&s.progress,&progress,sizeof(progress))&&!memcmp(&s.channels[0].binding,&binding,sizeof(binding)));
+  kfree_skb(a.skb);assert(!allocations);
+ }
+ /* Failure after the early check is caught again under the final queue lock;
+  * it does not transfer ownership or renew the previously accepted intent. */
+ struct sl_connection_session s;struct sl_socket_binding b={0};init_batch(&s,&b);
+ fixture_security_revision=2;fixture_security_level=1;
+ struct sl_admission a={.session=&s,.channel=&s.channels[0],.constraint=intent_for(&s,&s.channels[0],1,2),.length=4};
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a));
+ sl_channel_fail(&s.progress);a.constraint.deadline_monotonic_ns=fixture_now_ns;
+ a.skb=alloc_skb(4,0);assert(sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a)==-ENOTCONN&&a.skb);kfree_skb(a.skb);
+ /* An active negotiation still has its original expiry and EAGAIN behavior. */
+ init_batch(&s,&b);s.progress.phase=SL_CH_NEGOTIATING;
+ a=(struct sl_admission){.session=&s,.channel=&s.channels[0],.constraint=intent_for(&s,&s.channels[0],1,2),.length=4,.skb=alloc_skb(4,0)};
+ assert(!sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a));
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a)==-EAGAIN&&a.skb);
+ a.constraint.deadline_monotonic_ns=fixture_now_ns;
+ assert(sparklink_native_session_admit(1,7,11,3,1,sl_tx_access,&a)==-ETIMEDOUT&&sparklink_native_session_admit(1,7,11,3,1,sl_admit,&a)==-ETIMEDOUT&&a.skb);
+ kfree_skb(a.skb);assert(!allocations);fixture_security_revision=1;fixture_security_level=0;
+}
 static void prepare_intent_tests(void) {
  struct sl_connection_session s;struct sl_socket_binding b={0};init_batch(&s,&b);
  struct socket sock={.sk=&b.sk};copy_limit=48;fixture_security_revision=2;fixture_security_level=1;
@@ -1221,6 +1259,7 @@ static void prepare_intent_tests(void) {
 int main(void){
  prepare_intent_tests();
  send_constraint_tests();
+ inactive_intent_admission_tests();
  identifier_zero_request_tests();negotiated_limit_tests();
  struct sl_connection_session s={.controller=1,.generation=7,.lifetime=11,.epoch=1,.handle=3};struct sl_socket_binding socket_binding={.sk={.refs=1,.sk_rcvbuf=100000,.sk_data_ready=data_ready}};struct sock *sk=&socket_binding.sk;
  sl_channel_start(&s.progress, 249, 254);sl_channel_request_submitted(&s.progress,0);sl_channel_peer_capability(&s.progress, 249, 254, 0);sl_channel_response_submitted(&s.progress,0);
