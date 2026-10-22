@@ -25,6 +25,7 @@
 #include "dli.h"
 #include "discovery.h"
 #include "connection.h"
+#include "fw_profile.h"
 #include "recovery.h"
 
 #define WS73_VID		0xffff
@@ -65,6 +66,8 @@ struct ws73_port {
 	char path[16];
 	bool attached;
 	struct ws73_recovery_budget budget;
+	bool rom_profile_pending;
+	struct ws73_fw_profile rom_profile;
 };
 /* Keep identity/budget across USB address changes; never evict a failed port.
  * Holding controller references prevents pointer reuse until module teardown.
@@ -126,6 +129,13 @@ struct ws73_usb {
 	unsigned int command_credits;
 	struct ws73_dli_info info;
 	struct ws73_chip_info chip_info;
+	/* phase_lock protects selected inputs and this-interface filesystem checks.
+	 * These are not a firmware execution or hardware identity attestation.
+	 */
+	char profile_directory[WS73_PROFILE_DIRECTORY_SIZE];
+	struct ws73_fw_profile input_profile;
+	bool profile_loaded;
+	u8 profile_checked;
 	struct ws73_sle_efuse_info address_source;
 	int address_source_error;
 	struct ws73_dli_result dli_result;
@@ -204,9 +214,14 @@ static const struct {
 	const char *name;
 	u32 address;
 } ws73_images[] = {
-	{ "sparklink/ws73/ws73.bin", 0x400000 },
-	{ "sparklink/ws73/wifi_cali.bin", 0x430000 },
-	{ "sparklink/ws73/btc_cali.bin", 0x440000 },
+	{ "ws73.bin", 0x400000 },
+	{ "wifi_cali.bin", 0x430000 },
+	{ "btc_cali.bin", 0x440000 },
+};
+
+static const char * const ws73_profile_names[WS73_PROFILE_FILES] = {
+	"ws73.bin", "wifi_cali.bin", "btc_cali.bin",
+	"bsle_custom.bin", "pm_config.bin",
 };
 
 static const struct {
@@ -309,6 +324,78 @@ static int ws73_validate_image(const struct firmware *fw)
 		return -EBADMSG;
 	sha256(fw->data + WS73_FW_HEADER, fw->size - WS73_FW_HEADER, actual);
 	return memcmp(expected, actual, sizeof(actual)) ? -EBADMSG : 0;
+}
+
+/* phase_lock held. Input identity survives a recovery of this interface, but
+ * actual HCC identity is queried afresh by runtime_start(). No file fallback.
+ */
+static int ws73_profile_load(struct ws73_usb *ws)
+{
+	const struct firmware *file = NULL;
+	struct ws73_fw_profile selected;
+	char name[WS73_PROFILE_PATH_SIZE];
+	int ret;
+
+	ws->profile_checked = 0;
+	ret = snprintf(name, sizeof(name), "%s/profile.bin", ws->profile_directory);
+	if (ret < 0 || (size_t)ret >= sizeof(name))
+		return -ENAMETOOLONG;
+	ret = request_firmware_direct(&file, name, &ws->intf->dev);
+	if (ret)
+		return ret;
+	ret = ws73_fw_profile_decode(file->data, file->size, &selected);
+	if (!ret && ws->profile_loaded)
+		ret = ws73_fw_profile_same(&ws->input_profile, &selected);
+	if (!ret) {
+		mutex_lock(&ws73_ports_lock);
+		if (ws->port->rom_profile_pending)
+			ret = ws73_fw_profile_same(&ws->port->rom_profile, &selected);
+		mutex_unlock(&ws73_ports_lock);
+	}
+	if (!ret) {
+		ws->input_profile = selected;
+		ws->profile_loaded = true;
+	}
+	release_firmware(file);
+	return ret;
+}
+
+/* phase_lock held; returned firmware belongs to the caller on success only. */
+static int ws73_profile_file(struct ws73_usb *ws, unsigned int index,
+			     const struct firmware **result)
+{
+	const struct firmware *file = NULL;
+	u8 digest[SHA256_DIGEST_SIZE];
+	char name[WS73_PROFILE_PATH_SIZE];
+	int ret;
+
+	if (!result || !ws->profile_loaded || index >= WS73_PROFILE_FILES)
+		return -EINVAL;
+	*result = NULL;
+	ws->profile_checked &= ~(1U << index);
+	ret = snprintf(name, sizeof(name), "%s/%s", ws->profile_directory,
+		       ws73_profile_names[index]);
+	if (ret < 0 || (size_t)ret >= sizeof(name))
+		return -ENAMETOOLONG;
+	ret = request_firmware_direct(&file, name, &ws->intf->dev);
+	if (ret)
+		return ret;
+	if (index < WS73_PROFILE_CUSTOM)
+		ret = ws73_validate_image(file);
+	else if (file->size != (index == WS73_PROFILE_CUSTOM ? WS73_WIRE_CUSTOM_DATA_SIZE : 4))
+		ret = -EINVAL;
+	if (!ret) {
+		sha256(file->data, file->size, digest);
+		ret = ws73_fw_profile_digest(&ws->input_profile, index, digest);
+	}
+	if (ret) {
+		dev_err(&ws->intf->dev, "invalid selected input %s: %d\n", name, ret);
+		release_firmware(file);
+		return ret;
+	}
+	ws->profile_checked |= 1U << index;
+	*result = file;
+	return 0;
 }
 
 static int ws73_download_image(struct ws73_usb *ws, const struct firmware *fw,
@@ -428,19 +515,25 @@ static void ws73_boot_work(struct work_struct *work)
 		goto out;
 	WRITE_ONCE(ws->stage, WS73_LOADING);
 	ws73_pending_status(ws, WS73_LOADING, 0);
-	/* Validate all images before the first device write. */
+	/* Select and validate all images before the first device write. Only a
+	 * matching input closure may cross this port's ROM/runtime transition.
+	 */
+	mutex_lock(&ws->phase_lock);
+	ret = ws73_profile_load(ws);
 	for (i = 0; i < ARRAY_SIZE(images); i++) {
-		ret = request_firmware(&images[i], ws73_images[i].name,
-				       &ws->intf->dev);
 		if (ret)
-			goto out;
-		ret = ws73_validate_image(images[i]);
-		if (ret) {
-			dev_err(&ws->intf->dev, "invalid firmware %s: %d\n",
-				ws73_images[i].name, ret);
-			goto out;
-		}
+			break;
+		ret = ws73_profile_file(ws, i, &images[i]);
 	}
+	if (!ret) {
+		mutex_lock(&ws73_ports_lock);
+		ws->port->rom_profile = ws->input_profile;
+		ws->port->rom_profile_pending = true;
+		mutex_unlock(&ws73_ports_lock);
+	}
+	mutex_unlock(&ws->phase_lock);
+	if (ret)
+		goto out;
 
 	ret = ws73_command(ws, "READM 0x40019380 4", NULL);
 	if (ret)
@@ -1166,10 +1259,13 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	 * another dongle or synthesized as an all-zero calibration block.
 	 * Validate both inputs before sending any runtime command.
 	 */
-	ret = request_firmware(&custom, "sparklink/ws73/bsle_custom.bin", &ws->intf->dev);
+	ret = ws73_profile_load(ws);
 	if (ret)
 		goto out;
-	ret = request_firmware(&pm, "sparklink/ws73/pm_config.bin", &ws->intf->dev);
+	ret = ws73_profile_file(ws, WS73_PROFILE_CUSTOM, &custom);
+	if (ret)
+		goto out;
+	ret = ws73_profile_file(ws, WS73_PROFILE_PM, &pm);
 	if (ret)
 		goto out;
 	if (custom->size != WS73_WIRE_CUSTOM_DATA_SIZE || pm->size != 4) {
@@ -1213,8 +1309,10 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	ret = ws73_chip_query(&io, &ws->chip_info);
 	if (ret)
 		goto out;
-	if (ws->chip_info.bus != 0) {
-		ret = -EPROTO;
+	ret = ws73_fw_profile_model(&ws->input_profile, ws->chip_info.model, ws->chip_info.bus);
+	if (ret) {
+		dev_err(&ws->intf->dev, "selected profile/HCC model mismatch: expected=%u observed=%u bus=%u\n",
+			ws->input_profile.model, ws->chip_info.model, ws->chip_info.bus);
 		goto out;
 	}
 	dev_info(&ws->intf->dev, "HCC reported WS73%c bus=USB (not firmware attestation)\n",
@@ -1288,6 +1386,9 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	}
 	if (ret)
 		goto out;
+	mutex_lock(&ws73_ports_lock);
+	ws->port->rom_profile_pending = false;
+	mutex_unlock(&ws73_ports_lock);
 	WRITE_ONCE(ws->stage, WS73_NATIVE_SETUP);
 	WRITE_ONCE(ws->last_error, 0);
 	schedule_delayed_work(&ws->health_work, msecs_to_jiffies(1000));
@@ -1624,6 +1725,29 @@ static ssize_t native_runtime_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(native_runtime);
 
+static ssize_t firmware_profile_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	ssize_t size;
+
+	if (!ws)
+		return -ENODEV;
+	mutex_lock(&ws->phase_lock);
+	if (ws->profile_loaded)
+		size = sysfs_emit(buf,
+				  "source=os-input directory=%s expected_model=WS73%c bus=USB filesystem_checked=%02x execution_attested=0\n",
+				  ws->profile_directory,
+				  "USE"[ws->input_profile.model], ws->profile_checked);
+	else
+		size = sysfs_emit(buf,
+				  "source=os-input directory=%s selection=none execution_attested=0\n",
+				  ws->profile_directory);
+	mutex_unlock(&ws->phase_lock);
+	return size;
+}
+static DEVICE_ATTR_RO(firmware_profile);
+
 static struct attribute *ws73_attrs[] = {
 	&dev_attr_boot_stage.attr,
 	&dev_attr_boot_error.attr,
@@ -1637,6 +1761,7 @@ static struct attribute *ws73_attrs[] = {
 	&dev_attr_chip_information.attr,
 	&dev_attr_hcc_memory_observation.attr,
 	&dev_attr_sle_address_source.attr,
+	&dev_attr_firmware_profile.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ws73);
@@ -1644,8 +1769,10 @@ ATTRIBUTE_GROUPS(ws73);
 static int ws73_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_host_interface *alt = intf->cur_altsetting;
+	struct usb_device *udev = interface_to_usbdev(intf);
 	struct ws73_usb *ws;
 	unsigned int i;
+	int ret;
 	u8 eps;
 
 	if (alt->desc.bInterfaceNumber ||
@@ -1656,10 +1783,22 @@ static int ws73_probe(struct usb_interface *intf, const struct usb_device_id *id
 	eps = alt->desc.bNumEndpoints;
 	if (eps != 2 && eps != 5)
 		return -ENODEV;
+	/* A USB2 physical route remains stable from full-speed ROM to high-speed
+	 * runtime; a USB3 companion port is a different namespace, not a fallback.
+	 */
+	if ((udev->speed != USB_SPEED_FULL && udev->speed != USB_SPEED_HIGH) ||
+	    udev->bus->root_hub->speed > USB_SPEED_HIGH)
+		return -EOPNOTSUPP;
 
 	ws = kzalloc_obj(*ws);
 	if (!ws)
 		return -ENOMEM;
+	ret = ws73_fw_profile_directory(ws->profile_directory, sizeof(ws->profile_directory),
+					dev_name(udev->bus->controller), udev->devpath);
+	if (ret) {
+		kfree(ws);
+		return ret;
+	}
 	/* Validate the known roles by address and transfer type, not ordering. */
 	for (i = 0; i < eps; i++) {
 		const struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
@@ -1795,8 +1934,6 @@ module_exit(ws73_exit);
 
 MODULE_DESCRIPTION("WS73 USB firmware, BSLE and native Runtime transport for SparkLink");
 MODULE_LICENSE("GPL");
-MODULE_FIRMWARE("sparklink/ws73/ws73.bin");
-MODULE_FIRMWARE("sparklink/ws73/wifi_cali.bin");
-MODULE_FIRMWARE("sparklink/ws73/btc_cali.bin");
-MODULE_FIRMWARE("sparklink/ws73/bsle_custom.bin");
-MODULE_FIRMWARE("sparklink/ws73/pm_config.bin");
+/* Per-device profile and five inputs are provisioned explicitly below
+ * sparklink/ws73/by-path/<controller>-usb2-<route>/. There is no global fallback.
+ */

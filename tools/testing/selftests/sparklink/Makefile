@@ -4,6 +4,7 @@ TEST_GEN_PROGS := ws73_bsle_test ws73_dli_test ws73_discovery_test
 TEST_GEN_PROGS += ws73_recovery_test sparklink_backend_test
 TEST_GEN_PROGS += ws73_acb_test
 TEST_GEN_PROGS += ws73_chip_test
+TEST_GEN_PROGS += ws73_fw_profile_test
 TEST_GEN_PROGS += ws73_sle_efuse_test
 TEST_GEN_PROGS += virtual_codec_test
 TEST_GEN_PROGS += sle_channel_wire_test sle_channel_signal_test
@@ -37,6 +38,9 @@ TEST_PROGS += run_usb_firmware.py
 TEST_PROGS += run_usb_binding.py
 TEST_PROGS += run_ws73_runtime_rx.py
 TEST_PROGS += run_ws73_hcc_memory.py
+TEST_PROGS += run_ws73_fw_profile.py
+TEST_FILES += firmware/profile_driver_fixture.c
+TEST_FILES += firmware/profile_codec_cbmc.c
 TEST_PROGS += run_standard_provider.py
 TEST_PROGS += run_standard_driver.py
 TEST_PROGS += run_usb_discovery.py run_backend_command_port.py run_usb_bootstrap_metadata.py
@@ -48,6 +52,9 @@ TEST_FILES += dli_parser_budget.py retired_uapi_test.c retired_ioctl_cases.h ret
 TEST_FILES += run_virtual_vm.py standard_event_fixture.rs retired-standard-events retired-registry-version
 
 include ../lib.mk
+
+$(OUTPUT)/ws73_fw_profile_test: ws73_fw_profile_test.c ../../../../drivers/sparklink/ws73/fw_profile.c ../../../../drivers/sparklink/ws73/fw_profile.h
+	$(CC) $(CFLAGS) $< ../../../../drivers/sparklink/ws73/fw_profile.c $(LDLIBS) -o $@
 
 $(OUTPUT)/ws73_chip_test: ws73_chip_test.c ../../../../drivers/sparklink/ws73/wire.c ../../../../drivers/sparklink/ws73/bsle.c ../../../../drivers/sparklink/ws73/wire.h ../../../../drivers/sparklink/ws73/bsle.h
 	$(CC) $(CFLAGS) $< ../../../../drivers/sparklink/ws73/wire.c ../../../../drivers/sparklink/ws73/bsle.c $(LDLIBS) -o $@
