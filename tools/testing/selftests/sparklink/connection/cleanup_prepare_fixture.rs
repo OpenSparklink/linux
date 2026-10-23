@@ -22,9 +22,9 @@ struct Plan{opcode:u16,length:u16,params:[u8;3]}
 struct Driver{scenario:u8}
 impl Driver{fn prepare_connection(&self,r:&SleConnectionSubmit)->Result<Plan>{
  HELD.with(|v|assert!(v.borrow().is_empty(),"driver callback under IRQ guard"));
- assert_eq!((r.version,r.profile,r.operation,r.generation,r.handle,r.reason,r.request_id),(1,1,2,7,0,0x13,0));assert_eq!(r.params,[0;60]);
+ assert_eq!((r.version,r.profile,r.operation,r.generation,r.handle,r.reason,r.request_id),(1,1,2,7,0,0x10,0));assert_eq!(r.params,[0;60]);
  OWNER.with(|v|{let borrowed=v.borrow();let o=borrowed.as_ref().unwrap();match self.scenario{1=>o.host.lock().candidate=None,2=>*o.schedule_gate.lock()=true,_=>{}}});
- if self.scenario==3{return Err(Error(-95))} Ok(Plan{opcode:0x1403,length:3,params:[0,0,0x13]})
+ if self.scenario==3{return Err(Error(-95))} Ok(Plan{opcode:0x1403,length:3,params:[0,0,0x10]})
 }}
 mod sle_dli{use super::*;pub enum ControllerBackend{Native(Driver)} impl ControllerBackend{pub(super) fn provider(&self)->&Driver{let Self::Native(c)=self;c}}}
 mod actual{use super::*;
@@ -35,7 +35,7 @@ fn owner()->Arc<ControllerRuntime>{let o=Rc::new(ControllerRuntime{identity:Iden
 #[test] fn callback_has_no_irq_guard_and_rechecks_link_and_retirement(){
  for scenario in 0..4{let o=owner();let s=ControllerState{controller:sle_dli::ControllerBackend::Native(Driver{scenario})};let r=actual::invoke(&o,&s);
   assert_eq!(r,match scenario{0=>Ok(true),1=>Ok(false),2=>Err(ENODEV),_=>Err(Error(-95))});
-  let h=o.host.lock();assert_eq!(h.submissions.len(),usize::from(scenario==0));if scenario==0{assert_eq!(h.submissions[0],(0,0x1403,vec![0,0,0x13]));}
+  let h=o.host.lock();assert_eq!(h.submissions.len(),usize::from(scenario==0));if scenario==0{assert_eq!(h.submissions[0],(0,0x1403,vec![0,0,0x10]));}
  }
 }
 #[test] fn unsupported_controller_and_no_candidate_admit_no_operation(){

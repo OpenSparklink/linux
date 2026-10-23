@@ -7,6 +7,13 @@ acceptance proves a submission/accounting boundary, not negotiated transport,
 socket ABI, peer delivery, hardware or RF. The native WS73 discovery path must
 also be regressed with a freshly built kernel and two real devices in a VM.
 
+run_native_connection_host.py also compiles the actual process-context
+progress_connection_cleanup caller. Its driver fixture checks the SLE 0x10
+remote-user termination request used by the Native daemon; 0x13 is not the
+Bluetooth meaning in SLE. The fixture covers preparation failure, retirement
+and a disappearing cleanup candidate without inventing a physical Down.
+It does not prove firmware acceptance, callback drain or peer termination.
+
 The Rust source is compiled with -D warnings. C boundaries require
 ASan/UBSan/LeakSanitizer; a restricted ptrace environment may prevent LSan
 execution and must be corrected, not recorded as a passing/skipped gate.

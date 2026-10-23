@@ -57,11 +57,13 @@ fn progress_connection_cleanup(owner: &Arc<ControllerRuntime>, state: &Controlle
     let candidate = owner.host.lock().cleanup_candidate()?;
     let Some(handle) = candidate else { return Ok(false); };
     let controller = state.controller.provider();
-    // Normal local management termination. This is a protocol reason, not a
-    // vendor opcode; the retained driver owns wire preparation and validation.
+    // Use the same SLE remote-user termination reason as the Native daemon.
+    // 0x13 means encryption mode not acceptable in SLE, not Bluetooth's
+    // remote-user termination. The driver still owns wire preparation; only
+    // actual controller outcomes may settle either end of the connection.
     let request = SleConnectionSubmit {
         version: 1, profile: owner.protocol_profile, operation: 2,
-        generation: owner.identity.generation, handle: handle as u32, reason: 0x13,
+        generation: owner.identity.generation, handle: handle as u32, reason: 0x10,
         // SAFETY: integer/byte-only repr(C); no uninitialized request fields.
         ..unsafe { core::mem::zeroed() }
     };
