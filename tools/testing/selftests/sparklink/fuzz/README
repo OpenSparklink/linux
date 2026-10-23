@@ -31,8 +31,13 @@ EFAULT/bad user pointers belong to the actual syscall VM gate.
 The runner checks sanitizer/coverage symbols, full libFuzzer terminal summaries,
 actual execution counts of required production functions and unchanged source
 hashes. Missing tools/results/profiles, sanitizer diagnostics, a masked failure
-or truncated logs cannot pass. Five synthetic supervisor negative-control tests
-are separate from production codec exploration.
+or truncated logs cannot pass. Synthetic supervisor negative-control tests
+are separate from production codec exploration. The initial unqualified receipt
+precedes Git/source/tool metadata collection; each external metadata command has
+a recorded30-second wall deadline. A metadata timeout is a failed/unverified run,
+never permission to omit source identity or upgrade an older run. The supervisor
+terminates its own timed-out command group, including inherited-pipe Git helpers;
+this does not authorize killing other builds. Preserve partial logs and report.
 
 BOUNDED_FUZZ_COMPLETED_NO_FINDING means only the recorded finite input budget.
 It is not a proof or a kernel KASAN/KCSAN/lockdep qualification. Query/BSLE state

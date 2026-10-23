@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import time
 
@@ -20,6 +21,36 @@ ROOT = HERE.parents[3]
 REQUIRED = ['ws73_wire_receive', 'ws73_wire_acb_fragment_decode',
             'ws73_wire_acb_fragment', 'ws73_dli_validate_security_event',
             'ws73_dli_validate_reply', 'ws73_dli_link_outcome']
+METADATA_TIMEOUT_SECONDS = 30
+
+
+def bounded_command(command, env=None, timeout=60):
+    """Own/reap the subprocess group, including Git lazy-fetch helpers.
+
+    Killing only Git and then draining its pipe can still wait on a descendant
+    holding that pipe. This offline Linux supervisor never owns device work.
+    """
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               cwd=ROOT, env=env, start_new_session=True)
+    try:
+        raw, _ = process.communicate(timeout=timeout)
+        return process.returncode, raw
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raw, _ = process.communicate(timeout=5)
+        return 'TIMEOUT', raw
+    finally:
+        # Also handle cancellation/interruption of the supervisor itself. A
+        # missing/completed=False receipt cannot become accepted exploration.
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=5)
 
 
 def completed(text, code):
@@ -65,13 +96,13 @@ def run(args):
                    Path(__file__), HERE/'fuzz/test_ws73_codec_verdict.py',
                    ROOT/'net/sparklink/sle_channel_wire.c', ROOT/'net/sparklink/sle_channel_wire.h']
     maximum = 64 if dynamic else 20480
-    snapshot = {str(p.relative_to(ROOT)): digest(p) for p in sources}
+    snapshot = {}
     report = dict(schema_version=1, contract=args.contract, status='RUNNING_NOT_QUALIFIED', completed=False,
                   accepted_exploration=False, proof=False, physical_acceptance=False,
-                  source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
-                  source_hashes=snapshot, source_worktree_status=subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).splitlines(), phases=[], bounds=dict(runs=args.runs,seed=args.seed,
+                  source_commit=None, source_hashes=snapshot, source_worktree_status=None,
+                  phases=[], bounds=dict(runs=args.runs,seed=args.seed,
                   max_input_bytes=maximum,input_timeout_seconds=2,phase_wall_timeout_seconds=60,
-                  software_memory_mb=512),
+                  metadata_wall_timeout_seconds=METADATA_TIMEOUT_SECONDS,software_memory_mb=512),
                   real_dependencies='Production wire.c/dli.c, libc malloc, Clang libFuzzer/ASAN/UBSAN and LLVM coverage; no protocol/USB/clock/lock success stubs',
                   fixture='Hand-authored legal/malformed input corpus and input-bounds observer callback with explicit ECANCELED outcome',
                   excluded=['kernel allocator/locks/refcounts/USB callbacks and real concurrency',
@@ -91,11 +122,9 @@ def run(args):
         row = dict(name=name, command=command, status='RUNNING', start_ns=time.time_ns())
         report['phases'].append(row); save()
         try:
-            p = subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                               env=env,timeout=timeout,cwd=ROOT)
-            row['exit']=p.returncode; raw=p.stdout
-        except subprocess.TimeoutExpired as e:
-            raw=e.stdout or b'';row['exit']='TIMEOUT'
+            row['exit'], raw = bounded_command(command, env=env, timeout=timeout)
+        except OSError as error:
+            row['exit'], raw = 'UNAVAILABLE', str(error).encode()
         (out/(name+'.log')).write_bytes(raw)
         row.update(log_sha256=hashlib.sha256(raw).hexdigest(),end_ns=time.time_ns())
         row['status']='COMMAND_COMPLETED' if row['exit']==0 else 'FAILED_OR_UNVERIFIED'
@@ -103,13 +132,27 @@ def run(args):
         if row['exit']!=0: raise RuntimeError(name+' failed or timed out')
         return raw.decode(errors='replace')
     try:
+        # Persist an unqualified receipt before Git, source reads, compiler
+        # discovery or version probes. Failure never leaves an absent report.
+        save()
+        snapshot.update({str(p.relative_to(ROOT)): digest(p) for p in sources})
+        report['source_commit'] = invoke('source-commit', ['git','rev-parse','HEAD'],
+                                        timeout=METADATA_TIMEOUT_SECONDS).strip()
+        if not re.fullmatch(r'[0-9a-f]{40}', report['source_commit']):
+            raise ValueError('invalid source commit')
+        report['source_worktree_status'] = invoke('source-worktree', ['git','status','--porcelain'],
+                                                 timeout=METADATA_TIMEOUT_SECONDS).splitlines()
         compiler=os.environ.get('CC','clang')
         profdata=os.environ.get('LLVM_PROFDATA','llvm-profdata')
         cov=os.environ.get('LLVM_COV','llvm-cov')
         for name in [compiler, profdata,cov,'nm']:
             if not shutil.which(name):raise RuntimeError('required tool unavailable: '+name)
-        report['tools']={name:subprocess.check_output([name,'--version'],text=True).splitlines()[0]
-                         for name in [compiler,profdata,cov]}
+        report['tools']={}
+        for i,name in enumerate([compiler,profdata,cov]):
+            version = invoke('tool-version-'+str(i), [name,'--version'],
+                             timeout=METADATA_TIMEOUT_SECONDS).splitlines()
+            if not version:raise ValueError('empty tool version: '+name)
+            report['tools'][name] = version[0]
         catalog=json.loads(sources[1].read_text())
         if catalog['schema_version']!=1 or len(catalog['seeds'])<10:raise ValueError('bounded fixed corpus missing')
         fixed=out/'fixed-corpus';fixed.mkdir()
@@ -125,7 +168,7 @@ def run(args):
                  '-fprofile-instr-generate','-fcoverage-mapping',
                  *[str(p) for p in ([sources[0], sources[4]] if dynamic else [sources[0], sources[4], sources[6]])],'-o',str(binary)]
         invoke('compile',command)
-        symbols=subprocess.check_output(['nm',str(binary)],text=True)
+        symbols=invoke('instrumentation-symbols',['nm',str(binary)])
         for symbol in ['__asan_init','__ubsan_handle_', '__sanitizer_cov_8bit_counters_init','LLVMFuzzerTestOneInput']:
             if symbol not in symbols:raise ValueError('missing instrumentation: '+symbol)
         report['binary_sha256']=digest(binary)
