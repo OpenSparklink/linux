@@ -1,0 +1,8 @@
+fn do_stop_scan(context: &RuntimeContext) -> Result<i32> {
+    let mut ss = context.lock()?;
+    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+    if !s.adv_scan.is_scanning() { return Err(EBUSY); }
+    s.controller.enable_scan(false)?;
+    s.adv_scan.stop_scanning()?;
+    Ok(0)
+}

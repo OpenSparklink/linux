@@ -187,7 +187,7 @@ const struct security_class_mapping secclass_map[] = {
 #ifdef __KERNEL__ /* avoid this check when building host programs */
 #include <linux/socket.h>
 
-#if PF_MAX > 46
+#if PF_MAX > 47
 #error New address family defined, please update secclass_map.
 #endif
 #endif

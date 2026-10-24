@@ -1,0 +1,66 @@
+// Attribute 1: max_connections (read/write, 1..8)
+#[vtable]
+impl configfs::AttributeOperations<1> for SparkLinkConfig {
+    type Data = SparkLinkConfig;
+
+    fn show(_data: &SparkLinkConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        let val = MAX_CONNECTIONS.load(Ordering::Relaxed);
+        Ok(int_to_page(u32::from(val), page))
+    }
+
+    fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
+        let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
+        let val: u8 = s.trim().parse().map_err(|_| EINVAL)?;
+        if val == 0 || val > 8 {
+            return Err(EINVAL);
+        }
+        MAX_CONNECTIONS.store(val, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+// Attribute 2: adv_interval_ms (read/write, 20..10240)
+#[vtable]
+impl configfs::AttributeOperations<2> for SparkLinkConfig {
+    type Data = SparkLinkConfig;
+
+    fn show(_data: &SparkLinkConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        let val = ADV_INTERVAL_MS.load(Ordering::Relaxed);
+        Ok(int_to_page(u32::from(val), page))
+    }
+
+    fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
+        let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
+        let val: u16 = s.trim().parse().map_err(|_| EINVAL)?;
+        if !(20..=10240).contains(&val) {
+            return Err(EINVAL);
+        }
+        ADV_INTERVAL_MS.store(val, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+// Attribute 3: scan_window_ms (read/write, 10..10240)
+#[vtable]
+impl configfs::AttributeOperations<3> for SparkLinkConfig {
+    type Data = SparkLinkConfig;
+
+    fn show(_data: &SparkLinkConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        let val = SCAN_WINDOW_MS.load(Ordering::Relaxed);
+        Ok(int_to_page(u32::from(val), page))
+    }
+
+    fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
+        let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
+        let val: u16 = s.trim().parse().map_err(|_| EINVAL)?;
+        if !(10..=10240).contains(&val) {
+            return Err(EINVAL);
+        }
+        SCAN_WINDOW_MS.store(val, Ordering::Relaxed);
+        Ok(())
+    }
+}
+

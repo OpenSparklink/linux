@@ -1,0 +1,35 @@
+SSAP legacy containment / historical codec
+==========================================
+
+Run: python3 tools/testing/selftests/sparklink/run_ssap_containment.py
+
+The runner compiles the test-only historical ssap/legacy_staging.rs, appending
+private child tests, and the actual remote ioctl dispatcher body. KVec/allocation
+and the transport TCID constant are explicit dependency fixtures. Nine tests
+cover all opcodes and input lengths including 65535/65536, repeated full frames,
+no allocation/mutation/ACK on unsupported ingress, no method echo, no unowned
+notifications, atomic property replacement after OOM, and local value/permission
+boundaries, all reserved operation bits and rejected property registration.
+The whole kernel build separately checks production wiring.
+
+legacy_codec.rs preserves the previous offset-format codec only as test material.
+Its section references are inherited history, not standard conformance claims.
+The offset fields / short-payload completion heuristic do not implement the
+message-control fields in T/XS 20001-2025 tables 72, 75 and 76. The unsafe
+transaction accumulator is deleted, not copied into a test backend. The original
+implementation and failure findings remain in Git history at 75b77fc19613.
+
+No production Engine, remote request builder, automatic notification drain or
+method echo uses this codec. Remote ioctls, notifications, indications and the
+remaining ingress stub return EOPNOTSUPP; inbound legacy channels are dropped
+without parsing, consuming/granting credit or ACKing. Native WS73 typed discovery
+and its USB/HCC/BSLE path are unchanged. Local service staging is not publication.
+
+This is containment, not complete R04/R07/R08 remediation. The final userspace
+Engine needs standard codecs/fragment flags, explicit peer/generation ownership,
+request correlation/deadlines/cancellation, permission/error conformance,
+transactional queue/credit submission, memory budgets and real peer tests. Native
+PDU sockets, negotiated reliability and indication ACK semantics are still open.
+
+The staging/session model is no longer compiled by the production kernel.
+It preserves permissions/OOM/failure history and must not become a new wire Engine.

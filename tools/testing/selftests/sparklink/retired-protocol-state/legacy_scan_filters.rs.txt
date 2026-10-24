@@ -1,0 +1,24 @@
+        SL_IOCTL_SCAN_RESULT_COUNT => {
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            drain_controller_events(s);
+            let count = s.adv_scan.scan_result_count();
+            Ok(count as isize)
+        }
+        SL_IOCTL_SET_SCAN_FILTER => {
+            let params: SleScanFilter = read_user_struct(arg)?;
+            let count = (params.uuid_count as usize).min(sle_adv::SCAN_FILTER_MAX_UUIDS);
+            let mut filter = sle_adv::ScanFilter::default();
+            filter.uuid_count = count as u8;
+            filter.uuids[..count].copy_from_slice(&params.uuids[..count]);
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.set_scan_filter(filter);
+            Ok(0)
+        }
+        SL_IOCTL_CLEAR_SCAN_FILTER => {
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.clear_scan_filter();
+            Ok(0)
+        }

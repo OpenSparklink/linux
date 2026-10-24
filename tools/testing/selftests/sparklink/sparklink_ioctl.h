@@ -1,1 +1,1 @@
-/home/sanchuanhehe/Documents/linux/include/uapi/linux/sparklink_ioctl.h
+../../../../include/uapi/linux/sparklink_ioctl.h

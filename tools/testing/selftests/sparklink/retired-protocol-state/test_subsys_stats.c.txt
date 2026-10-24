@@ -1,0 +1,41 @@
+static void test_subsys_stats(int fd)
+{
+	test_header("Subsystem statistics observability");
+
+	/* First query dev_count for cross-reference */
+	int dev_count = ioctl(fd, SL_IOCTL_DEV_COUNT, NULL);
+
+	int ret;
+
+	struct sle_subsys_stats ss;
+
+	memset(&ss, 0, sizeof(ss));
+	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
+	check("SUBSYS_STATS", ret);
+	if (ret == 0) {
+		printf("  dev_count=%u pending=%u runtime=%u active_conn=%u\n",
+		       ss.dev_count, ss.pending_count, ss.runtime_count,
+		       ss.active_connections);
+		printf("  conn: created=%u completed=%u\n",
+		       ss.total_conn_created, ss.total_conn_completed);
+		printf("  mgmt: submitted=%u timeouts=%u pending=%u\n",
+		       ss.total_mgmt_submitted, ss.total_mgmt_timeouts,
+		       ss.mgmt_pending);
+		printf("  power: state=%u transitions=%u\n",
+		       ss.power_state, ss.power_transitions);
+
+		/* Cross-reference: dev_count should match */
+		if (dev_count > 0 && ss.dev_count == (uint16_t)dev_count)
+			printf("  OK:   dev_count matches DEV_COUNT ioctl\n");
+		else if (dev_count > 0)
+			printf("  WARN: dev_count mismatch: stats=%u ioctl=%d\n",
+			       ss.dev_count, dev_count);
+
+		/* total_conn_created >= total_conn_completed */
+		if (ss.total_conn_created >= ss.total_conn_completed)
+			printf("  OK:   created(%u) >= completed(%u)\n",
+			       ss.total_conn_created, ss.total_conn_completed);
+		else
+			printf("  WARN: created < completed\n");
+	}
+}

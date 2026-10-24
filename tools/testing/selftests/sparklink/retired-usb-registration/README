@@ -1,0 +1,26 @@
+Retired generic USB implementation evidence (test-only)
+=======================================================
+
+No file here is imported by the default kernel or daemon. These files do not
+establish standard USB hardware support or WS73 wire conformance.
+
+sle_transport.rs and attach_metadata.rs preserve the previous registration
+and metadata projection. The pending/open production source regression is
+run_usb_registration.py; hardware acceptance is a separate VM gate.
+
+legacy_usb_codec.rs preserves exact unused encoder/header-parser segments
+from Linux 5a49caef5a6e8742d978fd66aa685b5b6472c68b. The old encoders silently
+truncate and mask inputs; the header parser ignores reserved bits. These are
+historical failure witnesses, not supported behavior. Do not restore this
+codec to production. Actual USB transmission uses retained C context APIs.
+
+run_usb_codec_isolation.py separately checks four bounds on the actual live
+parse_event_packet body (errno/allocation dependencies are fixtures) and
+three historical codec witnesses. It does not prove callback lifetime,
+allocator failure handling, IRQ safety, module ownership, PM or radio I/O.
+
+Unconsumed Rust low-level URB/sync wrappers and corresponding C OUT/sync
+helpers have been deleted rather than maintained as a second transport API.
+Actual C RX allocation/submit/kill/join and immutable registered ingress
+callbacks remain in production. Full common Backend and bus/build migration
+remains open in OpenSparklink/linux #4, #9, #10, #12, #14 and #19.

@@ -1,0 +1,45 @@
+pub(crate) fn drain_controller_events(shared: &mut ControllerState) {
+    let mut tagged = match new_event_batch() {
+        Ok(batch) => batch,
+        Err(_) => {
+            // Leave attributed events queued for the owner worker.
+            pr_err!("sparklink: cannot allocate inline RX staging\n");
+            return;
+        }
+    };
+    // Multiple rounds: each round may generate new DLI commands whose
+    // responses arrive in a subsequent round. Limit total iterations
+    // to bound lock hold time on the ioctl path.
+    let mut total = 0u32;
+    for _round in 0..4 {
+        let mut drained_this_round = 0u32;
+
+        if let Some(owner) = sle_ingress::ingress_owner(shared.identity) {
+            if process_host_reply(&owner, shared) {
+                drained_this_round += 1;
+                total += 1;
+            }
+        }
+
+        // 2. This registration's bounded ingress (exact identity).
+        // Do not dequeue more events than this invocation can process.
+        let count =
+            sle_ingress::drain_events_for(shared.identity, &mut tagged[..(32 - total) as usize]);
+        for item in tagged.iter_mut().take(count) {
+            let (dev_id, ev_opt) = core::mem::take(item);
+            if let Some(ev) = ev_opt {
+                debug_assert_eq!(dev_id, Some(shared.identity.id));
+                process_controller_event(shared, &ev);
+                drained_this_round += 1;
+                total += 1;
+                if total >= 32 {
+                    return;
+                }
+            }
+        }
+
+        if drained_this_round == 0 {
+            break;
+        }
+    }
+}

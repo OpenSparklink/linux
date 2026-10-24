@@ -1,0 +1,37 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -1262,11 +1262,34 @@
+     qemu_add_exit_notifier(&s->exit);
+ }
+
++/* A pulse, not state: the existing autoscan timer performs the next open. */
++static bool usb_host_get_retry(Object *obj, Error **errp)
++{
++    return false;
++}
++
++static void usb_host_set_retry(Object *obj, bool value, Error **errp)
++{
++    USBHostDevice *s = USB_HOST_DEVICE(obj);
++
++    /* QMP and auto-open are serialized. Never interfere with a live opener. */
++    if (!value || s->dh != NULL || USB_DEVICE(s)->attached) {
++        return;
++    }
++    if (!s->needs_autoscan) {
++        error_setg(errp, "host-retry requires an auto-scan filter");
++        return;
++    }
++    s->errcount = 0;
++}
++
+ static void usb_host_instance_init(Object *obj)
+ {
+     USBDevice *udev = USB_DEVICE(obj);
+     USBHostDevice *s = USB_HOST_DEVICE(udev);
+
++    object_property_add_bool(obj, "host-retry",
++                             usb_host_get_retry, usb_host_set_retry);
+     device_add_bootindex_property(obj, &s->bootindex,
+                                   "bootindex", NULL,
+                                   &udev->qdev);
