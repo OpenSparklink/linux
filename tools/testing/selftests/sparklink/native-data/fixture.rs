@@ -14,7 +14,7 @@ pub type Result<T=()> = std::result::Result<T, Error>;
 pub const EINVAL:Error=Error(-22);pub const ENODEV:Error=Error(-19);pub const EAGAIN:Error=Error(-11);
 pub const EMSGSIZE:Error=Error(-90);pub const EIO:Error=Error(-5);pub const ENOBUFS:Error=Error(-105);
 pub const ENOMEM:Error=Error(-12);pub const EOVERFLOW:Error=Error(-75);pub const GFP_ATOMIC:()=();
-pub mod bindings {pub const EPROTO:i32=71;pub const EALREADY:i32=114;pub const ECONNRESET:i32=104;pub const EACCES:i32=13;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
+pub mod bindings {pub const EPROTO:i32=71;pub const EALREADY:i32=114;pub const ECONNRESET:i32=104;pub const ENOTCONN:i32=107;pub const EACCES:i32=13;pub const ESTALE:i32=116;pub const EOPNOTSUPP:i32=95;pub const ENOBUFS:i32=105;pub const EMSGSIZE:i32=90;
 pub unsafe fn ktime_get_boottime()->i64{super::NOW.with(|n|*n.borrow() as i64)}}
 pub mod prelude {pub use crate::{Error,Result,KVec,ENODEV,EINVAL,ENOBUFS,EMSGSIZE,EAGAIN,EIO,ENOMEM,GFP_ATOMIC};}
 pub mod sync {pub use std::rc::Rc as Arc;}
@@ -114,6 +114,12 @@ unsafe fn sparklink_native_transport_acb(p:*mut c_void,ticket:*mut c_void,handle
   3=>*owner.schedule_gate.lock()=true,
   4=>{link(&owner,handle,2);link(&owner,handle,1);},
   7=>{let mut host=owner.host.lock();host.grants.revoke();assert!(host.grants.activate(2,true));},
+  // Dependency scheduling point only: use the real production link transition
+  // between Native preparation and the actual final Ticket callback. Full
+  // typed Disconnect admission is covered by the complete Host fixture.
+  8=>{let mut host=owner.host.lock();let lifetime=host.link_snapshot().2.iter().flatten()
+    .find(|link|link.handle==handle).unwrap().lifetime;
+    assert!(host.links.stop_submission(lifetime,handle));},
   5=>return 0, // deliberately lying fixture; production entry must reject it.
   _=>(),
  }
@@ -279,15 +285,49 @@ fn acb(handle:u16,payload:&[u8])->Vec<u8>{let mut p=vec![0xa3,handle as u8,(hand
 }
 
 #[test] fn actual_ticket_rechecks_down_revoke_retirement_and_reused_handle_before_submit(){
- for (mode,expected) in [(1,-116),(2,-13),(3,-19),(4,-116),(5,-71)] {
+ for (mode,expected) in [(1,-116),(2,-13),(3,-19),(4,-116),(5,-71),(8,-107)] {
   let(a,b)=setup();link(&a,0,1);link(&b,0,1);
   BEFORE_COMMIT.with(|v|*v.borrow_mut()=mode);
   assert_eq!(send(0,7,1,0,b"never queue"),expected);
   assert!(TX.with(|t|t.borrow().is_empty()));
+  assert_eq!(SUBMIT_CALLS.with(Cell::get),0);
   assert_eq!(a.data.lock().credits.maximum(),Ok(254));
   BEFORE_COMMIT.with(|v|*v.borrow_mut()=0);
   assert_eq!(send(1,8,1,0,b"independent"),0);
  }
+}
+#[test] fn actual_closing_retains_debt_until_nocp_without_reopening_or_cross_link_withdrawal(){
+ let(a,b)=setup();link(&a,0,1);link(&a,1,1);link(&b,0,1);
+ let other=a.host.lock().link_snapshot().2.iter().flatten().find(|link|link.handle==1).copied().unwrap();
+ assert_eq!(send(0,7,1,0,b"already submitted"),0);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).connection_debt,1);
+ BEFORE_COMMIT.with(|v|*v.borrow_mut()=8);
+ assert_eq!(send(0,7,1,0,b"closed after preparation"),-107);
+ BEFORE_COMMIT.with(|v|*v.borrow_mut()=0);
+ assert_eq!(SUBMIT_CALLS.with(Cell::get),1);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).connection_debt,1);
+ assert_eq!(send(0,7,1,0,b"closing"),-107);
+ assert_eq!(TX.with(|t|t.borrow().len()),1);
+ link(&a,0,1); // Repeated physical Up is not a new lifetime or permission.
+ assert_eq!(send(0,7,1,0,b"duplicate Up"),-107);
+ assert!(a.host.lock().link_snapshot().2.iter().flatten().any(|link|*link==other));
+ assert_eq!(send(0,7,other.lifetime,1,b"same controller other link"),0);
+ assert_eq!(send(1,8,1,0,b"other controller"),0);
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,1]),0);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).connection_debt,0);
+ assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
+ assert_eq!(send(0,7,1,0,b"late NOCP cannot reopen"),-107);
+ assert_eq!(TX.with(|t|t.borrow().len()),3);
+ assert_eq!(b.data.lock().credits.snapshot(1,0).outstanding,1);
+ link(&a,0,2);link(&a,0,1);
+ let current=a.host.lock().link_snapshot().2.iter().flatten().find(|link|link.handle==0).copied().unwrap();
+ assert_ne!(current.lifetime,1);assert!(current.admits_new_work());
+ assert!(!a.host.lock().links.stop_submission(1,0));
+ assert_eq!(send(0,7,1,0,b"old lifetime"),-116);
+ assert_eq!(send(0,7,current.lifetime,0,b"new lifetime"),0);
+ // This exercises a single injected matching completion. It does not prove
+ // wire NOCP uniqueness or a hardware barrier against old duplicate events.
 }
 #[test] fn actual_never_queued_failure_rolls_back_only_current_reservation(){
  let(a,_)=setup();link(&a,0,1);
@@ -557,6 +597,50 @@ unsafe extern "C" fn actual_inspection_callback(value:*const sle_data_credit::Cr
  assert_eq!(a.data.lock().credits.snapshot(1,0).outstanding,1);
 }
 
+#[test] fn actual_closing_refuses_queue_and_inspect_and_keeps_stopped_session_until_down(){
+ let(a,b)=setup();link(&a,0,1);link(&b,0,1);
+ let(p,e)=session(0,7,1,0);assert_eq!(e,0);assert!(!p.is_null());
+ let(q,e)=session(1,8,1,0);assert_eq!(e,0);assert!(!q.is_null());
+ assert_eq!(send(0,7,1,0,b"retained physical debt"),0);
+ let mut queued=0usize;let mut inspected=0usize;
+ let admit=|count:&mut usize|unsafe{sle_sessions::sparklink_native_session_admit_rust(0,7,1,0,1,
+   Some(actual_admission_callback),(count as *mut usize).cast())};
+ let inspect=|count:&mut usize|unsafe{sle_sessions::sparklink_native_session_inspect_rust(0,7,1,0,1,
+   Some(actual_inspection_callback),(count as *mut usize).cast())};
+ assert_eq!(admit(&mut queued),0);assert_eq!(inspect(&mut inspected),0);
+ assert_eq!((queued,inspected),(1,1));
+ assert!(a.host.lock().links.stop_submission(1,0));
+ for _ in 0..2 {
+  assert_eq!(admit(&mut queued),-107);assert_eq!(inspect(&mut inspected),-107);
+  assert_eq!((queued,inspected),(1,1));
+  assert_eq!(unsafe{sle_sessions::sparklink_native_session_status_rust(0,7,1,0,1)},-107);
+  let(denied,error)=session(0,7,1,0);assert!(denied.is_null());assert_eq!(error,-107);
+  a.reconcile_sessions();
+  assert_eq!(a.sessions.lock().iter().flatten().count(),1);
+  let(receipt,epoch)=a.existing_session_for_event(1,0).unwrap();assert_eq!(receipt,p);assert_eq!(epoch,1);
+  unsafe{assert!((*p.cast::<FakeSession>()).stopped);assert_eq!((*p.cast::<FakeSession>()).refs,3);
+    assert!(!(*q.cast::<FakeSession>()).stopped);sl_connection_session_put(receipt);}
+  link(&a,0,1); // Duplicate Up cannot resume the stopped physical Session.
+ }
+ assert_eq!(a.data.lock().credits.snapshot(1,0).connection_debt,1);
+ assert_eq!(send(1,8,1,0,b"peer remains usable"),0);
+ assert_eq!(receive(0,7,&[0xa2,9,0,3,0,0,0,1]),0);
+ assert_eq!(admit(&mut queued),-107);assert_eq!(inspect(&mut inspected),-107);
+ assert_eq!((queued,inspected),(1,1));
+ link(&a,0,2);a.reconcile_sessions();
+ assert!(a.existing_session_for_event(1,0).is_none());
+ assert_eq!(a.sessions.lock().iter().flatten().count(),0);
+ unsafe{assert_eq!((*p.cast::<FakeSession>()).refs,1);}
+ link(&a,0,1);a.reconcile_sessions();
+ let lifetime=a.host.lock().link_snapshot().2.iter().flatten().find(|link|link.handle==0).unwrap().lifetime;
+ assert_ne!(lifetime,1);
+ let(new,e)=session(0,7,lifetime,0);assert_eq!(e,0);assert!(!new.is_null());assert_ne!(new,p);
+ assert_eq!(session(0,7,1,0).1,-116);
+ assert_eq!(send(0,7,lifetime,0,b"new physical Session"),0);
+ a.stop_sessions(-19);b.stop_sessions(-19);
+ unsafe{for pointer in [p,q,new]{sl_connection_session_put(pointer);}}
+}
+
 fn security_event(event:u16,body:&[u8])->Vec<u8>{let mut v=vec![0xa2,event as u8,(event>>8)as u8,body.len()as u8,0];v.extend_from_slice(body);v}
 #[test] fn installation_event_ingress_freezes_exact_physical_lifetime_without_qualification(){
  let(a,b)=setup();link(&a,0,1);link(&b,0,1);
@@ -621,7 +705,7 @@ fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u6
  let before=TX.with(|v|v.borrow().len());
  let eligible={let host=owner.host.lock();let(_,known,links)=host.link_snapshot();
   generation==owner.identity.generation && known && host.admits_data() && host.grants.permits(epoch)
-   && links.iter().flatten().any(|link|link.handle==0 && link.lifetime==lifetime)
+   && links.iter().flatten().any(|link|link.handle==0 && link.lifetime==lifetime && link.admits_new_work())
    && !*owner.schedule_gate.lock() && owner.transport_open.load(Ordering::Acquire) && scope.live};
  let result=unsafe{test_guarded(owner.identity.id,generation,lifetime,0,0,
    bytes.as_ptr(),bytes.len(),epoch,Some(consent_scope),(scope as *mut ConsentScope).cast())};
@@ -666,8 +750,8 @@ fn sequence_send(owner:&Owner,scope:&mut ConsentScope,generation:u64,lifetime:u6
     9=>{assert_eq!(sequence_send(&a,&mut scope,6,1,1),-19);},
     10=>a.transport_open.store(false,Ordering::Release),
     11=>*a.schedule_gate.lock()=true,
-    12=>{let mut mode=((random>>8)%5) as u8;
-      mode=[1,2,3,4,7][mode as usize];
+    12=>{let mut mode=((random>>8)%6) as u8;
+      mode=[1,2,3,4,7,8][mode as usize];
       if mode==7 && !a.host.lock().grants.accepts(2){mode=2;}
       BEFORE_COMMIT.with(|v|*v.borrow_mut()=mode);
       sequence_send(&a,&mut scope,7,1,1);BEFORE_COMMIT.with(|v|*v.borrow_mut()=0);},

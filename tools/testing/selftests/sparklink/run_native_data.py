@@ -66,6 +66,11 @@ def run(output):
                 'test_binary_sha256': hashlib.sha256(binary).hexdigest(),
                 'scope': 'Failed dependency-fixture test, not hardware qualification'}, indent=2)+'\n')
         process.check_returncode()
+        for case in [
+                'actual_ticket_rechecks_down_revoke_retirement_and_reused_handle_before_submit',
+                'actual_closing_retains_debt_until_nocp_without_reopening_or_cross_link_withdrawal',
+                'actual_closing_refuses_queue_and_inspect_and_keeps_stopped_session_until_down']:
+            assert f'test {case} ... ok' in result, 'required actual closing transition case missing: '+case
     assert runner.read_bytes() == runner_bytes
     assert all(p.read_bytes() == data for p, data in originals.items())
     count = re.search(r'test result: ok\. (\d+) passed; 0 failed;', result)
@@ -85,8 +90,14 @@ def run(output):
         map(int, sequence.groups())))
     record['sequence_scope'] = ('Actual production NativeTX/credit/authority/ingress transitions after a valid '
         'initial submit, 1024 seeded 32-event sequences; explicit USB/locks/clock/owner/consent fixtures. '
-        'Conservation, no stale submit, definite/uncertain failure and controller isolation only. '
+        'Conservation, no stale/Closing submit, definite/uncertain failure and controller isolation only. '
         'Not exhaustive/formal, original-deadline/worker/VFS concurrency or NOCP accuracy/reuse proof.')
+    record['closing_scope'] = ('Actual LinkObservation stop_submission, Native preparation/atomic commit '
+        'and Session queue/inspect/reconcile bodies; Closing between preparation and commit cannot newly '
+        'submit or refund prior debt, matching late NOCP does not reopen, other links/controllers remain '
+        'usable, stopped physical Session remains until observed Down. Typed Disconnect Host admission '
+        'is exercised separately by the complete Host fixture; locks/USB/clock/C Session refs are explicit '
+        'dependencies here, not live kernel concurrency, callback drain, NOCP uniqueness or hardware proof.')
     if output:
         output.write_text(json.dumps(record, indent=2) + '\n')
     print(json.dumps(record, indent=2))

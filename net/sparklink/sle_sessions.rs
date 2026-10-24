@@ -80,6 +80,7 @@ impl super::ControllerRuntime {
         if !host.admits_data() || !host.grants.permits(epoch) { return Err(Error::from_errno(-(kernel::bindings::EACCES as i32))); }
         let link = links.iter().flatten().find(|link| link.lifetime == lifetime && link.handle == handle)
             .ok_or(Error::from_errno(-(kernel::bindings::ESTALE as i32)))?;
+        if !link.admits_new_work() { return Err(Error::from_errno(-(kernel::bindings::ENOTCONN as i32))); }
         let maximum = data.credits.maximum().map_err(super::sle_native_data::error)?;
         if let Some(admission) = admission {
             // SAFETY: callback is synchronous, atomic Session queue admission.
@@ -164,12 +165,17 @@ impl super::ControllerRuntime {
                 let denied = !host.grants.permits(session.epoch);
                 let physical_down = known && !links.iter().flatten().any(|link|
                     link.lifetime == session.lifetime && link.handle == session.handle);
+                let closing = links.iter().flatten().any(|link|
+                    link.lifetime == session.lifetime && link.handle == session.handle
+                        && !link.admits_new_work());
                 let reason = if denied && error == -(kernel::bindings::ECONNRESET as i32) {
                     -(kernel::bindings::EACCES as i32)
+                } else if closing && error == -(kernel::bindings::ECONNRESET as i32) {
+                    -(kernel::bindings::ENOTCONN as i32)
                 } else { error };
                 if physical_down || *gate {
                     actions[index] = entry.take().map(|s| Action::Retire(s, reason));
-                } else if !session.stopped && (denied || !known
+                } else if !session.stopped && (denied || closing || !known
                     || error != -(kernel::bindings::ECONNRESET as i32)) {
                     // Stop author/data work once, but KEEP the table reference
                     // to the same physical object through async receipts/Down.

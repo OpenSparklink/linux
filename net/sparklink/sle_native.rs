@@ -961,6 +961,9 @@ pub(crate) unsafe extern "C" fn sparklink_native_tx_commit_rust(
     let Some(link) = links.iter().flatten().find(|link| link.handle == ticket.handle && link.lifetime == ticket.lifetime) else {
         return -(kernel::bindings::ESTALE as i32);
     };
+    // Same Host lock as successful typed Disconnect admission. Check before
+    // reserving credit; already submitted USB/debt remains an obligation.
+    if !link.admits_new_work() { return -(kernel::bindings::ENOTCONN as i32); }
     if let Err(error) = data.credits.reserve(ticket.lifetime, ticket.handle, ticket.length) {
         ticket.credit_blocked.set(error == super::sle_data_credit::CreditError::WouldBlock);
         return super::sle_native_data::error(error).to_errno();
@@ -1032,9 +1035,10 @@ unsafe fn native_acb_send(
         if !owner.transport_open.load(Ordering::Acquire) || !known { return EAGAIN.to_errno(); }
         if !host.admits_data() { return -(kernel::bindings::EACCES as i32); }
         if epoch.is_some_and(|epoch| !host.grants.permits(epoch)) { return -(kernel::bindings::EACCES as i32); }
-        if !links.iter().flatten().any(|link| link.handle == handle && link.lifetime == lifetime) {
+        let Some(link) = links.iter().flatten().find(|link| link.handle == handle && link.lifetime == lifetime) else {
             return -(kernel::bindings::ESTALE as i32);
-        }
+        };
+        if !link.admits_new_work() { return -(kernel::bindings::ENOTCONN as i32); }
         match data.credits.maximum() {
             Ok(maximum) if length <= maximum as usize => (),
             Ok(_) => return -(kernel::bindings::EMSGSIZE as i32),

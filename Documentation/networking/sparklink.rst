@@ -98,6 +98,26 @@ blocking channel setup are explicitly unsupported.
 Constrained channel send state
 ==============================
 
+Successful typed Disconnect admission closes new work for the selected physical
+connection lifetime before returning, even while its command waits for credit.
+Validation or queue admission failure leaves the link permission unchanged.
+This local Closing state is distinct from the observed physical Up/Down state.
+It is published under the same Host lock held across the actual atomic USB
+submission ticket, before any new data-credit reservation. Software admission,
+new Session access, relay and per-link command work also check this permission.
+Channel access to a locally closing link returns ENOTCONN; after actual Down,
+the old lifetime remains stale. Other links and controllers are unaffected.
+
+Cancellation, command rejection or expiry cannot reopen the old lifetime.
+An explicit subsequent Disconnect may still clean up the observed physical
+link. Session work stops while its physical table reference is retained until
+real Down. Already submitted USB, command reply slots and data debt remain
+owned and are settled by the existing completion paths; Closing synthesizes
+neither Down nor a credit refund. Duplicate Up reports cannot reset permission.
+Only actual Down followed by a new connection creates a new lifetime with
+independent permission. This does not establish hardware NOCP attribution or
+handle reuse safety, and requires a new real-device qualification artifact.
+
 Runtime identity and Grant authority are checked before the Session callbacks.
 Under the Session lock, both early TX access and final queue admission reject
 an inactive Session or retired Binding with ENOTCONN before inspecting a cached

@@ -112,7 +112,10 @@ impl CommandHost {
         let id=command.ticket.identity;
         if !self.admits_data() || !self.grants.permits(id.grant_epoch) {return Err(Error::from_errno(-(kernel::bindings::EACCES as i32)));}
         let (_,known,links)=self.links.snapshot();
-        if !known || !links.iter().flatten().any(|l|l.lifetime==id.lifetime&&l.handle==id.handle) {return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));}
+        if !known {return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));}
+        let Some(link) = links.iter().flatten().find(|l|l.lifetime==id.lifetime&&l.handle==id.handle)
+            else {return Err(Error::from_errno(-(kernel::bindings::ESTALE as i32)));};
+        if !link.admits_new_work() {return Err(Error::from_errno(-(kernel::bindings::ENOTCONN as i32)));}
         Ok(())
     }
     pub(crate) fn enqueue_relay(&mut self, opcode:u16, params:&[u8], deadline:u64,
@@ -159,6 +162,9 @@ impl CommandHost {
         scope.valid() && self.admits_data() && self.grants.permits(scope.lease_epoch)
             && self.link_snapshot().1 && self.links.matches(scope.link.lifetime, scope.link.handle,
                 scope.link.role, scope.link.address_type, scope.link.address)
+            && self.link_snapshot().2.iter().flatten().any(|link|
+                link.lifetime == scope.link.lifetime && link.handle == scope.link.handle
+                    && link.admits_new_work())
     }
 
     pub(crate) fn enqueue_link_command(&mut self, opcode: u16, params: &[u8], seq: u32,
@@ -336,6 +342,19 @@ impl CommandHost {
         self.requests.push_connection(opcode, params, cookie, operation, deadline).map_err(Error::from)?;
         if self.connections.reserve(file, request, cookie, intent, now, deadline, reference).is_err() {
             self.requests.remove_cookie(cookie); return Err(EINVAL);
+        }
+        if let Some(reference) = reference {
+            // Linearization point: queue and author reservation succeeded,
+            // while the caller still holds the Host lock shared by actual USB
+            // commit. The validated physical identity cannot change here.
+            // Cancel/reject/timeout never reopen this lifetime; a subsequent
+            // typed Disconnect may still clean up the observed physical link.
+            if !self.links.stop_submission(reference.lifetime, reference.handle) {
+                // An internal invariant failure cannot publish submit success
+                // or reopen data. Retain physical obligations and fault closed.
+                let _ = self.fail(EIO);
+                return Err(EIO);
+            }
         }
         self.next_cookie = next;
         Ok(())

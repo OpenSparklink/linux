@@ -20,9 +20,19 @@ pub(crate) struct LinkEvidence {
 
 pub(crate) const CAPACITY: usize = 16;
 
+/// Local submission authority, not a controller-reported link outcome.
+/// Closing is irreversible for this lifetime, even if its author cancels or
+/// the controller rejects Disconnect. Only actual Down removes the obligation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Submission {
+    Open,
+    Closing,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Link {
     pub(crate) lifetime: u64,
+    pub(crate) submission: Submission,
     /// IRQ-safe ingress barrier, separate from the connection table revision.
     /// A queued/dropped security receipt must already invalidate an older
     /// security snapshot. Zero is permanently poisoned after counter overflow.
@@ -31,6 +41,12 @@ pub(crate) struct Link {
     pub(crate) role: u8,
     pub(crate) address_type: u8,
     pub(crate) address: [u8; 6],
+}
+
+impl Link {
+    pub(crate) fn admits_new_work(&self) -> bool {
+        self.submission == Submission::Open
+    }
 }
 
 pub(crate) struct LinkObservation {
@@ -54,6 +70,16 @@ impl LinkObservation {
     }
 
     pub(crate) fn known(&self) -> bool { !self.uncertain }
+    /// Called after successful typed Disconnect admission, under the same
+    /// Host lock held across actual Ticket submission. Does not remove a link,
+    /// advance its physical revision, release debt or manufacture an outcome.
+    pub(crate) fn stop_submission(&mut self, lifetime: u64, handle: u16) -> bool {
+        if !self.known() || lifetime == 0 { return false; }
+        let Some(link) = self.links.iter_mut().flatten().find(|link|
+            link.lifetime == lifetime && link.handle == handle) else { return false; };
+        link.submission = Submission::Closing;
+        true
+    }
     pub(crate) fn matches(&self, lifetime: u64, handle: u16, role: u8, address_type: u8, address: [u8;6]) -> bool {
         self.known() && lifetime != 0 && self.links.iter().flatten().any(|link|
             link.handle == handle && link.lifetime == lifetime
@@ -107,7 +133,7 @@ impl LinkObservation {
             self.uncertain = true;
             return;
         }
-        let link = Link { lifetime: 0, security_revision: 1, handle, role: evidence.role as u8,
+        let link = Link { lifetime: 0, submission: Submission::Open, security_revision: 1, handle, role: evidence.role as u8,
             address_type: evidence.address_type as u8, address: evidence.address };
         if let Some(existing) = self.links.iter().flatten().find(|entry| entry.handle == handle) {
             if existing.role != link.role || existing.address_type != link.address_type
@@ -129,6 +155,30 @@ mod tests {
     }
     fn disconnected(handle: u16) -> LinkEvidence {
         LinkEvidence {kind:2,status:0,handle:handle as u32,role:0,address_type:0,address:[0;6],reserved:[0;2]}
+    }
+    #[test]
+    fn closing_is_local_irreversible_and_keeps_physical_obligations() {
+        let mut state = LinkObservation::new();
+        state.observe(&connected(7, [1; 6]));
+        state.observe(&connected(8, [2; 6]));
+        let (revision, known, before) = state.snapshot();
+        assert!(!state.stop_submission(0, 7));
+        assert!(!state.stop_submission(2, 7));
+        assert!(state.snapshot().2 == before);
+        assert!(state.stop_submission(1, 7));
+        assert!(state.matches(1, 7, 0, 0, [1; 6]));
+        assert_eq!((state.snapshot().0, state.known()), (revision, known));
+        assert!(!state.clear_for_management());
+        assert!(!state.snapshot().2[0].unwrap().admits_new_work());
+        assert!(state.snapshot().2[1] == before[1]);
+        state.observe(&connected(7, [1; 6]));
+        assert!(!state.snapshot().2[0].unwrap().admits_new_work());
+        assert_eq!(state.security_receipt(7), Some((1, 2)));
+        state.observe(&disconnected(7));
+        state.observe(&connected(7, [1; 6]));
+        assert!(!state.stop_submission(1, 7));
+        assert!(state.snapshot().2[0].unwrap().admits_new_work());
+        assert_ne!(state.snapshot().2[0].unwrap().lifetime, 1);
     }
     #[test]
     fn security_receipt_is_per_link_non_authorizing_and_survives_queue_loss() {

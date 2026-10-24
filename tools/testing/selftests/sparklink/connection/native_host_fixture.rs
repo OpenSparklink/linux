@@ -208,6 +208,158 @@ fn create(h:&mut CommandHost,id:u64){h.submit_connection(42,id,sle_connection_op
 fn status(opcode:u16,status:u8)->SleEvent {SleEvent::NativeCommandReply{opcode,command_credits:1,status,complete:false,data:vec![]}}
 fn up(h:&mut CommandHost,address:[u8;6]){h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:7,role:0,address_type:0,address,reserved:[0;2]})}
 fn down(h:&mut CommandHost){h.observe_link(&sle_link_observation::LinkEvidence{kind:2,status:0,handle:7,role:0,address_type:0,address:[0;6],reserved:[0;2]})}
+
+// These tests execute the complete production Host/Link transitions above.
+// The fixture clock, allocator and wire events do not establish kernel lock,
+// USB submission, NOCP or real peer-delivery qualification.
+fn observed(h:&CommandHost,handle:u16)->sle_link_observation::Link {
+ h.link_snapshot().2.into_iter().flatten().find(|link|link.handle==handle).unwrap()
+}
+fn disconnect(h:&mut CommandHost,id:u64)->Result {
+ h.submit_connection(42,id,sle_connection_operation::Intent::Disconnect{handle:7},2,
+  0x1403,&[7,0,19],100,Some(reference(7)))
+}
+#[test] fn accepted_disconnect_closes_submission_before_selection_without_fabricating_down(){
+ clock(1);let mut h=query_host();let before=observed(&h,7);let revision=h.link_snapshot().0;
+ assert!(before.admits_new_work());disconnect(&mut h,1).unwrap();
+ let after=observed(&h,7);assert!(!after.admits_new_work());
+ assert_eq!((after.lifetime,after.handle,after.role,after.address_type,after.address,after.security_revision),
+  (before.lifetime,before.handle,before.role,before.address_type,before.address,before.security_revision));
+ assert_eq!((h.link_snapshot().0,h.link_snapshot().1),(revision,true));
+ assert!(h.admits_data());assert!(h.grants.permits(1));assert_eq!(h.credits,1);assert!(h.active.is_none());
+ let result=h.connection_result(42,1).unwrap();assert_eq!(result.state,sle_connection_operation::State::Queued);
+ assert_eq!((result.command_status,result.outcome_status,result.handle),(None,None,None));
+ assert!(!h.link_command_current(query_scope()));
+ // Repeated Up observations cannot restore the withdrawn submit permission.
+ up(&mut h,[1;6]);assert!(!observed(&h,7).admits_new_work());assert_eq!(h.link_snapshot().0,revision);
+ // Closing is not a stale physical identity: Disconnect itself must still run.
+ let request=h.next(|_|true).unwrap().unwrap();assert_eq!(request.connection,Some(2));
+ assert_eq!(h.validate_command_commit(request.cookie,request.opcode),Ok(()));
+ assert_eq!(h.credits,0);assert!(!h.active.as_ref().unwrap().transport_submitted);
+ assert!(h.links.contains(7));assert!(!h.links_clear_for_management());
+}
+#[test] fn disconnected_submission_is_closed_while_waiting_for_real_command_credit(){
+ clock(1);let mut h=query_host();let peer=query_host();h.credits=0;
+ disconnect(&mut h,1).unwrap();
+ for _ in 0..3 {assert!(h.next(|_|true).unwrap().is_none());assert!(!observed(&h,7).admits_new_work());}
+ assert_eq!(h.next_deadline(),Some(101));assert_eq!(h.credits,0);assert!(h.active.is_none());
+ assert!(h.link_snapshot().1);assert!(h.links.contains(7));assert!(h.fault.is_none());
+ assert!(observed(&peer,7).admits_new_work());assert!(peer.link_command_current(query_scope()));
+ assert_eq!(peer.credits,1);assert!(peer.requests.is_empty());
+ h.receive(SleEvent::CommandCredits{credits:1});
+ let request=h.next(|_|true).unwrap().unwrap();assert_eq!(request.connection,Some(2));
+ assert_eq!(h.validate_command_commit(request.cookie,request.opcode),Ok(()));
+ assert!(!observed(&h,7).admits_new_work());
+}
+#[test] fn rejected_disconnect_admission_preserves_link_and_queue_atomically(){
+ for scenario in 0..7 {
+  clock(1);let mut h=query_host();
+  let before=h.link_snapshot();let cookie=h.next_cookie;
+  let (operation,timeout,expected)=match scenario {0=>(1,100,Some(reference(7))),
+   1=>(2,0,Some(reference(7))),2=>(2,10001,Some(reference(7))),3=>(2,100,None),
+   4=>(2,100,Some(sle_connection_operation::ExpectedLink{lifetime:2,..reference(7)})),
+   5=>(2,100,Some(sle_connection_operation::ExpectedLink{handle:8,..reference(7)})),
+   _=>(2,100,Some(sle_connection_operation::ExpectedLink{address:[2;6],..reference(7)}))};
+  let error=h.submit_connection(42,1,sle_connection_operation::Intent::Disconnect{handle:7},operation,
+   0x1403,&[7,0,19],timeout,expected).unwrap_err();
+  assert_eq!(error,if scenario==4||scenario==6{-116}else{EINVAL});
+  let after=h.link_snapshot();assert_eq!((after.0,after.1),(before.0,before.1));assert!(after.2==before.2);
+  assert_eq!(h.next_cookie,cookie);assert_eq!(h.credits,1);assert!(h.requests.is_empty());
+  assert!(h.connection_result(42,1).is_none());assert!(h.link_command_current(query_scope()));
+ }
+ // Exhaust the actual production queue; a rejected enqueue must not close it.
+ clock(1);let mut h=query_host();let mut seq=1;
+ while h.requests.available()>0 {h.enqueue_diagnostic(0x0404,&[],seq,100).unwrap();seq+=1;}
+ let before=h.link_snapshot();let cookie=h.next_cookie;let queued=h.requests.len();
+ assert_eq!(disconnect(&mut h,1),Err(EBUSY));
+ assert!(h.link_snapshot().2==before.2);assert_eq!(h.next_cookie,cookie);assert_eq!(h.requests.len(),queued);
+ assert_eq!(h.credits,1);assert!(h.connection_result(42,1).is_none());assert!(observed(&h,7).admits_new_work());
+}
+#[test] fn busy_other_link_disconnect_does_not_withdraw_this_link(){
+ clock(1);let mut h=query_host();
+ h.observe_link(&sle_link_observation::LinkEvidence{kind:1,status:0,handle:8,role:0,address_type:0,address:[2;6],reserved:[0;2]});
+ let other=observed(&h,8);let expected=sle_connection_operation::ExpectedLink{
+  lifetime:other.lifetime,handle:8,role:0,address_type:0,address:[2;6]};
+ h.submit_connection(42,1,sle_connection_operation::Intent::Disconnect{handle:8},2,0x1403,&[8,0,19],100,Some(expected)).unwrap();
+ let cookie=h.next_cookie;let queued=h.requests.len();
+ assert_eq!(disconnect(&mut h,2),Err(EBUSY));assert_eq!(h.next_cookie,cookie);assert_eq!(h.requests.len(),queued);
+ assert!(observed(&h,7).admits_new_work());assert!(!observed(&h,8).admits_new_work());
+ assert!(h.link_command_current(query_scope()));assert!(h.connection_result(42,2).is_none());
+ assert_eq!(h.credits,1);assert!(h.grants.permits(1));
+}
+#[test] fn cancelled_queued_disconnect_cannot_reopen_the_same_physical_lifetime(){
+ clock(1);let mut h=query_host();disconnect(&mut h,1).unwrap();h.cancel_connection(42,1).unwrap();
+ assert_eq!(h.connection_result(42,1).unwrap().state,sle_connection_operation::State::Cancelled);
+ assert!(h.connections.clear());assert!(h.requests.is_empty());assert_eq!(h.credits,1);
+ assert!(!observed(&h,7).admits_new_work());assert!(h.links.contains(7));assert!(h.link_snapshot().1);
+ assert!(!h.links_clear_for_management());assert_eq!(h.resume_management(),Err(EBUSY));
+ up(&mut h,[1;6]);assert!(!observed(&h,7).admits_new_work());
+ // A new explicit cleanup request is permitted without reviving data work.
+ disconnect(&mut h,2).unwrap();let request=h.next(|_|true).unwrap().unwrap();
+ assert_eq!(h.validate_command_commit(request.cookie,request.opcode),Ok(()));assert!(!observed(&h,7).admits_new_work());
+}
+#[test] fn unsubmitted_disconnect_cancel_refunds_only_command_reservation_not_link_permission(){
+ clock(1);let mut h=query_host();disconnect(&mut h,1).unwrap();let request=h.next(|_|true).unwrap().unwrap();
+ h.cancel_connection(42,1).unwrap();assert_eq!(h.validate_command_commit(request.cookie,request.opcode),Err(-125));
+ assert_eq!(h.credits,0);h.abort_unsubmitted(request.cookie,-125).unwrap();
+ assert_eq!(h.credits,1);assert!(h.active.is_none());assert!(h.connections.clear());
+ assert!(!observed(&h,7).admits_new_work());assert!(h.links.contains(7));assert!(h.fault.is_none());
+ let result=h.connection_result(42,1).unwrap();assert_eq!(result.state,sle_connection_operation::State::Cancelled);
+ assert_eq!((result.command_status,result.outcome_status,result.handle),(None,None,None));
+}
+#[test] fn rejected_disconnect_status_and_failed_outcome_never_restore_submission(){
+ for status_rejected in [false,true] {
+  clock(1);let mut h=query_host();disconnect(&mut h,1).unwrap();let request=h.next(|_|true).unwrap().unwrap();
+  h.command_committed(request.cookie);h.transport_complete(request.cookie);
+  h.receive(status(0x1403,if status_rejected{1}else{0}));assert!(h.take_reply().is_some());
+  if !status_rejected {h.observe_link(&sle_link_observation::LinkEvidence{
+   kind:2,status:1,handle:7,role:0,address_type:0,address:[0;6],reserved:[0;2]});}
+  let result=h.connection_result(42,1).unwrap();
+  assert_eq!((result.state,result.error),(sle_connection_operation::State::Failed,-121));
+  assert_eq!(result.command_status,Some(if status_rejected{1}else{0}));
+  assert_eq!(result.outcome_status,if status_rejected{None}else{Some(1)});
+  assert!(h.connections.clear());assert!(h.fault.is_none());assert_eq!(h.credits,1);
+  assert!(h.link_snapshot().1);assert!(h.links.contains(7));assert!(!observed(&h,7).admits_new_work());
+  disconnect(&mut h,2).unwrap();assert!(!observed(&h,7).admits_new_work());
+ }
+}
+#[test] fn disconnect_original_deadline_never_revives_submission_or_changes_peer(){
+ for submitted in [false,true] {
+  clock(1);let mut h=query_host();let peer=query_host();disconnect(&mut h,1).unwrap();
+  if submitted {let request=h.next(|_|true).unwrap().unwrap();h.command_committed(request.cookie);
+   h.transport_complete(request.cookie);h.receive(status(0x1403,0));h.take_reply();}
+  assert_eq!(h.next_deadline(),Some(101));clock(100);assert!(!h.timed_out_at(100));
+  assert!(!observed(&h,7).admits_new_work());assert_eq!(h.next_deadline(),Some(101));
+  clock(101);assert_eq!(h.timed_out_at(101),submitted);
+  if submitted {h.fail(ETIMEDOUT);}else{assert!(h.next(|_|true).unwrap().is_none());}
+  let result=h.connection_result(42,1).unwrap();assert_eq!(result.error,ETIMEDOUT);
+  assert_eq!(result.state,if submitted{sle_connection_operation::State::Faulted}else{sle_connection_operation::State::Failed});
+  assert!(!observed(&h,7).admits_new_work());assert!(!h.links_clear_for_management());
+  assert!(peer.fault.is_none());assert!(observed(&peer,7).admits_new_work());assert_eq!(peer.credits,1);
+ }
+}
+#[test] fn disconnect_history_eviction_cannot_restore_permission_or_drop_physical_obligation(){
+ clock(1);let mut h=query_host();
+ for id in 1..=35 {
+  disconnect(&mut h,id).unwrap();h.cancel_connection(42,id).unwrap();
+  assert!(!observed(&h,7).admits_new_work());assert!(h.links.contains(7));assert!(h.connections.clear());
+  assert_eq!(h.credits,1);assert!(h.requests.is_empty());
+ }
+ assert!(h.connection_result(42,1).is_none());assert!(h.connection_result(42,35).is_some());
+ assert!(!h.links_clear_for_management());assert!(!observed(&h,7).admits_new_work());
+}
+#[test] fn only_real_down_then_new_lifetime_restores_new_permission_without_touching_peer(){
+ clock(1);let mut h=query_host();let peer=query_host();let original=observed(&h,7);
+ disconnect(&mut h,1).unwrap();h.cancel_connection(42,1).unwrap();
+ assert!(!observed(&h,7).admits_new_work());down(&mut h);assert!(h.links_clear_for_management());
+ up(&mut h,[1;6]);let fresh=observed(&h,7);assert_ne!(fresh.lifetime,original.lifetime);assert!(fresh.admits_new_work());
+ let cookie=h.next_cookie;assert_eq!(disconnect(&mut h,2),Err(-116));
+ assert_eq!(h.next_cookie,cookie);assert!(observed(&h,7).admits_new_work());assert!(h.connection_result(42,2).is_none());
+ let expected=sle_connection_operation::ExpectedLink{lifetime:fresh.lifetime,..reference(7)};
+ h.submit_connection(42,2,sle_connection_operation::Intent::Disconnect{handle:7},2,0x1403,&[7,0,19],100,Some(expected)).unwrap();
+ assert!(!observed(&h,7).admits_new_work());assert!(observed(&peer,7).admits_new_work());
+ assert_eq!(observed(&peer,7).lifetime,original.lifetime);assert_eq!(peer.credits,1);assert!(peer.grants.permits(1));
+}
 #[test] fn real_status_out_and_physical_outcome_require_all_three_and_disconnect_obligation(){
  clock(1);let mut h=host();create(&mut h,1);let r=h.next(|_|true).unwrap().unwrap();assert_eq!(r.connection,Some(1));
  assert!(h.receive(status(0x1401,0)).is_none());assert!(h.take_reply().is_none());
