@@ -185,6 +185,7 @@ struct fake {
 	unsigned char tx[864], rx[220];
 	unsigned int sequence, sends, opens, notifications, bulk_reads, boot_reads;
 	unsigned int drains, closes, close_reads;
+	unsigned int timeout_send;
 	unsigned long long now;
 	unsigned long long close_wait_started;
 	enum ws73_bsle_phase phase;
@@ -216,6 +217,11 @@ static int send_data(void *context, size_t size)
 	CHECK(size == sizes[f->sends]);
 	CHECK(get32(f->tx + 8) == f->sequence - 1);
 	f->sends++;
+	if (f->timeout_send == f->sends) {
+		/* A callback failure does not tell us whether firmware consumed it. */
+		f->now += 3000;
+		return -ETIMEDOUT;
+	}
 	if (f->fault == SEND_ERROR && f->sends == 3)
 		return -EREMOTEIO;
 	if (f->fault == DISCONNECTED && f->sends == 5)
@@ -343,6 +349,30 @@ static void warm_tests(void)
 	const int errors[] = { 0, -ETIMEDOUT, -EREMOTEIO, -ETIMEDOUT, -EPROTO,
 			      -EIO, -EREMOTEIO, -ENODEV, -ETIMEDOUT };
 	const enum fault missing_close[] = { CLOSE_SILENT, CLOSE_EMPTY };
+
+	/* CLOSE acknowledgement permits configuration, not transport success.
+	 * Every actual send can fail after submission. The sequencer must return
+	 * that error without continuing, retrying, or rolling back its sequence.
+	 * Callback/time fixtures do not prove USB drain or the failure's cause.
+	 */
+	for (unsigned int failed_send = 1; failed_send <= 6; failed_send++) {
+		struct fake untouched;
+
+		init_fake(&a, NORMAL);
+		init_fake(&b, NORMAL);
+		memcpy(&untouched, &b, sizeof(b));
+		a.timeout_send = failed_send;
+		CHECK(ws73_bsle_restore(&a.io, pm, 4, custom, 140) == -ETIMEDOUT);
+		CHECK(a.closes == 1 && a.close_reads == 3);
+		CHECK(a.sends == failed_send && a.sequence == failed_send);
+		CHECK(!a.opens && a.phase == WS73_BSLE_CONFIGURING);
+		CHECK(a.phase_history == ((1U << WS73_BSLE_DRAINING) |
+			(1U << WS73_BSLE_CLOSING) | (1U << WS73_BSLE_WAIT_CLOSE) |
+			(1U << WS73_BSLE_CONFIGURING)));
+		CHECK(!memcmp(&b, &untouched, sizeof(b)));
+		CHECK(ws73_bsle_start(&b.io, pm, 4, custom, 140) == 0);
+		CHECK(b.phase == WS73_BSLE_TRANSPORT_OPEN && b.sequence == 6);
+	}
 
 	/* A successful USB CLOSE is not a BSLE CLOSE acknowledgement. Exercise
 	 * the production restore/wait functions with both timed-out and empty
