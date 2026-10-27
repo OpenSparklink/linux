@@ -177,6 +177,7 @@ enum fault {
 	NORMAL, NO_BSP, NO_CUSTOM, ACTION_ONLY, PANIC, BAD_AGGREGATE,
 	SEND_ERROR, OPEN_ERROR, DISCONNECTED, DEADLINE_ACK,
 	DRAIN_BUSY, DRAIN_PANIC, DRAIN_OVERSIZE, DRAIN_ERROR, DRAIN_DEADLINE,
+	CLOSE_SILENT, CLOSE_EMPTY,
 };
 
 struct fake {
@@ -185,6 +186,7 @@ struct fake {
 	unsigned int sequence, sends, opens, notifications, bulk_reads, boot_reads;
 	unsigned int drains, closes, close_reads;
 	unsigned long long now;
+	unsigned long long close_wait_started;
 	enum ws73_bsle_phase phase;
 	enum fault fault;
 	unsigned int phase_history;
@@ -201,6 +203,8 @@ static void phase(void *context, enum ws73_bsle_phase p)
 
 	f->phase = p;
 	f->phase_history |= 1U << p;
+	if (p == WS73_BSLE_WAIT_CLOSE)
+		f->close_wait_started = f->now;
 }
 
 static int send_data(void *context, size_t size)
@@ -260,7 +264,8 @@ static int receive_data(void *context, unsigned int timeout)
 			return -ETIMEDOUT;
 		}
 		/* Both a stale BOOT_FINISH and stale CLOSE must be discarded. */
-		if (f->drains <= 2 || f->fault == DRAIN_BUSY) {
+		if ((f->drains <= 2 && f->fault != CLOSE_SILENT &&
+		     f->fault != CLOSE_EMPTY) || f->fault == DRAIN_BUSY) {
 			ack_packet(f->rx, f->drains == 1 ? 2 : 4, f->drains == 1 ? 1 : 3);
 			return 156;
 		}
@@ -269,6 +274,13 @@ static int receive_data(void *context, unsigned int timeout)
 	}
 	if (f->phase == WS73_BSLE_WAIT_CLOSE) {
 		f->close_reads++;
+		if (f->fault == CLOSE_SILENT) {
+			/* now already advanced one millisecond at entry. */
+			f->now += timeout - 1;
+			return -ETIMEDOUT;
+		}
+		if (f->fault == CLOSE_EMPTY)
+			return 0;
 		ack_packet(f->rx, f->close_reads == 1 ? 2 : 4,
 			   f->close_reads == 1 ? 1 : f->close_reads == 2 || f->fault == ACTION_ONLY ? 2 : 3);
 		return 156;
@@ -330,6 +342,32 @@ static void warm_tests(void)
 				     PANIC, SEND_ERROR, DISCONNECTED, DEADLINE_ACK };
 	const int errors[] = { 0, -ETIMEDOUT, -EREMOTEIO, -ETIMEDOUT, -EPROTO,
 			      -EIO, -EREMOTEIO, -ENODEV, -ETIMEDOUT };
+	const enum fault missing_close[] = { CLOSE_SILENT, CLOSE_EMPTY };
+
+	/* A successful USB CLOSE is not a BSLE CLOSE acknowledgement. Exercise
+	 * the production restore/wait functions with both timed-out and empty
+	 * transport reads; neither can open/configure or extend the deadline.
+	 * The I/O and clock are fixtures: this does not prove firmware recovery,
+	 * actual USB cancellation/drain, or concurrent controller isolation.
+	 */
+	for (unsigned int i = 0; i < sizeof(missing_close) / sizeof(missing_close[0]); i++) {
+		struct fake untouched;
+
+		init_fake(&a, missing_close[i]);
+		init_fake(&b, NORMAL);
+		memcpy(&untouched, &b, sizeof(b));
+		CHECK(ws73_bsle_restore(&a.io, pm, 4, custom, 140) == -ETIMEDOUT);
+		CHECK(a.drains == 1 && a.closes == 1 && a.close_reads > 0);
+		CHECK(a.close_reads <= 500);
+		CHECK(a.now - a.close_wait_started == 10000);
+		CHECK(a.phase == WS73_BSLE_WAIT_CLOSE);
+		CHECK(a.phase_history == ((1U << WS73_BSLE_DRAINING) |
+			(1U << WS73_BSLE_CLOSING) | (1U << WS73_BSLE_WAIT_CLOSE)));
+		CHECK(!a.opens && !a.sends && !a.sequence);
+		CHECK(!memcmp(&b, &untouched, sizeof(b)));
+		CHECK(ws73_bsle_start(&b.io, pm, 4, custom, 140) == 0);
+		CHECK(b.phase == WS73_BSLE_TRANSPORT_OPEN && b.opens == 1);
+	}
 
 	for (unsigned int i = 0; i < sizeof(faults) / sizeof(faults[0]); i++) {
 		init_fake(&a, faults[i]);
