@@ -1,3 +1,45 @@
+What:           /sys/bus/usb/devices/<interface>/bsle_attempts
+Date:           November 2026
+Contact:        OpenSparklink maintainers (https://github.com/OpenSparklink/linux/issues)
+Description:
+                Read-only bounded observations of the existing BSLE start and
+                restore sequencer in this USB-interface incarnation. A read
+                performs no USB operation and does not admit a retry.
+
+                Header: version=1 count=N capacity=8 omitted=M
+                Then N lines, in original invocation order:
+                attempt=N kind=K phase=P result=R start_ms=S end_ms=E sequence_start=A sequence_end=B
+
+                K is 0 for initial start, 1 for the one warm-adoption restore,
+                or 2 for a later admitted protocol restore. P is the existing
+                driver stage at return, before another attempt can replace it.
+                R is the unchanged sequencer return (zero or negative errno).
+                S/E bracket that invocation using the kernel monotonic clock;
+                they are not USB-submit/completion or RF timestamps. A/B are
+                the driver's HCC sequence observations, not protocol credit
+                or a count of controller-accepted packets.
+
+                The first eight completed invocations are immutable. Later
+                invocations are not retained; omitted saturates at UINT_MAX.
+                Kernel attempt logs and failure_diagnostics remain separate
+                observations of later activity. The bounded prefix resets
+                with a new USB-interface allocation, not with a protocol
+                recovery or stable-budget renewal. It is not inherited across
+                re-enumeration or an earlier controller generation.
+
+                The per-device phase mutex serializes recording and reading.
+                A busy bootstrap/recovery returns EAGAIN without waiting or
+                publishing a partial record. Empty count means no sequencer
+                invocation has completed in this incarnation, not success;
+                profile/input failures before invocation remain reported by
+                boot_error and failure_diagnostics. Removal uses the existing
+                driver attribute-reader lifetime and work drain.
+
+                No result supplies Ready, model or executing-image identity,
+                a CLOSE state-clear barrier, final USB/Host drain, peer
+                delivery, or recovery qualification. Retry limits, original
+                deadlines, firmware inputs and protocol decisions are unchanged.
+
 What:           /sys/bus/usb/devices/.../chip_information
 Date:           October 2026
 Contact:        OpenSparklink <https://github.com/OpenSparklink/linux/issues>

@@ -38,6 +38,7 @@ TEST_PROGS += run_usb_firmware.py
 TEST_PROGS += run_usb_binding.py
 TEST_PROGS += run_ws73_runtime_rx.py
 TEST_PROGS += run_ws73_hcc_memory.py
+TEST_PROGS += run_ws73_boot_attempts.py
 TEST_PROGS += run_ws73_fw_profile.py
 TEST_FILES += firmware/profile_driver_fixture.c
 TEST_FILES += firmware/profile_codec_cbmc.c

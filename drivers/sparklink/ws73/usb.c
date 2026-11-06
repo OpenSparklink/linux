@@ -59,6 +59,29 @@ enum ws73_stage {
 	WS73_NATIVE_READY,
 };
 
+#define WS73_BSLE_ATTEMPTS_MAX 8U
+
+enum ws73_bsle_attempt_kind {
+	WS73_BSLE_ATTEMPT_INITIAL,
+	WS73_BSLE_ATTEMPT_WARM,
+	WS73_BSLE_ATTEMPT_PROTOCOL,
+};
+
+struct ws73_bsle_attempt_record {
+	u64 start_ms, end_ms;
+	unsigned int kind, phase, sequence_start, sequence_end;
+	int result;
+};
+
+/* Observation only. phase_lock serializes both append and the sysfs copy.
+ * Retain the first finite prefix; later recovery must not overwrite its cause.
+ * This USB-interface incarnation never inherits another incarnation's history.
+ */
+struct ws73_bsle_attempt_history {
+	unsigned int count, omitted;
+	struct ws73_bsle_attempt_record records[WS73_BSLE_ATTEMPTS_MAX];
+};
+
 #define WS73_PORTS_MAX 64
 struct ws73_port {
 	struct device *controller;
@@ -123,6 +146,7 @@ struct ws73_usb {
 	bool runtime_transport;
 	bool metadata_valid;
 	unsigned int warm_recovery_attempts;
+	struct ws73_bsle_attempt_history bsle_attempts;
 	int warm_recovery_cause;
 	int warm_recovery_result;
 	u64 warm_recovery_started_ms;
@@ -1210,6 +1234,41 @@ static const struct sparklink_native_ops ws73_native_ops = {
 	.send_acb_fragment = ws73_native_acb_fragment,
 };
 
+/* phase_lock held. This wrapper observes the existing sequencer; it neither
+ * admits a retry nor supplies a protocol/state-clear/Ready acknowledgment.
+ */
+static int ws73_run_bsle_attempt(struct ws73_usb *ws, struct ws73_bsle_io *io,
+				 const struct firmware *pm,
+				 const struct firmware *custom,
+				 enum ws73_bsle_attempt_kind kind)
+{
+	struct ws73_bsle_attempt_history *history = &ws->bsle_attempts;
+	struct ws73_bsle_attempt_record sample = {
+		.start_ms = ws73_now_ms(ws),
+		.kind = kind,
+		.sequence_start = ws->tx_sequence,
+	};
+	int ret;
+
+	lockdep_assert_held(&ws->phase_lock);
+	ret = kind == WS73_BSLE_ATTEMPT_INITIAL ?
+		ws73_bsle_start(io, pm->data, pm->size, custom->data, custom->size) :
+		ws73_bsle_restore(io, pm->data, pm->size, custom->data, custom->size);
+	sample.end_ms = ws73_now_ms(ws);
+	sample.phase = READ_ONCE(ws->stage);
+	sample.sequence_end = ws->tx_sequence;
+	sample.result = ret;
+	if (history->count < WS73_BSLE_ATTEMPTS_MAX)
+		history->records[history->count++] = sample;
+	else if (history->omitted != ~0U)
+		history->omitted++;
+	dev_info(&ws->intf->dev,
+		 "BSLE attempt kind=%u phase=%u result=%d start_ms=%llu end_ms=%llu sequence=%u/%u retained=%u omitted=%u\n",
+		 sample.kind, sample.phase, sample.result, sample.start_ms, sample.end_ms,
+		 sample.sequence_start, sample.sequence_end, history->count, history->omitted);
+	return ret;
+}
+
 /* phase_lock held; previous generation's callbacks/URBs have been joined
  * before a restore. Query fresh metadata and publish only a new Setup owner.
  */
@@ -1276,8 +1335,9 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 	dev_info(&ws->intf->dev, "BSLE customize SHA256=%*phN\n", (int)sizeof(digest), digest);
 	sha256(pm->data, pm->size, digest);
 	dev_info(&ws->intf->dev, "PM config SHA256=%*phN\n", (int)sizeof(digest), digest);
-	ret = restore ? ws73_bsle_restore(&io, pm->data, pm->size, custom->data, custom->size) :
-		ws73_bsle_start(&io, pm->data, pm->size, custom->data, custom->size);
+	ret = ws73_run_bsle_attempt(ws, &io, pm, custom,
+				    restore ? WS73_BSLE_ATTEMPT_PROTOCOL :
+				    WS73_BSLE_ATTEMPT_INITIAL);
 	if (ret == -ETIMEDOUT && READ_ONCE(ws->stage) == WS73_WAIT_BSP &&
 	    !READ_ONCE(ws->stopping) && !ws->warm_recovery_attempts) {
 		unsigned int delay;
@@ -1297,7 +1357,7 @@ static int ws73_runtime_start(struct ws73_usb *ws, bool restore)
 		WRITE_ONCE(ws->recovery_io, true);
 		dev_info(&ws->intf->dev, "warm recovery attempt=1 cause=%d\n", ws->warm_recovery_cause);
 		msleep(delay);
-		ret = ws73_bsle_restore(&io, pm->data, pm->size, custom->data, custom->size);
+		ret = ws73_run_bsle_attempt(ws, &io, pm, custom, WS73_BSLE_ATTEMPT_WARM);
 		ws->warm_recovery_result = ret;
 		dev_info(&ws->intf->dev, "warm recovery result=%d elapsed_ms=%llu\n", ret,
 			 ws73_now_ms(ws) - ws->warm_recovery_started_ms);
@@ -1503,6 +1563,33 @@ static ssize_t failure_diagnostics_show(struct device *dev,
 		READ_ONCE(ws->dli_result.event), READ_ONCE(ws->dli_result.hardware_error));
 }
 static DEVICE_ATTR_RO(failure_diagnostics);
+
+static ssize_t bsle_attempts_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct ws73_usb *ws = usb_get_intfdata(to_usb_interface(dev));
+	struct ws73_bsle_attempt_history *history = &ws->bsle_attempts;
+	ssize_t size;
+	unsigned int i;
+
+	/* Do not wait through a ten-second stage or publish a partial record. */
+	if (!mutex_trylock(&ws->phase_lock))
+		return -EAGAIN;
+	size = sysfs_emit(buf, "version=1 count=%u capacity=%u omitted=%u\n",
+			  history->count, WS73_BSLE_ATTEMPTS_MAX, history->omitted);
+	for (i = 0; i < history->count; i++) {
+		const struct ws73_bsle_attempt_record *sample = &history->records[i];
+
+		size += sysfs_emit_at(buf, size,
+			"attempt=%u kind=%u phase=%u result=%d start_ms=%llu end_ms=%llu sequence_start=%u sequence_end=%u\n",
+			i + 1, sample->kind, sample->phase, sample->result,
+			sample->start_ms, sample->end_ms,
+			sample->sequence_start, sample->sequence_end);
+	}
+	mutex_unlock(&ws->phase_lock);
+	return size;
+}
+static DEVICE_ATTR_RO(bsle_attempts);
 
 static ssize_t runtime_transport_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
@@ -1754,6 +1841,7 @@ static struct attribute *ws73_attrs[] = {
 	&dev_attr_warm_recovery.attr,
 	&dev_attr_recovery_budget.attr,
 	&dev_attr_failure_diagnostics.attr,
+	&dev_attr_bsle_attempts.attr,
 	&dev_attr_runtime_transport.attr,
 	&dev_attr_metadata_valid.attr,
 	&dev_attr_native_runtime.attr,
