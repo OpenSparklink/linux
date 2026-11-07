@@ -1,0 +1,64 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef _SPARKLINK_NATIVE_FFI_H
+#define _SPARKLINK_NATIVE_FFI_H
+
+#include <linux/sparklink_native.h>
+
+struct sparklink_native_transport;
+void sparklink_standard_receive_rust(u32 id, u64 generation, const u8 *data,
+                                    int length, u8 lane, int status);
+struct sparklink_backend_pending;
+u32 sparklink_native_transport_bus(const struct sparklink_native_transport *transport);
+
+int sparklink_native_register_rust(const struct sparklink_native_info *info,
+				   struct sparklink_native_transport *transport,
+                                   const struct sparklink_native_identity *reserved,
+				   struct sparklink_native_identity *identity);
+int sparklink_backend_reserve_rust(u32 bus, u32 profile, struct sparklink_native_identity *identity);
+int sparklink_backend_pending_update_rust(u16 id, u64 generation, u32 phase, int error);
+int sparklink_backend_pending_query_rust(u16 id, u64 generation, struct sparklink_backend_pending *status);
+void sparklink_backend_cancel_rust(u16 id, u64 generation);
+void sparklink_native_unregister_rust(u16 id, u64 generation);
+int sparklink_native_health_rust(u16 id, u64 generation);
+int sparklink_native_current_address_rust(u16 id,u64 generation,u8 *address);
+void sparklink_native_snoop_rx_rust(u16 id, u64 generation, const u8 *data, size_t length);
+void sparklink_native_snoop_tx_rust(u16 id, u64 generation, u16 opcode, const u8 *params, size_t length, int status);
+int sparklink_native_receive_rust(u16 id, u64 generation, const u8 *data, size_t length);
+int sparklink_native_acb_send_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+				 const u8 *data, size_t length);
+int sparklink_native_acb_take_rust(u16 id, u64 generation, u64 lifetime,
+				   u16 handle, u8 *data, size_t capacity,
+				   size_t *length, u64 *security_revision);
+int sparklink_native_acb_limits_rust(u16 id, u64 generation, u64 lifetime, u16 handle,
+				   u16 *maximum);
+int sparklink_native_event_rust(u16 id, u64 generation, u32 profile, u16 event_code,
+				const u8 *params, size_t length);
+
+int sparklink_native_link_event_rust(u16 id, u64 generation, u32 profile,
+    u16 event_code, const u8 *params, size_t length,
+    const struct sparklink_native_link_evidence *evidence);
+
+void sparklink_native_transport_free(struct sparklink_native_transport *transport);
+void sparklink_native_transport_get(struct sparklink_native_transport *transport);
+int sparklink_native_transport_open(struct sparklink_native_transport *transport,
+				    u16 id, u64 generation);
+void sparklink_native_transport_close(struct sparklink_native_transport *transport);
+int sparklink_native_transport_validate(struct sparklink_native_transport *transport,
+					u16 opcode, const u8 *params, size_t length);
+int sparklink_native_transport_prepare(struct sparklink_native_transport *transport,
+	const struct sparklink_discovery_request *request,
+	struct sparklink_discovery_plan *plan);
+int sparklink_native_transport_validate_step(struct sparklink_native_transport *transport,
+	unsigned int operation, unsigned int step, unsigned int count,
+	u16 opcode, const u8 *params, size_t length);
+int sparklink_native_transport_prepare_connection(struct sparklink_native_transport *transport,
+	const struct sparklink_connection_request *request, struct sparklink_connection_plan *plan);
+int sparklink_native_transport_validate_connection(struct sparklink_native_transport *transport,
+	unsigned int operation, u16 opcode, const u8 *params, size_t length);
+int sparklink_native_transport_command(struct sparklink_native_transport *transport,
+				       u16 opcode, const u8 *params, size_t length);
+int sparklink_native_transport_acb(struct sparklink_native_transport *transport,
+				   struct sparklink_native_tx_ticket *ticket, u16 handle, u8 boundary, const u8 *data, size_t length);
+bool sparklink_native_transport_has_acb(struct sparklink_native_transport *transport);
+
+#endif

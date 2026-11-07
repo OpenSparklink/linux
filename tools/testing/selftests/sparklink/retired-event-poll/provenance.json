@@ -1,0 +1,14 @@
+{
+  "origin": "4ea441ee2e3a475c629f767e8228de83c88841ae",
+  "purpose": "historical implementation copy/copyout regressions only; no production poll or live current qualification",
+  "origin_hashes": {
+    "net/sparklink/sparklink_core.rs": "7eee1bad3e992885594e12ad555b2e86899ec742ef4cfe3aa3532024bb72444d",
+    "net/sparklink/sle_uapi.rs": "e332156977f30b6476d920d82d90315eeaab9c129211283241bfdd042675c283"
+  },
+  "source_fragments": [
+    "wire.rs",
+    "ring.rs",
+    "handler.rs",
+    "codec.rs"
+  ]
+}

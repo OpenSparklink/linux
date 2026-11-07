@@ -1,0 +1,42 @@
+{
+  "base": "a9915e820cccfaf9ce615b0b510ad7b814246986",
+  "classification": {
+    "immediate_delete": [
+      "Unconsumed default standard business event variants/decoder branches;not qualified WS73 Native data/connection/security",
+      "No-production-call ring new/push/pop/pending;production uses heap-init/tagged operations"
+    ],
+    "move_to_test": [
+      "Exact historical event model,decoder/discovery/status and ring semantics with source hash;no default production include"
+    ],
+    "wait_replacement": [
+      "Standard-profile connected business state needs canonical lifetime/Session integration and gates;rejected/count before enqueue until then",
+      "RawUAPI/full AppSDK/C-Python/deployment remain original R4/R5/R6"
+    ]
+  },
+  "sources": {
+    "net/sparklink/sle_dli.rs": "3c0cbf68a777d7d025767636c8f04eca5e7cf77b446fa860cb008641afcf595d",
+    "net/sparklink/sle_standard_dli.rs": "a07c9af73eb2b71554a3e73fd32f06726cbbab48ef807b250a7c88aeac92e606"
+  },
+  "archive": {
+    "event_model.rs": "7b46a0b1c55fce8bd10634d6cac50c904dc1f3280516bd71d6a606979c5a1408",
+    "decoder.rs": "1c8eddb39815e55060a8375adfdac75cb31a8c2c5993cbd198802d2e6895701e",
+    "ring.rs": "b66932075df066da756a273c7e4c30e6854927e2632d4464aa656bebc3d026a9"
+  },
+  "retained": [
+    "CommandCredits",
+    "CommandComplete",
+    "CommandStatus",
+    "NativeCommandReply",
+    "NativeControllerData",
+    "NativeSecurityInstallation",
+    "HardwareError"
+  ],
+  "scope": "No Native dialect/RF feature removal. HardwareError exact one-byte validation;unconsumed standard events now rejected,not fake success. Historical semantics are not conformance/current qualification.",
+  "issues": [
+    "K#6",
+    "K#17",
+    "K#19",
+    "U#3",
+    "U#8"
+  ]
+}

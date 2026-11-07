@@ -1,0 +1,206 @@
+/// Get the current GT role (C FFI export). 0=TNode, 1=GNode.
+#[no_mangle]
+pub extern "C" fn sparklink_genl_get_role() -> u8 {
+    let context = RuntimeContext::default_selection();
+    let guard = context.lock().ok();
+    let ss = guard.as_deref();
+    match ss.and_then(Option::as_ref) {
+        Some(shared) => shared.local_role as u8,
+        None => 0,
+    }
+}
+
+/// Set the local GT role (C FFI export). 0=TNode, 1=GNode.
+/// Returns 0 on success, negative errno on failure.
+#[no_mangle]
+pub extern "C" fn sparklink_genl_set_role(role: u8) -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
+    let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
+    let mut guard = context.lock().ok();
+    let ss = guard.as_deref_mut();
+    match ss.and_then(Option::as_mut) {
+        Some(shared) => {
+            shared.local_role = if role == 1 {
+                GtRole::GNode
+            } else {
+                GtRole::TNode
+            };
+            0
+        }
+        None => -(bindings::ENODEV as i32),
+    }
+}
+
+/// Connection info result for genl (C FFI).
+///
+/// Field order and explicit padding ensure identical layout on 32-bit
+/// and 64-bit ABIs.  All u64 fields are placed at 8-byte aligned
+/// offsets and explicit `_pad` fields replace compiler-inserted gaps.
+#[repr(C)]
+pub struct GenlConnInfo {
+    /// Total TX bytes (offset 0, 8-byte aligned).
+    pub tx_bytes: u64,
+    /// Total RX bytes (offset 8).
+    pub rx_bytes: u64,
+    /// Connection handle (offset 16).
+    pub handle: u16,
+    /// Data channel MTU (offset 18).
+    pub data_mtu: u16,
+    /// Data channel MPS (offset 20).
+    pub data_mps: u16,
+    /// Service management channel MTU (offset 22).
+    pub svc_mtu: u16,
+    /// Peer SLE address (6 bytes, offset 24).
+    pub peer_addr: [u8; 6],
+    /// Connection state (offset 30).
+    pub state: u8,
+    /// Local GT role (0=T, 1=G) (offset 31).
+    pub role: u8,
+    /// Bandwidth in MHz (offset 32).
+    pub bandwidth_mhz: u8,
+    /// MCS index (offset 33).
+    pub mcs_index: u8,
+    /// Data channel transport mode (0=unreliable, 1=reliable) (offset 34).
+    pub data_mode: u8,
+    /// Explicit padding to 4-byte boundary (offset 35).
+    pub _pad: [u8; 1],
+}
+
+/// Get connection info by handle (C FFI export).
+/// Returns 0 on success, negative errno on failure.
+///
+/// # Safety
+///
+/// `out` must be a valid, aligned pointer to a `GenlConnInfo` struct.
+#[no_mangle]
+pub unsafe extern "C" fn sparklink_genl_get_conn_info(handle: u16, out: *mut GenlConnInfo) -> i32 {
+    let context = RuntimeContext::default_selection();
+    let guard = context.lock().ok();
+    let ss = guard.as_deref();
+    match ss.and_then(Option::as_ref) {
+        Some(shared) => match shared.conn.info(handle) {
+            Ok(entry) => {
+                // SAFETY: caller guarantees out is a valid, aligned pointer.
+                let info = unsafe { &mut *out };
+                info.handle = entry.handle;
+                info.state = entry.state as u8;
+                info.role = entry.local_role as u8;
+                info.peer_addr = entry.peer_addr;
+                info.bandwidth_mhz = entry.params.bandwidth_mhz;
+                info.mcs_index = entry.params.mcs_index;
+                info.tx_bytes = entry.tx_bytes;
+                info.rx_bytes = entry.rx_bytes;
+                info.data_mtu = entry.channels.data.mtu;
+                info.data_mps = entry.channels.data.mps;
+                info.data_mode = entry.channels.data.mode as u8;
+                info.svc_mtu = entry.channels.svc_mgmt.mtu;
+                info._pad = [0];
+                0
+            }
+            Err(_) => -(bindings::ENOENT as i32),
+        },
+        None => -(bindings::ENODEV as i32),
+    }
+}
+
+/// Power management info result for genl (C FFI).
+#[repr(C)]
+pub struct GenlPmInfo {
+    /// Power state.
+    pub state: u8,
+    /// Force-active flag.
+    pub force_active: u8,
+    /// Estimated power percentage.
+    pub power_pct: u8,
+    /// Padding.
+    _pad: u8,
+    /// State transition count.
+    pub transitions: u32,
+}
+
+/// Get power management info (C FFI export).
+///
+/// # Safety
+///
+/// `out` must be a valid, aligned pointer to a `GenlPmInfo` struct.
+#[no_mangle]
+pub unsafe extern "C" fn sparklink_genl_get_pm_info(out: *mut GenlPmInfo) -> i32 {
+    let context = RuntimeContext::default_selection();
+    let guard = context.lock().ok();
+    let ss = guard.as_deref();
+    match ss.and_then(Option::as_ref) {
+        Some(shared) => {
+            // SAFETY: caller guarantees out is a valid, aligned pointer.
+            let info = unsafe { &mut *out };
+            info.state = shared.power.state as u8;
+            info.force_active = if shared.power.is_forced_active() {
+                1
+            } else {
+                0
+            };
+            info.power_pct = shared.power.estimated_power_pct();
+            info._pad = 0;
+            info.transitions = shared.power.stats.transitions;
+            0
+        }
+        None => -(bindings::ENODEV as i32),
+    }
+}
+
+/// DLI controller info result for genl (C FFI).
+#[repr(C)]
+pub struct GenlDliInfo {
+    /// DLI bus type.
+    pub bus_type: u8,
+    /// Max concurrent connections.
+    pub max_conn: u8,
+    /// Supported transport modes (bitmask).
+    pub transport_modes: u8,
+    /// Measurement capabilities (bitmask).
+    pub measurement_cap: u8,
+    /// Firmware version.
+    pub fw_version: u32,
+    /// Feature bitmask.
+    pub features: u64,
+    /// Maximum MTU.
+    pub max_mtu: u16,
+    /// Maximum MPS.
+    pub max_mps: u16,
+    /// Security capabilities (bitmask).
+    pub security_cap: u16,
+    /// Extended feature bits 64-72.
+    pub features_ext: u16,
+}
+
+/// Get DLI controller info (C FFI export).
+///
+/// # Safety
+///
+/// `out` must be a valid, aligned pointer to a `GenlDliInfo` struct.
+#[no_mangle]
+pub unsafe extern "C" fn sparklink_genl_get_dli_info(out: *mut GenlDliInfo) -> i32 {
+    let context = RuntimeContext::default_selection();
+    let guard = context.lock().ok();
+    let ss = guard.as_deref();
+    match ss.and_then(Option::as_ref) {
+        Some(shared) => {
+            let ci = shared.controller.info();
+            // SAFETY: caller guarantees out is a valid, aligned pointer.
+            let info = unsafe { &mut *out };
+            info.bus_type = ci.bus as u8;
+            info.max_conn = ci.max_connections;
+            info.transport_modes = ci.transport_modes;
+            info.measurement_cap = ci.measurement_cap;
+            info.fw_version = ci.fw_version;
+            info.features = ci.features;
+            info.features_ext = ci.features_ext;
+            info.max_mtu = ci.max_mtu;
+            info.max_mps = ci.max_mps;
+            info.security_cap = ci.security_cap;
+            0
+        }
+        None => -(bindings::ENODEV as i32),
+    }
+}
+

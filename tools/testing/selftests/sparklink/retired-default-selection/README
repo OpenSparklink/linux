@@ -1,0 +1,21 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Exact default route/switch, legacy DLI aggregate and debug projection bodies
+from K6f2f71298029 are retained in legacy_projections.rs. No default production
+module includes this file. No current state or hardware acceptance is inferred.
+
+Registry publication retains exact owner/generation. Native calls require a
+selected File; DEV_SELECT(-1) clears that File and its observers, never follows
+another controller. dup/fork/fd passing share the File binding. An owning
+Managed/Diagnostic lease prevents rebinding until cleanup releases it.
+
+Unpublished DEV_SWITCH/DLI_INFO/DLI_RESET are rejected. Direct legacy reset is
+not Runtime recovery and cannot preserve Native lifetime/credit obligations.
+MGMT_STATS remains only for a selected standard profile0 Diagnostic ledger:
+existing actual autonomous expiry/cancel regressions must not be weakened.
+Native profile1 must not report its unrelated zero counters as quiescence.
+Use author DiagnosticResult and selected ControllerSnapshot for Native callers.
+
+protocol_state_unsupported_test.c exercises actual VM File selection, clear,
+dup/final-close, independent File isolation, refusal/CAP and unchanged output.
+Virtual/real qualification remains tied to exact new commit and manifests.

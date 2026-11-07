@@ -1,0 +1,62 @@
+WS73 runtime receive function regression
+=======================================
+
+Run `python3 run_ws73_runtime_rx.py --output /tmp/ws73-runtime-rx.json`.
+CC defaults to clang; a compiler with ASAN/UBSAN support is required.
+The test opens no USB device and installs no driver.
+Use `--artifacts /tmp/new-ws73-rx-artifacts` to retain the generated source,
+exact positive ELF and mutation sources/ELFs/stderr in a new directory. The
+report hashes these bytes. Without this option the report states that the
+temporary artifacts were not retained; replay needs a rebuild.
+
+The runner extracts the current production ws73_native_open,
+ws73_native_close and ws73_native_rx_complete bodies without changing their
+decisions. It compiles the actual wire.c HCC parser, rather than a second
+parser. The report binds bodies, source files, fixture, runner and compiler.
+
+Five temporary compiled mutations must be rejected by actual C assertions:
+ignored panic, accepted short notification, retired consumer misclassified,
+missing stop check before rearm and omitted notification cleanup. Compilation
+failure, timeout or sanitizer startup failure cannot satisfy these controls.
+The output is invalidated before work begins so a failed rerun cannot retain
+an old PASS. Raw detector failures remain failures.
+
+Scenarios cover stopped/broken/already-owned open, both allocation failures,
+both initial submission failures, notification lengths 0..7 and exact8,
+zero/advisory/unknown/panic words, transfer errors, zero successful bulk,
+valid aggregate, invalid later HCC slot before any consumer, retired Native
+consumer, consumer failure, stop during consumption, rearm error and late
+callback rejection. Advisory Wi-Fi flow/pool notifications never become DLI
+data, credit, Ready or fabricated completion in this path.
+
+Dependencies are visible in fixture.c: single-thread memory access macros,
+allocation, USB fill/submit/kill call records, programmable consumer and fault
+observation. Failures are injected into actual call sites. The USB kill stub
+does NOT implement the kernel's reject/use_count/barrier/wait protocol. A call
+to that stub is not proof of callback/ref drain. The Native consumer is not
+the Host: generation lookup, packet ownership, credit and Session dispatch
+need their own tests. The fixture survivor checks object-local side effects,
+not real controller isolation. No time bounds or fairness are established.
+
+The runtime driver already has one bulk RX URB and one notification interrupt
+URB, started after bootstrap. This test does not add another receiver, alter
+RX size/count or justify a performance change. Actual VM/device regressions,
+hardware failure RCA and nonmanual recovery remain separate requirements.
+
+HCC memory observation query
+----------------------------
+
+`python3 run_ws73_hcc_memory.py` extracts the actual driver query and the USB
+core usb_control_msg_recv body. It checks preconditions, finite fixed read,
+all short replies, an oversized reply, allocation/USB failures and observed
+stop/identity changes without overwriting an output on error. Five compiled
+assertion mutations exercise the verifier. Use --output and --artifacts to
+retain exact C/ELFs/stderr; a compiler/detector/timeout error is not a rejected
+behavioral counterexample. The output is invalidated before execution.
+
+The raw USB, allocation, mutex, access ordering, clock and simulated state
+changes remain single-thread fixtures. This does not establish real sysfs
+permissions, firmware support/counter meaning, callback/ref drain or concurrent
+unbinding. In particular a complete zero word is only a raw response, never
+DLI credit or proof of an empty device memory pool. Those properties require
+separate VM/device evidence on an exact artifact.

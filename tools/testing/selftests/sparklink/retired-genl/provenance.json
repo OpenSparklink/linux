@@ -1,0 +1,11 @@
+{
+  "kernel": "3d8a8aa06cdfc303d3fd49565a5bcf6617578965",
+  "source_hashes": {
+    "net/sparklink/sparklink_genl.c": "f1ae7aba9960a825b7f4206bdcd3a82fc969fc7865b9eaeb0dd6be2122a7689f",
+    "net/sparklink/sparklink_core.rs": "542ec14ec65fdcc2d00d6fe0934f073e993acdd3da4c7c950e871c13a20fc9d8",
+    "net/sparklink/sle_workers.rs": "7c5e87a1f4898487b0ca2d539123245df31c045be6b1f98aa096e9666acad173",
+    "include/uapi/linux/sparklink.h": "69a84db14bea78a6f325d5b80128d7bdaa12815c0198f8e42974b6a6d0e60990",
+    "tools/testing/selftests/sparklink/sparklink_test.c": "c75f1f74a2fdb274ed1821cdce4653a98cbf8ccaa46ddf142d76e7d9a5c5b9da"
+  },
+  "scope": "Historical source, not built into default kernel. No current transport or event qualification."
+}

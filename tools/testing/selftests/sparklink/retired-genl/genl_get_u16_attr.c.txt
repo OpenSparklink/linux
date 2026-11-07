@@ -1,0 +1,19 @@
+static uint16_t genl_get_u16_attr(char *msg, int msg_len, uint16_t attr_type)
+{
+	char *attr_start = msg + NLMSG_HDRLEN + GENL_HDRLEN;
+	int remaining = msg_len - NLMSG_HDRLEN - GENL_HDRLEN;
+
+	while (remaining >= (int)NLA_HDRLEN) {
+		struct nlattr *nla = (struct nlattr *)attr_start;
+
+		if (nla->nla_len < NLA_HDRLEN || (int)nla->nla_len > remaining)
+			break;
+		if (nla->nla_type == attr_type && nla->nla_len >= NLA_HDRLEN + 2)
+			return *(uint16_t *)((char *)nla + NLA_HDRLEN);
+		int step = NLA_ALIGN(nla->nla_len);
+
+		attr_start += step;
+		remaining -= step;
+	}
+	return 0xDEAD;
+}

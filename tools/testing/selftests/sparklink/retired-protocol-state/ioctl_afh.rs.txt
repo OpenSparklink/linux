@@ -1,0 +1,96 @@
+fn ioctl_afh(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
+    match cmd {
+        SL_IOCTL_AFH_SET_MAP => {
+            let params: SleAfhMapParams = read_user_struct(arg)?;
+            let map = sle_phy::ChannelMap::from_raw(params.map);
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(params.handle)?;
+            let min_ch = if params.min_channels > 0 {
+                params.min_channels
+            } else {
+                2
+            };
+            s.conn.set_channel_map(handle, map, min_ch)?;
+            Ok(0)
+        }
+        SL_IOCTL_AFH_GET_MAP => {
+            let params: SleAfhMapParams = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(params.handle)?;
+            let map = s.conn.get_channel_map(handle)?;
+            drop(ss);
+            let out = SleAfhMapParams {
+                handle,
+                min_channels: 0,
+                _pad: 0,
+                map: map.map,
+                used_count: map.used_count(),
+                _pad2: 0,
+            };
+            write_user_struct(arg, &out)?;
+            Ok(0)
+        }
+        SL_IOCTL_AFH_REPORT_RSSI => {
+            let rpt: SleAfhRssiReport = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(rpt.handle)?;
+            s.conn.report_rssi(handle, rpt.channel, rpt.rssi_dbm)?;
+            Ok(0)
+        }
+        SL_IOCTL_AFH_CLASSIFY => {
+            let params: SleAfhClassifyParams = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(params.handle)?;
+            let min_ch = if params.min_channels > 0 {
+                params.min_channels
+            } else {
+                2
+            };
+            let map = s
+                .conn
+                .classify_channels(handle, params.threshold_dbm, min_ch)?;
+            drop(ss);
+            let out = SleAfhClassifyParams {
+                handle,
+                threshold_dbm: params.threshold_dbm,
+                min_channels: min_ch,
+                map_out: map.map,
+                used_count: map.used_count(),
+                _pad: 0,
+            };
+            write_user_struct(arg, &out)?;
+            Ok(0)
+        }
+        SL_IOCTL_AFH_HOP_NEXT => {
+            let params: SleAfhHopInfo = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(params.handle)?;
+            let (ch, freq, ec) = s.conn.hop_next(handle)?;
+            drop(ss);
+            let out = SleAfhHopInfo {
+                handle,
+                channel: ch,
+                _pad: 0,
+                freq_mhz: freq,
+                event_counter: ec,
+            };
+            write_user_struct(arg, &out)?;
+            Ok(0)
+        }
+        SL_IOCTL_AFH_REPORT_RETX => {
+            let rpt: SleAfhRetxReport = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let handle = s.conn.resolve_handle(rpt.handle)?;
+            s.conn
+                .report_retx(handle, rpt.channel, rpt.retransmitted != 0)?;
+            Ok(0)
+        }
+        _ => Err(EINVAL),
+    }
+}

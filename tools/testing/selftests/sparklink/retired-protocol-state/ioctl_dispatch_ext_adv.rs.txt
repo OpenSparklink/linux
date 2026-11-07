@@ -1,0 +1,111 @@
+fn ioctl_dispatch_ext_adv(context: &RuntimeContext, cmd: u32, arg: usize) -> Result<isize> {
+    match cmd {
+        SL_IOCTL_EXT_ADV_CONFIGURE => {
+            let cfg: SleExtAdvConfig = read_user_struct(arg)?;
+            let primary_phy = sle_adv::ExtAdvPhy::from_raw(cfg.primary_phy).ok_or(EINVAL)?;
+            let secondary_phy = sle_adv::ExtAdvPhy::from_raw(cfg.secondary_phy).ok_or(EINVAL)?;
+            let bcast = sle_pdu::BroadcastType::from_raw(cfg.broadcast_type).ok_or(EINVAL)?;
+            let params = sle_adv::ExtAdvParams {
+                discovery_level: cfg.discovery_level,
+                interval_slots: u32::from(cfg.interval_ms) * 8,
+                broadcast_type: bcast,
+                tx_power: cfg.tx_power_dbm,
+                primary_phy,
+                secondary_phy,
+                sid: cfg.sid,
+                include_tx_power: cfg.include_tx_power != 0,
+                extended_adv_timing: cfg.ext_adv_timing,
+            };
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.ext_adv_configure(cfg.handle, params)?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_SET_DATA => {
+            let d: SleExtAdvData = read_user_struct(arg)?;
+            let len = (d.data_len as usize).min(ADV_DATA_MAX);
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.ext_adv_set_data(d.handle, &d.data[..len])?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_SET_SCAN_RSP => {
+            let d: SleExtAdvData = read_user_struct(arg)?;
+            let len = (d.data_len as usize).min(ADV_DATA_MAX);
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.ext_adv_set_scan_rsp(d.handle, &d.data[..len])?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_ENABLE => {
+            let handle: u8 = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.ext_adv_enable(handle)?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_DISABLE => {
+            let handle: u8 = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.ext_adv_disable(handle)?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_REMOVE => {
+            let handle: u8 = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan.ext_adv_remove(handle)?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_INFO => {
+            let params: SleExtAdvInfo = read_user_struct(arg)?;
+            let ss = context.lock()?;
+            let s = ss.as_ref().ok_or(ENODEV)?;
+            let (state, sid, phy, data_len, tx_count, timing, max_ev, ev_sent) =
+                s.adv_scan.ext_adv_info(params.handle)?;
+            drop(ss);
+            let out = SleExtAdvInfo {
+                handle: params.handle,
+                state: match state {
+                    sle_adv::ExtAdvState::Idle => 0,
+                    sle_adv::ExtAdvState::Configured => 1,
+                    sle_adv::ExtAdvState::Active => 2,
+                },
+                sid,
+                primary_phy: phy,
+                data_len: data_len as u16,
+                ext_adv_timing: timing,
+                max_adv_events: max_ev,
+                tx_count,
+                events_sent: ev_sent,
+                _pad: [0u8; 4],
+            };
+            write_user_struct(arg, &out)?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_ENABLE_EX => {
+            let p: SleExtAdvEnableParams = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.adv_scan
+                .ext_adv_enable_ex(p.handle, p.duration_10ms, p.max_adv_events)?;
+            Ok(0)
+        }
+        SL_IOCTL_EXT_ADV_TICK => {
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            let disabled = s.adv_scan.ext_adv_tick();
+            // Drive RPA refresh: each tick is 10ms, accumulate into
+            // full seconds for the RPA manager.
+            s.rpa_tick_accum += 1;
+            if s.rpa_tick_accum >= 100 {
+                // 100 * 10ms = 1 second
+                s.rpa_tick_accum = 0;
+                s.rpa.rpa_tick(1)?;
+            }
+            Ok(disabled as c_long)
+        }
+        _ => Err(EINVAL),
+    }
+}

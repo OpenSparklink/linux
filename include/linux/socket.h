@@ -256,7 +256,8 @@ struct ucred {
 				 * transport protocol
 				 */
 
-#define AF_MAX		46	/* For now.. */
+#define AF_SPARKLINK	46	/* Experimental SparkLink logical channel */
+#define AF_MAX		47	/* For now.. */
 
 /* Protocol families, same as address families. */
 #define PF_UNSPEC	AF_UNSPEC
@@ -307,6 +308,7 @@ struct ucred {
 #define PF_SMC		AF_SMC
 #define PF_XDP		AF_XDP
 #define PF_MCTP		AF_MCTP
+#define PF_SPARKLINK	AF_SPARKLINK
 #define PF_MAX		AF_MAX
 
 /* Maximum queue length specifiable by listen.  */

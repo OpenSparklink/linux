@@ -1,0 +1,6 @@
+	/* Verify manager operations still work after reset */
+	struct sle_subsys_stats ss;
+
+	memset(&ss, 0, sizeof(ss));
+	ret = ioctl(fd, SL_IOCTL_SUBSYS_STATS, &ss);
+	check("SUBSYS_STATS (post-reset)", ret);

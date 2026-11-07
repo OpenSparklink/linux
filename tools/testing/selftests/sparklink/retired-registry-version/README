@@ -1,0 +1,6 @@
+Exact selected prior source fragments and original fixtures;original full source
+identity and fragment hashes are in retirement-audit.json. The five minimal
+projection tests run separately as historical witnesses. Registry/install/pending
+fragments are retained source history,not replayed kernel concurrency qualification.
+No default production include. Full5byte version/10byte features stay withNative
+snapshot;there is no write-only packed registry version authority.

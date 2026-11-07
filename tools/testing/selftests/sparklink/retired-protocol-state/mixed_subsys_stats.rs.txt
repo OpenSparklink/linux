@@ -1,0 +1,31 @@
+        SL_IOCTL_SUBSYS_STATS => {
+            let (dev_count, pending_count, runtime_count) = {
+                let guard = SUBSYSTEM.lock();
+                let s = guard.as_ref().ok_or(ENODEV)?;
+                {
+                    let runtimes = s.runtimes.iter().flatten().count() as u8;
+                    let devices = s.dev_registry.count() as u16;
+                    (devices, (devices - u16::from(runtimes)) as u8, runtimes)
+                }
+            };
+            let ss = context.lock()?;
+            let s = ss.as_ref().ok_or(ENODEV)?;
+            let stats = SleSubsysStats {
+                dev_count,
+                pending_count,
+                runtime_count,
+                active_connections: s.conn.active_count() as u16,
+                mgmt_pending: s.cmd_pending.pending_count,
+                total_conn_created: s.conn.total_created as u32,
+                total_conn_completed: s.conn.total_completed as u32,
+                total_mgmt_submitted: s.cmd_pending.total_submitted as u32,
+                total_mgmt_timeouts: s.cmd_pending.total_timeouts as u32,
+                power_state: 0xff, // Unknown: no hardware PM snapshot.
+                _pad: [0; 3],
+                power_transitions: 0, // Unavailable, not a measured zero.
+                crc_errors: sle_pdu::crc_error_count(),
+            };
+            drop(ss);
+            write_user_struct(arg, &stats)?;
+            Ok(0)
+        }

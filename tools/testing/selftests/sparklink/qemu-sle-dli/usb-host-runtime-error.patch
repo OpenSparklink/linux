@@ -1,0 +1,88 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -97,6 +97,10 @@
+     bool                             allow_kernel_driver_detach;
+     bool                             allow_host_reset;
+ 
++    /* Explicit test-only QMP pulse; never armed by default. */
++    bool                             test_runtime_in_error_once;
++    uint64_t                         test_runtime_in_errors;
++
+     /* state */
+     QTAILQ_ENTRY(USBHostDevice)      next;
+     int                              seen, errcount;
+@@ -481,7 +485,21 @@
+     }
+ 
+     r->p->status = status_map[xfer->status];
+-    if (r->in && xfer->actual_length) {
++    if (s->test_runtime_in_error_once && r->in &&
++        xfer->status == LIBUSB_TRANSFER_COMPLETED &&
++        xfer->type == LIBUSB_TRANSFER_TYPE_BULK &&
++        xfer->endpoint == 0x81 && xfer->actual_length > 0) {
++        /* Deliver an artificial guest transport error instead of these
++         * bytes. The actual host transfer succeeded; do not reset, detach
++         * or manufacture a libusb failure/device disappearance. */
++        s->test_runtime_in_error_once = false;
++        s->test_runtime_in_errors++;
++        r->p->status = USB_RET_IOERROR;
++        error_report("WS73_TEST_RUNTIME_IN_ERROR: dev %d:%d ep 81 "
++                     "host_status=0 discarded_bytes=%d injected_count=%" PRIu64,
++                     s->bus_num, s->addr, xfer->actual_length,
++                     s->test_runtime_in_errors);
++    } else if (r->in && xfer->actual_length) {
+         usb_packet_copy(r->p, r->buffer, xfer->actual_length);
+     }
+     trace_usb_host_req_complete(s->bus_num, s->addr, r->p,
+@@ -1113,6 +1131,9 @@
+ {
+     USBDevice *udev = USB_DEVICE(s);
+ 
++    /* A test pulse belongs to this open transport, never a re-enumeration. */
++    s->test_runtime_in_error_once = false;
++
+     if (s->dh == NULL) {
+         return -1;
+     }
+@@ -1283,6 +1304,28 @@
+     s->errcount = 0;
+ }
+ 
++static bool usb_host_get_test_runtime_in_error(Object *obj, Error **errp)
++{
++    return USB_HOST_DEVICE(obj)->test_runtime_in_error_once;
++}
++
++static void usb_host_set_test_runtime_in_error(Object *obj, bool value,
++                                              Error **errp)
++{
++    USBHostDevice *s = USB_HOST_DEVICE(obj);
++
++    if (value && (!s->dh || !USB_DEVICE(s)->attached ||
++                  s->ddesc.idVendor != 0xffff || s->ddesc.idProduct != 0x3733 ||
++                  s->allow_host_reset || s->allow_kernel_driver_detach ||
++                  s->allow_one_guest_reset || s->allow_all_guest_resets ||
++                  s->test_runtime_in_error_once)) {
++        error_setg(errp, "test runtime error requires attached WS73, all reset/"
++                   "detach opt-outs and no pending injection");
++        return;
++    }
++    s->test_runtime_in_error_once = value;
++}
++
+ static void usb_host_instance_init(Object *obj)
+ {
+     USBDevice *udev = USB_DEVICE(obj);
+@@ -1290,6 +1333,12 @@
+ 
+     object_property_add_bool(obj, "host-retry",
+                              usb_host_get_retry, usb_host_set_retry);
++    object_property_add_bool(obj, "test-runtime-in-error-once",
++                             usb_host_get_test_runtime_in_error,
++                             usb_host_set_test_runtime_in_error);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-errors",
++                                  &s->test_runtime_in_errors,
++                                  OBJ_PROP_FLAG_READ);
+     device_add_bootindex_property(obj, &s->bootindex,
+                                   "bootindex", NULL,
+                                   &udev->qdev);

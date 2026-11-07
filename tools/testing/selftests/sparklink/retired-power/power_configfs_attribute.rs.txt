@@ -1,0 +1,31 @@
+// Attribute 4: power_mode (read/write, 0=active, 1=sniff, 2=idle)
+#[vtable]
+impl configfs::AttributeOperations<4> for SparkLinkConfig {
+    type Data = SparkLinkConfig;
+
+    fn show(_data: &SparkLinkConfig, page: &mut [u8; PAGE_SIZE]) -> Result<usize> {
+        let mode = POWER_MODE.load(Ordering::Relaxed);
+        let label = match mode {
+            0 => b"active\n" as &[u8],
+            1 => b"sniff\n",
+            2 => b"idle\n",
+            _ => b"unknown\n",
+        };
+        page[..label.len()].copy_from_slice(label);
+        Ok(label.len())
+    }
+
+    fn store(_data: &SparkLinkConfig, page: &[u8]) -> Result {
+        super::sle_authorization::require_admin()?;
+        let s = core::str::from_utf8(page).map_err(|_| EINVAL)?;
+        let val = match s.trim() {
+            "active" | "0" => 0u8,
+            "sniff" | "1" => 1u8,
+            "idle" | "2" => 2u8,
+            _ => return Err(EINVAL),
+        };
+        POWER_MODE.store(val, Ordering::Relaxed);
+        Ok(())
+    }
+}
+

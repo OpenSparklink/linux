@@ -1,0 +1,32 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Exact security/RPA model retired from default production at K5582a10c5ec8.
+The pre-removal hashes and caller/three-class audit are in the userspace
+security-state-retirement-audit-20261014.json. legacy_ioctls.rs,
+legacy_ral_dispatch.rs and legacy_pairing_worker.rs retain original bodies.
+
+Only run_security_remediation.py includes this model. Its 7 tests are historical
+state/semantic/failure regression, not current Runtime or hardware security.
+It separately compiles unchanged net/sparklink/sle_crypto.rs wrappers and actual
+sle_crypto_ffi.c CTR body against counted fault dependencies (5 C stages).
+The kernel mechanism sources remain in net/sparklink for future authenticated
+per-session security, but have no default object/module consumer. Do not restore
+controller-global state or wire responders. Real key installation, standard
+vectors, authentication, zeroization and VM peer security gates remain missing.
+
+2026-10-17 R4e: sle_crypto.rs and sle_crypto_ffi.c moved here byte-for-byte
+from K0cd4731 net/sparklink. Neither had a production module/Makefile consumer.
+Rust source SHA256 e3dc9d39a25eed3fa5432b27464ac2d37b3f531c5b9b61ca2a0d3994897b8d97;
+C source SHA256 544430bfc75e0e0e06adbcc303ae24564fdf163200902fecc624e6973bcdf70c.
+The original module-wide dead-code attribute is historical test material only;
+it is not an exception for production. Do not re-link this archived model.
+run_security_remediation.py uses these exact files with explicit fault fixtures;
+security/crypto_vm_probe.c includes the same C file for standard-vector/failure
+checks in a dedicated VM. No copied second implementation. Production P256/CMAC
+and pairing material remain net/sparklink/sle_pair_crypto.c and sle_pair_material.c.
+Old reports retain original paths/commits/hashes; new reports use new test paths.
+
+The archived C file still includes the actual production sle_pair_crypto.c.
+The dedicated VM module supplies net/sparklink as an explicit include search
+path, without copying or rewriting either implementation. A missing include
+must fail module build, never fall back to a model or claim VM PASS.

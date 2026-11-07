@@ -1,0 +1,19 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Exact measurement/global configfs/Kconfig and old mixed test bodies retained
+from Kdd11fa38a338. They are historical references, not production includes or
+current capability promises. Native measurement needs real capability discovery,
+controller/generation/connection identity and validated typed transactions;
+legacy defaults/direct submits are rejected before context or usercopy.
+
+configfs publishes only software version. Five removed global nodes must be
+ENOENT and cannot create a backend. Actual board firmware/config still belongs
+to each WS73 driver (bsle_custom.bin and pm_config.bin remain required).
+No-op SPARKLINK_SLE/DEBUGFS options are removed; Linux DEBUG_FS controls debugfs.
+Core no longer forces crypto algorithms without a production consumer; actual
+WS73 boot SHA256 dependency remains with its driver. Kernel crypto source is
+retained for future authenticated per-session mechanisms and fault tests.
+
+Root scratch no-ghost and actual Virtual checks now test absence and registry
+invariance. Preserve standard Diagnostic autonomous timeout/cancel/credit and
+real two-device qualification; do not revive old success/fallback behavior.

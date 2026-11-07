@@ -1,0 +1,15 @@
+{
+  "kernel": "43e55d59fe9559b08da9404da7051272a84a3acc",
+  "userspace": "384174601fe677d8a52376c7e3c28ab0b2c755c1",
+  "sources": {
+    "sle_conn.rs": "7b625a362843ec43283e773d0d8d315ab25b74cd7388c86a0c820b85f052fe70",
+    "sle_adv.rs": "fdc294b73ea0f0f52953c09056d40bfd7a32eaa5154f387bc9385d6bf14423d1",
+    "sle_phy.rs": "19afbd4567b177e8e641076809bbf688f932ea7ae658dd10c7c47a3629e324c1",
+    "sle_pdu.rs": "c07983584a963db052922cb2853bd963642974e02f8abe92b3d7e897069c3d3e",
+    "sparklink_core.rs": "37003eed817ae3b7eb2182802e0c2f669c2ec53c3af23398482559dc5138be53",
+    "sle_workers.rs": "84be6a8b9a305cb3921ab66a110418fba8116331fd57059c03588c14f2a3f36b",
+    "sle_host.rs": "e607769a6f9cbd7c0f8f277c8066f7323dc6eed2bce8136a5ac639ec8f97af82",
+    "sle_configfs.rs": "a208cab13c20326baefc40759f43c90b1ee2ec4d9c1b9f0acad97afee7997653"
+  },
+  "scope": "exact historical models/projection snippets, not current production mechanisms or RF proof"
+}

@@ -11,12 +11,50 @@ menuconfig SPARKLINK_DRIVERS
 
 if SPARKLINK_DRIVERS
 
+config SPARKLINK_STANDARD_USB
+	tristate "Standard SparkLink DLI USB query provider (experimental)"
+	depends on USB
+	help
+	  Bind standard E0/01/05 DLI device/interface descriptors. EP0 commands
+	  and interrupt events use the common per-controller Backend lifecycle.
+	  Query-only: standard typed policy/data and PM remain unqualified.
+	  Firmware/boot-ROM protocols belong to matched vendor drivers.
+	  The module is called sparklink_standard_usb. No test device is created.
+
+config SPARKLINK_WS73_USB
+	tristate "HiSilicon WS73 USB firmware and BSLE transport (experimental)"
+	depends on USB
+	select FW_LOADER
+	select CRYPTO_LIB_SHA256
+	help
+	  Bind WS73 USB interfaces (ffff:3733), validate and download the
+	  three boot images, and track re-enumeration into runtime mode.
+	  Images are loaded from sparklink/ws73/{ws73,wifi_cali,btc_cali}.bin.
+	  Runtime mode also requires raw board configuration files:
+	  sparklink/ws73/bsle_custom.bin (140 bytes) and pm_config.bin (4 bytes).
+	  Wait for BSP_READY, send configuration and open SLE, requiring actual
+	  CUSTOMIZE_RECEIVED and BOOT_FINISH replies. This experimental driver
+	  queries actual DLI metadata and registers an independent native
+	  Runtime in SETUP with bulk/notification URBs. Metadata, native
+	  advertising and scanning transactions have real two-device VM
+	  evidence. Per-device protocol recovery has bounded retries and
+	  diagnostics, but natural-fault/disappearance recovery and the full
+	  single/two/four-device matrix remain unqualified. Connection,
+	  security, board calibration qualification and USB PM remain open.
+	  Do not treat this experimental option as full protocol support.
+
+	  The module is called sparklink_ws73_usb.
+
 config SPARKLINK_VIRTUAL
 	tristate "Virtual SparkLink controller (testing)"
 	help
-	  A virtual SparkLink controller driver for development and testing
-	  purposes. This driver does not require real hardware and can be
-	  used to test the SparkLink protocol stack.
+	  Explicit test backend, disabled by default. Opening the root-only
+	  /dev/sparklink_virtual creates a TEST-bus standard-DLI query Runtime
+	  through the common Backend API. Final control-file close retires the
+	  exact generation and joins its bounded reply worker. dup shares it.
+	  Private test controls allow bounded delayed, dropped or failed replies.
+	  No radio, connection, data or physical acceptance is claimed. Production
+	  hardware drivers and the daemon do not generate these emulated replies.
 
 	  To compile this as a module, choose M here:
 	  the module will be called sparklink_virtual.

@@ -1,0 +1,37 @@
+The test runner compiles actual production bodies from sle_conn.rs,
+sparklink_core.rs and sle_usb_ffi.c. Only dependency/container/USB types are
+fixtures. Production source hashes are recorded and checked again after tests.
+
+No test sender or success injection is compiled into the kernel. Fixture
+acceptance proves a submission/accounting boundary, not negotiated transport,
+socket ABI, peer delivery, hardware or RF. The native WS73 discovery path must
+also be regressed with a freshly built kernel and two real devices in a VM.
+
+run_native_connection_host.py also compiles the actual process-context
+progress_connection_cleanup caller. Its driver fixture checks the SLE 0x10
+remote-user termination request used by the Native daemon; 0x13 is not the
+Bluetooth meaning in SLE. The fixture covers preparation failure, retirement
+and a disappearing cleanup candidate without inventing a physical Down.
+It does not prove firmware acceptance, callback drain or peer termination.
+
+The Rust source is compiled with -D warnings. C boundaries require
+ASan/UBSan/LeakSanitizer; a restricted ptrace environment may prevent LSan
+execution and must be corrected, not recorded as a passing/skipped gate.
+
+Optional typed link-recipe CBMC check (no device access):
+
+  python3 tools/testing/selftests/sparklink/run_link_query_cbmc.py --output NEW_DIRECTORY
+
+This compiles the actual production connection.c separately from
+connection/link_query_cbmc.c, checking private typed link selectors4/5/6, arbitrary
+32-bit request fields, 64-bit lengths, valid objects/NULL, output guards,
+failure atomicity, exact LE16 and recipe/validator agreement. Unwind64 has
+unwinding assertions. The runner requires all eleven named properties and all
+generated safety properties, and three deliberately wrong private source copies
+must produce the expected counterexamples. Missing/unsupported/timeout/warning
+or incomplete results remain UNPROVED. No production source is modified.
+
+CBMC/frontend/solver and serialized C object semantics are trusted. This does
+not prove Host locking, generation/lifetime, Grant/credit/Ticket, callbacks,
+NOCP/reuse, firmware behavior, application delivery or implementation refinement.
+test_link_query_cbmc.py checks verdict parsing only; its success is not a proof.

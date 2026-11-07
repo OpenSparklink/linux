@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Offline libFuzzer on unchanged production C. Never loads a driver or USB.
+
+A completed bounded exploration is not a proof, kernel concurrency/sanitizer
+qualification, firmware behavior, or real-device acceptance.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import time
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[3]
+REQUIRED = ['ws73_wire_receive', 'ws73_wire_acb_fragment_decode',
+            'ws73_wire_acb_fragment', 'ws73_dli_validate_security_event',
+            'ws73_dli_validate_reply', 'ws73_dli_link_outcome']
+METADATA_TIMEOUT_SECONDS = 30
+
+
+def bounded_command(command, env=None, timeout=60):
+    """Own/reap the subprocess group, including Git lazy-fetch helpers.
+
+    Killing only Git and then draining its pipe can still wait on a descendant
+    holding that pipe. This offline Linux supervisor never owns device work.
+    """
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               cwd=ROOT, env=env, start_new_session=True)
+    try:
+        raw, _ = process.communicate(timeout=timeout)
+        return process.returncode, raw
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raw, _ = process.communicate(timeout=5)
+        return 'TIMEOUT', raw
+    finally:
+        # Also handle cancellation/interruption of the supervisor itself. A
+        # missing/completed=False receipt cannot become accepted exploration.
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=5)
+
+
+def completed(text, code):
+    """Fail closed even when an incorrect wrapper masks a sanitizer exit."""
+    faults = ['ERROR:', 'runtime error:', 'AddressSanitizer:',
+              'UndefinedBehaviorSanitizer:', 'LeakSanitizer:', 'libFuzzer: deadly signal',
+              'LeakSanitizer has encountered a fatal error', 'unsupported instrumentation']
+    stats = re.search(r'stat::number_of_executed_units:\s*(\d+)', text)
+    done = re.search(r'Done (\d+) runs in \d+ second', text)
+    return (code == 0 and not any(word in text for word in faults)
+            and bool(re.search(r'#\d+\s+DONE\s+cov:', text))
+            and stats is not None and done is not None
+            and int(stats[1]) == int(done[1]) and int(done[1]) > 0)
+
+
+def coverage_counts(document, required=REQUIRED):
+    counts = {}
+    for section in document['data']:
+        for entry in section['functions']:
+            name = entry['name'].split(':')[-1]
+            if name in required:
+                counts[name] = counts.get(name, 0) + entry['count']
+    if set(counts) != set(required) or any(n <= 0 for n in counts.values()):
+        raise ValueError('required actual production functions did not execute')
+    return counts
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run(args):
+    out = args.output.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    sources = [HERE/'fuzz/ws73_codec_fuzz.c', HERE/'fuzz/ws73_codec_corpus.json',
+               Path(__file__), HERE/'fuzz/test_ws73_codec_verdict.py', ROOT/'drivers/sparklink/ws73/wire.c',
+               ROOT/'drivers/sparklink/ws73/wire.h', ROOT/'drivers/sparklink/ws73/dli.c',
+               ROOT/'drivers/sparklink/ws73/dli.h', ROOT/'drivers/sparklink/ws73/bsle.h']
+    dynamic = args.contract == 'cmtc'
+    required = ['sl_channel_signal_decode', 'sl_channel_signal_encode'] if dynamic else REQUIRED
+    if dynamic:
+        sources = [HERE/'channel/signal_fuzz.c', HERE/'channel/signal_corpus.json',
+                   Path(__file__), HERE/'fuzz/test_ws73_codec_verdict.py',
+                   ROOT/'net/sparklink/sle_channel_wire.c', ROOT/'net/sparklink/sle_channel_wire.h']
+    maximum = 64 if dynamic else 20480
+    snapshot = {}
+    report = dict(schema_version=1, contract=args.contract, status='RUNNING_NOT_QUALIFIED', completed=False,
+                  accepted_exploration=False, proof=False, physical_acceptance=False,
+                  source_commit=None, source_hashes=snapshot, source_worktree_status=None,
+                  phases=[], bounds=dict(runs=args.runs,seed=args.seed,
+                  max_input_bytes=maximum,input_timeout_seconds=2,phase_wall_timeout_seconds=60,
+                  metadata_wall_timeout_seconds=METADATA_TIMEOUT_SECONDS,software_memory_mb=512),
+                  real_dependencies='Production wire.c/dli.c, libc malloc, Clang libFuzzer/ASAN/UBSAN and LLVM coverage; no protocol/USB/clock/lock success stubs',
+                  fixture='Hand-authored legal/malformed input corpus and input-bounds observer callback with explicit ECANCELED outcome',
+                  excluded=['kernel allocator/locks/refcounts/USB callbacks and real concurrency',
+                            'BSLE/query state machines, split/concatenation transport, data credit/tickets/Grant',
+                            'full input/state proof, hardware/firmware behavior, security/trusted identity and natural recovery'])
+    if dynamic:
+        report.update(real_dependencies='Production sle_channel_wire.c, libc and Clang libFuzzer/ASAN/UBSAN/LLVM coverage; no protocol Engine or USB success stubs',
+                      fixture='Hand-authored public-format CMTC vectors, arbitrary valid C byte buffer, failure atomicity and roundtrip oracle',
+                      excluded=['Kernel allocator/locks/refcounts/USB and real concurrency',
+                                'Runtime credit/Grant/Session integration, complete temporal protocol or hardware/firmware behavior'])
+    report_file = out/'report.json'
+    def save():
+        temporary = out/'report.pending.json'
+        temporary.write_text(json.dumps(report,indent=2)+'\n')
+        temporary.replace(report_file)
+    def invoke(name, command, env=None, timeout=60):
+        row = dict(name=name, command=command, status='RUNNING', start_ns=time.time_ns())
+        report['phases'].append(row); save()
+        try:
+            row['exit'], raw = bounded_command(command, env=env, timeout=timeout)
+        except OSError as error:
+            row['exit'], raw = 'UNAVAILABLE', str(error).encode()
+        (out/(name+'.log')).write_bytes(raw)
+        row.update(log_sha256=hashlib.sha256(raw).hexdigest(),end_ns=time.time_ns())
+        row['status']='COMMAND_COMPLETED' if row['exit']==0 else 'FAILED_OR_UNVERIFIED'
+        save()
+        if row['exit']!=0: raise RuntimeError(name+' failed or timed out')
+        return raw.decode(errors='replace')
+    try:
+        # Persist an unqualified receipt before Git, source reads, compiler
+        # discovery or version probes. Failure never leaves an absent report.
+        save()
+        snapshot.update({str(p.relative_to(ROOT)): digest(p) for p in sources})
+        report['source_commit'] = invoke('source-commit', ['git','rev-parse','HEAD'],
+                                        timeout=METADATA_TIMEOUT_SECONDS).strip()
+        if not re.fullmatch(r'[0-9a-f]{40}', report['source_commit']):
+            raise ValueError('invalid source commit')
+        report['source_worktree_status'] = invoke('source-worktree', ['git','status','--porcelain'],
+                                                 timeout=METADATA_TIMEOUT_SECONDS).splitlines()
+        compiler=os.environ.get('CC','clang')
+        profdata=os.environ.get('LLVM_PROFDATA','llvm-profdata')
+        cov=os.environ.get('LLVM_COV','llvm-cov')
+        for name in [compiler, profdata,cov,'nm']:
+            if not shutil.which(name):raise RuntimeError('required tool unavailable: '+name)
+        report['tools']={}
+        for i,name in enumerate([compiler,profdata,cov]):
+            version = invoke('tool-version-'+str(i), [name,'--version'],
+                             timeout=METADATA_TIMEOUT_SECONDS).splitlines()
+            if not version:raise ValueError('empty tool version: '+name)
+            report['tools'][name] = version[0]
+        catalog=json.loads(sources[1].read_text())
+        if catalog['schema_version']!=1 or len(catalog['seeds'])<10:raise ValueError('bounded fixed corpus missing')
+        fixed=out/'fixed-corpus';fixed.mkdir()
+        for name,hexdata in catalog['seeds'].items():
+            if not re.fullmatch(r'[a-z0-9-]+',name):raise ValueError('invalid seed name')
+            data=bytes.fromhex(hexdata)
+            if len(data)>maximum:raise ValueError('seed exceeds input budget')
+            (fixed/name).write_bytes(data)
+        report['fixed_corpus']={p.name:digest(p) for p in sorted(fixed.iterdir())}
+        binary=out/'ws73-codec-fuzz'
+        command=[compiler,'-std=c11','-g','-O1','-Wall','-Wextra','-Werror',
+                 '-fsanitize=fuzzer,address,undefined','-fno-omit-frame-pointer',
+                 '-fprofile-instr-generate','-fcoverage-mapping',
+                 *[str(p) for p in ([sources[0], sources[4]] if dynamic else [sources[0], sources[4], sources[6]])],'-o',str(binary)]
+        invoke('compile',command)
+        symbols=invoke('instrumentation-symbols',['nm',str(binary)])
+        for symbol in ['__asan_init','__ubsan_handle_', '__sanitizer_cov_8bit_counters_init','LLVMFuzzerTestOneInput']:
+            if symbol not in symbols:raise ValueError('missing instrumentation: '+symbol)
+        report['binary_sha256']=digest(binary)
+        for phase,runs in [('replay',0),('explore',args.runs)]:
+            corpus=out/(phase+'-corpus');shutil.copytree(fixed,corpus)
+            env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1:abort_on_error=1',
+                     UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1',
+                     LLVM_PROFILE_FILE=str(out/(phase+'-%p.profraw')))
+            command=[str(binary),str(corpus),'-runs='+str(runs),'-seed='+str(args.seed),
+                     '-max_len='+str(maximum),'-timeout=2','-rss_limit_mb=512','-print_final_stats=1',
+                     '-artifact_prefix='+str(out)+'/' ]
+            text=invoke(phase,command,env)
+            if not completed(text,0):raise ValueError(phase+' missing complete, clean libFuzzer result')
+            count=int(re.search(r'stat::number_of_executed_units:\s*(\d+)',text)[1])
+            if phase=='explore' and count<args.runs:raise ValueError('exploration budget incomplete')
+            report['phases'][-1].update(status='BOUNDED_COMPLETED_NO_FINDING',executed_units=count)
+        profiles=sorted(out.glob('*.profraw'))
+        if not profiles:raise ValueError('coverage profiles missing')
+        merged=out/'merged.profdata'
+        invoke('merge-coverage',[profdata,'merge','-sparse',*[str(p) for p in profiles],'-o',str(merged)])
+        raw=invoke('export-coverage',[cov,'export',str(binary),'-instr-profile='+str(merged)])
+        report['actual_production_execution_counts']=coverage_counts(json.loads(raw),required)
+        report['final_corpus']={p.name:digest(p) for p in sorted((out/'explore-corpus').iterdir())}
+        if snapshot!={str(p.relative_to(ROOT)):digest(p) for p in sources}:raise ValueError('source changed during run')
+        report.update(status='BOUNDED_FUZZ_COMPLETED_NO_FINDING',accepted_exploration=True)
+    except (OSError,ValueError,RuntimeError,KeyError,subprocess.SubprocessError) as error:
+        report.update(status='FAILED_OR_UNVERIFIED',error=str(error))
+    finally:
+        report['completed']=True;save()
+    print(report['status'],report_file)
+    return 0 if report['accepted_exploration'] else 1
+
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',type=Path,required=True,help='new directory; never overwrite failures/corpus')
+    parser.add_argument('--runs',type=int,default=20000)
+    parser.add_argument('--contract', choices=['ws73','cmtc'], default='ws73')
+    parser.add_argument('--seed',type=int,default=730111)
+    args=parser.parse_args()
+    if not 1000<=args.runs<=1000000 or not 0<=args.seed<2**32:parser.error('bounded runs1000..1000000 and u32 seed required')
+    raise SystemExit(run(args))

@@ -1,0 +1,75 @@
+        SL_IOCTL_PM_INFO => {
+            let info = {
+                let ss = context.lock()?;
+                let s = ss.as_ref().ok_or(ENODEV)?;
+                let mut info: SlePmInfo = unsafe { core::mem::zeroed() };
+                info.state = s.power.state as u8;
+                info.force_active = if s.power.is_forced_active() { 1 } else { 0 };
+                info.power_pct = s.power.estimated_power_pct();
+                info.current_interval = s.power.interval.current_interval;
+                info.supervision_timeout = s.power.interval.supervision_timeout;
+                info.latency = s.power.interval.latency;
+                info.idle_count = s.power.stats.active_events.min(u64::from(u16::MAX)) as u16;
+                info.transitions = s.power.stats.transitions;
+                info.active_events = s.power.stats.active_events;
+                info.sniff_events = s.power.stats.sniff_events;
+                info.idle_events = s.power.stats.idle_events;
+                info
+            };
+            write_user_struct(arg, &info)?;
+            Ok(0)
+        }
+        SL_IOCTL_PM_SET_STATE => {
+            let cmd_data: SlePmStateCmd = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            match cmd_data.target_state {
+                0 => {
+                    s.power.resume();
+                    Ok(0)
+                }
+                1 => {
+                    s.power.on_activity();
+                    s.power.force_active(false);
+                    Ok(0)
+                }
+                3 => {
+                    s.power.suspend()?;
+                    Ok(0)
+                }
+                _ => Err(EINVAL),
+            }
+        }
+        SL_IOCTL_PM_SET_INTERVAL => {
+            let params: SlePmInterval = read_user_struct(arg)?;
+            let interval = sle_power::ConnInterval {
+                min_interval: params.min_interval,
+                max_interval: params.max_interval,
+                current_interval: params.min_interval,
+                latency: params.latency,
+                supervision_timeout: params.supervision_timeout,
+            };
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.power.update_interval(interval)?;
+            Ok(0)
+        }
+        SL_IOCTL_PM_FORCE_ACTIVE => {
+            let enable: u8 = read_user_struct(arg)?;
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.power.force_active(enable != 0);
+            Ok(0)
+        }
+        SL_IOCTL_PM_TICK => {
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.power.on_tick();
+            Ok(0)
+        }
+        SL_IOCTL_PM_ACTIVITY => {
+            let mut ss = context.lock()?;
+            let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+            s.power.on_activity();
+            Ok(0)
+        }

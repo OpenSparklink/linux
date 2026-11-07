@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "scope": "Public-format hand-authored CMTC vectors; no captures, SDK, firmware or secrets",
+  "seeds": {
+    "connect-ports": "10011200800a0100fa00ff0001010100221144336655",
+    "connect-no-ports": "10010a0080000100fa00ff000101",
+    "connect-eight-slqi": "1001110080000100fa00ff00080102030405060708",
+    "connect-response": "11ff040080910000",
+    "connect-refusal": "1100040080000100",
+    "close-request": "12ff02008091",
+    "close-response": "13000300809100",
+    "empty": "",
+    "truncated-header": "10",
+    "bad-length": "1000ffff",
+    "bad-code": "14000000",
+    "rfu-response": "1100040080910001",
+    "bad-tcid": "120002007f91",
+    "bad-result": "1100040080000500"
+  }
+}

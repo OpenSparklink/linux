@@ -1,0 +1,47 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Native security relay staging, not a default kernel feature
+==========================================================
+
+security_relay.rs is the intended pure transition code for the Native Host's
+physical ConnectionSession. It is actively being wired into the real Host;
+it is not the retired SecurityInner/SLE wire engine and is not built by the
+default Makefile. No allow(dead_code), mock success or weak-key fallback.
+
+Implemented: one prepared/submitted relay, two queued PDUs, exact SDK111 five
+byte envelope, immutable controller/generation/lifetime/handle/Grant epoch,
+original deadline, pre-submit withdrawal, in-flight reply obligation, and
+uncertain transport failure retaining debt/reset requirement. USB success is
+not Complete; successful Status is not terminal; no command credit is owned
+here. Payloads are bounded and never truncated.
+
+Integration requirements, still MISSING:
+
+* Runtime owns one such object/attempt per physical connection lifetime, not
+  per application fd. Reopening/dup must not recreate it or restart a deadline.
+  A new attempt on the same connection needs an explicit abort/drain protocol,
+  late-message quarantine and a verified barrier; changing local cookies alone
+  cannot establish that barrier. Constructor/canonical epoch allocation and
+  the sole session table have not yet been connected.
+* Host resolves authority under its actual lock and schedule gate, shares its
+  existing command credit/reservation, and keeps atomic driver submission under
+  these guards. The callback must return error only if never queued. A caller
+  supplied Identity is not an independently validated Grant or authorization.
+* Driver prepares/validates typed1812; raw metadata admission remains unchanged.
+  Explicit0014/000e/0011 decoding/attribution and the265-byte relay RX maximum,
+  real reply routing, physical abort/stop/join and reset barriers must be wired.
+* Opcode-only firmware completion carries no cookie/generation/lifetime. The
+  ticket API rejects local mismatches, but does NOT prove late/duplicate wire
+  replies cannot pay a newer same-opcode reservation. Firmware/hardware barrier
+  assumptions require dedicated models and VM-only controlled real tests.
+* Native same-Session candidate proof has a separate exact-source real qualification.
+  Explicit manager-only role-bound1c03/1c05/matching0011 implementation is under
+  new qualification; it is not Agent consent/authenticated identity/security
+  levels/Bond or remote CCC. Current status belongs to the userspace canonical
+  capability matrix, never this historical experiment directory.
+
+Exit staging only when the sole Host/Session producer and consumer are wired,
+strict builds/regressions and relevant implementation proofs pass, and exact
+new VM images preserve real two-device discovery/link/socket/length gates.
+Then move this SAME source into the normal module tree; do not maintain a second
+verification implementation. All S0-S6 and issue scopes remain open.

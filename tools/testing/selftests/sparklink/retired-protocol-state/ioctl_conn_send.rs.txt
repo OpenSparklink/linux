@@ -1,0 +1,23 @@
+fn ioctl_conn_send(context: &RuntimeContext, arg: usize) -> Result<isize> {
+    let cd: SleConnData = read_user_struct(arg)?;
+    let len = cd.length as usize;
+    if len > CONN_DATA_MAX {
+        return Err(EINVAL);
+    }
+    let mut ss = context.lock()?;
+    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+    let s: &mut ControllerState = s;
+    let controller = &s.controller;
+    let sent = s.conn.send(cd.handle, &cd.data[..len], |host_handle, wire_handle, payload| {
+        let handle = if controller.uses_command_host() {
+            wire_handle.ok_or(EPIPE)?
+        } else {
+            host_handle
+        };
+        let mut tx_buf = [0u8; 1 + CONN_DATA_MAX];
+        tx_buf[0] = sle_conn::tcid::DEFAULT_DATA as u8;
+        tx_buf[1..1 + payload.len()].copy_from_slice(payload);
+        controller.send_data(handle, &tx_buf[..1 + payload.len()])
+    })?;
+    Ok(sent as isize)
+}

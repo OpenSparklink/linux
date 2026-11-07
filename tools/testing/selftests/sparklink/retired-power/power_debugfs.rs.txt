@@ -1,0 +1,20 @@
+            _power_stats <- power_dir.read_callback_file(
+                c"stats",
+                Atomic::<u32>::new(0),
+                &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
+                    let context = RuntimeContext::default_selection();
+                    if let Ok(guard) = context.lock() {
+                        let ss = guard.as_ref().expect("validated live Runtime");
+                        let p = &ss.power;
+                        writeln!(f, "state: {:?}", p.state)?;
+                        writeln!(f, "forced_active: {}", p.is_forced_active())?;
+                        writeln!(f, "active_events: {}", p.stats.active_events)?;
+                        writeln!(f, "sniff_events: {}", p.stats.sniff_events)?;
+                        writeln!(f, "idle_events: {}", p.stats.idle_events)?;
+                        writeln!(f, "transitions: {}", p.stats.transitions)?;
+                        writeln!(f, "force_active_count: {}", p.stats.force_active_count)?;
+                        writeln!(f, "supervision_warnings: {}", p.stats.supervision_warnings)?;
+                    }
+                    Ok(())
+                },
+            ),

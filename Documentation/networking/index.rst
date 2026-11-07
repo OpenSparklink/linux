@@ -136,3 +136,5 @@ Contents:
    xfrm/index
    xdp-rx-metadata
    xsk-tx-metadata
+   ws73-development
+   sparklink-implementation

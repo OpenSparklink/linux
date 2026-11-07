@@ -1,0 +1,10 @@
+Historical standard DLI business event and unattributed ring witnesses.
+Exact base/source hashes in retirement-audit.json. No production include.
+The old decoded events had no worker consumer and carried no canonical lifetime.
+Current standard ingress accepts command responses/credits and HardwareError only;
+Native WS73 discovery,physical links,ACB/security Session paths remain separate existing consumers.
+These witnesses preserve parsing/ring behavior,not standards conformance or new feature qualification.
+
+run_standard_events.py requires a full matching Kernel source tree,as do the
+existing production-source fixture runners;installing these data files alone
+is not a standalone kernel-interface test suite.

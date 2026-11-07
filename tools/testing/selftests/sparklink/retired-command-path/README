@@ -1,0 +1,7 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Retired raw command-admission fixture from K64a324844bfc. No production consumer.
+The typed Diagnostic/discovery/connection/relay paths retain original deadlines,
+credit and actual submit tickets. enqueue_command.rs and ingress_fixture.rs are
+historical tests, not another Host or supported raw API. Never compile them into
+the default kernel. Current Runtime RX tests run separately.

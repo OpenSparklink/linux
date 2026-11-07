@@ -1,0 +1,9 @@
+{
+  "kernel": "7c6d530ffe2e94bb44b55e0ba9712f61093a7f3e",
+  "sources": {
+    "net/sparklink/sle_power.rs": "64e2dffaebb9a22524b505d253cb3edd3390407a4d377dfdd19728204cca5aa2",
+    "net/sparklink/sparklink_core.rs": "5fdf8e5c03909920d56b7194a77d0e8d3be8e0f217d42477742effc2838d6685",
+    "net/sparklink/sle_configfs.rs": "6ede342100fcdf6ade32d5da954b53ce7cccbba67f6c5871c05ea0546a6d4cc8"
+  },
+  "scope": "Historical unqualified model; not compiled into default kernel; not hardware PM."
+}

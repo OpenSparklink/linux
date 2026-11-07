@@ -1,0 +1,40 @@
+{
+  "base": "1e08ca19ded27d2365b2024463d92026a98af0ed",
+  "scope": "Exact selected prior private registry/registration version fragments and original fixtures retained as history;full immutable source at base hash. Only minimal projection/five tests executed as history,not all archived registry/install/pending bodies. No default include or new Host;Native full5version/10features stays current.",
+  "classification": {
+    "immediate_delete": [
+      "Write-only packed firmware version inSleDev and registration view;queried version transfer betweenNative andregistry"
+    ],
+    "move_to_test": [
+      "Prior minimal registration projection and five tests;prior registry/install/pending code and expectations preserved as source history"
+    ],
+    "wait_replacement": [
+      "Raw UAPI/current SDK/deployment tasks remain original R4/R5/R6;no new hardware capability inferred"
+    ]
+  },
+  "issues": [
+    "K#6",
+    "K#17",
+    "K#19",
+    "U#3",
+    "U#8"
+  ],
+  "source_files": {
+    "net/sparklink/sle_dli.rs": "a7c58bc9389c05764e4c58dc7552f66b8c4728095a3b37e5383a5b0a405c89c6",
+    "net/sparklink/sle_dev.rs": "e7f466a007f988093f1c93c267ca34121aabfbc6b10c84deda7fde5ec08b40f3",
+    "net/sparklink/sparklink_core.rs": "fcb176992e5a5d33056cd84125f55bf977e0b419e3e755e97887bd53b1c7e509",
+    "net/sparklink/sle_native.rs": "ca6e6bf9182a33b12b688a3ba62d84bf02d371ca38340d6736e045bcdec4dcd4",
+    "tools/testing/selftests/sparklink/backend_bus_fixture.rs": "4381cc3ae5ca4f3cdb4159b1119e09b39af5ba811ad13f133f2b4aafb93319b0",
+    "tools/testing/selftests/sparklink/backend_install_fixture.rs": "c521af5c87ed8ee1cfcff777add5ff16818a49de6d3cfd517c7a1d5a4acc6649",
+    "tools/testing/selftests/sparklink/usb-registration/pending_fixture.rs": "b09cf4d31fc52368f629bc53fc9fc12869a80ed0d5811468b253002f6e43ef7a"
+  },
+  "fragments": {
+    "net/sparklink/sle_dli.rs": "8428854707635a71f58f79d81f777c82dea2e231729de5ab3c62ffd3d2bed244",
+    "net/sparklink/sle_dev.rs": "e1802e70a996908e2b0b148ac4d9c703d16855375a23d9a63d39c8400f908238",
+    "net/sparklink/sparklink_core.rs": "b036b85ca2c50217e76c1dff4342166b95b75c792f0f63763ab55197c2314493",
+    "net/sparklink/sle_native.rs": "77feba53d59af410dbb7a29a74ab16eb522ab45000db3fa2a78e4df15abc8882",
+    "tools/testing/selftests/sparklink/backend_bus_fixture.rs": "4381cc3ae5ca4f3cdb4159b1119e09b39af5ba811ad13f133f2b4aafb93319b0",
+    "tools/testing/selftests/sparklink/backend_install_fixture.rs": "c521af5c87ed8ee1cfcff777add5ff16818a49de6d3cfd517c7a1d5a4acc6649",
+    "tools/testing/selftests/sparklink/usb-registration/pending_fixture.rs": "b09cf4d31fc52368f629bc53fc9fc12869a80ed0d5811468b253002f6e43ef7a"
+  }
+}

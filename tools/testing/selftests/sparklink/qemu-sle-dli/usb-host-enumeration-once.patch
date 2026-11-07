@@ -1,0 +1,133 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -93,6 +93,9 @@
+     bool                             needs_autoscan;
+     bool                             allow_one_guest_reset;
+     bool                             allow_all_guest_resets;
++    /* VM lab only: one budget across host detach/re-enumeration. */
++    bool                             test_enum_reset_once;
++    bool                             test_enum_reset_used;
+     bool                             suppress_remote_wake;
+     bool                             allow_kernel_driver_detach;
+     bool                             allow_host_reset;
+@@ -1282,12 +1285,25 @@
+     return ret;
+ }
+ 
++static bool usb_host_enum_reset_mode_valid(USBHostDevice *s)
++{
++    return !s->allow_host_reset && !s->allow_kernel_driver_detach &&
++           !s->allow_one_guest_reset && !s->allow_all_guest_resets &&
++           s->match.vendor_id == 0xffff && s->match.product_id == 0x3733 &&
++           s->match.bus_num && s->match.port && s->match.port[0];
++}
++
+ static void usb_host_realize(USBDevice *udev, Error **errp)
+ {
+     USBHostDevice *s = USB_HOST_DEVICE(udev);
+     libusb_device *ldev;
+     int rc;
+ 
++    if (s->test_enum_reset_once && !usb_host_enum_reset_mode_valid(s)) {
++        error_setg(errp, "enumeration-reset-once requires explicit WS73 port "
++                   "and all existing reset/detach opt-outs");
++        return;
++    }
+     if (usb_host_init() != 0) {
+         error_setg(errp, "failed to init libusb");
+         return;
+@@ -1391,6 +1407,7 @@
+                   s->ddesc.idVendor != 0xffff || s->ddesc.idProduct != 0x3733 ||
+                   s->allow_host_reset || s->allow_kernel_driver_detach ||
+                   s->allow_one_guest_reset || s->allow_all_guest_resets ||
++                  s->test_enum_reset_once ||
+                   s->test_runtime_in_error_once ||
+                   s->test_runtime_hold_once || s->test_runtime_held)) {
+         error_setg(errp, "test runtime error requires attached WS73, all reset/"
+@@ -1417,6 +1434,7 @@
+                   s->ddesc.idVendor != 0xffff || s->ddesc.idProduct != 0x3733 ||
+                   s->allow_host_reset || s->allow_kernel_driver_detach ||
+                   s->allow_one_guest_reset || s->allow_all_guest_resets ||
++                  s->test_enum_reset_once ||
+                   s->test_runtime_in_error_once || s->test_runtime_hold_once ||
+                   s->test_runtime_held)) {
+         error_setg(errp, "test hold requires attached WS73, all reset/detach "
+@@ -1444,11 +1462,18 @@
+     usb_host_test_release_hold(s, false);
+ }
+ 
++static bool usb_host_get_test_enum_reset_used(Object *obj, Error **errp)
++{
++    return USB_HOST_DEVICE(obj)->test_enum_reset_used;
++}
++
+ static void usb_host_instance_init(Object *obj)
+ {
+     USBDevice *udev = USB_DEVICE(obj);
+     USBHostDevice *s = USB_HOST_DEVICE(udev);
+ 
++    object_property_add_bool(obj, "test-enumeration-reset-used",
++                             usb_host_get_test_enum_reset_used, NULL);
+     object_property_add_bool(obj, "host-retry",
+                              usb_host_get_retry, usb_host_set_retry);
+     object_property_add_bool(obj, "test-runtime-in-error-once",
+@@ -1873,11 +1898,20 @@
+     USBHostDevice *s = USB_HOST_DEVICE(udev);
+     int rc;
+ 
+-    if (!s->allow_one_guest_reset && !s->allow_all_guest_resets) {
+-        return;
+-    }
+-    if (!s->allow_all_guest_resets && udev->addr == 0) {
+-        return;
++    if (s->test_enum_reset_once) {
++        if (!s->dh || udev->addr != 0 || s->test_enum_reset_used) {
++            return;
++        }
++        /* Consume before calling libusb, including error/disconnect paths.
++         * Open/close/autoscan never replenish this object's budget. */
++        s->test_enum_reset_used = true;
++    } else {
++        if (!s->allow_one_guest_reset && !s->allow_all_guest_resets) {
++            return;
++        }
++        if (!s->allow_all_guest_resets && udev->addr == 0) {
++            return;
++        }
+     }
+ 
+     trace_usb_host_reset(s->bus_num, s->addr);
+@@ -1970,6 +2004,10 @@
+ {
+     USBHostDevice *dev = opaque;
+ 
++    if (version_id < 2 && dev->test_enum_reset_once) {
++        /* Unknown budget from an older snapshot: suppress another reset. */
++        dev->test_enum_reset_used = true;
++    }
+     if (!dev->bh_postld) {
+         dev->bh_postld = qemu_bh_new_guarded(usb_host_post_load_bh, dev,
+                                              &DEVICE(dev)->mem_reentrancy_guard);
+@@ -1981,11 +2019,12 @@
+ 
+ static const VMStateDescription vmstate_usb_host = {
+     .name = "usb-host",
+-    .version_id = 1,
++    .version_id = 2,
+     .minimum_version_id = 1,
+     .post_load = usb_host_post_load,
+     .fields = (const VMStateField[]) {
+         VMSTATE_USB_DEVICE(parent_obj, USBHostDevice),
++        VMSTATE_BOOL_V(test_enum_reset_used, USBHostDevice, 2),
+         VMSTATE_END_OF_LIST()
+     }
+ };
+@@ -2005,6 +2044,8 @@
+                      allow_kernel_driver_detach, true),
+     DEFINE_PROP_BOOL("host-reset", USBHostDevice,
+                      allow_host_reset, true),
++    DEFINE_PROP_BOOL("test-enumeration-reset-once", USBHostDevice,
++                     test_enum_reset_once, false),
+     DEFINE_PROP_BOOL("guest-reset", USBHostDevice,
+                      allow_one_guest_reset, true),
+     DEFINE_PROP_BOOL("guest-resets-all", USBHostDevice,

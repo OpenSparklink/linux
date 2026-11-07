@@ -1,0 +1,19 @@
+Event record copy boundary
+==========================
+
+Run from any working directory:
+
+  python3 tools/testing/selftests/sparklink/run_event_copy.py
+
+The runner compiles the complete current sle_event.rs unchanged and the actual
+SparkLinkCtl::read_iter method. Kernel errno, mutex, iterator and unused in-place
+initializer dependencies have explicit fixtures. Nine tests cover all partial
+copy positions of the first/later record, zero/short buffers, capacity tails,
+bounded ring wrap/overflow, actual BroadcastRing fan-out and serialized shared-fd
+commit. Successful earlier records may be returned; an incomplete final record
+is retained and excluded from the returned count. No new production test hook.
+
+This is actual function coverage with dependency fixtures, not a live read(2)
+page fault, kernel mutex/lockdep, controller routing, removal wakeup or RF proof.
+The old DLI_POLL_EVENT ring/backend consumption is a different legacy path and
+still awaits migration to the independent controller event subscription.

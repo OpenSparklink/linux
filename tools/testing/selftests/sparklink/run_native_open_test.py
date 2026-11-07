@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Guest-only native API open/retirement gate; never WS73 hardware/RF evidence."""
+import argparse
+import gzip
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+
+from qemu_verdict import KERNEL_FAULT
+from vm_test_utils import file_record, copy_elf
+
+HERE = Path(__file__).resolve().parent
+SOURCE = HERE.parents[3]
+
+
+def checked_kernel_inputs(build, ws73_module=None):
+    """Consume the existing sealed native-artifact receipt, not mutable O=."""
+    manifest_path = build / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get('status') != 'NATIVE_BUILD_ARTIFACTS_VERIFIED':
+        raise RuntimeError('verified native build artifacts required')
+    config = (build / 'artifacts/.config').read_text()
+    for symbol in ['RUST', 'SPARKLINK', 'MODULES']:
+        if f'CONFIG_{symbol}=y\n' not in config:
+            raise RuntimeError('missing kernel configuration: ' + symbol)
+    if 'CONFIG_SPARKLINK_WS73_USB=y\n' not in config:
+        if 'CONFIG_SPARKLINK_WS73_USB=m\n' not in config or ws73_module is None:
+            raise RuntimeError('modular WS73 requires the explicit matching module')
+    records = []
+    for name, original in manifest['inputs'].items():
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError('invalid sealed artifact path')
+        path = build / ('vmlinux' if name == 'vmlinux' else 'artifacts/' + name)
+        record = file_record(path)
+        if record['sha256'] != original['sha256'] or path.stat().st_size != original['size']:
+            raise RuntimeError('kernel artifact does not match compiled manifest')
+        records.append(record)
+    required = {'.config', 'arch/x86/boot/bzImage', 'Module.symvers', 'include/config/kernel.release'}
+    if not required <= manifest['inputs'].keys():
+        raise RuntimeError('required sealed kernel artifact missing')
+    return [file_record(manifest_path), *records]
+
+
+def checked_ws73_module(module, build):
+    info = {name: subprocess.check_output(['modinfo', '-F', name, str(module)], text=True).strip()
+            for name in ['name', 'vermagic', 'signer', 'depends']}
+    release = (build / 'artifacts/include/config/kernel.release').read_text().strip()
+    if (info['name'] != 'sparklink_ws73_usb' or not info['signer'] or info['depends']
+            or info['vermagic'].split()[0] != release):
+        raise RuntimeError('matching signed standalone WS73 module required')
+    return dict(file=file_record(module), info=info)
+
+
+def assess(console, qemu_exit):
+    console = console.replace('\r', '')
+    errors = []
+    if qemu_exit or KERNEL_FAULT.search(console) or 'NATIVE_FAILURE:' in console:
+        errors.append('QEMU/guest/kernel failure')
+    snapshots = re.findall(r'^NATIVE_OPEN_SNAPSHOT: slot=(\d+) elapsed_ms=([^ ]+)$', console, re.M)
+    pending = re.findall(r'^NATIVE_OPEN_PENDING: slot=(\d+) id=(\d+) generation=(\d+) '
+                         r'snapshot_ms=([^ ]+) lease_eagain=1 refs=1 sends=0$', console, re.M)
+    if len(pending) != 4 or console.count('NATIVE_OPEN_PENDING:') != 4:
+        errors.append('missing, duplicate or malformed opening observations')
+    else:
+        try:
+            if ([int(p[0]) for p in pending] != list(range(4)) or
+                    [int(p[1]) for p in pending] != [1] * 4 or
+                    any(not 0 < int(p[2]) <= 2**64 - 1 for p in pending) or
+                    any(int(pending[i][2]) >= int(pending[i + 1][2]) for i in range(3)) or
+                    any(not math.isfinite(float(p[3])) or not 0 <= float(p[3]) < 200 for p in pending)):
+                errors.append('invalid owner/generation or blocked snapshot')
+        except ValueError:
+            errors.append('invalid opening measurement')
+        if snapshots != [(p[0], p[3]) for p in pending] or console.count('NATIVE_OPEN_SNAPSHOT:') != 4:
+            errors.append('missing or inconsistent actual snapshot measurements')
+    retiring = re.findall(r'^NATIVE_OPEN_RETIRING: slot=(\d+) blocked=1 admission_closed=1 '
+                          r'close=0 put=0$', console, re.M)
+    if retiring != ['2', '3'] or console.count('NATIVE_OPEN_RETIRING:') != 2:
+        errors.append('missing, duplicate or malformed pre-join retirement evidence')
+    armed = re.findall(r'^NATIVE_OPEN_WATCH_ARMED: slot=(\d+) generation=(\d+) '
+                       r'epoll_empty=1 event=1 snoop=1$', console, re.M)
+    wake = re.findall(r'^NATIVE_OPEN_WAKE: slot=(\d+) elapsed_ms=([^ ]+) '
+                      r'event_hup=1 snoop_hup=1 blocked=1 close=0 put=0$', console, re.M)
+    if (len(pending) != 4 or armed != [(p[0], p[2]) for p in pending[2:]] or
+            console.count('NATIVE_OPEN_WATCH_ARMED:') != 2):
+        errors.append('missing or incorrect pre-retirement observer registration')
+    if len(wake) != 2 or [p[0] for p in wake] != ['2', '3'] or console.count('NATIVE_OPEN_WAKE:') != 2:
+        errors.append('missing or incorrect observer retirement wake evidence')
+    else:
+        try:
+            if any(not math.isfinite(float(p[1])) or not 0 <= float(p[1]) < 200 for p in wake):
+                errors.append('observer retirement wake blocked by open')
+        except ValueError:
+            errors.append('invalid observer wake measurement')
+    if 'NATIVE_OPEN_WAKE_TIMEOUT:' in console:
+        errors.append('observer retirement wake timed out')
+    cases = re.findall(r'^NATIVE_OPEN_CASE: slot=(\d+) mode=(\d+) retiring=(\d+) result=(-?\d+) '
+                       r'close=(\d+) get=1 put=1 sends=0 survivor=1 stale=1$', console, re.M)
+    expected = [('0', '0', '0', '0', '1'), ('1', '1', '0', '-5', '0'),
+                ('2', '0', '1', '-19', '1'), ('3', '1', '1', '-5', '0')]
+    if cases != expected or console.count('NATIVE_OPEN_CASE:') != 4:
+        errors.append('missing, duplicate or incorrect terminal lifetime evidence')
+    sequence = re.findall(r'^NATIVE_OPEN_(SNAPSHOT|PENDING|WATCH_ARMED|WAKE|RETIRING|CASE): slot=(\d+)', console, re.M)
+    if sequence != [('SNAPSHOT', '0'), ('PENDING', '0'), ('CASE', '0'),
+                    ('SNAPSHOT', '1'), ('PENDING', '1'), ('CASE', '1'),
+                    ('SNAPSHOT', '2'), ('PENDING', '2'), ('WATCH_ARMED', '2'), ('WAKE', '2'), ('RETIRING', '2'), ('CASE', '2'),
+                    ('SNAPSHOT', '3'), ('PENDING', '3'), ('WATCH_ARMED', '3'), ('WAKE', '3'), ('RETIRING', '3'), ('CASE', '3')]:
+        errors.append('out-of-order open lifecycle phases')
+    exact = ['NATIVE_TYPED_HOST: index=0 queries=18 features=80 version=5 unsupported_opcode=1 invalid_timeout=1',
+             'NATIVE_OPEN_LIFECYCLE: PASS synthetic_only=1 cases=4',
+             'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0']
+    for marker in exact:
+        if console.splitlines().count(marker) != 1:
+            errors.append('missing or duplicate ' + marker)
+    positions = [console.find('NATIVE_OPEN_CASE: slot=3'), *[console.find(p) for p in exact],
+                 console.find('RUNTIME_KERNEL_LOG_BEGIN'), console.find('RUNTIME_KERNEL_LOG_END')]
+    if any(p < 0 for p in positions) or positions != sorted(positions):
+        errors.append('out-of-order completion/process/log evidence')
+    if re.findall(r'^NATIVE_OPEN_MODULE_EXIT: (.*)$', console, re.M) != ['0'] or \
+            re.findall(r'^RUNTIME_GUEST_EXIT: (.*)$', console, re.M) != ['0']:
+        errors.append('unsuccessful or malformed process exit')
+    if console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1 or console.count('RUNTIME_KERNEL_LOG_END') != 1:
+        errors.append('missing or duplicate full kernel log')
+    else:
+        log = console.split('RUNTIME_KERNEL_LOG_BEGIN', 1)[1].split('RUNTIME_KERNEL_LOG_END', 1)[0]
+        if '[    0.000000]' not in log:
+            errors.append('kernel log missing early record')
+    return errors
+
+
+def assess_userfault(console, qemu_exit):
+    """Require actual kernel usercopy faults, independent progress and no late lease."""
+    console = console.replace('\r', '')
+    errors = []
+    if qemu_exit or KERNEL_FAULT.search(console) or 'NATIVE_FAILURE:' in console:
+        errors.append('QEMU/guest/kernel failure')
+    armed = re.findall(r'^RPC_FAULT_ARMED: mode=(query|acquire) id=(\d+) generation=(\d+) '
+                       r'kernel_wp=1 thread=1 epoll_empty=1$', console, re.M)
+    if len(armed) != 2 or [p[:2] for p in armed] != [('query', '1'), ('acquire', '1')] or \
+            console.count('RPC_FAULT_ARMED:') != 2:
+        errors.append('missing or incorrect actual usercopy barrier')
+    elif not 0 < int(armed[0][2]) < int(armed[1][2]) <= 2**64 - 1:
+        errors.append('invalid usercopy owner generation')
+    queries = re.findall(r'^RPC_FAULT_QUERY: elapsed_ms=([^ ]+) free=1 copy_blocked=1$', console, re.M)
+    wakes = re.findall(r'^RPC_FAULT_WAKE: mode=(query|acquire) elapsed_ms=([^ ]+) '
+                       r'event_hup=1 snoop_hup=1 copy_blocked=1$', console, re.M)
+    if len(queries) != 1 or console.count('RPC_FAULT_QUERY:') != 1:
+        errors.append('missing independent management query')
+    if [p[0] for p in wakes] != ['query', 'acquire'] or console.count('RPC_FAULT_WAKE:') != 2:
+        errors.append('missing independent retirement notifications')
+    try:
+        if any(not math.isfinite(float(v)) or not 0 <= float(v) < 200 for v in [*queries, *[p[1] for p in wakes]]):
+            errors.append('usercopy blocked unrelated observation')
+    except ValueError:
+        errors.append('invalid usercopy progress timing')
+    cases = re.findall(r'^RPC_FAULT_CASE: mode=(query|acquire) copy_release=1 result=(snapshot|ENODEV) '
+                       r'get=1 put=1 close=1 sends=0 old_fd=ENODEV new_lease=1 survivor=1$', console, re.M)
+    if cases != [('query', 'snapshot'), ('acquire', 'ENODEV')] or console.count('RPC_FAULT_CASE:') != 2:
+        errors.append('missing exact usercopy result/retirement proof')
+    phases = re.findall(r'^RPC_FAULT_(ARMED|QUERY|WAKE|CASE):(?: mode=(query|acquire))?', console, re.M)
+    if phases != [('ARMED', 'query'), ('QUERY', ''), ('WAKE', 'query'), ('CASE', 'query'),
+                  ('ARMED', 'acquire'), ('WAKE', 'acquire'), ('CASE', 'acquire')]:
+        errors.append('usercopy phases out of order')
+    if any(p in console for p in ['RPC_FAULT_QUERY_BLOCKED:', 'RPC_FAULT_WAKE_TIMEOUT:', 'RPC_FAULT_LATE_LEASE:']):
+        errors.append('blocked progress or late lease')
+    exact = ['NATIVE_TYPED_HOST: index=0 queries=18 features=80 version=5 unsupported_opcode=1 invalid_timeout=1',
+             'RPC_FAULT_LIFECYCLE: PASS synthetic_only=1 cases=2',
+             'NATIVE_OPEN_MODULE_EXIT: 0', 'RUNTIME_GUEST_EXIT: 0']
+    if any(console.splitlines().count(p) != 1 for p in exact):
+        errors.append('missing or duplicate terminal usercopy evidence')
+    positions = [console.find('RPC_FAULT_CASE: mode=acquire'), *[console.find(p) for p in exact],
+                 console.find('RUNTIME_KERNEL_LOG_BEGIN'), console.find('RUNTIME_KERNEL_LOG_END')]
+    if any(p < 0 for p in positions) or positions != sorted(positions):
+        errors.append('out-of-order usercopy terminal evidence')
+    for prefix in ['RUNTIME_GUEST_EXIT', 'NATIVE_OPEN_MODULE_EXIT']:
+        if re.findall('^' + prefix + r': (.*)$', console, re.M) != ['0']:
+            errors.append('unsuccessful usercopy process/module exit')
+    if console.count('RUNTIME_KERNEL_LOG_BEGIN') != 1 or console.count('RUNTIME_KERNEL_LOG_END') != 1:
+        errors.append('missing full usercopy kernel log')
+    elif '[    0.000000]' not in console.split('RUNTIME_KERNEL_LOG_BEGIN', 1)[1].split('RUNTIME_KERNEL_LOG_END', 1)[0]:
+        errors.append('usercopy kernel log missing early record')
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--kernel-build', type=Path, required=True)
+    parser.add_argument('--fixture-module', type=Path, required=True,
+                        help='matching signed test module; build separately under the shared CPU budget')
+    parser.add_argument('--ws73-module', type=Path,
+                        help='explicit signed WS73 module for CONFIG_SPARKLINK_WS73_USB=m')
+    parser.add_argument('--qemu', type=Path, required=True)
+    parser.add_argument('--qemu-data', type=Path, required=True)
+    parser.add_argument('--busybox', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--userfault', action='store_true', help='management usercopy WP gate; needs CONFIG_USERFAULTFD=y')
+    args = parser.parse_args()
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = dict(status='RUNNING', physical_acceptance=False,
+                    scope='blocked native callback fixture and synthetic WS73 survivor')
+    try:
+        kernel = args.kernel_build.resolve() / 'artifacts/arch/x86/boot/bzImage'
+        config = args.kernel_build / 'artifacts/.config'
+        manifest['kernel_inputs'] = checked_kernel_inputs(args.kernel_build.resolve(), args.ws73_module)
+        if args.userfault and 'CONFIG_USERFAULTFD=y\n' not in config.read_text():
+            raise RuntimeError('userfault gate needs CONFIG_USERFAULTFD=y')
+        manifest['userfault'] = args.userfault
+        if args.userfault:
+            manifest['scope'] = 'actual kernel ioctl usercopy WP, observation/admission retirement; synthetic only'
+        sources = [HERE / 'ws73_native_open_test.c', HERE / 'native_runtime_probe.h', HERE / 'retired_ioctl_numbers.h',
+                   HERE / 'native-open/native_open_fixture.c', HERE / 'native-open/native_open_fixture.h',
+                   HERE / 'native-open/Makefile', Path(__file__).resolve(), HERE / 'qemu_verdict.py',
+                   HERE / 'vm_test_utils.py']
+        if args.userfault:
+            sources += [HERE / 'ws73_native_rpc_fault_test.c']
+        manifest['sources'] = [file_record(p) for p in sources]
+        manifest['inputs'] = [file_record(p) for p in [kernel, config,
+                                                      args.qemu, args.busybox]]
+        data_inputs = sorted(p for p in args.qemu_data.resolve(strict=True).rglob('*') if p.is_file())
+        if not data_inputs:
+            raise RuntimeError('QEMU data inputs must not be empty')
+        manifest['inputs'] += [file_record(p) for p in data_inputs]
+        module = args.fixture_module.resolve(strict=True)
+        fixture_info = {name: subprocess.check_output(['modinfo', '-F', name, str(module)], text=True).strip()
+                        for name in ['name', 'vermagic', 'signer', 'depends']}
+        release = (args.kernel_build / 'artifacts/include/config/kernel.release').read_text().strip()
+        if (fixture_info['name'] != 'native_open_fixture' or not fixture_info['signer']
+                or fixture_info['depends'] or fixture_info['vermagic'].split()[0] != release):
+            raise RuntimeError('matching signed standalone Native open fixture required')
+        manifest['module_input'] = file_record(module)
+        manifest['module_info'] = fixture_info
+        manifest['inputs'].append(manifest['module_input'])
+        initroot = output / 'initramfs'
+        for name in ['bin', 'dev', 'proc', 'sys', 'lib/firmware/sparklink/ws73']:
+            (initroot / name).mkdir(parents=True)
+        shutil.copy2(args.busybox, initroot / 'bin/busybox')
+        for applet in ['sh', 'mount', 'mdev', 'sleep', 'poweroff', 'dmesg', 'insmod', 'rmmod']:
+            (initroot / 'bin' / applet).symlink_to('busybox')
+        shutil.copy2(module, initroot / 'native_open_fixture.ko')
+        if args.ws73_module:
+            manifest['ws73_module'] = checked_ws73_module(args.ws73_module, args.kernel_build)
+            manifest['inputs'].append(manifest['ws73_module']['file'])
+            shutil.copy2(args.ws73_module, initroot / 'ws73.ko')
+        source = HERE / ('ws73_native_rpc_fault_test.c' if args.userfault else 'ws73_native_open_test.c')
+        command = ['gcc', '-O2', '-Wall', '-Wextra', '-Werror',
+                   *(['-pthread'] if args.userfault else []), str(source), '-o', str(output / 'open-test')]
+        manifest['guest_compile_args'] = command
+        with (output / 'guest-build.log').open('wb') as log:
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        dynamic_inputs = copy_elf(output / 'open-test', initroot / 'bin/open_test', initroot)
+        manifest['inputs'] += [file_record(p) for p in dynamic_inputs]
+        manifest['guest_compiler'] = subprocess.check_output(['gcc', '--version'], text=True).splitlines()[0]
+        firmware = initroot / 'lib/firmware/sparklink/ws73'
+        (firmware / 'bsle_custom.bin').write_bytes(bytes(range(140)))
+        (firmware / 'pm_config.bin').write_bytes(bytes.fromhex('01000000'))
+        (initroot / 'init').write_text('''#!/bin/sh
+export PATH=/bin
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev || mdev -s
+insmod /native_open_fixture.ko
+status=$?
+if [ "$status" = 0 ]; then
+    /bin/open_test
+    status=$?
+fi
+rmmod native_open_fixture
+module_status=$?
+echo "NATIVE_OPEN_MODULE_EXIT: $module_status"
+echo "RUNTIME_GUEST_EXIT: $status"
+echo "RUNTIME_KERNEL_LOG_BEGIN"
+dmesg
+echo "RUNTIME_KERNEL_LOG_END"
+poweroff -f
+''')
+        if args.ws73_module:
+            init = initroot / 'init'
+            init.write_text(init.read_text().replace('insmod /native_open_fixture.ko',
+                'insmod /ws73.ko || { echo NATIVE_FAILURE: ws73-module; poweroff -f; exit 1; }\n'
+                'insmod /native_open_fixture.ko'))
+        (initroot / 'init').chmod(0o755)
+        manifest['guest_files'] = [file_record(p) for p in sorted(initroot.rglob('*'))
+                                   if p.is_file() and not p.is_symlink()]
+        names = b'\0'.join(os.fsencode(str(p.relative_to(initroot)))
+                           for p in sorted(initroot.rglob('*'))) + b'\0'
+        with (output / 'pack.log').open('wb') as log:
+            packed = subprocess.run(['cpio', '--null', '-o', '--format=newc'], cwd=initroot,
+                                    input=names, stdout=subprocess.PIPE, stderr=log, check=True).stdout
+        archive = output / 'initramfs.cpio.gz'
+        archive.write_bytes(gzip.compress(packed, mtime=0))
+        manifest['initramfs'] = file_record(archive)
+        console = output / 'console.log'
+        command = [str(args.qemu.resolve()), '-L', str(args.qemu_data.resolve()),
+                   '-kernel', str(kernel), '-initrd', str(archive),
+                   '-append', 'console=ttyS0 loglevel=5 log_buf_len=4M panic=1 oops=panic',
+                   '-serial', 'file:' + str(console), '-display', 'none', '-no-reboot',
+                   '-m', '256M', '-smp', '2', '-device', 'qemu-xhci,id=xhci',
+                   '-device', 'usb-ws73-test,id=sle0,bus=xhci.0,port=1']
+        if os.access('/dev/kvm', os.R_OK | os.W_OK):
+            command.append('-enable-kvm')
+        manifest['qemu_args'] = command
+        with (output / 'qemu-stderr.log').open('wb') as log:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                code = process.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise RuntimeError('guest timed out')
+        manifest['qemu_exit'] = code
+        manifest['errors'] = (assess_userfault if args.userfault else assess)(console.read_text(errors='replace'), code)
+        for record in manifest['sources'] + manifest['inputs']:
+            if file_record(Path(record['path'])) != record:
+                manifest['errors'].append('input changed during test: ' + record['path'])
+        manifest['kernel_inputs_after'] = checked_kernel_inputs(args.kernel_build.resolve(), args.ws73_module)
+        if manifest['kernel_inputs'] != manifest['kernel_inputs_after']:
+            manifest['errors'].append('compiled kernel inputs changed during test')
+        manifest['status'] = 'FAIL' if manifest['errors'] else 'PASS'
+    except Exception as error:
+        manifest.update(status='FAIL', error=str(error))
+    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(json.dumps(dict(status=manifest['status'], errors=manifest.get('errors'),
+                          error=manifest.get('error'), physical_acceptance=False)))
+    return int(manifest['status'] != 'PASS')
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

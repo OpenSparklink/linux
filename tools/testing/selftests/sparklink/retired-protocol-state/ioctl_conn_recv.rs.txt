@@ -1,0 +1,13 @@
+fn ioctl_conn_recv(context: &RuntimeContext, arg: usize) -> Result<isize> {
+    let cd: SleConnData = read_user_struct(arg)?;
+    let mut ss = context.lock()?;
+    let s = Option::as_mut(&mut *ss).ok_or(ENODEV)?;
+    let handle = s.conn.resolve_handle(cd.handle)?;
+    let mut out: SleConnData = unsafe { core::mem::zeroed() };
+    out.handle = handle;
+    let recv_len = s.conn.recv(handle, &mut out.data)?;
+    out.length = recv_len.min(CONN_DATA_MAX) as u16;
+    drop(ss);
+    write_user_struct(arg, &out)?;
+    Ok(0)
+}

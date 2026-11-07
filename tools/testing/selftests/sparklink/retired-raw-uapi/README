@@ -1,0 +1,53 @@
+Unpublished raw controller ABI retirement: historical inputs, not production.
+
+Immediately removed:
+- 101 obsolete ioctl declarations, their authorization membership and rejection
+  dispatchers. Unknown encoded commands now reach ENOTTY before CAP, selection,
+  Runtime lookup or usercopy. Old numbers remain reserved; current unsupported
+  new modes keep their own explicit error contracts.
+- Unused old Kernel C/Rust layouts and the old normalized public event codes.
+  Current 26 controls and 27 C ABI structures retain their original numbers,
+  fields, sizes and semantics. Native Host/Session/Grant/credit/Ticket unchanged.
+
+Test-only witnesses:
+- include/ and net/ preserve exact original4b6 source. dispatch.rs preserves the
+  retired arms. ssap_permissions.h is the original permission helper, not a new
+  SSAP implementation. Actual userspace permission types and Engine remain.
+- test-migration-audit.json binds thirteen original suite/tool sources by hash.
+  The old monolithic suite, raw Runtime/hotplug/USB terminal loops and old CLI
+  are no longer default tests or recommended tools. Files are retained verbatim;
+  their relative includes require their original source checkout for replay.
+- retained-numbers.json comes from independently compiled pre-retirement
+  x86_64/i386 declarations. retired_ioctl_numbers.h is test-only and never an
+  alias to the new API. run_raw_uapi_retirement.py checks both targets and
+  deliberate mutations. This is not actual ioctl or compatibility proof.
+
+Current consumers and migration:
+- run_virtual_vm.py uses retired_uapi_test.c: actual current file affinity and
+  every101old encoding, buffer/NULL/invalid-user-address, ENOTTY and unchanged
+  output. Root and uid1000, two rounds; new VM qualification is required.
+- Native open/usercopy probes use native_runtime_probe.h with actual typed
+  DiagnosticSubmit/Result, original generation/request/sequence/deadline and
+  accounting checks. Shared generic QMP/artifact helpers are vm_test_utils.py.
+- kernel_authorization_test.c tests12current privileged and12observational
+  commands plus affinity; old101are ENOTTY even with inherited fds and no CAP.
+  Retired configfs attributes must be absent; old PM models are not re-enabled.
+- daemon management seed uses a real typed query and denies another author's
+  retained result with EPERM. New slkconfig has no shared reply queue to drain.
+- User VM bundle/caller, private cross-language history and CI pin migrate in
+  the companion userspace change. Kernel build alone does not qualify them.
+
+Waiting for replacement/acceptance:
+- Migrate useful old synthetic USB terminal, repeated-reply/hotplug and bounded
+  recovery cases to current typed requests before claiming new coverage. The
+  current Virtual gate and preserved pure regressions do not cover the whole
+  historical USB runner. Neither those historical models nor QMP/manual power
+  cycles qualify natural fault recovery.
+- Exact new full Kernel/normal and private-module boot, actual permissions and
+  real WS73 short/boundary/long/Owned/security preservation gates remain needed.
+- Full R5 AppSDK/CLI/C-Python/contracts and R6 clean-VM deployment remain open.
+
+Authority: sparklink/project/implementation-plan.md WP18 R4f2e; K#6/#17/#19,
+U#3/#6/#8. Full S0-S6/19WP/10FV/12DG and all original acceptance remain.
+History or local compilation must never be relabelled current architecture,
+formal, actual driver concurrency, RF or automatic recovery acceptance.

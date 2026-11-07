@@ -30,515 +30,6 @@ struct sci_dev_info {
 	__u8  _reserved[24];
 };
 
-/* --- Advertising / scanning --------------------------------------------- */
-
-struct sle_adv_params {
-	__u16 dev_index;
-	__u16 interval_ms;
-	__u8  discovery_level;
-	__u8  _reserved[11];
-};
-
-struct sle_scan_params {
-	__u16 dev_index;
-	__u16 window_ms;
-	__u16 interval_ms;
-	__u8  filter_discovery_level;
-	__u8  _reserved[9];
-};
-
-/* Extended scan filter for service UUID matching (T/XS 20001-2025 §6.4).
- * Up to 4 standard 16-bit service UUIDs; a result passes if its
- * advertising TLV data (types 0x05/0x07) contains at least one match.
- * uuid_count == 0 disables UUID filtering.
- */
-struct sle_scan_filter {
-	__u8  uuid_count;
-	__u8  _reserved[3];
-	__u16 uuids[4];
-};
-
-struct sle_ext_adv_config {
-	__u8  handle;
-	__u8  discovery_level;
-	__u8  sid;
-	__u8  broadcast_type;
-	__u8  primary_phy;
-	__u8  secondary_phy;
-	__s8  tx_power_dbm;
-	__u8  include_tx_power;
-	__u16 interval_ms;
-	__u8  ext_adv_timing;
-	__u8  _reserved[5];
-};
-
-struct sle_ext_adv_data {
-	__u8  handle;
-	__u8  _pad;
-	__u16 data_len;
-	__u8  data[252];
-};
-
-struct sle_ext_adv_info {
-	__u8  handle;
-	__u8  state;
-	__u8  sid;
-	__u8  primary_phy;
-	__u16 data_len;
-	__u8  ext_adv_timing;
-	__u8  max_adv_events;
-	__u64 tx_count;
-	__u32 events_sent;
-	__u8  _pad[4];
-};
-
-struct sle_ext_adv_enable_params {
-	__u8  handle;
-	__u8  max_adv_events;
-	__u16 duration_10ms;
-	__u8  _reserved[4];
-};
-
-struct sle_inject_adv {
-	__u8  addr[6];
-	__s8  rssi;
-	__u8  discovery_level;
-	__u8  name[32];
-	__u8  name_len;
-	__u8  _reserved[7];
-};
-
-struct sle_inject_raw_adv {
-	__s8  rssi;
-	__u8  _pad;
-	__u16 pdu_len;
-	__u8  pdu_data[264];
-};
-
-/* --- Connection management ---------------------------------------------- */
-
-struct sle_connect_params {
-	__u8  peer_addr[6];
-	__u8  gt_role;
-	__u8  bandwidth;
-	__u8  mcs_index;
-	__u8  _pad;
-	__u16 timeout_10ms;
-	__u8  _reserved[4];
-};
-
-struct sle_conn_info {
-	__u64 tx_bytes;
-	__u64 rx_bytes;
-	__u16 handle;
-	__u16 event_group_period;
-	__u16 supervision_timeout;
-	__u16 tx_pending;
-	__u16 rx_pending;
-	__u8  state;
-	__u8  peer_addr[6];
-	__u8  local_role;
-	__u8  bandwidth_mhz;
-	__u8  mcs_index;
-	__u8  tx_seq;
-	__u8  rx_seq;
-	__u16 data_mtu;
-	__u16 data_mps;
-	__u16 svc_mtu;
-	__u8  data_mode;
-	__u8  ssap_info_exchanged;
-	__u16 ssap_mtu;
-	__u8  ssap_reliable_mode;
-	__u8  ssap_version_major;
-	__u16 smtc_tx_credits;
-	__u16 smtc_rx_credits;
-	__u16 dudtc_tx_credits;
-	__u16 dudtc_rx_credits;
-};
-
-struct sle_conn_data {
-	__u16 handle;
-	__u16 length;
-	__u8  data[255];
-	__u8  _reserved;
-};
-
-struct sle_inject_conn_resp {
-	__u16 handle;
-	__u8  response_type;
-	__u8  bandwidth_mhz;
-	__u8  mcs_index;
-	__u8  _pad;
-	__u16 supervision_timeout;
-	__u16 data_mtu;
-	__u16 data_mps;
-};
-
-struct sle_conn_list {
-	__u16 count;
-	__u16 _pad;
-	__u16 handles[8];
-	__u8  _reserved[4];
-};
-
-struct sle_conn_mtu_params {
-	__u16 handle;
-	__u16 mtu;
-	__u16 mps;
-	__u16 _pad;
-};
-
-/* --- AFH (Adaptive Frequency Hopping) ----------------------------------- */
-
-struct sle_afh_map_params {
-	__u16 handle;
-	__u8  min_channels;
-	__u8  _pad;
-	__u8  map[10];
-	__u8  used_count;
-	__u8  _pad2;
-};
-
-struct sle_afh_rssi_report {
-	__u16 handle;
-	__u8  channel;
-	__s8  rssi_dbm;
-};
-
-struct sle_afh_classify_params {
-	__u16 handle;
-	__s8  threshold_dbm;
-	__u8  min_channels;
-	__u8  map_out[10];
-	__u8  used_count;
-	__u8  _pad;
-};
-
-struct sle_afh_hop_info {
-	__u16 handle;
-	__u8  channel;
-	__u8  _pad;
-	__u16 freq_mhz;
-	__u16 event_counter;
-};
-
-struct sle_afh_retx_report {
-	__u16 handle;
-	__u8  channel;
-	__u8  retransmitted;
-};
-
-/* --- Security management ------------------------------------------------ */
-
-struct sle_psk_params {
-	__u8 psk[16];
-};
-
-struct sle_pair_params {
-	__u8 method;
-	__u8 _reserved[3];
-};
-
-struct sle_sec_info {
-	__u8 state;
-	__u8 method;
-	__u8 mode;
-	__u8 enc_enabled;
-	__u8 enc_key_fingerprint[4];
-	__u8 _reserved[8];
-};
-
-struct sle_hash_test {
-	__u16 in_len;
-	__u16 _pad;
-	__u8  data[220];
-	__u8  digest[32];
-};
-
-struct sle_sm4_block_test {
-	__u8  key[16];
-	__u8  input[16];
-	__u8  output[16];
-	__u8  decrypt;
-	__u8  _pad[15];
-};
-
-struct sle_hmac_test {
-	__u16 key_len;
-	__u16 data_len;
-	__u8  key[64];
-	__u8  data[160];
-	__u8  digest[32];
-};
-
-struct sle_oob_data {
-	__u8 data[64];
-};
-
-struct sle_passkey_input {
-	__u32 passkey;
-};
-
-struct sle_password_params {
-	__u8  len;
-	__u8  _reserved[3];
-	__u8  data[32];
-};
-
-/* --- RAL / RPA management ----------------------------------------------- */
-
-struct sle_ral_add_params {
-	__u8  resolve_algo;
-	__u8  peer_id_type;
-	__u8  peer_irkid;
-	__u8  local_irkid;
-	__u8  peer_id[6];
-	__u8  _reserved[2];
-	__u8  peer_irk[16];
-	__u8  local_irk[16];
-};
-
-struct sle_ral_remove_params {
-	__u8  peer_id_type;
-	__u8  _reserved;
-	__u8  peer_id[6];
-};
-
-struct sle_ral_query_params {
-	__u8  id_type;
-	__u8  _reserved;
-	__u8  id[6];
-	__u8  rpa[6];
-	__u8  _pad[2];
-};
-
-/* --- Narrowband AFH measurement (T/XS 10003-2025 §8.7) ----------------- */
-
-struct sle_meas_cap {
-	__u8  meas_types;
-	__u8  max_instances;
-	__u8  antenna_count;
-	__u8  _reserved;
-};
-
-struct sle_meas_link_param {
-	__u16 handle;
-	__u8  meas_type;
-	__u8  config_index;
-	__u16 interval;
-	__u16 duration;
-};
-
-struct sle_meas_action {
-	__u16 handle;
-	__u8  action;
-	__u8  config_index;
-};
-
-/* --- SSAP service layer ------------------------------------------------- */
-
-struct ssap_summary {
-	__u16 service_count;
-	__u16 property_count;
-	__u16 total_entries;
-	__u16 mtu;
-	__u16 notification_count;
-	__u8  _reserved[6];
-};
-
-struct ssap_read_write {
-	__u16 handle;
-	__u16 length;
-	__u8  data[252];
-};
-
-struct ssap_service_entry {
-	__u16 start_handle;
-	__u16 end_handle;
-	__u16 uuid16;
-	__u8  primary;
-	__u8  _pad;
-};
-
-struct ssap_service_list {
-	__u16 count;
-	__u8  _pad[2];
-	struct ssap_service_entry services[15];
-};
-
-struct ssap_notification {
-	__u16 handle;
-	__u8  indication;
-	__u8  length;
-	__u8  data[252];
-};
-
-struct ssap_add_service {
-	__u16 uuid16;
-	__u8  primary;
-	__u8  _pad;
-	__u8  uuid128[16];
-	__u16 start_handle;
-	__u8  _reserved[6];
-};
-
-struct ssap_add_property {
-	__u16 uuid16;
-	__u8  ops;
-	__u8  value_len;
-	__u8  value[248];
-	__u16 handle;
-	__u8  _reserved[2];
-};
-
-/* --- Power management --------------------------------------------------- */
-
-struct sle_pm_info {
-	__u8  state;
-	__u8  force_active;
-	__u8  power_pct;
-	__u8  _pad;
-	__u16 current_interval;
-	__u16 supervision_timeout;
-	__u16 latency;
-	__u16 idle_count;
-	__u32 transitions;
-	__u64 active_events;
-	__u64 sniff_events;
-	__u64 idle_events;
-	__u8  _reserved[8];
-};
-
-struct sle_pm_state_cmd {
-	__u8 target_state;
-	__u8 _reserved[3];
-};
-
-struct sle_pm_interval {
-	__u16 min_interval;
-	__u16 max_interval;
-	__u16 latency;
-	__u16 supervision_timeout;
-};
-
-/* --- Sync link management ----------------------------------------------- */
-
-struct sle_sync_cig_config {
-	__u8  cig_id;
-	__u8  link_count;
-	__u8  adapt_mode;
-	__u8  _pad;
-	__u32 sdu_interval_g2t;
-	__u32 sdu_interval_t2g;
-	__u16 max_sdu_g2t;
-	__u16 max_sdu_t2g;
-	__u16 max_latency_g2t;
-	__u16 max_latency_t2g;
-	__u8  retransmit_g2t;
-	__u8  retransmit_t2g;
-	__u16 handles_out[8];
-	__u8  _tail_pad[2];
-};
-
-struct sle_sync_big_config {
-	__u8  big_id;
-	__u8  link_count;
-	__u8  adapt_mode;
-	__u8  _pad;
-	__u32 sdu_interval_g2t;
-	__u32 sdu_interval_t2g;
-	__u16 max_sdu_g2t;
-	__u16 max_sdu_t2g;
-	__u16 max_latency_g2t;
-	__u16 max_latency_t2g;
-	__u8  retransmit_g2t;
-	__u8  retransmit_t2g;
-	__u16 handles_out[8];
-	__u8  _tail_pad[2];
-};
-
-struct sle_sync_create_cmd {
-	__u8  group_id;
-	__u8  link_count;
-	__u8  _pad[2];
-	__u16 acl_handles[8];
-};
-
-struct sle_sync_datapath_cmd {
-	__u16 sync_handle;
-	__u8  direction;
-	__u8  path_id;
-	__u8  codec_id;
-	__u8  _pad[3];
-};
-
-struct sle_sync_link_info {
-	__u16 sync_handle;
-	__u16 acl_handle;
-	__u8  group_id;
-	__u8  stream_id;
-	__u8  link_type;
-	__u8  state;
-	__u32 sdu_interval_g2t;
-	__u32 sdu_interval_t2g;
-	__u16 max_sdu_g2t;
-	__u16 max_sdu_t2g;
-	__u8  datapath_configured;
-	__u8  _pad2[3];
-};
-
-struct sle_sync_reject_cmd {
-	__u16 sync_handle;
-	__u8  reason;
-	__u8  _pad;
-};
-
-struct sle_sync_data_cmd {
-	__u16 sync_handle;
-	__u8  segment;
-	__u8  priority;
-	__u16 len;
-	__u8  _pad[2];
-	__u8  data[247];
-	__u8  _pad2;
-};
-
-/* --- DLI controller ----------------------------------------------------- */
-
-struct sle_dli_info {
-	__u8  bus;
-	__u8  _pad[3];
-	__u32 firmware_version;
-	__u64 features;
-	__u8  max_connections;
-	__u8  max_adv_sets;
-	__u8  transport_modes;
-	__u8  measurement_cap;
-	__u16 max_mtu;
-	__u16 max_mps;
-	__u16 security_cap;
-	__u16 features_ext;
-	__u8  name[32];
-	__u8  _reserved[4];
-};
-
-struct sle_dli_event {
-	__u8  event_type;
-	__u8  status;
-	__u16 handle;
-	__u16 opcode;
-	__u16 data_len;
-	__u8  data[240];
-	__u8  addr[6];
-	__u8  _pad[2];
-};
-
-struct sle_dli_cmd {
-	__u16 opcode;
-	__u16 param_len;
-	__u32 seq;
-	__u8  params[240];
-};
 
 struct sle_mgmt_stats {
 	__u16 pending;
@@ -548,98 +39,124 @@ struct sle_mgmt_stats {
 	__u32 total_timeouts;
 };
 
-/* --- PHY layer ---------------------------------------------------------- */
 
-struct sle_phy_info {
-	__u8  mcs_index;
-	__u8  bandwidth_mhz;
-	__u8  pilot_density;
-	__s8  tx_power_dbm;
-	__u8  mimo_mode;
-	__u8  num_tx_ant;
-	__u8  num_rx_ant;
-	__u8  ofdm;
-	__u32 data_rate_kbps;
-	__u8  hop_channel;
-	__u8  hop_increment;
-	__u8  hop_used_channels;
-	__u8  _pad;
-	__u8  modulation;
-	__u8  code_rate_num;
-	__u8  code_rate_den;
-	__u8  _reserved[5];
+/* Explicitly selected registration. Native Ready means actual metadata and
+ * both initialization stop operations completed, with no Host fault. It is
+ * not an RF/calibration attestation. valid_fields bit 0 identifies the full
+ * queried native tuple; profile0 preserves its queried tuple without claiming a connected-data path.
+ */
+#define SLE_CONTROLLER_SNAPSHOT_VERSION 1U
+#define SLE_CONTROLLER_READY 1U
+#define SLE_CONTROLLER_SETUP 2U
+#define SLE_CONTROLLER_FAULT 4U
+#define SLE_CONTROLLER_FULL_METADATA 1U
+struct sle_controller_snapshot {
+	__aligned_u64 generation;
+	__u32 version;
+	__u32 flags;
+	__u32 profile;
+	__u32 valid_fields;
+	__u16 dev_index;
+	__u8 bus;
+	__u8 command_credits;
+	__u16 acb_length;
+	__u16 icb_length;
+	__u8 acb_count;
+	__u8 icb_count;
+	__u8 version_tuple[5];
+	__u8 features[10];
+	__u8 address[6];
+	__u8 reserved_byte;
+	__s32 error;
+	__u8 reserved[4];
+};
+#define SL_IOCTL_CONTROLLER_SNAPSHOT _IOWR(SL_MAGIC, 0x8a, struct sle_controller_snapshot)
+
+/* Core registration state, not Host Ready. Query without selecting a Runtime.
+ * Input: version=1, dev_index, generation (0 probes), all other fields zero.
+ * Snapshot linearizes under the registry lock; generation names that observation.
+ * Phase/error are raw provider diagnostics only while Pending/Fault.
+ */
+#define SLE_REGISTRATION_VERSION 1U
+#define SLE_REGISTRATION_PENDING 1U
+#define SLE_REGISTRATION_FAULT 2U
+#define SLE_REGISTRATION_INSTALLED 3U
+#define SLE_REGISTRATION_RETIRING 4U
+struct sle_registration_snapshot {
+	__aligned_u64 generation;
+	__u32 version;
+	__u32 state;
+	__u32 profile;
+	__u32 phase;
+	__s32 error;
+	__u16 dev_index;
+	__u8 bus;
+	__u8 reserved_byte;
+	__u8 reserved[8];
+};
+#define SL_IOCTL_REGISTRATION_SNAPSHOT _IOWR(SL_MAGIC, 0x9f, struct sle_registration_snapshot)
+
+
+/* Matched final Complete receipt in CLOCK_BOOTTIME ns. Zero until success.
+ * Observational, explicit generation/request; does not consume event history.
+ * The existing sle_discovery_result and ioctl remain unchanged. */
+struct sle_discovery_timing {
+ __aligned_u64 generation;
+ __aligned_u64 request_id;
+ __aligned_u64 completed_boottime_ns;
+ __u32 version;
+ __u32 flags;
+ __u32 operation;
+ __u32 state;
+ __u16 dev_index;
+ __u16 opcode;
+ __u8 status;
+ __u8 reserved[3];
+};
+#define SL_IOCTL_DISCOVERY_TIMING _IOWR(SL_MAGIC, 0x8f, struct sle_discovery_timing)
+
+
+/* Versioned, non-destructive native controller event stream. All integer
+ * fields use the same native-endian convention as existing SparkLink ioctls.
+ * payload contains exact validated controller parameters, not USB/HCC headers.
+ * Profile describes their dialect; no discovery fields are normalized here.
+ */
+#define SLE_CONTROLLER_EVENT_VERSION 1U
+#define SLE_CONTROLLER_EVENT_PAYLOAD_MAX 288U
+#define SLE_CONTROLLER_EVENT_PROFILE_WS73_HCC 1U
+
+struct sle_controller_event {
+	__aligned_u64 seq;             /* starts at 1 per registration */
+	__aligned_u64 generation;      /* immutable registration identity */
+	__aligned_u64 timestamp_ns;    /* CLOCK_BOOTTIME at receipt */
+	__aligned_u64 lost;            /* overwritten entries after requested cursor */
+	__u32 profile;
+	__u16 dev_index;
+	__u16 event_code;
+	__u16 payload_len;
+	__u16 flags;                   /* zero in version 1 */
+	__u32 _reserved;               /* zero */
+	__u8 payload[SLE_CONTROLLER_EVENT_PAYLOAD_MAX];
 };
 
-struct sle_phy_mcs_cmd {
-	__u8  mcs_index;
-	__u8  _reserved[3];
+struct sle_controller_event_query {
+	__aligned_u64 after_seq;       /* caller-owned cursor, 0 starts oldest retained */
+	__aligned_u64 generation;      /* 0 only with after_seq=0; otherwise exact identity */
+	__u32 version;                 /* SLE_CONTROLLER_EVENT_VERSION */
+	__u32 flags;                   /* input must be zero */
+	struct sle_controller_event event; /* output only; ignored on input */
 };
 
-struct sle_phy_txpower_cmd {
-	__s8  tx_power_dbm;
-	__u8  _reserved[3];
-};
+/* GET is nonblocking: EAGAIN means no newer event, ENODEV a retired/mismatched
+ * registration, EINVAL a future cursor/flags, EOPNOTSUPP an unknown version.
+ * No shared dequeue: independent readers can request the same sequence.
+ * GET subscribes this fd's poll to this registration's native stream, even
+ * on EAGAIN. read(2) is unsupported; use GET for complete records. Poll without a selected
+ * subscription reports POLLERR.
+ * DEV_SELECT resets this poll subscription. Errors never advance the cursor.
+ * Management replies continue through their dedicated transaction path.
+ */
 
-struct sle_phy_mcs_select {
-	__u32 min_kbps;
-	__u32 effective_kbps;
-	__s16 sinr_db_x10;
-	__u8  bandwidth_mhz;
-	__u8  selected_mcs;
-};
-
-struct sle_phy_hop_info {
-	__u8  channel;
-	__u8  _pad;
-	__u16 freq_mhz;
-	__u16 event_counter;
-	__u8  _reserved[2];
-};
-
-struct sle_phy_bw_cmd {
-	__u8  bandwidth_mhz;
-	__u8  _reserved[3];
-};
-
-struct sle_sinr_thresholds {
-	__s16 thresholds[13];
-	__u8  _pad[2];
-};
-
-/* --- Subsystem statistics ----------------------------------------------- */
-
-struct sle_subsys_stats {
-	__u16 dev_count;
-	__u8  proto_count;
-	__u8  binding_count;
-	__u16 active_connections;
-	__u16 mgmt_pending;
-	__u32 total_conn_created;
-	__u32 total_conn_completed;
-	__u32 total_mgmt_submitted;
-	__u32 total_mgmt_timeouts;
-	__u8  power_state;
-	__u8  _pad2[3];
-	__u32 power_transitions;
-	__u32 crc_errors;
-};
-
-/* --- Event wire format -------------------------------------------------- */
-
-struct sle_wire_event {
-	__u8  event_type;
-	__u8  payload_len;
-	__u8  payload[40];
-	__u8  _pad[2];
-};
-
-struct sle_event_stats {
-	__u32 pending;
-	__u32 _pad;
-	__u64 total_enqueued;
-	__u64 total_dropped;
-	__u64 total_delivered;
-};
 
 /* =========================================================================
  * IOCTL magic and command definitions
@@ -648,290 +165,513 @@ struct sle_event_stats {
 
 #define SL_MAGIC	'S'
 
-/* --- Device management -------------------------------------------------- */
+/* Retired unpublished raw operation numbers;never reused:
+ * 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x20, 0x21, 0x22, 0x23, 0x24, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x73, 0x74, 0x75, 0x76, 0x77, 0x80, 0x81, 0x83, 0x84, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0xa0, 0xa1, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xc0, 0xc1, 0xc2, 0xc3
+ * Historical encodings/layouts live only in selftests/retired-raw-uapi.
+ */
 
-#define SL_IOCTL_DEV_REGISTER		_IO(SL_MAGIC, 0x01)
-#define SL_IOCTL_DEV_UNREGISTER		_IOW(SL_MAGIC, 0x02, __u16)
+
+/* 0x01/0x02: removed unpublished no-op registration commands; not reused. */
 #define SL_IOCTL_DEV_COUNT		_IOR(SL_MAGIC, 0x03, __u32)
 #define SL_IOCTL_DEV_INFO		_IOR(SL_MAGIC, 0x04, struct sci_dev_info)
-#define SL_IOCTL_DEV_SWITCH		_IOW(SL_MAGIC, 0x05, __u16)
 #define SL_IOCTL_DEV_LIST		_IOR(SL_MAGIC, 0x06, __u16)
 
 /**
  * SL_IOCTL_DEV_SELECT - Set per-fd device affinity.
  *
- * Unlike DEV_SWITCH (which changes the global active controller),
- * DEV_SELECT only affects the calling fd.  Subsequent ioctls on this
- * fd auto-switch to the bound device.
+ * Bind this open File to one exact registration owner. dup/fork/SCM_RIGHTS
+ * share this File binding; no implicit/global controller route exists.
+ * A live ownership lease forbids rebinding until its cleanup completes.
  *
- * @arg: __s16  -1 = follow global active, >= 0 = bind to device id.
+ * @arg: __s16  -1 = clear this File binding/observers; >= 0 = bind device id.
  */
 #define SL_IOCTL_DEV_SELECT		_IOW(SL_MAGIC, 0x07, __s16)
 
 /**
  * SL_IOCTL_DEV_GET_ACTIVE - Get the effective device for this fd.
  *
- * Returns the per-fd target if set, otherwise the global active_dev_id.
- * 0xFFFF means no device is active.
+ * Returns this File target id even if retired; it does not assert Ready.
+ * 0xFFFF means this File is unselected.
  *
  * @arg: __u16 (output)
  */
 #define SL_IOCTL_DEV_GET_ACTIVE		_IOR(SL_MAGIC, 0x08, __u16)
 
-/* --- Advertising / scanning --------------------------------------------- */
 
-#define SL_IOCTL_START_ADV		_IOW(SL_MAGIC, 0x10, struct sle_adv_params)
-#define SL_IOCTL_STOP_ADV		_IO(SL_MAGIC, 0x11)
-#define SL_IOCTL_START_SCAN		_IOW(SL_MAGIC, 0x12, struct sle_scan_params)
-#define SL_IOCTL_STOP_SCAN		_IO(SL_MAGIC, 0x13)
+/* Removed unpublished SSAP ioctls 0x50..0x5f, 0x6f, 0x72; not reused. */
 
-/* --- Extended advertising ----------------------------------------------- */
-
-#define SL_IOCTL_EXT_ADV_CONFIGURE	_IOW(SL_MAGIC, 0x14, struct sle_ext_adv_config)
-#define SL_IOCTL_EXT_ADV_SET_DATA	_IOW(SL_MAGIC, 0x15, struct sle_ext_adv_data)
-#define SL_IOCTL_EXT_ADV_ENABLE		_IOW(SL_MAGIC, 0x16, __u8)
-#define SL_IOCTL_EXT_ADV_DISABLE	_IOW(SL_MAGIC, 0x17, __u8)
-#define SL_IOCTL_EXT_ADV_REMOVE		_IOW(SL_MAGIC, 0x18, __u8)
-#define SL_IOCTL_EXT_ADV_INFO		_IOWR(SL_MAGIC, 0x19, struct sle_ext_adv_info)
-#define SL_IOCTL_EXT_ADV_ENABLE_EX	_IOW(SL_MAGIC, 0x1A, struct sle_ext_adv_enable_params)
-#define SL_IOCTL_EXT_ADV_TICK		_IO(SL_MAGIC, 0x1B)
-#define SL_IOCTL_EXT_ADV_SET_SCAN_RSP	_IOW(SL_MAGIC, 0x1C, struct sle_ext_adv_data)
-
-/* --- Advertising injection / scan results ------------------------------- */
-
-#define SL_IOCTL_INJECT_ADV		_IOW(SL_MAGIC, 0x20, struct sle_inject_adv)
-#define SL_IOCTL_SCAN_RESULT_COUNT	_IO(SL_MAGIC, 0x21)
-#define SL_IOCTL_INJECT_RAW_ADV		_IOW(SL_MAGIC, 0x22, struct sle_inject_raw_adv)
-
-/* --- Extended scan filter (T/XS 20001-2025 §6.4) ------------------------ */
-
-#define SL_IOCTL_SET_SCAN_FILTER	_IOW(SL_MAGIC, 0x23, struct sle_scan_filter)
-#define SL_IOCTL_CLEAR_SCAN_FILTER	_IO(SL_MAGIC, 0x24)
-
-/* --- Connection management ---------------------------------------------- */
-
-#define SL_IOCTL_CONNECT		_IOW(SL_MAGIC, 0x30, struct sle_connect_params)
-#define SL_IOCTL_DISCONNECT		_IOW(SL_MAGIC, 0x31, __u16)
-#define SL_IOCTL_CONN_INFO		_IOWR(SL_MAGIC, 0x32, struct sle_conn_info)
-#define SL_IOCTL_CONN_SEND		_IOW(SL_MAGIC, 0x33, struct sle_conn_data)
-#define SL_IOCTL_CONN_RECV		_IOWR(SL_MAGIC, 0x34, struct sle_conn_data)
-#define SL_IOCTL_INJECT_CONN_RESP	_IOW(SL_MAGIC, 0x35, struct sle_inject_conn_resp)
-#define SL_IOCTL_INJECT_CONN_DATA	_IOW(SL_MAGIC, 0x36, struct sle_conn_data)
-#define SL_IOCTL_CONN_COUNT		_IO(SL_MAGIC, 0x37)
-#define SL_IOCTL_CONN_LIST		_IOR(SL_MAGIC, 0x38, struct sle_conn_list)
-#define SL_IOCTL_SET_CONN_MTU		_IOW(SL_MAGIC, 0x39, struct sle_conn_mtu_params)
-
-/* --- AFH (Adaptive Frequency Hopping) ----------------------------------- */
-
-#define SL_IOCTL_AFH_SET_MAP		_IOW(SL_MAGIC, 0x3A, struct sle_afh_map_params)
-#define SL_IOCTL_AFH_GET_MAP		_IOWR(SL_MAGIC, 0x3B, struct sle_afh_map_params)
-#define SL_IOCTL_AFH_REPORT_RSSI	_IOW(SL_MAGIC, 0x3C, struct sle_afh_rssi_report)
-#define SL_IOCTL_AFH_CLASSIFY		_IOWR(SL_MAGIC, 0x3D, struct sle_afh_classify_params)
-#define SL_IOCTL_AFH_HOP_NEXT		_IOWR(SL_MAGIC, 0x3E, struct sle_afh_hop_info)
-#define SL_IOCTL_AFH_REPORT_RETX	_IOW(SL_MAGIC, 0x3F, struct sle_afh_retx_report)
-
-/* --- Security management ------------------------------------------------ */
-
-#define SL_IOCTL_SEC_SET_PSK		_IOW(SL_MAGIC, 0x40, struct sle_psk_params)
-#define SL_IOCTL_SEC_PAIR		_IOW(SL_MAGIC, 0x41, struct sle_pair_params)
-#define SL_IOCTL_SEC_INFO		_IOR(SL_MAGIC, 0x42, struct sle_sec_info)
-#define SL_IOCTL_SEC_ENCRYPT_ON		_IO(SL_MAGIC, 0x43)
-#define SL_IOCTL_SEC_SM3_TEST		_IOW(SL_MAGIC, 0x44, struct sle_hash_test)
-#define SL_IOCTL_SEC_SM4_ENC_TEST	_IOW(SL_MAGIC, 0x45, struct sle_conn_data)
-#define SL_IOCTL_SEC_SM4_DEC_TEST	_IOW(SL_MAGIC, 0x46, struct sle_conn_data)
-#define SL_IOCTL_SEC_SM4_BLOCK_TEST	_IOWR(SL_MAGIC, 0x47, struct sle_sm4_block_test)
-#define SL_IOCTL_SEC_HMAC_TEST		_IOWR(SL_MAGIC, 0x48, struct sle_hmac_test)
-#define SL_IOCTL_SEC_RESET		_IO(SL_MAGIC, 0x49)
-#define SL_IOCTL_SEC_GET_PASSKEY	_IOR(SL_MAGIC, 0x4A, __u32)
-#define SL_IOCTL_SEC_CONFIRM_PASSKEY	_IO(SL_MAGIC, 0x4B)
-#define SL_IOCTL_SEC_REJECT_PASSKEY	_IO(SL_MAGIC, 0x4C)
-#define SL_IOCTL_SEC_SET_OOB		_IOW(SL_MAGIC, 0x4D, struct sle_oob_data)
-#define SL_IOCTL_SEC_INPUT_PASSKEY	_IOW(SL_MAGIC, 0x4E, struct sle_passkey_input)
-#define SL_IOCTL_SEC_SET_PASSWORD	_IOW(SL_MAGIC, 0x4F, struct sle_password_params)
-
-/* --- SSAP service layer ------------------------------------------------- */
-
-#define SL_IOCTL_SSAP_REGISTER_SVC	_IO(SL_MAGIC, 0x50)
-#define SL_IOCTL_SSAP_INFO		_IOR(SL_MAGIC, 0x51, struct ssap_summary)
-#define SL_IOCTL_SSAP_READ		_IOWR(SL_MAGIC, 0x52, struct ssap_read_write)
-#define SL_IOCTL_SSAP_WRITE		_IOW(SL_MAGIC, 0x53, struct ssap_read_write)
-#define SL_IOCTL_SSAP_FIND_SVC		_IOR(SL_MAGIC, 0x54, struct ssap_service_list)
-#define SL_IOCTL_SSAP_NOTIFY		_IOW(SL_MAGIC, 0x55, __u16)
-#define SL_IOCTL_SSAP_DEQUEUE_NTF	_IOR(SL_MAGIC, 0x56, struct ssap_notification)
-#define SL_IOCTL_SSAP_ADD_SVC		_IOWR(SL_MAGIC, 0x57, struct ssap_add_service)
-#define SL_IOCTL_SSAP_ADD_PROP		_IOWR(SL_MAGIC, 0x58, struct ssap_add_property)
-#define SL_IOCTL_SSAP_REMOVE_SVC	_IOW(SL_MAGIC, 0x59, __u16)
-
-/* --- Remote SSAP client-side operations --------------------------------- */
-
-struct ssap_remote_cmd {
-	__u16 conn_handle;
-	__u8  _reserved[2];
-};
-
-struct ssap_remote_discover {
-	__u16 conn_handle;
-	__u16 start_handle;
-	__u16 end_handle;
-	__u16 count;		/* output: number of entries discovered */
-};
-
-struct ssap_remote_read_write {
-	__u16 conn_handle;
-	__u16 handle;
-	__u16 length;
-	__u8  _pad[2];
-	__u8  data[248];
-};
-
-struct ssap_uuid_op {
-	__u16 conn_handle;
-	__u16 uuid16;		/* 0 when using uuid128 */
-	__u8  uuid128[16];	/* ignored when uuid16 != 0 */
-	__u16 handle;		/* output: matched handle */
-	__u16 length;		/* output: data length */
-	__u8  data[232];	/* output: read data (READ_BY_UUID only) */
-};
-
-#define SL_IOCTL_SSAP_EXCHANGE_INFO	_IOW(SL_MAGIC, 0x5A, struct ssap_remote_cmd)
-#define SL_IOCTL_SSAP_REMOTE_DISCOVER	_IOWR(SL_MAGIC, 0x5B, struct ssap_remote_discover)
-#define SL_IOCTL_SSAP_REMOTE_READ	_IOWR(SL_MAGIC, 0x5C, struct ssap_remote_read_write)
-#define SL_IOCTL_SSAP_REMOTE_WRITE	_IOW(SL_MAGIC, 0x5D, struct ssap_remote_read_write)
-#define SL_IOCTL_SSAP_REMOTE_EVENT	_IOR(SL_MAGIC, 0x5E, struct ssap_notification)
-#define SL_IOCTL_SSAP_CALL_METHOD	_IOWR(SL_MAGIC, 0x5F, struct ssap_remote_read_write)
-#define SL_IOCTL_SSAP_FIND_BY_UUID	_IOWR(SL_MAGIC, 0x6F, struct ssap_uuid_op)
-#define SL_IOCTL_SSAP_READ_BY_UUID	_IOWR(SL_MAGIC, 0x72, struct ssap_uuid_op)
-
-/* --- Power management --------------------------------------------------- */
-
-#define SL_IOCTL_PM_INFO		_IOR(SL_MAGIC, 0x60, struct sle_pm_info)
-#define SL_IOCTL_PM_SET_STATE		_IOW(SL_MAGIC, 0x61, struct sle_pm_state_cmd)
-#define SL_IOCTL_PM_SET_INTERVAL	_IOW(SL_MAGIC, 0x62, struct sle_pm_interval)
-#define SL_IOCTL_PM_FORCE_ACTIVE	_IOW(SL_MAGIC, 0x63, __u8)
-#define SL_IOCTL_PM_TICK		_IO(SL_MAGIC, 0x64)
-#define SL_IOCTL_PM_ACTIVITY		_IO(SL_MAGIC, 0x65)
-
-/* --- Sync link management ----------------------------------------------- */
-
-#define SL_IOCTL_SYNC_UCAST_PARAM	_IOWR(SL_MAGIC, 0x66, struct sle_sync_cig_config)
-#define SL_IOCTL_SYNC_UCAST_CREATE	_IOW(SL_MAGIC, 0x67, struct sle_sync_create_cmd)
-#define SL_IOCTL_SYNC_UCAST_REMOVE	_IOW(SL_MAGIC, 0x68, __u8)
-#define SL_IOCTL_SYNC_MCAST_PARAM	_IOWR(SL_MAGIC, 0x69, struct sle_sync_big_config)
-#define SL_IOCTL_SYNC_MCAST_CREATE	_IOW(SL_MAGIC, 0x6A, struct sle_sync_create_cmd)
-#define SL_IOCTL_SYNC_MCAST_REMOVE	_IOW(SL_MAGIC, 0x6B, __u8)
-#define SL_IOCTL_SYNC_DATAPATH_CFG	_IOW(SL_MAGIC, 0x6C, struct sle_sync_datapath_cmd)
-#define SL_IOCTL_SYNC_DATAPATH_REMOVE	_IOW(SL_MAGIC, 0x6D, __u16)
-#define SL_IOCTL_SYNC_INFO		_IOWR(SL_MAGIC, 0x6E, struct sle_sync_link_info)
-#define SL_IOCTL_SYNC_UCAST_ACCEPT	_IOW(SL_MAGIC, 0x73, __u16)
-#define SL_IOCTL_SYNC_UCAST_REJECT	_IOW(SL_MAGIC, 0x74, struct sle_sync_reject_cmd)
-#define SL_IOCTL_SYNC_MCAST_ACCEPT	_IOW(SL_MAGIC, 0x75, __u16)
-#define SL_IOCTL_SYNC_MCAST_REJECT	_IOW(SL_MAGIC, 0x76, struct sle_sync_reject_cmd)
-#define SL_IOCTL_SYNC_DATA_SEND	_IOW(SL_MAGIC, 0x77, struct sle_sync_data_cmd)
-
-/* --- Event notification ------------------------------------------------- */
-
-#define SL_IOCTL_EVENT_COUNT		_IO(SL_MAGIC, 0x70)
-#define SL_IOCTL_EVENT_STATS		_IOR(SL_MAGIC, 0x71, struct sle_event_stats)
 
 /* --- DLI controller ----------------------------------------------------- */
 
-#define SL_IOCTL_DLI_INFO		_IOR(SL_MAGIC, 0x80, struct sle_dli_info)
-#define SL_IOCTL_USB_DEV_COUNT		_IO(SL_MAGIC, 0x81)
-#define SL_IOCTL_DLI_POLL_EVENT		_IOR(SL_MAGIC, 0x82, struct sle_dli_event)
-#define SL_IOCTL_DLI_RESET		_IO(SL_MAGIC, 0x83)
-#define SL_IOCTL_DLI_SEND_CMD		_IOWR(SL_MAGIC, 0x84, struct sle_dli_cmd)
 #define SL_IOCTL_MGMT_STATS		_IOR(SL_MAGIC, 0x85, struct sle_mgmt_stats)
 
-/* --- Subsystem statistics ----------------------------------------------- */
 
-#define SL_IOCTL_SUBSYS_STATS		_IOR(SL_MAGIC, 0x86, struct sle_subsys_stats)
-
-/* --- PHY layer ---------------------------------------------------------- */
-
-#define SL_IOCTL_PHY_INFO		_IOR(SL_MAGIC, 0x90, struct sle_phy_info)
-#define SL_IOCTL_PHY_SET_MCS		_IOW(SL_MAGIC, 0x91, struct sle_phy_mcs_cmd)
-#define SL_IOCTL_PHY_SET_TXPOWER	_IOW(SL_MAGIC, 0x92, struct sle_phy_txpower_cmd)
-#define SL_IOCTL_PHY_MCS_SELECT		_IOWR(SL_MAGIC, 0x93, struct sle_phy_mcs_select)
-#define SL_IOCTL_PHY_HOP_NEXT		_IOR(SL_MAGIC, 0x94, struct sle_phy_hop_info)
-#define SL_IOCTL_PHY_SET_BW		_IOW(SL_MAGIC, 0x95, struct sle_phy_bw_cmd)
-#define SL_IOCTL_PHY_GET_SINR		_IOR(SL_MAGIC, 0x96, struct sle_sinr_thresholds)
-#define SL_IOCTL_PHY_SET_SINR		_IOW(SL_MAGIC, 0x97, struct sle_sinr_thresholds)
-
-/* --- Capability / channel negotiation ----------------------------------- */
-
-struct sle_conn_peer_cap {
-	__u16	handle;
-	__u8	features[10];
-	__u8	features_valid;
-	__u8	version;
-	__u16	manufacturer;
-	__u16	subversion;
-	__u8	version_valid;
-	__u8	_reserved[3];
+/* Versioned, per-fd-bound typed controller discovery operations.
+ * Select a device first. Result request_id=0/generation=0 probes identity and
+ * radio state. Submit requires the returned generation and a caller-chosen
+ * nonzero request_id (unique while retained); _IOW has no post-submit copyout.
+ * Successful ioctl means accepted, never radio enabled. Results are copied
+ * non-destructively; 64 records retained, oldest terminal results may evict.
+ * Nonterminal records never evict. Wrong generation/retired fd: ENODEV;
+ * absent/evicted request: ENOENT; retained duplicate id: EEXIST.
+ * Advertising/scan intervals, request_rx_duration, connection intervals and
+ * event lengths use 125us slots; duration/supervision_timeout use 10ms;
+ * conn_max_latency and max_events are counts. Address/type/frame/mode values are explicit
+ * in profile, with no implicit mapping/default. Currently WS73_HCC only.
+ * data/response are opaque complete profile data, not inner/outer AD builders.
+ */
+#define SLE_DISCOVERY_VERSION 1U
+#define SLE_DISCOVERY_ADV_START 1U
+#define SLE_DISCOVERY_ADV_STOP 2U
+#define SLE_DISCOVERY_SCAN_START 3U
+#define SLE_DISCOVERY_SCAN_STOP 4U
+/* Explicit params -> successful OFF Complete; never enables advertising. */
+#define SLE_DISCOVERY_ADV_CONFIGURE_OFF 5U
+#define SLE_DISCOVERY_SCAN_INITIALIZE_OFF 6U
+#define SLE_DISCOVERY_SCAN_RESPONSE 1U
+#define SLE_DISCOVERY_FAULT 1U /* result flags, not Ready */
+#define SLE_DISCOVERY_QUEUED 1U
+#define SLE_DISCOVERY_PENDING 2U
+#define SLE_DISCOVERY_SUCCEEDED 3U
+#define SLE_DISCOVERY_FAILED 4U /* raw controller status preserved; error=0 */
+#define SLE_DISCOVERY_CANCELLED 5U
+#define SLE_DISCOVERY_FAULTED 6U /* error is negative errno */
+#define SLE_DISCOVERY_RADIO_UNKNOWN 0U
+#define SLE_DISCOVERY_RADIO_OFF 1U
+#define SLE_DISCOVERY_RADIO_ON 2U
+struct sle_discovery_adv_config {
+	__u32 handle;
+	__u32 mode;
+	__u32 gt_role;
+	__u32 interval_min;
+	__u32 interval_max;
+	__u32 channel_map;
+	__u32 own_address_type;
+	__u32 peer_address_type;
+	__u8 own_address[6];
+	__u8 peer_address[6];
+	__u32 filter;
+	__s32 tx_power;
+	__u32 primary_frame;
+	__u32 secondary_frame;
+	__u32 secondary_phy;
+	__u32 secondary_pilot;
+	__u32 secondary_mcs;
+	__u32 secondary_max_skip;
+	__u32 sid;
+	__u32 request_notification;
+	__u32 max_requests;
+	__u32 request_rx_duration;
+	__u32 conn_interval_min;
+	__u32 conn_interval_max;
+	__u32 conn_max_latency;
+	__u32 supervision_timeout;
+	__u32 min_event_length;
+	__u32 max_event_length;
+};
+struct sle_discovery_scan_config {
+	__u32 own_address_type;
+	__u32 filter;
+	__u32 frame_types;
+	__u32 active;
+	__u32 interval;
+	__u32 window;
+	__u32 filter_duplicates;
+};
+struct sle_discovery_submit {
+	__u32 version;
+	__u32 profile;
+	__u32 operation;
+	__u32 flags;
+	__aligned_u64 generation;
+	__aligned_u64 request_id;
+	struct sle_discovery_adv_config advertising;
+	struct sle_discovery_scan_config scanning;
+	__u32 handle;
+	__u32 duration;
+	__u32 max_events;
+	__u32 data_len;
+	__u32 scan_response_len;
+	__u32 reserved;
+	__u8 data[251];
+	__u8 scan_response[251];
+	__u8 reserved_tail[2];
+};
+struct sle_discovery_result {
+	__aligned_u64 generation;
+	__aligned_u64 request_id;
+	__u32 version;
+	__u32 flags;
+	__u32 profile;
+	__u32 operation;
+	__u32 state;
+	__s32 error;
+	__s32 selected_power;
+	__u32 radio_adv;
+	__u32 radio_scan;
+	__u16 dev_index;
+	__u16 opcode;
+	__u8 step;
+	__u8 count;
+	__u8 status;
+	__u8 power_valid;
+	__u8 reserved[4];
 };
 
-struct sle_conn_param_update {
-	__u16	handle;
-	__u16	interval_min;
-	__u16	interval_max;
-	__u16	latency;
-	__u16	supervision_timeout;
-	__u8	_reserved[2];
-};
+#define SL_IOCTL_CONTROLLER_EVENT_GET	_IOWR(SL_MAGIC, 0x87, struct sle_controller_event_query)
 
-struct sle_conn_phy_update {
-	__u16	handle;
-	__u8	mcs_index;
-	__u8	bandwidth_mhz;
-};
+#define SL_IOCTL_DISCOVERY_SUBMIT _IOW(SL_MAGIC, 0x88, struct sle_discovery_submit)
+#define SL_IOCTL_DISCOVERY_RESULT _IOWR(SL_MAGIC, 0x89, struct sle_discovery_result)
 
-#define SL_IOCTL_CONN_READ_PEER_FEATURES _IOWR(SL_MAGIC, 0x98, struct sle_conn_peer_cap)
-#define SL_IOCTL_CONN_READ_PEER_VERSION	 _IOWR(SL_MAGIC, 0x99, struct sle_conn_peer_cap)
-#define SL_IOCTL_CONN_UPDATE_PARAMS	 _IOW(SL_MAGIC, 0x9A, struct sle_conn_param_update)
-#define SL_IOCTL_CONN_PHY_UPDATE	 _IOW(SL_MAGIC, 0x9B, struct sle_conn_phy_update)
-
-/* --- Role management ---------------------------------------------------- */
-
-#define SL_IOCTL_SET_ROLE		_IOW(SL_MAGIC, 0xA0, __u8)
-#define SL_IOCTL_GET_ROLE		_IOR(SL_MAGIC, 0xA1, __u8)
-
-/* --- RAL / RPA management ----------------------------------------------- */
-
-#define SL_IOCTL_RAL_ADD		_IOW(SL_MAGIC, 0xB0, struct sle_ral_add_params)
-#define SL_IOCTL_RAL_REMOVE		_IOW(SL_MAGIC, 0xB1, struct sle_ral_remove_params)
-#define SL_IOCTL_RAL_CLEAR		_IO(SL_MAGIC, 0xB2)
-#define SL_IOCTL_RAL_SIZE		_IOR(SL_MAGIC, 0xB3, __u8)
-#define SL_IOCTL_RAL_READ_PEER_RPA	_IOWR(SL_MAGIC, 0xB4, struct sle_ral_query_params)
-#define SL_IOCTL_RAL_READ_LOCAL_RPA	_IOWR(SL_MAGIC, 0xB5, struct sle_ral_query_params)
-#define SL_IOCTL_RPA_ENABLE		_IOW(SL_MAGIC, 0xB6, __u8)
-#define SL_IOCTL_RPA_SET_TIMEOUT	_IOW(SL_MAGIC, 0xB7, __u16)
-
-/* --- Narrowband AFH measurement (T/XS 10003-2025 §8.7) ----------------- */
-
-#define SL_IOCTL_MEAS_READ_CAP		_IOR(SL_MAGIC, 0xC0, struct sle_meas_cap)
-#define SL_IOCTL_MEAS_SET_LINK_PARAM	_IOW(SL_MAGIC, 0xC1, struct sle_meas_link_param)
-#define SL_IOCTL_MEAS_ACTION		_IOW(SL_MAGIC, 0xC2, struct sle_meas_action)
-#define SL_IOCTL_MEAS_ENABLE		_IOW(SL_MAGIC, 0xC3, __u8)
 
 /* =========================================================================
  * Event type constants
  * =========================================================================
  */
 
-#define SLE_EVT_CONN_STATE	0x01
-#define SLE_EVT_ADV_REPORT	0x02
-#define SLE_EVT_DATA_RECV	0x03
-#define SLE_EVT_SEC_CHANGED	0x04
-#define SLE_EVT_PWR_CHANGED	0x05
-#define SLE_EVT_HW_ERROR	0x06
+#define SLE_MANAGEMENT_VERSION 1U
+#define SLE_MANAGEMENT_MANAGED 1U
+#define SLE_MANAGEMENT_DIAGNOSTIC 2U
+#define SLE_MANAGEMENT_FREE 0U
+#define SLE_MANAGEMENT_HELD 1U
+#define SLE_MANAGEMENT_REVOKING 2U
+#define SLE_MANAGEMENT_FAULTED 3U
+struct sle_management_request {
+    __aligned_u64 generation;
+    __aligned_u64 lease;
+    __u32 version;
+    __u32 mode;
+    __u32 flags;
+    __u32 reserved;
+};
+struct sle_management_query {
+    __aligned_u64 generation;
+    __aligned_u64 lease;
+    __u32 version;
+    __u32 mode;
+    __u32 state;
+    __u32 flags; /* bit 0: owning file; bit 1: raw failure reply valid */
+    __s32 error;
+    __u32 status;
+    __u32 opcode;
+    __u32 reserved;
+};
+#define SL_IOCTL_MANAGEMENT_ACQUIRE _IOWR(SL_MAGIC, 0x8b, struct sle_management_request)
+#define SL_IOCTL_MANAGEMENT_RELEASE _IOW(SL_MAGIC, 0x8c, struct sle_management_request)
+#define SL_IOCTL_MANAGEMENT_QUERY _IOWR(SL_MAGIC, 0x8d, struct sle_management_query)
 
-/* Narrowband / measurement events (§9.1.33–§9.1.39) */
-#define SLE_EVT_NB_MEAS_INFO		0x22
-#define SLE_EVT_NB_MEAS_STATE		0x23
-#define SLE_EVT_NB_MEAS_PARAM		0x24
-#define SLE_EVT_LOCAL_NB_MEAS_CAP	0x25
-#define SLE_EVT_PEER_NB_MEAS_CAP	0x26
-#define SLE_EVT_MEAS_STATE_CHANGE	0x27
-#define SLE_EVT_MEAS_QUANTITY		0x28
+/* Independent privileged DLI seam trace, not a command/reply consumer. RX
+ * denotes a validated HCC slot before DLI decoding; TX denotes transfer result,
+ * timestamped after transport completion, so RX may precede TX in the log.
+ * WS73 packet bytes include the A1/A2 header. Oversize packets have an explicit
+ * truncated prefix and original_length, never silently masquerade as complete.
+ */
+#define SLE_SNOOP_VERSION 1U
+#define SLE_SNOOP_PAYLOAD_MAX 320U
+#define SLE_SNOOP_RX 1U
+#define SLE_SNOOP_TX 2U
+#define SLE_SNOOP_WS73_DLI 1U
+#define SLE_SNOOP_STANDARD_DLI 2U
+#define SLE_SNOOP_TRUNCATED 1U
+/* Sensitive parameters omitted; original length retained, header only captured. */
+#define SLE_SNOOP_REDACTED 2U
+struct sle_snoop_record {
+    __aligned_u64 seq, generation, timestamp_ns, lost;
+    __u32 profile, original_length;
+    __s32 status;
+    __u16 dev_index;
+    __u8 direction, format;
+    __u16 captured_length, flags;
+    __u32 reserved;
+    __u8 payload[SLE_SNOOP_PAYLOAD_MAX];
+};
+struct sle_snoop_query {
+    __aligned_u64 generation, after_seq;
+    __u32 version, flags;
+    __aligned_u64 reserved;
+    struct sle_snoop_record record;
+};
+#define SL_IOCTL_SNOOP_GET _IOWR(SL_MAGIC, 0x8e, struct sle_snoop_query)
+
+/* Owner-private result of a metadata diagnostic admitted by the same fd.
+ * Input: version=1, flags=0, exact generation and nonzero admission seq.
+ * State: 1 pending, 2 complete-success, 3 failed (error or controller status).
+ * Missing/evicted is ENOENT; queries never acknowledge or remove a result.
+ */
+struct sle_diagnostic_result {
+    __u32 version, flags;
+    __aligned_u64 generation;
+    __u32 seq, state;
+    __s32 error;
+    __u16 opcode;
+    __u8 status, _pad;
+    __u16 data_len;
+    __u8 _reserved[6];
+    __u8 data[64];
+};
+#define SL_IOCTL_DIAGNOSTIC_RESULT _IOWR(SL_MAGIC, 0xd0, struct sle_diagnostic_result)
+
+/* Native profile1 metadata only. version1/flags0, exact selected generation,
+ * nonzero request_id increasing for NEW admissions on this open fd; seq=0 on
+ * input. Retry same retained ID/opcode/timeout returns the original seq and
+ * deadline even after submission copyout EFAULT. Evicted old IDs ESTALE, changed
+ * opcode/timeout EINVAL; never resend. A new fd is a new author/ID namespace.
+ * action1 submits; action2 cancels only an existing request (same fields).
+ * Cancellation snapshot is ECANCELED; on-wire slot/credits remain reserved for
+ * real reply or timeout. Already-final requests keep their original result.
+ * timeout_ms 1..5000 is the whole admission deadline, not wire-only time.
+ */
+struct sle_diagnostic_submit {
+    __u32 version, flags;
+    __aligned_u64 generation, request_id;
+    __u32 timeout_ms;
+    __u16 opcode, reserved;
+    __u32 seq, action;
+};
+#define SL_IOCTL_DIAGNOSTIC_SUBMIT _IOWR(SL_MAGIC, 0xd1, struct sle_diagnostic_submit)
+
+/* Unpublished experimental volatile address setup. CAP_NET_ADMIN and the
+ * original File's exclusive Diagnostic lease;untouched Setup only,no links.
+ * One mutation per registration. Six bytes in driver order,not an official
+ * address allocation claim;no permanent storage operation is exposed.
+ * version1/flags0/reserved0,nonzero generation/request_id,seq0 on input.
+ * action1 admits;action2 withdraws original author with identical parameters.
+ * Same ID/payload retry returns its original seq/deadline,never resends.
+ * The existing Diagnostic result exposes the real setter Complete ONLY.
+ * A causally newer real 0406 query must verify the value before the original
+ * 1..5000ms deadline;until then metadata is invalid and Managed is refused.
+ * Closing/releasing unverified setup quarantines instead of claiming Free.
+ * This first version needs fresh initialization for a further address change.
+ */
+struct sle_runtime_address_submit {
+    __u32 version, flags;
+    __aligned_u64 generation, request_id;
+    __u32 timeout_ms, seq, action;
+    __u8 address[6], reserved[6];
+};
+#define SL_IOCTL_RUNTIME_ADDRESS_SUBMIT _IOWR(SL_MAGIC, 0xd7, struct sle_runtime_address_submit)
+
+/* Unpublished version-1 typed Managed link commands. profile1 only.
+ * Requires CAP_NET_ADMIN, original File's Managed lease and exact epoch/link.
+ * kind1=RSSI,kind2=PHY,kind3=payload preference; action1=admit,2=cancel same author/payload/id.
+ * argument=0 for queries; kind3 uses nonzero LE16 payload preference.
+ * No effective packet budget,MTU,Ready or security state is changed by an ack.
+ * deadline_monotonic_ns is the original same-kernel CLOCK_MONOTONIC expiry,
+ * including caller/admission waits. timeout_ms1..5000 bounds remaining time,
+ * not a new relative grant. Retry retains both; final USB checks exact ns.
+ * Success Status alone is not a measurement;successful Complete must echo
+ * the captured handle for queries;kind3 requires status-only Complete. Cancellation/release cannot erase physical debt.
+ * No arbitrary opcode, new Host or raw Diagnostic takeover.
+ * Old query-only ioctl numbers0xd8/0xd9 are retired and must not be reused.
+ */
+struct sle_link_command_submit {
+    __u32 version, action;
+    __aligned_u64 generation, lease_epoch, request_id, lifetime;
+    __aligned_u64 deadline_monotonic_ns;
+    __u32 timeout_ms, seq;
+    __u16 handle;
+    __u8 role, address_type, address[6], kind, reserved;
+    __u16 argument, reserved_tail;
+};
+/* Input version1/flags0/generation and seq or original request_id;other
+ * fields output. Same-File nonconsuming history remains readable following
+ * lease release;eviction returns ENOENT,retirement ENODEV. Zero reserved.
+ * state1=pending,2=controller success,3=controller/local error.
+ * flags:1=current link+lease identity NOW (not sample freshness),
+ * 2=value available,4=controller status valid. Local error is negative errno.
+ * data is successful Complete body only:handle LE16 then RSSI signed byte
+ * (127 invalid),or eight PHY wire bytes (SDK dialect interpretation separate).
+ * kind3 success carries no data and never sets value-available. argument echoes
+ * the original preference,not an effective/negotiated value. Results are neither
+ * Ready/security qualification nor RF/peer delivery.
+ */
+struct sle_link_command_result {
+    __u32 version, flags;
+    __aligned_u64 generation, lease_epoch, request_id, lifetime;
+    __aligned_u64 deadline_monotonic_ns;
+    __u32 seq, state;
+    __s32 error;
+    __u16 handle;
+    __u8 kind, status, role, address_type, address[6];
+    __u16 data_len;
+    __u16 argument;
+    __u8 reserved[2], data[10];
+};
+#define SL_IOCTL_LINK_COMMAND_SUBMIT _IOWR(SL_MAGIC, 0xda, struct sle_link_command_submit)
+#define SL_IOCTL_LINK_COMMAND_RESULT _IOWR(SL_MAGIC, 0xdb, struct sle_link_command_result)
+
+
+/* Unpublished Native typed connection ABI. File-local nonzero request IDs
+ * increase monotonically. Submit has no copyout; retry/query never repeats I/O.
+ * Cancellation cancels the author only, not the physical controller procedure.
+ * Success requires real OUT, CommandStatus acceptance and matching outcome.
+ * Timeout is an absolute whole-operation budget in milliseconds (1..10000).
+ * Status validity is explicit, so raw status zero is not an absent result.
+ */
+#define SLE_CONNECTION_VERSION 1U
+#define SLE_CONNECTION_CREATE 1U
+#define SLE_CONNECTION_DISCONNECT 2U
+#define SLE_CONNECTION_CANCEL_AUTHOR 3U
+#define SLE_CONNECTION_QUEUED 1U
+#define SLE_CONNECTION_ON_WIRE 2U
+#define SLE_CONNECTION_AWAITING_OUTCOME 3U
+#define SLE_CONNECTION_SUCCEEDED 4U
+#define SLE_CONNECTION_FAILED 5U
+#define SLE_CONNECTION_CANCELLED 6U
+#define SLE_CONNECTION_FAULTED 7U
+#define SLE_CONNECTION_COMMAND_STATUS_VALID 1U
+#define SLE_CONNECTION_OUTCOME_STATUS_VALID 2U
+#define SLE_CONNECTION_HANDLE_VALID 4U
+struct sle_connection_parameters {
+    __u32 filter, own_address_type, peer_address_type;
+    __u8 peer_address[6], reserved[2];
+    __u32 gt_negotiate, frame;
+    __u32 scan_interval, scan_window, interval_min, interval_max;
+    __u32 latency, supervision_timeout, event_min, event_max;
+};
+struct sle_connection_submit {
+    __u32 version, profile, operation, flags;
+    __aligned_u64 generation, request_id;
+    __u32 timeout_ms, handle, reason, reserved;
+    struct sle_connection_parameters parameters;
+    __u32 reserved_tail;
+    /* Unpublished v2: required for Disconnect, zero for Create/author cancel.
+     * Kernel rechecks this physical reference at admission AND selection. */
+    __aligned_u64 expected_lifetime;
+    __u8 expected_address[6], expected_address_type, expected_role;
+};
+struct sle_connection_result {
+    __u32 version, profile, state, operation;
+    __aligned_u64 generation, request_id;
+    __s32 error, fault_error;
+    __u32 command_status, outcome_status, handle, flags;
+    __u16 dev_index;
+    __u8 reserved[6];
+};
+#define SL_IOCTL_CONNECTION_SUBMIT _IOW(SL_MAGIC, 0x9c, struct sle_connection_submit)
+#define SL_IOCTL_CONNECTION_RESULT _IOWR(SL_MAGIC, 0x9d, struct sle_connection_result)
+
+/* Observed physical links for one live registration. event_seq is sampled
+ * atomically with the table; replay only link events newer than this barrier.
+ * lifetime is registration-local and changes on handle reuse. flags=0 with
+ * error means UNKNOWN, never an authoritative empty table. */
+#define SLE_LINK_SNAPSHOT_MAX 16
+#define SLE_LINK_SNAPSHOT_KNOWN 1
+struct sle_link_info {
+    __aligned_u64 lifetime;
+    __u16 handle;
+    __u8 role, address_type, address[6], reserved[6];
+};
+struct sle_link_snapshot {
+    __aligned_u64 generation, event_seq, revision;
+    __u32 version, profile, flags, count;
+    __s32 error;
+    __u16 dev_index;
+    __u8 reserved[2];
+    struct sle_link_info links[SLE_LINK_SNAPSHOT_MAX];
+};
+#define SL_IOCTL_LINK_SNAPSHOT _IOWR(SL_MAGIC, 0x9e, struct sle_link_snapshot)
+
+/* Experimental manager-approved security mechanism; NOT authenticated Pair.
+ * Both operations require the same active Managed File and CAP_NET_ADMIN.
+ * flags selects exactly one mode1/2/3/4 below; no raw TX/RX/keys.
+ * action1 arms T response; action2 starts G request. Other roles unsupported.
+ * Once per physical lifetime; no same-life retry, no restart after expiry.
+ * Entire original timeout1..5000ms includes policy admission/queue/replies.
+ * state4 means only own real Complete plus observed peer capability bytes;
+ * it is NOT an ACK that the peer processed our offer, pairing, trust or keys.
+ * state8 is unauthenticated candidate key agreement after real peer proof;
+ * all own relay Completes must drain. It does not grant trusted identity.
+ * state3 is pending install; state9 requires real own command acceptance and
+ * lifetime-bound0011 initial encryption-on, NOT Agent/identity/trusted Grant.
+ * mode4 additionally requires the original author's explicit comparison-code
+ * confirmation before DH proof. state11 reports this installed mechanism;
+ * userspace Agent policy is separate from this historical result. Current
+ * facts come from CONNECTION_SECURITY; fixed socket Grants freeze/check their
+ * security epoch. Neither operation result nor Grant establishes Bond.
+ * Legacy global security facade remains EOPNOTSUPP. Same-life re-pairing has
+ * no qualified barrier and is rejected. Revoke/Down never refunds debt.
+ */
+#define SLE_SECURITY_CAPABILITY_ONLY 1U
+/* Experimental no-entry/no-MITM/no-Bond candidate key agreement. state8 means
+ * fresh peer DH proof plus drained real relay Completes, NOT authenticated
+ * identity, installation, encryption, Agent consent or Bond. No raw keys/API.
+ */
+#define SLE_SECURITY_KEY_AGREEMENT_ONLY 2U
+/* Explicit manager policy: no-MITM/no-Bond candidate then real role-specific
+ * installation. state9 is observed UNAUTHENTICATED encryption, never Agent
+ * approval, authenticated peer identity, trusted Grant or Bond. */
+#define SLE_SECURITY_UNAUTHENTICATED_ENCRYPTION 3U
+/* Explicit privileged numeric-comparison mechanism; Agent UI/policy belongs
+ * to userspace, no Bond or arbitrary trusted flag.
+ * flags8 marks a live comparison prompt; flags16 local confirmation,32 real
+ * peer proof,64 installed numeric mechanism. state11 requires all actual
+ * protocol/confirmation/installation stages, never an arbitrary trust flag. */
+#define SLE_SECURITY_NUMERIC_COMPARISON 4U
+struct sle_security_negotiation_submit {
+    /* version2; absolute CLOCK_MONOTONIC ns, set before policy/Agent waiting.
+     * timeout_ms bounds the remaining budget (1..5000), never resets it.
+     * Session checks this original deadline through crypto and final submit.
+     * Host coarse cleanup ticks do not extend authorization. */
+    __aligned_u64 generation, lifetime, request_id, deadline_monotonic_ns;
+    __u32 version, profile, action, flags, timeout_ms;
+    __u16 handle;
+    __u8 role, address_type, address[6], reserved[2];
+};
+/* Cancel only this original Managed File's security author request. Does not
+ * release the controller lease, disconnect, clear installed keys or erase
+ * submitted physical obligations. Successful ioctl is local withdrawal only;
+ * terminal requests remain unchanged. No wire cancel/Complete is fabricated. */
+struct sle_security_negotiation_cancel {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version;
+    __u16 handle, reserved;
+};
+struct sle_security_negotiation_result {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version, profile, state;
+    __s32 error;
+    __u32 flags;
+    __u16 handle;
+    __u8 role, status;
+    __u8 local_caps[10], peer_caps[10];
+    __u32 comparison_code; /* valid only while flags8; may be zero (000000) */
+};
+/* Same original Managed File/request/physical identity; no raw proof or keys.
+ * accept0 is local rejection, not a fabricated remote failure/physical rollback.
+ * Reserved bytes zero; original deadline cannot be replaced or extended. */
+struct sle_security_numeric_confirm {
+    __aligned_u64 generation, lifetime, request_id;
+    __u32 version, comparison_code;
+    __u16 handle;
+    __u8 accept, reserved[5];
+};
+#define SL_IOCTL_SECURITY_NUMERIC_CONFIRM _IOW(SL_MAGIC, 0xd5, struct sle_security_numeric_confirm)
+#define SL_IOCTL_SECURITY_NEGOTIATION_SUBMIT _IOW(SL_MAGIC, 0xd2, struct sle_security_negotiation_submit)
+#define SL_IOCTL_SECURITY_NEGOTIATION_RESULT _IOWR(SL_MAGIC, 0xd3, struct sle_security_negotiation_result)
+#define SL_IOCTL_SECURITY_NEGOTIATION_CANCEL _IOW(SL_MAGIC, 0xd4, struct sle_security_negotiation_cancel)
+
+/* Current physical Session mechanism snapshot; not an author-operation result.
+ * Managed + CAP_NET_ADMIN, exact nonzero generation/lifetime, version1; all
+ * output fields zero on input. No allocation, exchange, raw keys or trust bit.
+ * security_epoch is per physical lifetime and advances at receipt ingress,
+ * BEFORE ordinary event queueing. A lost/pending receipt cannot preserve an
+ * older positive snapshot. Epoch0 is poisoned overflow and returns EOVERFLOW.
+ * level0 none; level1 no-MITM encryption; level2 explicitly confirmed numeric
+ * mechanism. These are NOT named peer identity, local app authorization, Bond
+ * or a protected Grant. flags: cipher1, numeric confirmation2, proof4, accept8.
+ * Query revalidates active lease, controller and physical lifetime under locks.
+ * Off/failure/rekey/withdraw/Down/retire cannot revive with a late on event.
+ * A snapshot is informational, not authorization for a later USB submission.
+ * Firmware handle-only receipt attribution still needs a proven reuse barrier.
+ */
+struct sle_connection_security {
+    __aligned_u64 generation, lifetime, security_epoch;
+    __u32 version, profile, level, flags;
+    __u16 handle;
+    __u8 method, key_size;
+    __s32 error;
+};
+#define SL_IOCTL_CONNECTION_SECURITY _IOWR(SL_MAGIC, 0xd6, struct sle_connection_security)
 
 #endif /* _UAPI_LINUX_SPARKLINK_IOCTL_H */

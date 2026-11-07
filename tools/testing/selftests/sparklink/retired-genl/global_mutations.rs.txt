@@ -1,0 +1,60 @@
+/// Start advertising (C FFI). Returns 0 on success, negative errno on failure.
+#[no_mangle]
+pub extern "C" fn sparklink_do_start_adv(interval_ms: u32, discovery_level: u8) -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
+    let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
+    let context = &context;
+    match do_start_adv(context, interval_ms, discovery_level) {
+        Ok(v) => v,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Stop advertising (C FFI). Returns 0 on success, negative errno on failure.
+#[no_mangle]
+pub extern "C" fn sparklink_do_stop_adv() -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
+    let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
+    let context = &context;
+    match do_stop_adv(context) {
+        Ok(v) => v,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Start scanning (C FFI). Returns 0 on success, negative errno on failure.
+#[no_mangle]
+pub extern "C" fn sparklink_do_start_scan(
+    window_ms: u32,
+    interval_ms: u32,
+    filter_level: u8,
+) -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
+    let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
+    let context = &context;
+    match do_start_scan(context, window_ms, interval_ms, filter_level) {
+        Ok(v) => v,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Stop scanning (C FFI). Returns 0 on success, negative errno on failure.
+#[no_mangle]
+pub extern "C" fn sparklink_do_stop_scan() -> i32 {
+    if let Err(error) = sle_authorization::require_admin() { return error.to_errno(); }
+    let context = RuntimeContext::default_selection();
+    if context.owner.as_ref().is_some_and(|owner| owner.protocol_profile != 0) { return EPERM.to_errno(); }
+    let context = &context;
+    match do_stop_scan(context) {
+        Ok(v) => v,
+        Err(e) => e.to_errno(),
+    }
+}
+
+
+
+
+

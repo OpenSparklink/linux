@@ -1,0 +1,121 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -111,6 +111,11 @@
+     uint64_t                         test_runtime_releases;
+     uint64_t                         test_runtime_bounded_releases;
+     uint64_t                         test_runtime_hold_drops;
++    /* Disabled by default: deliver up to two original successful frames before
++     * retaining the next one. No reply construction, payload or status edits. */
++    uint64_t                         test_runtime_skip_requested;
++    uint64_t                         test_runtime_skip_remaining;
++    uint64_t                         test_runtime_skipped;
+ 
+     /* state */
+     QTAILQ_ENTRY(USBHostDevice)      next;
+@@ -539,6 +544,15 @@
+         xfer->endpoint == 0x81 && xfer->actual_length > 0) {
+         g_autofree char *digest = g_compute_checksum_for_data(
+             G_CHECKSUM_SHA256, r->buffer, xfer->actual_length);
++        if (s->test_runtime_skip_remaining) {
++            s->test_runtime_skip_remaining--;
++            s->test_runtime_skipped++;
++            error_report("WS73_TEST_RUNTIME_SKIP: dev %d:%d bytes=%d "
++                         "host_status=0 skipped=%" PRIu64 " sha256=%s",
++                         s->bus_num, s->addr, xfer->actual_length,
++                         s->test_runtime_skipped, digest);
++            goto deliver_original;
++        }
+         s->test_runtime_hold_once = false;
+         s->test_runtime_held = r;
+         s->test_runtime_holds++;
+@@ -552,6 +566,7 @@
+                      s->test_runtime_holds, digest);
+         return; /* retain xfer/buffer/request; no guest copy/completion/free */
+     }
++deliver_original:
+     r->p->status = status_map[xfer->status];
+     if (s->test_runtime_in_error_once && r->in &&
+         xfer->status == LIBUSB_TRANSFER_COMPLETED &&
+@@ -1209,6 +1224,9 @@
+     /* A test pulse belongs to this open transport, never a re-enumeration. */
+     s->test_runtime_in_error_once = false;
+     s->test_runtime_hold_once = false;
++    s->test_runtime_skip_requested = 0;
++    s->test_runtime_skip_remaining = 0;
++    s->test_runtime_skipped = 0;
+ 
+     if (s->dh == NULL) {
+         return -1;
+@@ -1441,7 +1459,51 @@
+                    "opt-outs and no pending hold/error");
+         return;
+     }
++    if (value) {
++        s->test_runtime_skip_remaining = s->test_runtime_skip_requested;
++        s->test_runtime_skipped = 0;
++    }
+     s->test_runtime_hold_once = value;
++}
++
++static void usb_host_set_test_runtime_skip(USBHostDevice *s, unsigned count,
++                                           Error **errp)
++{
++    if (count > 2 || !s->dh || !USB_DEVICE(s)->attached ||
++        s->ddesc.idVendor != 0xffff || s->ddesc.idProduct != 0x3733 ||
++        s->allow_host_reset || s->allow_kernel_driver_detach ||
++        s->allow_one_guest_reset || s->allow_all_guest_resets ||
++        s->test_enum_reset_once || s->test_runtime_in_error_once || s->test_runtime_hold_once ||
++        s->test_runtime_held) {
++        error_setg(errp, "test skip requires idle attached WS73, all reset/"
++                   "detach opt-outs and a maximum of two original frames");
++        return;
++    }
++    s->test_runtime_skip_requested = count;
++    s->test_runtime_skip_remaining = 0;
++    s->test_runtime_skipped = 0;
++}
++
++static bool usb_host_get_test_runtime_skip_one(Object *obj, Error **errp)
++{
++    return USB_HOST_DEVICE(obj)->test_runtime_skip_requested == 1;
++}
++
++static void usb_host_set_test_runtime_skip_one(Object *obj, bool value,
++                                              Error **errp)
++{
++    usb_host_set_test_runtime_skip(USB_HOST_DEVICE(obj), value ? 1 : 0, errp);
++}
++
++static bool usb_host_get_test_runtime_skip_two(Object *obj, Error **errp)
++{
++    return USB_HOST_DEVICE(obj)->test_runtime_skip_requested == 2;
++}
++
++static void usb_host_set_test_runtime_skip_two(Object *obj, bool value,
++                                              Error **errp)
++{
++    usb_host_set_test_runtime_skip(USB_HOST_DEVICE(obj), value ? 2 : 0, errp);
+ }
+ 
+ static bool usb_host_get_test_runtime_release(Object *obj, Error **errp)
+@@ -1479,6 +1541,20 @@
+     object_property_add_bool(obj, "test-runtime-in-error-once",
+                              usb_host_get_test_runtime_in_error,
+                              usb_host_set_test_runtime_in_error);
++    object_property_add_bool(obj, "test-runtime-in-skip-one",
++                             usb_host_get_test_runtime_skip_one,
++                             usb_host_set_test_runtime_skip_one);
++    object_property_add_bool(obj, "test-runtime-in-skip-two",
++                             usb_host_get_test_runtime_skip_two,
++                             usb_host_set_test_runtime_skip_two);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-skip-requested",
++                                  &s->test_runtime_skip_requested,
++                                  OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-skip-remaining",
++                                  &s->test_runtime_skip_remaining,
++                                  OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-skipped",
++                                  &s->test_runtime_skipped, OBJ_PROP_FLAG_READ);
+     object_property_add_bool(obj, "test-runtime-in-hold-once",
+                              usb_host_get_test_runtime_hold,
+                              usb_host_set_test_runtime_hold);

@@ -1,0 +1,219 @@
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -100,6 +100,14 @@
+     /* Explicit test-only QMP pulse; never armed by default. */
+     bool                             test_runtime_in_error_once;
+     uint64_t                         test_runtime_in_errors;
++    /* Test only: retain one completed host transfer, never fake a reply. */
++    bool                             test_runtime_hold_once;
++    USBHostRequest                  *test_runtime_held;
++    QEMUTimer                       *test_runtime_hold_timer;
++    uint64_t                         test_runtime_holds;
++    uint64_t                         test_runtime_releases;
++    uint64_t                         test_runtime_bounded_releases;
++    uint64_t                         test_runtime_hold_drops;
+ 
+     /* state */
+     QTAILQ_ENTRY(USBHostDevice)      next;
+@@ -474,6 +482,44 @@
+     }
+ }
+ 
++static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer);
++
++/* QMP, timers and libusb callbacks serialize under BQL. Clear timer/identity
++ * before completing/freeing, so cancellation/close cannot replay this request. */
++static bool usb_host_test_clear_hold(USBHostDevice *s, USBHostRequest *r)
++{
++    if (s->test_runtime_held != r) {
++        return false;
++    }
++    s->test_runtime_held = NULL;
++    timer_del(s->test_runtime_hold_timer);
++    timer_free(s->test_runtime_hold_timer);
++    s->test_runtime_hold_timer = NULL;
++    return true;
++}
++
++static void usb_host_test_release_hold(USBHostDevice *s, bool bounded)
++{
++    USBHostRequest *r = s->test_runtime_held;
++    if (!r) {
++        return;
++    }
++    usb_host_test_clear_hold(s, r);
++    s->test_runtime_releases++;
++    s->test_runtime_bounded_releases += bounded;
++    error_report("WS73_TEST_RUNTIME_HOLD_RELEASE: dev %d:%d bytes=%d "
++                 "bounded=%d releases=%" PRIu64,
++                 s->bus_num, s->addr, r->xfer->actual_length,
++                 bounded, s->test_runtime_releases);
++    /* Original successful xfer/buffer, unchanged, via the normal callback. */
++    usb_host_req_complete_data(r->xfer);
++}
++
++static void usb_host_test_hold_timeout(void *opaque)
++{
++    usb_host_test_release_hold(opaque, true);
++}
++
+ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
+ {
+     USBHostRequest *r = xfer->user_data;
+@@ -484,6 +530,25 @@
+         goto out; /* request was canceled */
+     }
+ 
++    if (s->test_runtime_hold_once && r->in &&
++        xfer->status == LIBUSB_TRANSFER_COMPLETED &&
++        xfer->type == LIBUSB_TRANSFER_TYPE_BULK &&
++        xfer->endpoint == 0x81 && xfer->actual_length > 0) {
++        g_autofree char *digest = g_compute_checksum_for_data(
++            G_CHECKSUM_SHA256, r->buffer, xfer->actual_length);
++        s->test_runtime_hold_once = false;
++        s->test_runtime_held = r;
++        s->test_runtime_holds++;
++        s->test_runtime_hold_timer = timer_new_ms(
++            QEMU_CLOCK_REALTIME, usb_host_test_hold_timeout, s);
++        timer_mod(s->test_runtime_hold_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
++        error_report("WS73_TEST_RUNTIME_HOLD: dev %d:%d bytes=%d "
++                     "host_status=0 holds=%" PRIu64 " sha256=%s",
++                     s->bus_num, s->addr, xfer->actual_length,
++                     s->test_runtime_holds, digest);
++        return; /* retain xfer/buffer/request; no guest copy/completion/free */
++    }
+     r->p->status = status_map[xfer->status];
+     if (s->test_runtime_in_error_once && r->in &&
+         xfer->status == LIBUSB_TRANSFER_COMPLETED &&
+@@ -521,6 +586,7 @@
+ {
+     USBHostDevice  *s = r->host;
+     bool inflight = (r->p && r->p->state == USB_PACKET_ASYNC);
++    bool held = usb_host_test_clear_hold(s, r);
+ 
+     if (inflight) {
+         r->p->status = USB_RET_NODEV;
+@@ -533,7 +599,13 @@
+         }
+         r->p = NULL;
+ 
+-        libusb_cancel_transfer(r->xfer);
++        if (!held) {
++            libusb_cancel_transfer(r->xfer);
++        }
++    }
++    if (held) {
++        s->test_runtime_hold_drops++;
++        usb_host_req_free(r); /* host transfer already completed; no callback */
+     }
+ }
+ 
+@@ -1133,6 +1205,7 @@
+ 
+     /* A test pulse belongs to this open transport, never a re-enumeration. */
+     s->test_runtime_in_error_once = false;
++    s->test_runtime_hold_once = false;
+ 
+     if (s->dh == NULL) {
+         return -1;
+@@ -1318,12 +1391,57 @@
+                   s->ddesc.idVendor != 0xffff || s->ddesc.idProduct != 0x3733 ||
+                   s->allow_host_reset || s->allow_kernel_driver_detach ||
+                   s->allow_one_guest_reset || s->allow_all_guest_resets ||
+-                  s->test_runtime_in_error_once)) {
++                  s->test_runtime_in_error_once ||
++                  s->test_runtime_hold_once || s->test_runtime_held)) {
+         error_setg(errp, "test runtime error requires attached WS73, all reset/"
+                    "detach opt-outs and no pending injection");
+         return;
+     }
+     s->test_runtime_in_error_once = value;
++}
++
++static bool usb_host_get_test_runtime_hold(Object *obj, Error **errp)
++{
++    return USB_HOST_DEVICE(obj)->test_runtime_hold_once;
++}
++
++static bool usb_host_get_test_runtime_held(Object *obj, Error **errp)
++{
++    return USB_HOST_DEVICE(obj)->test_runtime_held != NULL;
++}
++
++static void usb_host_set_test_runtime_hold(Object *obj, bool value, Error **errp)
++{
++    USBHostDevice *s = USB_HOST_DEVICE(obj);
++    if (value && (!s->dh || !USB_DEVICE(s)->attached ||
++                  s->ddesc.idVendor != 0xffff || s->ddesc.idProduct != 0x3733 ||
++                  s->allow_host_reset || s->allow_kernel_driver_detach ||
++                  s->allow_one_guest_reset || s->allow_all_guest_resets ||
++                  s->test_runtime_in_error_once || s->test_runtime_hold_once ||
++                  s->test_runtime_held)) {
++        error_setg(errp, "test hold requires attached WS73, all reset/detach "
++                   "opt-outs and no pending hold/error");
++        return;
++    }
++    s->test_runtime_hold_once = value;
++}
++
++static bool usb_host_get_test_runtime_release(Object *obj, Error **errp)
++{
++    return false; /* pulse */
++}
++
++static void usb_host_set_test_runtime_release(Object *obj, bool value, Error **errp)
++{
++    USBHostDevice *s = USB_HOST_DEVICE(obj);
++    if (!value) {
++        return;
++    }
++    if (!s->test_runtime_held) {
++        error_setg(errp, "test release requires an actual held transfer");
++        return;
++    }
++    usb_host_test_release_hold(s, false);
+ }
+ 
+ static void usb_host_instance_init(Object *obj)
+@@ -1336,6 +1454,24 @@
+     object_property_add_bool(obj, "test-runtime-in-error-once",
+                              usb_host_get_test_runtime_in_error,
+                              usb_host_set_test_runtime_in_error);
++    object_property_add_bool(obj, "test-runtime-in-hold-once",
++                             usb_host_get_test_runtime_hold,
++                             usb_host_set_test_runtime_hold);
++    object_property_add_bool(obj, "test-runtime-in-held",
++                             usb_host_get_test_runtime_held, NULL);
++    object_property_add_bool(obj, "test-runtime-in-release",
++                             usb_host_get_test_runtime_release,
++                             usb_host_set_test_runtime_release);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-holds",
++                                  &s->test_runtime_holds, OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-releases",
++                                  &s->test_runtime_releases, OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-bounded-releases",
++                                  &s->test_runtime_bounded_releases,
++                                  OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(obj, "test-runtime-in-hold-drops",
++                                  &s->test_runtime_hold_drops,
++                                  OBJ_PROP_FLAG_READ);
+     object_property_add_uint64_ptr(obj, "test-runtime-in-errors",
+                                   &s->test_runtime_in_errors,
+                                   OBJ_PROP_FLAG_READ);
+@@ -1369,8 +1505,14 @@
+ 
+     r = usb_host_req_find(s, p);
+     if (r && r->p) {
++        bool held = usb_host_test_clear_hold(s, r);
+         r->p = NULL; /* mark as dead */
+-        libusb_cancel_transfer(r->xfer);
++        if (held) {
++            s->test_runtime_hold_drops++;
++            usb_host_req_free(r);
++        } else {
++            libusb_cancel_transfer(r->xfer);
++        }
+     }
+ }
+ 

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Actual native ACB bodies and budget/queue; explicit USB/locking fixtures."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+from run_connection_tx import function
+
+
+def run(output):
+    if output and any(p.exists() for p in [output, output.with_suffix('.bin'), output.with_suffix('.fixture.rs')]):
+        raise ValueError('refuse to overwrite existing source-bound evidence')
+    runner = Path(__file__).resolve()
+    runner_bytes = runner.read_bytes()
+    here = Path(__file__).resolve().parent
+    root = here.parents[3]
+    net = root / 'net/sparklink'
+    files = [net / n for n in ['sle_native.rs', 'sle_link_observation.rs',
+                             'sle_data_credit.rs', 'sle_native_data.rs', 'sle_host.rs', 'sle_sessions.rs', 'sle_grant.rs']]
+    files.append(net/'sle_dli.rs')
+    files.append(here / 'native-data/fixture.rs')
+    originals = {p: p.read_bytes() for p in files}
+    fixture = originals[files[-1]].decode()
+    variant=re.search(r'NativeSecurityInstallation\s*\{[^}]+\},',originals[net/'sle_dli.rs'].decode()).group()
+    fixture=fixture.replace('// @@SECURITY_INSTALL_EVENT@@',variant)
+    fixture = fixture.replace('// @@ADMITTED@@', function((net/'sle_host.rs').read_text(), 'admits_data'))
+    # The existing balanced-body extractor accepts Rust fn signatures, not
+    # extern ABI spelling. Only normalize the signature; preserve whole bodies.
+    source = re.sub(r'unsafe extern "C" fn (\w+)', r'unsafe fn \1', originals[files[0]].decode())
+    start = source.index('struct NativeTxTicket {')
+    end = source.index('\n}', start) + 2
+    fixture = fixture.replace('// @@TICKET@@', source[start:end])
+    for marker, name in [('CONTROLLER_DATA', 'native_controller_data_valid'),
+                         ('RECEIVE', 'sparklink_native_receive_rust'),
+                         ('SEND', 'sparklink_native_acb_send_rust'),
+                         ('SEND_COMMON', 'native_acb_send'),
+                         ('DEFERRED_SEND', 'sparklink_native_acb_send_deferred_rust'),
+                         ('COMMIT', 'sparklink_native_tx_commit_rust'),
+                         ('TAKE', 'sparklink_native_acb_take_rust')]:
+        fixture = fixture.replace('// @@' + marker + '@@', function(source, name))
+    with tempfile.TemporaryDirectory(prefix='sparklink-native-data-') as directory:
+        tmp = Path(directory)
+        (tmp / 'fixture.rs').write_text(fixture)
+        for p in files[1:-1]:
+            (tmp / p.name).write_bytes(originals[p])
+        subprocess.run([os.environ.get('RUSTC', 'rustc'), '--edition=2021', '--test',
+                        '-D', 'warnings', str(tmp / 'fixture.rs'), '-o', str(tmp / 'test')], check=True)
+        binary = (tmp / 'test').read_bytes()
+        if output:
+            with output.with_suffix('.bin').open('xb') as destination:
+                destination.write(binary)
+            with output.with_suffix('.fixture.rs').open('xb') as destination:
+                destination.write(fixture.encode())
+        process = subprocess.run([str(tmp / 'test'), '--test-threads=1', '--show-output'], text=True,capture_output=True)
+        result=process.stdout
+        print(result);print(process.stderr)
+        if process.returncode and output:
+            output.write_text(json.dumps({'status': 'FAIL', 'exit': process.returncode,
+                'runner_sha256': hashlib.sha256(runner_bytes).hexdigest(),
+                'generated_fixture_sha256': hashlib.sha256(fixture.encode()).hexdigest(),
+                'test_binary_sha256': hashlib.sha256(binary).hexdigest(),
+                'scope': 'Failed dependency-fixture test, not hardware qualification'}, indent=2)+'\n')
+        process.check_returncode()
+        for case in [
+                'actual_ticket_rechecks_down_revoke_retirement_and_reused_handle_before_submit',
+                'actual_closing_retains_debt_until_nocp_without_reopening_or_cross_link_withdrawal',
+                'actual_closing_refuses_queue_and_inspect_and_keeps_stopped_session_until_down']:
+            assert f'test {case} ... ok' in result, 'required actual closing transition case missing: '+case
+    assert runner.read_bytes() == runner_bytes
+    assert all(p.read_bytes() == data for p, data in originals.items())
+    count = re.search(r'test result: ok\. (\d+) passed; 0 failed;', result)
+    assert count
+    record = {'status': 'NATIVE_ACB_PRODUCTION_SOURCE_BOUNDARIES_PASS', 'tests': int(count[1]),
+              'scope': 'actual ingress/send/take and credit/queue modules; allocation, locks, owner registry and USB dependencies are fixtures',
+              'real_data_acceptance': False, 'socket_acceptance': False,
+              'sources': {str(p.relative_to(root)): hashlib.sha256(b).hexdigest() for p, b in originals.items()}}
+    record.update(runner_sha256=hashlib.sha256(runner_bytes).hexdigest(),
+                  generated_fixture_sha256=hashlib.sha256(fixture.encode()).hexdigest(),
+                  test_binary_sha256=hashlib.sha256(binary).hexdigest(),
+                  rustc=subprocess.check_output([os.environ.get('RUSTC', 'rustc'), '--version'], text=True).strip())
+    sequence = re.search(r'ACTUAL_NATIVE_SEQUENCE_FUZZ seed=(\d+) cases=(\d+) events=(\d+) primed=(\d+) accepted=(\d+) refused=(\d+) failure_attempts=(\d+) atomic_rejections=(\d+) uncertain=(\d+)', result)
+    assert sequence, 'missing required stateful sequence exploration'
+    record['stateful_sequences'] = dict(zip(
+        ['seed', 'cases', 'events', 'primed', 'accepted', 'refused', 'failure_attempts', 'atomic_rejections', 'uncertain'],
+        map(int, sequence.groups())))
+    record['sequence_scope'] = ('Actual production NativeTX/credit/authority/ingress transitions after a valid '
+        'initial submit, 1024 seeded 32-event sequences; explicit USB/locks/clock/owner/consent fixtures. '
+        'Conservation, no stale/Closing submit, definite/uncertain failure and controller isolation only. '
+        'Not exhaustive/formal, original-deadline/worker/VFS concurrency or NOCP accuracy/reuse proof.')
+    record['closing_scope'] = ('Actual LinkObservation stop_submission, Native preparation/atomic commit '
+        'and Session queue/inspect/reconcile bodies; Closing between preparation and commit cannot newly '
+        'submit or refund prior debt, matching late NOCP does not reopen, other links/controllers remain '
+        'usable, stopped physical Session remains until observed Down. Typed Disconnect Host admission '
+        'is exercised separately by the complete Host fixture; locks/USB/clock/C Session refs are explicit '
+        'dependencies here, not live kernel concurrency, callback drain, NOCP uniqueness or hardware proof.')
+    if output:
+        output.write_text(json.dumps(record, indent=2) + '\n')
+    print(json.dumps(record, indent=2))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path)
+    run(parser.parse_args().output)

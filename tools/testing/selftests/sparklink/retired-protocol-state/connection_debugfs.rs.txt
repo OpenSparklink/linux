@@ -1,0 +1,14 @@
+            _conn_stats <- conn_dir.read_callback_file(
+                c"stats",
+                Atomic::<u32>::new(0),
+                &|_dummy: &Atomic<u32>, f: &mut core::fmt::Formatter<'_>| {
+                    let context = RuntimeContext::default_selection();
+                    if let Ok(guard) = context.lock() {
+                        let ss = guard.as_ref().expect("validated live Runtime");
+                        writeln!(f, "active: {}", ss.conn.active_count())?;
+                        writeln!(f, "total_created: {}", ss.conn.total_created)?;
+                        writeln!(f, "total_completed: {}", ss.conn.total_completed)?;
+                    }
+                    Ok(())
+                },
+            ),
